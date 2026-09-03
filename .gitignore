@@ -1,0 +1,20 @@
+﻿# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Disposable local and agent-generated artifacts
+.artifacts/
+
+# Local runtime databases
+*.db
+
+# Private documentation
+private_docs
+
