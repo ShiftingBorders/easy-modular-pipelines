@@ -1,0 +1,5 @@
+{
+    "Mname": "VARCHAR(255) NOT NULL",
+    "MVersion": "VARCHAR(255) NOT NULL",
+    "MHash": "VARCHAR(255) NOT NULL"
+}
