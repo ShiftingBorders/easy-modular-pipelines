@@ -14,10 +14,17 @@ Use only the project environment managed by `uv` for project-related Python exec
 
 - `uv sync`: create or update `.venv` from `pyproject.toml` and `uv.lock`.
 - `uv run python -m compileall core experimentrunner.py webserver.py`: perform a quick syntax check.
+- `uv run python -m unittest discover -s tests -p "test_*.py" -v`: run the
+  approved standard-library test suite.
+- `uv run --with ruff ruff check core tests`: run Ruff without adding it as a
+  project dependency.
 - `uv run python experimentrunner.py`: run the experiment entry point once implemented.
 - `uv run fastapi dev webserver.py`: start the development API after `webserver.py` exposes a FastAPI application.
 
-There is currently no packaging backend or configured automated test dependency. When the maintainer authorizes a development tool, add it through `uv` and commit the resulting `pyproject.toml` and `uv.lock` changes together.
+There is currently no packaging backend or external automated test dependency.
+The approved test framework is Python's standard-library `unittest`. When the
+maintainer authorizes a development dependency, add it through `uv` and commit
+the resulting `pyproject.toml` and `uv.lock` changes together.
 
 ## Coding Style & Naming Conventions
 
@@ -74,7 +81,16 @@ When a feature is ready for testing, first create a Markdown test-plan template 
 
 The maintainer then describes in natural language how each listed file or behavior should be tested. Review that description together and resolve ambiguities. Write or modify test code only after the maintainer explicitly confirms the plan. Apply this same plan-and-approval workflow to all later test changes; existing approval does not automatically authorize new cases or altered assertions.
 
-After approval, place tests under `tests/` using names such as `test_hashdb.py` and functions such as `test_rejects_invalid_schema`. Keep each test traceable by name and scope to the approved behavior; the temporary plan is coordination material and is not a permanent project specification. No test framework or coverage threshold is established yet; request approval before adding one or changing test dependencies.
+After approval, place `unittest` tests under `tests/` using names such as
+`test_hashdb.py` and methods such as `test_rejects_invalid_schema`. Keep each
+test traceable by name and scope to the approved behavior; the temporary plan
+is coordination material and is not a permanent project specification. No
+coverage threshold is established yet; request approval before adding another
+test framework, changing test dependencies, or establishing a coverage policy.
+
+VS Code test discovery is configured in `.vscode/settings.json` for `unittest`,
+the `tests/` start directory, and the `test_*.py` filename pattern. Keep these
+settings aligned with the command-line discovery command above.
 
 ## Commit & Pull Request Guidelines
 
