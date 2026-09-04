@@ -5,14 +5,18 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from pydantic import ValidationError
 
 from core.hashdb import HashDB
+from core.hashdb_utils.dataclasses import HashDBConfig
 from core.hashdb_utils.hashdb_errors import (
     FailedOpenHashDB,
     HashDBConfigError,
     HashDBConnectionClosedError,
     ModuleRegisterError,
+    ModuleRemoveError,
     SchemaValidationFail,
     TableCreationErr,
     UnexpectedSchemaValErr,
@@ -21,6 +25,10 @@ from core.hashdb_utils.hashdb_states import (
     ColumnValidationResult,
     ModuleAddResult,
     SchemaValidationStatus,
+)
+from core.hashdb_utils.hashdb_validation import (
+    clear_module_data_input,
+    validate_column_desc,
 )
 
 LOCKED_SCHEMA = {
@@ -96,8 +104,10 @@ class HashDBConfigTests(HashDBTestCase):
         config_path = self.temp_path / "config.json"
         self._write_json(config_path, [])
 
-        with self.assertRaises(HashDBConfigError):
+        with self.assertRaises(HashDBConfigError) as raised:
             HashDB(config_path)
+
+        self.assertIsInstance(raised.exception.__cause__, ValidationError)
 
     def test_rejects_missing_config_fields(self) -> None:
         """Both schema_path and db_path are required."""
@@ -213,6 +223,33 @@ class HashDBConfigTests(HashDBTestCase):
         self.assertEqual(config["schema_path"], self.schema_path.resolve())
         self.assertEqual(config["db_path"], database_path.resolve())
 
+    def test_returns_pydantic_config_with_path_values(self) -> None:
+        """Configuration validation returns typed filesystem paths."""
+        database_path = self.temp_path / "hash.db"
+
+        config = self._new_uninitialized_hash_db()._validate_config(
+            {
+                "schema_path": self.schema_path,
+                "db_path": database_path,
+            }
+        )
+
+        self.assertIsInstance(config, HashDBConfig)
+        self.assertEqual(config.schema_path, self.schema_path)
+        self.assertEqual(config.db_path, database_path)
+
+    def test_accepts_additional_config_fields(self) -> None:
+        """Unknown settings remain available for forward compatibility."""
+        config = self._new_uninitialized_hash_db()._validate_config(
+            {
+                "schema_path": self.schema_path,
+                "db_path": self.temp_path / "hash.db",
+                "future_setting": "value",
+            }
+        )
+
+        self.assertEqual(config.future_setting, "value")
+
     def test_wraps_database_open_error_and_preserves_cause(self) -> None:
         """SQLite open failures retain their cause in FailedOpenHashDB."""
         hash_db = self._new_uninitialized_hash_db()
@@ -278,7 +315,6 @@ class HashDBSchemaFileTests(HashDBTestCase):
 
     def test_column_description_validation_results(self) -> None:
         """Each invalid column condition returns its specific result."""
-        hash_db = self._new_uninitialized_hash_db()
         cases = (
             ("Mname", "TEXT", ColumnValidationResult.column_valid),
             ("bad-name", "TEXT", ColumnValidationResult.column_name_invalid_char),
@@ -291,8 +327,26 @@ class HashDBSchemaFileTests(HashDBTestCase):
 
         for column_name, column_type, expected_result in cases:
             with self.subTest(name=column_name, column_type=column_type):
-                result = hash_db._validate_column_desc(column_name, column_type)
+                result = validate_column_desc(column_name, column_type)
                 self.assertIs(result, expected_result)
+
+    def test_module_data_validation_normalizes_valid_values(self) -> None:
+        """The shared module-data helper strips surrounding whitespace."""
+        result = clear_module_data_input(" module ", " 1.0 ", " hash ")
+
+        self.assertEqual(result, ("module", "1.0", "hash"))
+
+    def test_module_data_validation_rejects_invalid_values(self) -> None:
+        """The shared module-data helper rejects empty and non-string values."""
+        invalid_values = ("", "   ", None, 1, [], {})
+
+        for position in range(3):
+            for invalid_value in invalid_values:
+                with self.subTest(position=position, value=invalid_value):
+                    values = ["module", "1.0", "hash"]
+                    values[position] = invalid_value
+                    with self.assertRaises(ModuleRegisterError):
+                        clear_module_data_input(*values)
 
 
 class HashDBDatabaseSchemaTests(HashDBTestCase):
@@ -701,6 +755,85 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         ).fetchone()
         self.assertEqual(table, ("MAIN",))
 
+    def test_removes_existing_module_hash(self) -> None:
+        """Removing an existing module returns True and makes it unavailable."""
+        self.hash_db.add_module_hash("module", "1", "hash-1")
+
+        removed = self.hash_db.remove_module_hash("module", "1")
+
+        self.assertTrue(removed)
+        self.assertEqual(self.hash_db.get_module_hash("module", "1"), "")
+
+    def test_missing_removal_preserves_other_modules(self) -> None:
+        """Removing an unknown pair returns False without changing other rows."""
+        self.hash_db.add_module_hash("other", "1", "hash-1")
+
+        removed = self.hash_db.remove_module_hash("missing", "1")
+
+        self.assertFalse(removed)
+        self.assertEqual(self.hash_db.get_module_hash("other", "1"), "hash-1")
+
+    def test_removes_only_requested_module_version(self) -> None:
+        """Removal leaves other versions of the same module intact."""
+        self.hash_db.add_module_hash("module", "1", "hash-1")
+        self.hash_db.add_module_hash("module", "2", "hash-2")
+
+        self.assertTrue(self.hash_db.remove_module_hash("module", "1"))
+        self.assertEqual(self.hash_db.get_module_hash("module", "1"), "")
+        self.assertEqual(self.hash_db.get_module_hash("module", "2"), "hash-2")
+
+    def test_normalizes_removal_values(self) -> None:
+        """Removal strips surrounding whitespace from name and version."""
+        self.hash_db.add_module_hash("module", "1", "hash-1")
+
+        self.assertTrue(self.hash_db.remove_module_hash(" module ", " 1 "))
+
+    def test_rejects_invalid_removal_values(self) -> None:
+        """Removal rejects empty and non-string names and versions."""
+        invalid_values = ("", "   ", None, 1, [], {})
+
+        for position in range(2):
+            for invalid_value in invalid_values:
+                with self.subTest(position=position, value=invalid_value):
+                    values = ["module", "1"]
+                    values[position] = invalid_value
+                    with self.assertRaises(ModuleRegisterError):
+                        self.hash_db.remove_module_hash(*values)
+
+    def test_removal_treats_sql_metacharacters_as_data(self) -> None:
+        """Parameterized removal treats SQL-like identifiers as plain data."""
+        module_name = 'module"; DROP TABLE "MAIN"; --'
+        module_version = "1' OR '1'='1"
+        self.hash_db.add_module_hash(module_name, module_version, "hash")
+
+        self.assertTrue(self.hash_db.remove_module_hash(module_name, module_version))
+        table = self.hash_db.hash_db.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'MAIN'"
+        ).fetchone()
+        self.assertEqual(table, ("MAIN",))
+
+    def test_removal_persists_after_reopening_database(self) -> None:
+        """A committed removal remains effective after reopening HashDB."""
+        self.hash_db.add_module_hash("module", "1", "hash-1")
+        self.hash_db.remove_module_hash("module", "1")
+        self.hash_db.close_connection()
+
+        self.hash_db = HashDB(self.config_path)
+
+        self.assertEqual(self.hash_db.get_module_hash("module", "1"), "")
+
+    def test_wraps_removal_sqlite_error_and_preserves_cause(self) -> None:
+        """SQLite removal failures are wrapped in ModuleRemoveError."""
+        removal_error = sqlite3.OperationalError("removal failed")
+        self.hash_db.hash_db.close()
+        self.hash_db.hash_db = MagicMock()
+        self.hash_db.hash_db.execute.side_effect = removal_error
+
+        with self.assertRaises(ModuleRemoveError) as raised:
+            self.hash_db.remove_module_hash("module", "1")
+
+        self.assertIs(raised.exception.__cause__, removal_error)
+
     def test_closed_database_rejects_public_operations(self) -> None:
         """Public operations use a custom error after HashDB is closed."""
         self.hash_db.close_connection()
@@ -708,6 +841,7 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         operations = (
             lambda: self.hash_db.add_module_hash("module", "1", "hash"),
             lambda: self.hash_db.get_module_hash("module", "1"),
+            lambda: self.hash_db.remove_module_hash("module", "1"),
         )
         for operation in operations:
             with (

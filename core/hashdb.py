@@ -2,13 +2,15 @@
 
 import sqlite3
 from pathlib import Path
-from typing import Any
 
+from pydantic import ValidationError
+
+from core.hashdb_utils.dataclasses import HashDBConfig
 from core.hashdb_utils.hashdb_errors import (
     FailedOpenHashDB,
     HashDBConfigError,
     HashDBConnectionClosedError,
-    ModuleRegisterError,
+    ModuleRemoveError,
     SchemaValidationFail,
     TableCreationErr,
     UnexpectedSchemaValErr,
@@ -17,6 +19,10 @@ from core.hashdb_utils.hashdb_states import (
     ColumnValidationResult,
     ModuleAddResult,
     SchemaValidationStatus,
+)
+from core.hashdb_utils.hashdb_validation import (
+    clear_module_data_input,
+    validate_column_desc,
 )
 from utils.dataloading import load_json
 
@@ -31,10 +37,10 @@ class HashDB:
             config_path: Path to a configuration containing `schema_path` and
                 `db_path`.
         """
-        config = self._load_db_config(config_path)
-        self._validate_config(config)
-        schema = self._validate_schema_file(config["schema_path"])
-        self._load_db(config["db_path"], schema)
+        loaded_config = self._load_db_config(config_path)
+        config = self._validate_config(loaded_config)
+        schema = self._validate_schema_file(config.schema_path)
+        self._load_db(config.db_path, schema)
 
     def _load_db_config(self, config_path: Path) -> dict:
         """Load configuration and resolve its paths relative to its file.
@@ -65,93 +71,25 @@ class HashDB:
             config[path_key] = configured_path.resolve()
         return config
 
-    def _validate_config(self, config: dict) -> None:
+    def _validate_config(self, config: object) -> HashDBConfig:
         """Validate the required database configuration fields.
 
         Args:
             config: Loaded database configuration.
 
+        Returns:
+            The validated database configuration.
+
         Raises:
             HashDBConfigError: If the configuration structure or either path
                 is invalid.
         """
-        if not isinstance(config, dict):
-            raise HashDBConfigError("Invalid database config: expected a JSON object.")
-        if "schema_path" not in config or "db_path" not in config:
+        try:
+            return HashDBConfig.model_validate(config)
+        except ValidationError as error:
             raise HashDBConfigError(
-                "Invalid database config: expected an object containing "
-                "'schema_path' and 'db_path'."
-            )
-
-        schema_path = config["schema_path"]
-        if not isinstance(schema_path, (str, Path)) or not str(schema_path).strip():
-            raise HashDBConfigError(
-                "Invalid database config: 'schema_path' must be a non-empty "
-                "filesystem path."
-            )
-        schema_path = Path(schema_path)
-        if schema_path.suffix.lower() != ".json" or not schema_path.is_file():
-            raise HashDBConfigError(
-                "Invalid database config: 'schema_path' must reference an "
-                "existing JSON file."
-            )
-
-        db_path = config["db_path"]
-        if not isinstance(db_path, (str, Path)) or not str(db_path).strip():
-            raise HashDBConfigError(
-                "Invalid database config: 'db_path' must be a non-empty "
-                "filesystem path."
-            )
-        db_path = Path(db_path)
-        if db_path.exists() and not db_path.is_file():
-            raise HashDBConfigError(
-                "Invalid database config: 'db_path' must not reference a directory."
-            )
-        if not db_path.parent.is_dir():
-            raise HashDBConfigError(
-                "Invalid database config: the parent directory of 'db_path' must exist."
-            )
-
-        config["schema_path"] = schema_path
-        config["db_path"] = db_path
-
-    def _validate_column_desc(
-        self,
-        column_name: Any,
-        column_type: Any,
-    ) -> ColumnValidationResult:
-        """Validate a column name and its SQLite type declaration.
-
-        Args:
-            column_name: Column name to validate.
-            column_type: SQLite type declaration to validate.
-
-        Returns:
-            The result describing whether the column is valid or why it is
-            invalid.
-        """
-        allowed_name_characters = set(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
-        )
-        allowed_type_characters = set(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ (),"
-        )
-
-        if (
-            not isinstance(column_name, str)
-            or not column_name.strip()
-            or "\x00" in column_name
-        ):
-            return ColumnValidationResult.column_name_err
-        if any(character not in allowed_name_characters for character in column_name):
-            return ColumnValidationResult.column_name_invalid_char
-
-        if not isinstance(column_type, str) or not column_type.strip():
-            return ColumnValidationResult.column_type_err
-        if any(character not in allowed_type_characters for character in column_type):
-            return ColumnValidationResult.column_type_invalid_char
-
-        return ColumnValidationResult.column_valid
+                f"Invalid database configuration: {error}"
+            ) from error
 
     def _validate_schema_file(self, schema_path: Path) -> dict:
         """Load and validate a database schema file.
@@ -188,7 +126,7 @@ class HashDB:
             )
 
         for column_name, column_type in schema.items():
-            val_res = self._validate_column_desc(column_name, column_type)
+            val_res = validate_column_desc(column_name, column_type)
             if val_res != ColumnValidationResult.column_valid:
                 raise SchemaValidationFail(
                     f"Column {column_name}, {column_type} validation failed "
@@ -332,40 +270,6 @@ class HashDB:
                 "configured column names, order, types, or constraints."
             )
 
-    def _clear_module_data_input(
-        self,
-        module_name: str,
-        module_version: str,
-        module_hash: str,
-    ) -> tuple[str, str, str]:
-        """Validate and normalize module identity and hash values.
-
-        Args:
-            module_name: Module name to normalize.
-            module_version: Module version to normalize.
-            module_hash: Module hash to normalize.
-
-        Returns:
-            The values without surrounding whitespace.
-
-        Raises:
-            ModuleRegisterError: If any value is not a non-empty string.
-        """
-        module_data = (module_name, module_version, module_hash)
-        if any(
-            not isinstance(value, str) or not value.strip() for value in module_data
-        ):
-            raise ModuleRegisterError(
-                "Can't register module with following values: "
-                f"{module_name}, {module_version}, {module_hash}"
-            )
-        module_name, module_version, module_hash = (
-            module_name.strip(),
-            module_version.strip(),
-            module_hash.strip(),
-        )
-        return module_name, module_version, module_hash
-
     def add_module_hash(
         self,
         module_name: str,
@@ -393,7 +297,7 @@ class HashDB:
                 "Cannot register a module because the HashDB connection is closed."
             )
 
-        module_name, module_version, module_hash = self._clear_module_data_input(
+        module_name, module_version, module_hash = clear_module_data_input(
             module_name,
             module_version,
             module_hash,
@@ -430,7 +334,7 @@ class HashDB:
                 "Cannot get a module hash because the HashDB connection is closed."
             )
 
-        module_name, module_version, _ = self._clear_module_data_input(
+        module_name, module_version, _ = clear_module_data_input(
             module_name,
             module_version,
             "_",
@@ -443,6 +347,44 @@ class HashDB:
         if module is None:
             return ""
         return module[0]
+
+    def remove_module_hash(self, module_name: str, module_version: str) -> bool:
+        """Remove the hash stored for a module name and version.
+
+        Args:
+            module_name: Name of the module to remove.
+            module_version: Version of the module to remove.
+
+        Returns:
+            True when a stored hash was removed, otherwise False.
+
+        Raises:
+            HashDBConnectionClosedError: If the database connection is closed.
+            ModuleRegisterError: If the module name or version is invalid.
+            ModuleRemoveError: If SQLite cannot remove the module hash.
+        """
+        if self._connection_closed:
+            raise HashDBConnectionClosedError(
+                "Cannot remove a module hash because the HashDB connection is closed."
+            )
+
+        module_name, module_version, _ = clear_module_data_input(
+            module_name,
+            module_version,
+            "_",
+        )
+
+        try:
+            with self.hash_db:
+                delete_result = self.hash_db.execute(
+                    'DELETE FROM "MAIN" WHERE "Mname" = ? AND "MVersion" = ?',
+                    (module_name, module_version),
+                )
+        except sqlite3.Error as error:
+            raise ModuleRemoveError(
+                "Failed to remove the module hash from HashDB."
+            ) from error
+        return delete_result.rowcount > 0
 
     def close_connection(self) -> None:
         """Close the SQLite connection if it is currently open."""

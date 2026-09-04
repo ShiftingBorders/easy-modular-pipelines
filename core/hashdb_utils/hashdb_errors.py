@@ -18,6 +18,10 @@ class ModuleRegisterError(Exception):
     """Raised when module registration data is invalid."""
 
 
+class ModuleRemoveError(Exception):
+    """Raised when SQLite cannot remove a module hash."""
+
+
 class HashDBConnectionClosedError(Exception):
     """Raised when an operation requires an open HashDB connection."""
 
