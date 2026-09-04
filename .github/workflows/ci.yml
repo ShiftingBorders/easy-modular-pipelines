@@ -13,8 +13,14 @@ concurrency:
 
 jobs:
   checks:
-    name: Python 3.12 checks
-    runs-on: ubuntu-latest
+    name: Python 3.12 checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
 
     steps:
       - name: Check out repository
