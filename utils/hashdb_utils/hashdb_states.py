@@ -1,15 +1,14 @@
 from enum import Enum
 
+from core.storage_contracts import ModuleAddResult
+
+__all__ = ["ColumnValidationResult", "ModuleAddResult", "SchemaValidationStatus"]
+
 
 class SchemaValidationStatus(Enum):
     correct = "CORRECT"
     mismatch = "MISMATCH"
     empty = "EMPTY"
-
-
-class ModuleAddResult(Enum):
-    module_added = True
-    module_exists_err = False
 
 
 class ColumnValidationResult(Enum):

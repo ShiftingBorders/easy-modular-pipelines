@@ -10,23 +10,20 @@ from unittest.mock import MagicMock, patch
 from pydantic import ValidationError
 
 from core.hashdb import HashDB
-from core.hashdb_utils.dataclasses import HashDBConfig
-from core.hashdb_utils.hashdb_errors import (
-    FailedOpenHashDB,
-    HashDBConfigError,
-    HashDBConnectionClosedError,
-    ModuleRegisterError,
-    ModuleRemoveError,
-    SchemaValidationFail,
-    TableCreationErr,
-    UnexpectedSchemaValErr,
+from core.storage_contracts import ModuleAddResult
+from core.storage_errors import (
+    StorageClosedError,
+    StorageConfigurationError,
+    StorageError,
+    StorageInputError,
+    StorageUnavailable,
 )
-from core.hashdb_utils.hashdb_states import (
+from utils.hashdb_utils.dataclasses import HashDBConfig
+from utils.hashdb_utils.hashdb_states import (
     ColumnValidationResult,
-    ModuleAddResult,
     SchemaValidationStatus,
 )
-from core.hashdb_utils.hashdb_validation import (
+from utils.hashdb_utils.hashdb_validation import (
     clear_module_data_input,
     validate_column_desc,
 )
@@ -81,30 +78,35 @@ class HashDBConfigTests(HashDBTestCase):
 
     def test_rejects_missing_config_file(self) -> None:
         """A nonexistent configuration file must fail during JSON loading."""
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaises(StorageConfigurationError) as raised:
             HashDB(self.temp_path / "missing.json")
+        self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
 
     def test_rejects_config_directory(self) -> None:
         """A directory cannot be used as the configuration file."""
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaises(StorageConfigurationError) as raised:
             HashDB(self.temp_path)
+        self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
 
     def test_rejects_invalid_json_config(self) -> None:
         """Malformed configuration JSON must fail during loading."""
         config_path = self.temp_path / "config.json"
         config_path.write_text("", encoding="utf-8")
 
-        with self.assertRaises(ValueError) as raised:
+        with self.assertRaises(StorageConfigurationError) as raised:
             HashDB(config_path)
 
-        self.assertIsInstance(raised.exception.__cause__, json.JSONDecodeError)
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        self.assertIsInstance(
+            raised.exception.__cause__.__cause__, json.JSONDecodeError
+        )
 
     def test_rejects_non_object_config(self) -> None:
         """The top-level configuration value must be an object."""
         config_path = self.temp_path / "config.json"
         self._write_json(config_path, [])
 
-        with self.assertRaises(HashDBConfigError) as raised:
+        with self.assertRaises(StorageConfigurationError) as raised:
             HashDB(config_path)
 
         self.assertIsInstance(raised.exception.__cause__, ValidationError)
@@ -117,7 +119,7 @@ class HashDBConfigTests(HashDBTestCase):
             with self.subTest(config=config):
                 config_path = self.temp_path / f"config_{number}.json"
                 self._write_json(config_path, config)
-                with self.assertRaises(HashDBConfigError):
+                with self.assertRaises(StorageConfigurationError):
                     HashDB(config_path)
 
     def test_rejects_invalid_config_path_values(self) -> None:
@@ -132,14 +134,14 @@ class HashDBConfigTests(HashDBTestCase):
                     config[field_name] = invalid_value
                     config_path = self.temp_path / f"{field_name}_{number}.json"
                     self._write_json(config_path, config)
-                    with self.assertRaises(HashDBConfigError):
+                    with self.assertRaises(StorageConfigurationError):
                         HashDB(config_path)
 
     def test_rejects_missing_schema_file(self) -> None:
         """schema_path must reference an existing file."""
         config_path = self._write_config(schema_path="missing.json")
 
-        with self.assertRaises(HashDBConfigError):
+        with self.assertRaises(StorageConfigurationError):
             HashDB(config_path)
 
     def test_rejects_schema_without_json_extension(self) -> None:
@@ -148,7 +150,7 @@ class HashDBConfigTests(HashDBTestCase):
         self._write_json(schema_path, LOCKED_SCHEMA)
         config_path = self._write_config(schema_path="schema.txt")
 
-        with self.assertRaises(HashDBConfigError):
+        with self.assertRaises(StorageConfigurationError):
             HashDB(config_path)
 
     def test_rejects_schema_directory(self) -> None:
@@ -158,7 +160,7 @@ class HashDBConfigTests(HashDBTestCase):
         schema_directory.mkdir()
         config_path = self._write_config(schema_path="schema.json")
 
-        with self.assertRaises(HashDBConfigError):
+        with self.assertRaises(StorageConfigurationError):
             HashDB(config_path)
 
     def test_rejects_directory_as_database_path(self) -> None:
@@ -167,14 +169,14 @@ class HashDBConfigTests(HashDBTestCase):
         database_directory.mkdir()
         config_path = self._write_config(db_path="database")
 
-        with self.assertRaises(HashDBConfigError):
+        with self.assertRaises(StorageConfigurationError):
             HashDB(config_path)
 
     def test_rejects_database_path_with_missing_parent(self) -> None:
         """The parent directory of a new database must already exist."""
         config_path = self._write_config(db_path="missing/hash.db")
 
-        with self.assertRaises(HashDBConfigError):
+        with self.assertRaises(StorageConfigurationError):
             HashDB(config_path)
 
     def test_creates_missing_database_file_in_existing_directory(self) -> None:
@@ -251,13 +253,13 @@ class HashDBConfigTests(HashDBTestCase):
         self.assertEqual(config.future_setting, "value")
 
     def test_wraps_database_open_error_and_preserves_cause(self) -> None:
-        """SQLite open failures retain their cause in FailedOpenHashDB."""
+        """SQLite open failures retain their cause in StorageUnavailable."""
         hash_db = self._new_uninitialized_hash_db()
         open_error = sqlite3.OperationalError("cannot open database")
 
         with (
             patch("core.hashdb.sqlite3.connect", side_effect=open_error),
-            self.assertRaises(FailedOpenHashDB) as raised,
+            self.assertRaises(StorageUnavailable) as raised,
         ):
             hash_db._load_db(self.temp_path / "hash.db", LOCKED_SCHEMA)
 
@@ -273,14 +275,14 @@ class HashDBSchemaFileTests(HashDBTestCase):
             with self.subTest(schema=schema):
                 path = self.temp_path / f"schema_{number}.json"
                 self._write_json(path, schema)
-                with self.assertRaises(SchemaValidationFail):
+                with self.assertRaises(StorageConfigurationError):
                     self._new_uninitialized_hash_db()._validate_schema_file(path)
 
     def test_rejects_schema_with_fewer_than_three_columns(self) -> None:
         """The schema must contain all three locked columns."""
         self._write_json(self.schema_path, {"Mname": "VARCHAR(255) NOT NULL"})
 
-        with self.assertRaises(SchemaValidationFail):
+        with self.assertRaises(StorageConfigurationError):
             self._new_uninitialized_hash_db()._validate_schema_file(self.schema_path)
 
     def test_rejects_any_change_to_locked_schema(self) -> None:
@@ -301,7 +303,7 @@ class HashDBSchemaFileTests(HashDBTestCase):
             with self.subTest(schema=schema):
                 path = self.temp_path / f"changed_schema_{number}.json"
                 self._write_json(path, schema)
-                with self.assertRaises(SchemaValidationFail):
+                with self.assertRaises(StorageConfigurationError):
                     self._new_uninitialized_hash_db()._validate_schema_file(path)
 
     def test_accepts_locked_schema_and_preserves_order(self) -> None:
@@ -345,7 +347,7 @@ class HashDBSchemaFileTests(HashDBTestCase):
                 with self.subTest(position=position, value=invalid_value):
                     values = ["module", "1.0", "hash"]
                     values[position] = invalid_value
-                    with self.assertRaises(ModuleRegisterError):
+                    with self.assertRaises(StorageInputError):
                         clear_module_data_input(*values)
 
 
@@ -489,7 +491,7 @@ class HashDBDatabaseSchemaTests(HashDBTestCase):
         connection.close()
         hash_db = self._new_uninitialized_hash_db()
 
-        with self.assertRaises(SchemaValidationFail):
+        with self.assertRaises(StorageConfigurationError):
             hash_db._load_db(database_path, LOCKED_SCHEMA)
 
         self.assertTrue(hash_db._connection_closed)
@@ -508,7 +510,7 @@ class HashDBDatabaseSchemaTests(HashDBTestCase):
                 "_validate_db_schema",
                 side_effect=validation_error,
             ),
-            self.assertRaises(UnexpectedSchemaValErr) as raised,
+            self.assertRaises(StorageError) as raised,
         ):
             hash_db._load_db(":memory:", LOCKED_SCHEMA)
 
@@ -607,7 +609,7 @@ class HashDBTableCreationTests(HashDBTestCase):
                 return_value=SchemaValidationStatus.empty,
             ),
             patch.object(hash_db, "_create_table", side_effect=creation_error),
-            self.assertRaises(TableCreationErr) as raised,
+            self.assertRaises(StorageError) as raised,
         ):
             hash_db._load_db(":memory:", LOCKED_SCHEMA)
 
@@ -675,7 +677,7 @@ class HashDBModuleOperationsTests(HashDBTestCase):
                 with self.subTest(position=position, value=invalid_value):
                     values = ["module", "1.0", "hash-1"]
                     values[position] = invalid_value
-                    with self.assertRaises(ModuleRegisterError):
+                    with self.assertRaises(StorageInputError):
                         self.hash_db.add_module_hash(*values)
 
         row_count = self.hash_db.hash_db.execute(
@@ -692,7 +694,7 @@ class HashDBModuleOperationsTests(HashDBTestCase):
                 with self.subTest(position=position, value=invalid_value):
                     values = ["module", "1.0"]
                     values[position] = invalid_value
-                    with self.assertRaises(ModuleRegisterError):
+                    with self.assertRaises(StorageInputError):
                         self.hash_db.get_module_hash(*values)
 
     def test_duplicate_pair_preserves_original_hash(self) -> None:
@@ -797,7 +799,7 @@ class HashDBModuleOperationsTests(HashDBTestCase):
                 with self.subTest(position=position, value=invalid_value):
                     values = ["module", "1"]
                     values[position] = invalid_value
-                    with self.assertRaises(ModuleRegisterError):
+                    with self.assertRaises(StorageInputError):
                         self.hash_db.remove_module_hash(*values)
 
     def test_removal_treats_sql_metacharacters_as_data(self) -> None:
@@ -823,13 +825,13 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         self.assertEqual(self.hash_db.get_module_hash("module", "1"), "")
 
     def test_wraps_removal_sqlite_error_and_preserves_cause(self) -> None:
-        """SQLite removal failures are wrapped in ModuleRemoveError."""
+        """SQLite removal failures are wrapped in StorageError."""
         removal_error = sqlite3.OperationalError("removal failed")
         self.hash_db.hash_db.close()
         self.hash_db.hash_db = MagicMock()
         self.hash_db.hash_db.execute.side_effect = removal_error
 
-        with self.assertRaises(ModuleRemoveError) as raised:
+        with self.assertRaises(StorageError) as raised:
             self.hash_db.remove_module_hash("module", "1")
 
         self.assertIs(raised.exception.__cause__, removal_error)
@@ -846,7 +848,7 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         for operation in operations:
             with (
                 self.subTest(operation=operation),
-                self.assertRaises(HashDBConnectionClosedError),
+                self.assertRaises(StorageClosedError),
             ):
                 operation()
 

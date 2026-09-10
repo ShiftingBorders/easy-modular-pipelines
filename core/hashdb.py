@@ -2,29 +2,30 @@
 
 import sqlite3
 from pathlib import Path
+from typing import NoReturn
 
 from pydantic import ValidationError
 
-from core.hashdb_utils.dataclasses import HashDBConfig
-from core.hashdb_utils.hashdb_errors import (
-    FailedOpenHashDB,
-    HashDBConfigError,
-    HashDBConnectionClosedError,
-    ModuleRemoveError,
-    SchemaValidationFail,
-    TableCreationErr,
-    UnexpectedSchemaValErr,
+from core.storage_contracts import ModuleAddResult
+from core.storage_errors import (
+    StorageAccessError,
+    StorageCapacityError,
+    StorageClosedError,
+    StorageConfigurationError,
+    StorageConflict,
+    StorageError,
+    StorageUnavailable,
 )
-from core.hashdb_utils.hashdb_states import (
+from utils.dataloading import load_json
+from utils.hashdb_utils.dataclasses import HashDBConfig
+from utils.hashdb_utils.hashdb_states import (
     ColumnValidationResult,
-    ModuleAddResult,
     SchemaValidationStatus,
 )
-from core.hashdb_utils.hashdb_validation import (
+from utils.hashdb_utils.hashdb_validation import (
     clear_module_data_input,
     validate_column_desc,
 )
-from utils.dataloading import load_json
 
 
 class HashDB:
@@ -52,8 +53,13 @@ class HashDB:
             The loaded configuration with absolute schema and database paths
             when their original values are valid path-like values.
         """
-        config_path = Path(config_path).resolve()
-        config = load_json(config_path)
+        try:
+            config_path = Path(config_path).resolve()
+            config = load_json(config_path)
+        except (OSError, ValueError, TypeError) as error:
+            raise StorageConfigurationError(
+                f"Cannot load hash storage configuration: {config_path}"
+            ) from error
         if not isinstance(config, dict):
             return config
 
@@ -81,13 +87,13 @@ class HashDB:
             The validated database configuration.
 
         Raises:
-            HashDBConfigError: If the configuration structure or either path
+            StorageConfigurationError: If the configuration structure or either path
                 is invalid.
         """
         try:
             return HashDBConfig.model_validate(config)
         except ValidationError as error:
-            raise HashDBConfigError(
+            raise StorageConfigurationError(
                 f"Invalid database configuration: {error}"
             ) from error
 
@@ -101,26 +107,31 @@ class HashDB:
             A mapping of column names to SQLite type declarations.
 
         Raises:
-            SchemaValidationFail: If the schema differs from the locked schema
+            StorageConfigurationError: If the schema differs from the locked schema
                 or contains an invalid column description.
         """
-        schema = load_json(schema_path)
+        try:
+            schema = load_json(schema_path)
+        except (OSError, ValueError) as error:
+            raise StorageConfigurationError(
+                f"Cannot load hash storage schema: {schema_path}"
+            ) from error
         locked_schema = {
             "Mname": "VARCHAR(255) NOT NULL",
             "MVersion": "VARCHAR(255) NOT NULL",
             "MHash": "VARCHAR(255) NOT NULL",
         }
         if not isinstance(schema, dict):
-            raise SchemaValidationFail(
+            raise StorageConfigurationError(
                 "Invalid database schema: expected a JSON object mapping column "
                 "names to SQLite column types."
             )
         if len(schema) < 3:
-            raise SchemaValidationFail(
+            raise StorageConfigurationError(
                 "Invalid database schema: at least three columns are required."
             )
         if list(schema.items()) != list(locked_schema.items()):
-            raise SchemaValidationFail(
+            raise StorageConfigurationError(
                 "Invalid database schema: the schema must exactly match the "
                 "first-version HashDB schema."
             )
@@ -128,7 +139,7 @@ class HashDB:
         for column_name, column_type in schema.items():
             val_res = validate_column_desc(column_name, column_type)
             if val_res != ColumnValidationResult.column_valid:
-                raise SchemaValidationFail(
+                raise StorageConfigurationError(
                     f"Column {column_name}, {column_type} validation failed "
                     f"due to error: {val_res}."
                 )
@@ -221,54 +232,38 @@ class HashDB:
             db.execute(create_statement)
 
     def _load_db(self, db_file_path: Path, db_schema):
-        """Open the database and ensure that table `MAIN` has the expected schema.
-
-        Args:
-            db_file_path: Path to the SQLite database file.
-            db_schema: Expected column names and SQLite type declarations.
-
-        Raises:
-            FailedOpenHashDB: If SQLite cannot open the database file.
-            UnexpectedSchemaValErr: If SQLite fails while validating the
-                database schema.
-            TableCreationErr: If SQLite cannot create table `MAIN`.
-            SchemaValidationFail: If an existing `MAIN` table has a different
-                schema.
-        """
+        """Open storage and validate its schema before any persistent changes."""
+        self._connection_closed = True
         try:
             self.hash_db = sqlite3.connect(db_file_path)
-            self._connection_closed = False
-        except sqlite3.Error as error:
-            raise FailedOpenHashDB(
-                f"Failed to open DB file with error: {error}"
-            ) from error
-        try:
-            schema_val = self._validate_db_schema(self.hash_db, db_schema)
-        except sqlite3.Error as error:
-            self.close_connection()
-            raise UnexpectedSchemaValErr(
-                f"Failed to validate DB schema with unexpected error: {error}"
-            ) from error
-        except Exception:
-            self.close_connection()
+        except (sqlite3.ProgrammingError, sqlite3.InterfaceError):
             raise
-        if schema_val == SchemaValidationStatus.empty:
+        except sqlite3.Error as error:
+            raise StorageUnavailable(
+                f"Cannot open hash storage at {db_file_path}."
+            ) from error
+        self._connection_closed = False
+
+        operation = "validate the hash storage schema"
+        try:
             try:
-                self._create_table(self.hash_db, db_schema)
+                schema_status = self._validate_db_schema(self.hash_db, db_schema)
+                if schema_status == SchemaValidationStatus.empty:
+                    operation = "create the hash storage table"
+                    self._create_table(self.hash_db, db_schema)
+                elif schema_status == SchemaValidationStatus.mismatch:
+                    raise StorageConfigurationError(
+                        "Database schema mismatch: table 'MAIN' does not match the "
+                        "configured column names, order, types, or constraints."
+                    )
             except sqlite3.Error as error:
+                self._raise_storage_error(error, operation)
+        except BaseException as error:
+            try:
                 self.close_connection()
-                raise TableCreationErr(
-                    f"Failed to create HashDB table with error: {error}"
-                ) from error
-            except Exception:
-                self.close_connection()
-                raise
-        elif schema_val == SchemaValidationStatus.mismatch:
-            self.close_connection()
-            raise SchemaValidationFail(
-                "Database schema mismatch: table 'MAIN' does not match the "
-                "configured column names, order, types, or constraints."
-            )
+            except (StorageError, sqlite3.Error) as cleanup_error:
+                error.add_note(f"Closing hash storage also failed: {cleanup_error}")
+            raise
 
     def add_module_hash(
         self,
@@ -288,12 +283,13 @@ class HashDB:
             `module_exists_err`.
 
         Raises:
-            HashDBConnectionClosedError: If the database connection is closed.
-            ModuleRegisterError: If any module value is invalid.
+            StorageClosedError: If the database connection is closed.
+            StorageInputError: If any module value is invalid.
+            StorageError: If the driver cannot complete the insert or commit.
         """
 
         if self._connection_closed:
-            raise HashDBConnectionClosedError(
+            raise StorageClosedError(
                 "Cannot register a module because the HashDB connection is closed."
             )
 
@@ -303,13 +299,16 @@ class HashDB:
             module_hash,
         )
 
-        with self.hash_db:
-            insert_result = self.hash_db.execute(
-                'INSERT INTO "MAIN" ("Mname", "MVersion", "MHash") '
-                "VALUES (?, ?, ?) "
-                'ON CONFLICT ("Mname", "MVersion") DO NOTHING',
-                (module_name, module_version, module_hash),
-            )
+        try:
+            with self.hash_db:
+                insert_result = self.hash_db.execute(
+                    'INSERT INTO "MAIN" ("Mname", "MVersion", "MHash") '
+                    "VALUES (?, ?, ?) "
+                    'ON CONFLICT ("Mname", "MVersion") DO NOTHING',
+                    (module_name, module_version, module_hash),
+                )
+        except sqlite3.Error as error:
+            self._raise_storage_error(error, "add a module hash")
         if insert_result.rowcount == 0:
             return ModuleAddResult.module_exists_err
         return ModuleAddResult.module_added
@@ -325,12 +324,13 @@ class HashDB:
             The stored module hash, or an empty string when no module is found.
 
         Raises:
-            HashDBConnectionClosedError: If the database connection is closed.
-            ModuleRegisterError: If the module name or version is invalid.
+            StorageClosedError: If the database connection is closed.
+            StorageInputError: If the module name or version is invalid.
+            StorageError: If the driver cannot complete the lookup.
         """
 
         if self._connection_closed:
-            raise HashDBConnectionClosedError(
+            raise StorageClosedError(
                 "Cannot get a module hash because the HashDB connection is closed."
             )
 
@@ -340,10 +340,13 @@ class HashDB:
             "_",
         )
 
-        module = self.hash_db.execute(
-            'SELECT "MHash" FROM "MAIN" WHERE "Mname" = ? AND "MVersion" = ? LIMIT 1',
-            (module_name, module_version),
-        ).fetchone()
+        try:
+            module = self.hash_db.execute(
+                'SELECT "MHash" FROM "MAIN" WHERE "Mname" = ? AND "MVersion" = ? LIMIT 1',
+                (module_name, module_version),
+            ).fetchone()
+        except sqlite3.Error as error:
+            self._raise_storage_error(error, "get a module hash")
         if module is None:
             return ""
         return module[0]
@@ -359,12 +362,12 @@ class HashDB:
             True when a stored hash was removed, otherwise False.
 
         Raises:
-            HashDBConnectionClosedError: If the database connection is closed.
-            ModuleRegisterError: If the module name or version is invalid.
-            ModuleRemoveError: If SQLite cannot remove the module hash.
+            StorageClosedError: If the database connection is closed.
+            StorageInputError: If the module name or version is invalid.
+            StorageError: If SQLite cannot remove the module hash.
         """
         if self._connection_closed:
-            raise HashDBConnectionClosedError(
+            raise StorageClosedError(
                 "Cannot remove a module hash because the HashDB connection is closed."
             )
 
@@ -381,14 +384,40 @@ class HashDB:
                     (module_name, module_version),
                 )
         except sqlite3.Error as error:
-            raise ModuleRemoveError(
-                "Failed to remove the module hash from HashDB."
-            ) from error
+            self._raise_storage_error(error, "remove a module hash")
         return delete_result.rowcount > 0
 
     def close_connection(self) -> None:
         """Close the SQLite connection if it is currently open."""
         if self._connection_closed:
             return
-        self.hash_db.close()
+        try:
+            self.hash_db.close()
+        except sqlite3.Error as error:
+            self._raise_storage_error(error, "close hash storage")
         self._connection_closed = True
+
+    def _raise_storage_error(self, error: sqlite3.Error, operation: str) -> NoReturn:
+        """Translate known driver failures without hiding programming mistakes."""
+        if isinstance(error, (sqlite3.ProgrammingError, sqlite3.InterfaceError)):
+            raise error
+        code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+        if code in {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+            sqlite3.SQLITE_CANTOPEN,
+        }:
+            failure = StorageUnavailable
+        elif code == sqlite3.SQLITE_FULL:
+            failure = StorageCapacityError
+        elif code in {
+            sqlite3.SQLITE_AUTH,
+            sqlite3.SQLITE_PERM,
+            sqlite3.SQLITE_READONLY,
+        }:
+            failure = StorageAccessError
+        elif isinstance(error, sqlite3.IntegrityError):
+            failure = StorageConflict
+        else:
+            failure = StorageError
+        raise failure(f"Failed to {operation}.") from error

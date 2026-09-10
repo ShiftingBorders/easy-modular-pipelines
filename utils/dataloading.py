@@ -15,9 +15,8 @@ def load_json(path: Path | str) -> Any:
         except json.JSONDecodeError as error:
             raise ValueError(f"JSON file cannot be parsed: {path}") from error
 
+
 def type_match_nonempty(val: Any, targer_type: Any) -> bool:
     if not isinstance(val, targer_type):
         return False
-    if isinstance(val, str) and not val.strip():
-        return False
-    return True
+    return not isinstance(val, str) or bool(val.strip())

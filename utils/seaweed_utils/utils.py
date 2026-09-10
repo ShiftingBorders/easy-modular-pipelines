@@ -1,6 +1,6 @@
 import socket
 
-from core.seaweed_utils.seaweed_errors import SeaweedInputFailure
+from core.storage_errors import StorageInputError
 
 ALLOWED_CHARACTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
 
@@ -11,7 +11,7 @@ def clear_str(*args) -> tuple[str,...]:
     cleared_args = []
     for arg in args:
         if not isinstance(arg,str):
-            raise SeaweedInputFailure(f"Provided argument {arg} is not a string")
+            raise StorageInputError(f"Provided argument {arg} is not a string")
         cleared_args.append(arg.strip())
     return tuple(cleared_args)
 
@@ -50,6 +50,6 @@ def free_port_finder(n_tries: int, offset: int, binded_ip:str, *ports) -> tuple:
 
 def check_input_metadata(module_name: str, module_version: str):
     if module_name == "" or module_version == "":
-        raise SeaweedInputFailure(f"Module name ({module_name}) or module version ({module_version}) are empty")
+        raise StorageInputError(f"Module name ({module_name}) or module version ({module_version}) are empty")
     if not check_valid_characters(ALLOWED_CHARACTERS,module_name) or not check_valid_characters(ALLOWED_CHARACTERS, module_version):
-        raise SeaweedInputFailure(f"Module name ({module_name}) or module version ({module_version}) contain invalid characters")
+        raise StorageInputError(f"Module name ({module_name}) or module version ({module_version}) contain invalid characters")
