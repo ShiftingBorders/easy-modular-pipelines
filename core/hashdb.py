@@ -1,4 +1,4 @@
-# TODO: Согласовать фиксированную схему таблицы с её конфигурацией.
+
 
 import sqlite3
 from pathlib import Path
