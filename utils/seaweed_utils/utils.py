@@ -1,8 +1,8 @@
 import socket
 
 from core.storage_errors import StorageInputError
+from core.validation_constants import MODULE_IDENTITY_CHARACTERS as ALLOWED_CHARACTERS
 
-ALLOWED_CHARACTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
 
 class ClearStringErr(Exception):
     pass
