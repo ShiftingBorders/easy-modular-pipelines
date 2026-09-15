@@ -119,12 +119,22 @@ async def automatic_demo(requests, pending: dict, experiment_id: str) -> None:
 
 
 async def control(
-    project_root: Path, template: Path, manager: ModuleManager, automatic: bool
+    project_root: Path,
+    template: Path,
+    manager: ModuleManager,
+    automatic: bool,
+    resource_config_path: Path | None = None,
 ) -> None:
     context = multiprocessing.get_context("spawn")
     requests, responses = context.Queue(), context.Queue()
     runner = ExperimentRunner(project_root, manager)
-    controller = ExperimentController(project_root, runner, requests, responses)
+    controller = ExperimentController(
+        project_root,
+        runner,
+        requests,
+        responses,
+        resource_config_path=resource_config_path,
+    )
     pending = {}
     controller_task = asyncio.create_task(controller.serve())
     response_task = asyncio.create_task(receive_responses(responses, pending))
@@ -199,6 +209,11 @@ def main() -> None:
     parser.add_argument("--template", type=Path)
     parser.add_argument("--hash-config", type=Path)
     parser.add_argument("--filer-url", default="http://127.0.0.1:8888")
+    parser.add_argument(
+        "--resource-config",
+        type=Path,
+        help="Collector settings JSON; defaults to default_settings/resource_collector.json.",
+    )
     options = parser.parse_args()
     library_root = Path(__file__).resolve().parent
     storage_process = None
@@ -296,7 +311,17 @@ def main() -> None:
             )
         else:
             template = options.template.resolve()
-        asyncio.run(control(project_root, template, manager, options.auto))
+        asyncio.run(
+            control(
+                project_root,
+                template,
+                manager,
+                options.auto,
+                None
+                if options.resource_config is None
+                else options.resource_config.resolve(),
+            )
+        )
         print("Experiment files:", project_root / "experiments", flush=True)
     finally:
         if archives is not None:

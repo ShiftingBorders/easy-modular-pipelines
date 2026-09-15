@@ -12,6 +12,7 @@ from core.runner_utils.state import JsonObject, RunnerState
 
 class RunnerJournal:
     client: OperationLogger
+    reader_config_path: Path | None = None
 
     def open(self, state: RunnerState, *, create: bool) -> None:
         if getattr(self, "_opened", False):
@@ -37,7 +38,7 @@ class RunnerJournal:
             state.experiment_directory / "runner" / "journal.json", self._identity
         )
         # Existing-mode config also provides a stable entry point for later readers.
-        self._reader_config = self.write_client_config(state, context)
+        self.reader_config_path = self.write_client_config(state, context)
 
     def write_client_config(
         self, state: RunnerState, context: JsonObject, *, create: bool = False
@@ -95,3 +96,4 @@ class RunnerJournal:
             return
         self.client.close()
         self._opened = False
+        self.reader_config_path = None

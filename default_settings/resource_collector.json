@@ -1,0 +1,14 @@
+{
+  "sample_interval_seconds": 1,
+  "history_seconds": 900,
+  "max_buffer_bytes": 16777216,
+  "stale_after_intervals": 3,
+  "status_interval_seconds": 1,
+  "startup_timeout_seconds": 10,
+  "heartbeat_timeout_seconds": 10,
+  "shutdown_timeout_seconds": 5,
+  "restart_delays_seconds": [1, 2, 4, 8, 16, 30],
+  "stable_reset_seconds": 60,
+  "logging_busy_timeout_seconds": 0.05,
+  "logging_retry_seconds": 5
+}

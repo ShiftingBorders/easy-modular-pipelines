@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -29,6 +30,8 @@ class StageRunner:
         launcher: ModuleLauncher,
         journal: RunnerJournal,
         state_store: RunnerStateStore,
+        *,
+        notify_resources: Callable[[], None] | None = None,
     ) -> None:
         self._launcher = launcher
         self._journal = journal
@@ -37,6 +40,7 @@ class StageRunner:
         self._process = None
         self._process_attempt_id = None
         self._executor_processes = []
+        self._notify_resources = notify_resources
 
     async def execute(
         self, state: RunnerState, *, manual: bool = False
@@ -159,6 +163,8 @@ class StageRunner:
             definition["timeout_seconds"],
         )
         state.active_attempt = attempt
+        if self._notify_resources is not None:
+            self._notify_resources()
         state.stage_attempt_numbers[stage_id] = number
         self._journal.client.record_attempt_parameters(
             state.template,
@@ -227,21 +233,33 @@ class StageRunner:
             if (directory / "execution_result.json").is_file():
                 return attempt
             if lock.is_file():
-                metadata = read_json(lock)
-                if metadata.get("attempt_id") == attempt_id:
-                    self._connection = ParticipantConnection(
-                        lock,
-                        {
-                            "experiment_id": state.experiment_id,
-                            "stage_id": stage_id,
-                            "attempt_id": attempt_id,
-                        },
-                    )
-                    await self._connection.connect(
-                        timeout_seconds=max(0.001, deadline - time.monotonic())
-                    )
+                try:
+                    metadata = read_json(lock)
+                    if metadata.get("attempt_id") == attempt_id:
+                        self._connection = ParticipantConnection(
+                            lock,
+                            {
+                                "experiment_id": state.experiment_id,
+                                "stage_id": stage_id,
+                                "attempt_id": attempt_id,
+                            },
+                        )
+                        await self._connection.connect(
+                            timeout_seconds=max(0.001, deadline - time.monotonic())
+                        )
+                        return attempt
+                except (OSError, EOFError):
+                    # Completion publishes the result before deleting the endpoint.
+                    # A short stage can finish between the existence check and read.
+                    if not (directory / "execution_result.json").is_file():
+                        raise
+                    if self._connection is not None:
+                        await self._connection.close()
+                        self._connection = None
                     return attempt
             if self._process.poll() is not None:
+                if (directory / "execution_result.json").is_file():
+                    return attempt
                 raise RuntimeError(
                     f"Executor exited before publishing a result (exit {self._process.returncode})."
                 )
@@ -259,10 +277,15 @@ class StageRunner:
                 raise RuntimeError("Executor connection is unavailable.")
             request_id = str(uuid4())
             state.used_request_ids.add(request_id)
-            reply = await self._connection.query_command_state(
-                request_id,
-                timeout_seconds=state.template["unknown_state"]["timeout_seconds"],
-            )
+            try:
+                reply = await self._connection.query_command_state(
+                    request_id,
+                    timeout_seconds=state.template["unknown_state"]["timeout_seconds"],
+                )
+            except (OSError, EOFError):
+                if path.is_file():
+                    break
+                raise
             status = reply["data"]
             first_observation = (
                 attempt.started_at is None and status["started_at"] is not None
@@ -272,6 +295,8 @@ class StageRunner:
             attempt.started_at = status["started_at"]
             if first_observation:
                 self._save_state(state)
+                if self._notify_resources is not None:
+                    self._notify_resources()
             started = status.get("started_monotonic")
             if attempt.timeout_seconds is not None and started is not None:
                 deadline = (
@@ -303,6 +328,8 @@ class StageRunner:
             "pending": [],
             "exit_code": result["exit_code"],
         }
+        if self._notify_resources is not None:
+            self._notify_resources()
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
@@ -330,6 +357,11 @@ class StageRunner:
             return True
         if self._process_attempt_id != attempt.attempt_id:
             return True
+        # Cancelling the DAG may close a pending query while retaining its client.
+        # Reconnect before sending the independent interruption command.
+        if self._connection is not None:
+            await self._connection.close()
+            self._connection = None
         path = attempt.artifacts_directory / "execution_result.json"
         deadline = time.monotonic() + state.template["unknown_state"]["timeout_seconds"]
         lock = state.experiment_directory / "executor.lock.json"
@@ -352,6 +384,8 @@ class StageRunner:
                         "pending": [],
                         "exit_code": result["exit_code"],
                     }
+                    if self._notify_resources is not None:
+                        self._notify_resources()
                 return confirmed
             try:
                 if self._connection is None and lock.is_file():

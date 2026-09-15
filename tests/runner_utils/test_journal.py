@@ -32,11 +32,22 @@ class RuntimeJournalTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state["source"], "runner")
             self.assertIsNotNone(datetime.fromisoformat(state["observed_at"]).tzinfo)
             records = self.workspace.events(self.session.runner)
+            # Resource sampling is periodic, so this short stage may also have a
+            # fourth writer. The three execution roles must retain separate clients.
+            execution_records = [
+                row
+                for row in records
+                if row["context"]["source"] != "resource_collector"
+            ]
             self.assertEqual(
-                {row["context"]["source"] for row in records},
+                {row["context"]["source"] for row in execution_records},
                 {"runner", "executor", "module"},
             )
-            self.assertEqual(len({row["context"]["process_id"] for row in records}), 3)
+            execution_pids = {row["context"]["process_id"] for row in execution_records}
+            self.assertEqual(len(execution_pids), 3)
+            for row in records:
+                if row["context"]["source"] == "resource_collector":
+                    self.assertNotIn(row["context"]["process_id"], execution_pids)
             root = self.session.runner._state.experiment_directory
             configs = [
                 json.loads(path.read_text())

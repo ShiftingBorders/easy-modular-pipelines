@@ -10,6 +10,7 @@ from queue import Empty, Full
 from uuid import UUID
 
 from core.logger_utils.events import LoggingError, copy_json_object, require_text
+from core.resourcecollector import ResourceCollector
 from core.runner_utils.experimentrunner import ExperimentRunner
 from core.runner_utils.state import JsonObject
 
@@ -21,6 +22,8 @@ class ExperimentController:
         runner: ExperimentRunner,
         requests: Queue,
         responses: Queue,
+        *,
+        resource_config_path: Path | None = None,
     ) -> None:
         self._project_root = Path(project_root)
         if not self._project_root.is_absolute():
@@ -36,14 +39,23 @@ class ExperimentController:
         self._loops: list[asyncio.Task] = []
         self._reads: set[asyncio.Task] = set()
         self._closing = False
+        self.resources = ResourceCollector(
+            Path(__file__).resolve().parents[1]
+            / "default_settings"
+            / "resource_collector.json"
+            if resource_config_path is None
+            else resource_config_path
+        )
 
     async def serve(self) -> None:
         if self._loops or self._closing:
             raise RuntimeError("Controller is already running or closed.")
+        self._runner.set_resource_observer(self.resources.update)
         self._loops = [
             asyncio.create_task(self._receive_requests()),
             asyncio.create_task(self._execute_commands()),
             asyncio.create_task(self._write_responses()),
+            asyncio.create_task(self.resources.serve()),
         ]
         try:
             await asyncio.gather(*self._loops)
@@ -237,6 +249,14 @@ class ExperimentController:
 
     async def _read_request(self, request: JsonObject) -> JsonObject:
         args = copy_json_object(request.get("args", {}), "args")
+        if request["command"] == "stats.resources":
+            if args:
+                raise ValueError("stats.resources does not accept arguments.")
+            return self.resources.get_status()
+        if request["command"] == "stats.resources.history":
+            if args.keys() - {"after", "limit"}:
+                raise ValueError("Unknown resource history arguments.")
+            return self.resources.read_history(**args)
         if request["command"] == "stats.state":
             if args.keys() - {"experiment_id"}:
                 raise ValueError("Unknown stats.state arguments.")
@@ -297,3 +317,5 @@ class ExperimentController:
             return_exceptions=True,
         )
         self._active_tail.clear()
+        self._runner.set_resource_observer(None)
+        await self.resources.close()

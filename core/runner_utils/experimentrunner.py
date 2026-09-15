@@ -37,10 +37,13 @@ class ExperimentRunner:
         self._assembler = ExperimentAssembler(self._project_root, module_manager)
         self._journal = RunnerJournal()
         self._state_store = RunnerStateStore()
+        self._resource_observer: Callable[[JsonObject], None] | None = None
+        self._resource_error: str | None = None
         self._stages = StageRunner(
             ModuleLauncher(self._assembler, self._journal),
             self._journal,
             self._state_store,
+            notify_resources=self._publish_resources,
         )
         self._state: RunnerState | None = None
         self._task = None
@@ -103,6 +106,7 @@ class ExperimentRunner:
         self._template_path = Path(template_path)
         self._desired_mode = "paused" if delayed_start else "running"
         self._state = None
+        self._publish_resources()
         self._error = None
         self._last_attempt = None
         self._stop_requested = False
@@ -211,6 +215,7 @@ class ExperimentRunner:
         except Exception as error:  # noqa: BLE001 - Background failures become explicit experiment state.
             await self._fail(error, {})
         finally:
+            self._publish_resources()
             self._ready.set()
             self._idle.set()
 
@@ -393,6 +398,7 @@ class ExperimentRunner:
                 self._termination_confirmed = False
                 self._error["interruption_error"] = str(interruption_error)
             self._state.phase = "failed"
+            self._publish_resources()
             try:
                 self._journal.client.record_error(
                     error, context={"experiment_id": self._state.experiment_id}
@@ -424,6 +430,7 @@ class ExperimentRunner:
         return self._state
 
     def _save_state(self) -> None:
+        self._publish_resources()
         try:
             self._state_store.save(self._state)
         except OSError as error:
@@ -440,6 +447,74 @@ class ExperimentRunner:
         )
         if self._notify is not None:
             self._notify(self.get_state())
+
+    def set_resource_observer(
+        self, observer: Callable[[JsonObject], None] | None
+    ) -> None:
+        """Report target changes; the application controller owns their observation."""
+        self._resource_observer = observer
+        self._publish_resources()
+
+    def _publish_resources(self) -> None:
+        if self._resource_observer is None:
+            return
+        try:
+            self._resource_observer(self.get_resource_snapshot())
+            self._resource_error = None
+        except Exception as error:  # noqa: BLE001 - Optional observers cannot change execution policy.
+            self._resource_error = f"{type(error).__name__}: {error}"
+
+    def get_resource_snapshot(self) -> JsonObject:
+        """Describe actual targets without sampling the OS or exposing mutable state."""
+        state = self._state
+        path = self._journal.reader_config_path
+        if (
+            state is None
+            or path is None
+            or self._closed
+            or state.phase in ("completed", "stopped", "failed", "restoring")
+        ):
+            return {"context": {}, "logging_config_path": None, "targets": []}
+        context = {
+            "experiment_id": state.experiment_id,
+            "run_id": state.run_id,
+            "cycle_number": state.cycle_number,
+            "template_revision_id": state.template_revision_id,
+        }
+        targets = []
+        attempt = state.active_attempt
+        if (
+            attempt is not None
+            and attempt.process_identity is not None
+            and not (attempt.executor_status or {}).get("finished", False)
+        ):
+            definition = next(
+                item
+                for item in state.template["stages"]
+                if item["stage_id"] == attempt.stage_id
+            )
+            module = definition["module"]
+            targets.append(
+                {
+                    "series_id": attempt.attempt_id,
+                    "identity": dict(attempt.process_identity),
+                    "context": {
+                        **context,
+                        "stage_id": attempt.stage_id,
+                        "stage_execution_id": attempt.stage_execution_id,
+                        "attempt_id": attempt.attempt_id,
+                        "attempt_number": attempt.attempt_number,
+                        "module_name": module["name"],
+                        "module_version": module["version"],
+                        "module_hash": module["hash"],
+                    },
+                }
+            )
+        return {
+            "context": context,
+            "logging_config_path": str(path),
+            "targets": targets,
+        }
 
     def get_state(self) -> JsonObject:
         state = self._state
@@ -473,6 +548,7 @@ class ExperimentRunner:
             "observed_at": datetime.now(UTC).isoformat(),
             "services": [],
             "termination_confirmed": self._termination_confirmed,
+            "resource_observer_error": self._resource_error,
         }
 
     async def read_events(
@@ -492,6 +568,7 @@ class ExperimentRunner:
 
     async def close(self) -> None:
         self._closed = True
+        self._publish_resources()
         if self._task is not None and not self._task.done():
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)

@@ -149,8 +149,10 @@ class ExperimentControllerTests(unittest.IsolatedAsyncioTestCase):
                 self.workspace.stage(module, settings={"label": "C"}),
             ]
             await self.session.launch(self.workspace.template(stages))
-            self.assertEqual((await self.session.send("step"))["result"], "success")
-            self.assertEqual((await self.session.send("step"))["result"], "success")
+            first = await self.session.send("step")
+            self.assertEqual(first["result"], "success", first)
+            second = await self.session.send("step")
+            self.assertEqual(second["result"], "success", second)
             stage_id = stages[1]["stage_id"]
             self.assertEqual(self.session.runner._state.stage_retry_counts[stage_id], 1)
             rerun = await self.session.send("rerun", {"scope": "stage", "position": 2})
