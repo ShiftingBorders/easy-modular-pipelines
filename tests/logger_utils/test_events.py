@@ -1,164 +1,250 @@
-"""CONFIG-01..05 and DATA-01..05 from the approved logging plan."""
+"""Approved A1-A8, B2/B7/B8: explicit settings and the single event contract."""
 
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import UUID, uuid4
 
 from core.logger import OperationLogger
 from core.logger_utils.events import (
     LoggingConfigurationError,
     copy_json_object,
     encode_event,
-    load_logging_config,
+    load_logging_settings,
+    validate_checkpoint,
     validate_context,
+    validate_journal_identity,
 )
+from core.logger_utils.filtered import FilteredJournal
+from core.logger_utils.storage import SQLiteEventStore
+from tests.helpers.logging_fixtures import BASE_CONTEXT
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
+    STORE_OPTIONS,
     LoggingProcess,
     cleanup_directory,
     event_fixture,
-    read_database,
     write_settings,
 )
 
 
 class LoggingConfigurationTests(unittest.TestCase):
-    def setUp(self) -> None:
+    def setUp(self):
         SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
         temporary = tempfile.TemporaryDirectory(dir=SCRATCH_ROOT)
         self.addCleanup(cleanup_directory, temporary)
         self.folder = Path(temporary.name)
         self.config = write_settings(self.folder, db_path="logs/events.db")
 
-    def test_constructor_validates_absolute_path_without_io(self):
-        """CONFIG-01, LIFE-01: construction validates arguments without opening resources."""
+    def test_constructors_validate_paths_without_io_or_threads(self):
+        """A1: all three constructors are inert."""
         with (
-            patch.object(Path, "open") as file_open,
-            patch("sqlite3.connect") as connect,
+            patch.object(Path, "open") as opened,
+            patch("sqlite3.connect") as connected,
+            patch.object(threading.Thread, "start") as started,
         ):
             OperationLogger(self.config)
-            OperationLogger(str(self.config))
-            for value in (None, 42):
-                with self.subTest(value=value), self.assertRaises(TypeError):
-                    OperationLogger(value)
-            for value in ("", "relative.json", str(self.folder / "bad\x00.json")):
-                with self.subTest(value=value), self.assertRaises(ValueError):
-                    OperationLogger(value)
-            file_open.assert_not_called()
-            connect.assert_not_called()
+            SQLiteEventStore(self.folder / "events.db", **STORE_OPTIONS)
+            FilteredJournal(self.config, self.folder / "view.db")
+            for bad in ("", "relative.json", str(self.folder / "bad\x00.json")):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    OperationLogger(bad)
+            for bad in (None, 42):
+                with self.subTest(bad=bad), self.assertRaises(TypeError):
+                    OperationLogger(bad)
+            opened.assert_not_called()
+            connected.assert_not_called()
+            started.assert_not_called()
 
-    def test_configured_paths_do_not_depend_on_child_cwd(self):
-        """CONFIG-02: relative and absolute configured paths survive a different cwd."""
-        other = self.folder / "other"
-        other.mkdir()
-        for configured in ("logs/events.db", str(self.folder / "absolute.db")):
-            with self.subTest(path=configured):
-                self.config = write_settings(self.folder, db_path=configured)
-                process = LoggingProcess("cwd", self.config, str(other))
-                self.addCleanup(process.close)
-                process.start()
-                self.assertEqual(len(process.receive()["ids"]), 1)
-                self.assertEqual(process.wait(), 0)
-                expected = self.folder / configured
-                self.assertEqual(len(read_database(expected)), 1)
-                self.assertFalse((other / "logs").exists())
-
-    def test_windows_ambiguous_paths_are_rejected(self):
-        """CONFIG-02: Windows drive-relative/root-relative settings are not anchored to cwd."""
-        if os.name != "nt":
-            self.skipTest("Windows-specific path syntax.")
-        for value in ("C:events.db", "\\events.db"):
-            with self.subTest(path=value):
-                write_settings(self.folder, db_path=value)
-                with self.assertRaises(LoggingConfigurationError):
-                    OperationLogger(self.config).open()
-        self.assertFalse((self.folder / "logs").exists())
-
-    def test_invalid_files_preserve_cause_without_creating_database(self):
-        """CONFIG-03: read/JSON/Unicode/type failures have an actionable configuration error."""
-        for contents in (b"{", b"\xff", b"[]", b"null", b"7"):
-            with self.subTest(contents=contents):
-                self.config.write_bytes(contents)
-                with self.assertRaises(LoggingConfigurationError) as caught:
-                    OperationLogger(self.config).open()
-                self.assertIsNotNone(caught.exception.__cause__)
-                self.assertFalse((self.folder / "logs").exists())
-        for path in (self.folder / "missing.json", self.folder):
-            with (
-                self.subTest(path=path),
-                self.assertRaises(LoggingConfigurationError) as caught,
-            ):
-                OperationLogger(path).open()
-            self.assertIsInstance(caught.exception.__cause__, OSError)
-        failure = PermissionError("Controlled config read failure")
-        with (
-            patch.object(Path, "open", side_effect=failure),
-            self.assertRaises(LoggingConfigurationError) as caught,
-        ):
-            OperationLogger(self.config).open()
-        self.assertIs(caught.exception.__cause__, failure)
-
-    def test_required_and_unknown_configuration_fields(self):
-        """CONFIG-04: reject missing/typo fields while permitting other module settings."""
-        invalid = (
-            {},
-            {"logging": {}},
-            {"logging": []},
-            {"logging": {"db_path": "logs/events.db", "typo": True}},
-            {
-                "logging": {"db_path": "logs/events.db"},
-                "operation_context": {"typo": "x"},
-            },
+    def test_every_logging_field_is_required_and_unknown_fields_are_rejected(self):
+        """A2: validation precedes creation, with no defaults or legacy selector."""
+        original = json.loads(self.config.read_text(encoding="utf-8"))
+        documents = []
+        for field in original["logging"]:
+            document = json.loads(json.dumps(original))
+            del document["logging"][field]
+            documents.append((field, document))
+        for field in ("typo", "schema_version"):
+            document = json.loads(json.dumps(original))
+            document["logging"][field] = 1
+            documents.append((field, document))
+        documents.extend(
+            (
+                ("root", {}),
+                ("logging-list", {"logging": []}),
+                ("context", {**original, "operation_context": {"typo": "x"}}),
+            )
         )
-        for document in invalid:
-            with self.subTest(document=document):
+        for label, document in documents:
+            with self.subTest(label=label):
                 self.config.write_text(json.dumps(document), encoding="utf-8")
                 with self.assertRaises(LoggingConfigurationError):
                     OperationLogger(self.config).open()
                 self.assertFalse((self.folder / "logs").exists())
-        document = {
-            "logging": {"db_path": "logs/events.db"},
-            "model": {"temperature": 0.5},
-        }
-        self.config.write_text(json.dumps(document), encoding="utf-8")
-        with OperationLogger(self.config) as logger:
-            logger.record_event("test.settings")
-        self.assertNotIn("model", read_database(self.folder / "logs/events.db")[0])
 
-    def test_settings_defaults_and_limits(self):
-        """CONFIG-05: exercise both accepted boundaries and each invalid setting category."""
-        path, timeout, size, _ = load_logging_config(self.config)
-        self.assertEqual(
-            (path, timeout, size), (self.folder / "logs/events.db", 5, 1048576)
-        )
-        for key, accepted, rejected in (
+    def test_explicit_value_boundaries(self):
+        """A2/B7: null disables only event size; boolean never substitutes a number."""
+        for field, accepted, rejected in (
+            ("busy_timeout_seconds", (0.01, 60), (0, -1, 60.1, True, "5", None)),
+            ("max_event_bytes", (None, 1, 16777217), (0, -1, True, 1.5, "1")),
+            ("min_free_bytes", (0, 1, 67108864), (-1, True, 1.5, "0", None)),
             (
-                "busy_timeout_seconds",
-                (0.05, 60),
-                (0, -1, 60.001, True, "5", float("nan"), float("inf")),
-            ),
-            (
-                "max_event_bytes",
-                (1024, 16777216),
-                (1023, 16777217, True, "1024", 1024.5, float("nan"), float("inf")),
+                "filtered_refresh_interval_seconds",
+                (0.01, 1, 600),
+                (0, -1, True, "1", None),
             ),
         ):
             for value in accepted:
-                with self.subTest(key=key, value=value):
-                    write_settings(self.folder, **{key: value})
-                    values = load_logging_config(self.config)
-                    self.assertEqual(
-                        values[1 if key == "busy_timeout_seconds" else 2], value
-                    )
-            for value in rejected:
-                with self.subTest(key=key, value=value):
-                    write_settings(self.folder, **{key: value})
+                with self.subTest(field=field, value=value):
+                    config = write_settings(self.folder, **{field: value})
+                    settings, _ = load_logging_settings(config)
+                    self.assertEqual(settings[field], value)
+            for value in (*rejected, float("nan"), float("inf")):
+                with self.subTest(field=field, value=value):
+                    config = write_settings(self.folder, **{field: value})
                     with self.assertRaises(LoggingConfigurationError):
-                        OperationLogger(self.config).open()
-                    self.assertFalse((self.folder / "events.db").exists())
+                        load_logging_settings(config)
+        self.assertFalse((self.folder / "events.db").exists())
+
+    def test_expected_identity_is_explicit_normalized_and_detached(self):
+        """A6: expected identity is exactly two UUIDs."""
+        first, second = uuid4(), uuid4()
+        identity = {"journal_id": str(first).upper(), "generation": str(second)}
+        config = write_settings(
+            self.folder, open_mode="existing", expected_journal=identity
+        )
+        settings, _ = load_logging_settings(config)
+        self.assertEqual(
+            settings["expected_journal"],
+            {"journal_id": first.hex, "generation": second.hex},
+        )
+        identity["generation"] = "changed"
+        for value in (
+            None,
+            {},
+            {"journal_id": first.hex},
+            {"journal_id": first.hex, "generation": 1},
+            {"journal_id": first.hex, "generation": "invalid"},
+            {"journal_id": first.hex, "generation": second.hex, "extra": 1},
+        ):
+            with self.subTest(value=value):
+                config = write_settings(
+                    self.folder, open_mode="existing", expected_journal=value
+                )
+                with self.assertRaises(LoggingConfigurationError):
+                    load_logging_settings(config)
+        config = write_settings(
+            self.folder,
+            expected_journal={"journal_id": first.hex, "generation": second.hex},
+        )
+        with self.assertRaises(LoggingConfigurationError):
+            load_logging_settings(config)
+
+    def test_invalid_configuration_preserves_cause(self):
+        """A2: unreadable/malformed files cannot create a database."""
+        for text in ("{", "[]", '{"logging": NaN}'):
+            self.config.write_text(text, encoding="utf-8")
+            with self.assertRaises(LoggingConfigurationError) as caught:
+                OperationLogger(self.config).open()
+            self.assertIsNotNone(caught.exception.__cause__)
+        error = PermissionError("controlled config failure")
+        with (
+            patch.object(Path, "open", side_effect=error),
+            self.assertRaises(LoggingConfigurationError) as caught,
+        ):
+            OperationLogger(self.config).open()
+        self.assertIs(caught.exception.__cause__, error)
+        self.assertFalse((self.folder / "logs").exists())
+
+    def test_paths_survive_a_different_process_working_directory(self):
+        """A3: relative paths are anchored to the containing configuration."""
+        other = self.folder / "different-cwd"
+        other.mkdir()
+        for configured in ("logs/events.db", str(self.folder / "absolute.db")):
+            with self.subTest(path=configured):
+                config = write_settings(self.folder, db_path=configured)
+                child = LoggingProcess("cwd", config, str(other))
+                self.addCleanup(child.close)
+                child.start()
+                self.assertEqual(len(child.receive()["ids"]), 1)
+                self.assertEqual(child.wait(), 0)
+                target = Path(configured)
+                if not target.is_absolute():
+                    target = self.folder / target
+                self.assertTrue(target.exists())
+                self.assertEqual(list(other.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows path syntax")
+    def test_ambiguous_windows_paths_are_rejected(self):
+        """A3: root-relative and drive-relative paths must not use caller cwd."""
+        for value in (r"C:relative.db", r"\root-relative.db"):
+            with self.subTest(value=value):
+                config = write_settings(self.folder, db_path=value)
+                with self.assertRaises(LoggingConfigurationError):
+                    load_logging_settings(config)
+
+    def test_version_controlled_initial_values_are_explicit(self):
+        """A8: constructor defaults are data and never rescue an incomplete runtime JSON."""
+        defaults = json.loads(
+            (
+                Path(__file__).resolve().parents[2] / "default_settings/logging.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            defaults,
+            {
+                "busy_timeout_seconds": 5,
+                "max_event_bytes": None,
+                "min_free_bytes": 67108864,
+                "filtered_refresh_interval_seconds": 1,
+            },
+        )
+        self.config.write_text('{"logging":{"db_path":"missing.db"}}', encoding="utf-8")
+        with self.assertRaises(LoggingConfigurationError):
+            load_logging_settings(self.config)
+
+
+class ExtendedContextTests(unittest.TestCase):
+    def test_full_context_and_nulls_preserve_distinct_ids(self):
+        """B2: stage/cycle/attempt/service and lineage are independent."""
+        copied = validate_context(BASE_CONTEXT)
+        self.assertEqual(copied, BASE_CONTEXT)
+        copied["run_id"] = "changed"
+        self.assertNotEqual(copied, BASE_CONTEXT)
+        self.assertEqual(
+            validate_context(dict.fromkeys(BASE_CONTEXT)), dict.fromkeys(BASE_CONTEXT)
+        )
+
+    def test_invalid_context_counters_and_identifiers(self):
+        """B2/B8: no coercion of identifiers or positive integer counters."""
+        for field in BASE_CONTEXT:
+            values = (
+                (0, -1, True, 1.5, "1")
+                if field in ("cycle_number", "attempt_number", "stage_position")
+                else ("", " ", 1, "bad\x00")
+            )
+            for value in values:
+                with (
+                    self.subTest(field=field, value=value),
+                    self.assertRaises((ValueError, TypeError)),
+                ):
+                    validate_context({field: value})
+
+    def test_checkpoint_shape_and_uuid_validation(self):
+        """D1: checkpoint counters and ownership cannot be confused."""
+        identity = {"journal_id": uuid4().hex, "generation": uuid4().hex}
+        for key in ("cursor", "change_cursor"):
+            checkpoint = {**identity, key: 0}
+            self.assertEqual(validate_checkpoint(checkpoint, key), checkpoint)
+            for value in (-1, True, 1.5, "1", 2**63):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    validate_checkpoint({**identity, key: value}, key)
+        self.assertEqual(validate_journal_identity(identity), identity)
+        self.assertIsInstance(UUID(identity["generation"]), UUID)
 
 
 class LoggingEventValidationTests(unittest.TestCase):

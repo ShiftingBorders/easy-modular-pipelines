@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import TracebackType
@@ -24,10 +25,12 @@ from core.logger_utils.events import (
     SCHEMA_VERSION,
     JsonObject,
     LoggingStateError,
+    LoggingStorageError,
     copy_json_object,
-    load_logging_config,
+    load_logging_settings,
     require_number,
     require_text,
+    validate_command_result,
     validate_context,
 )
 from core.logger_utils.storage import SQLiteEventStore
@@ -50,6 +53,9 @@ class OperationLogger:
         self._failed = False
         self._process_id = os.getpid()
         self._lock = threading.RLock()
+        self._journal_path: Path | None = None
+        self._journal_identity: tuple[int, int] | None = None
+        self._journal_info: JsonObject | None = None
 
     def _check_process(self) -> None:
         if os.getpid() != self._process_id:
@@ -66,22 +72,79 @@ class OperationLogger:
                 raise LoggingStateError(
                     "Logger is already open; close it before reopening."
                 )
-            db_path, timeout, max_bytes, context = load_logging_config(
-                self._config_path
-            )
+            settings, context = load_logging_settings(self._config_path)
+            db_path = Path(settings["db_path"])
             context.setdefault("source", "library")
             # A context exported by a parent process must not identify this writer as it.
             context["host_name"] = socket.gethostname()
             context["process_id"] = self._process_id
             context = validate_context(context)
+            reopening = db_path == self._journal_path
+            expected = settings["expected_journal"]
+            if reopening and self._journal_info is not None:
+                expected = {
+                    name: self._journal_info[name]
+                    for name in ("journal_id", "generation")
+                }
             store = SQLiteEventStore(
                 db_path,
-                busy_timeout_seconds=timeout,
-                max_event_bytes=max_bytes,
+                busy_timeout_seconds=settings["busy_timeout_seconds"],
+                max_event_bytes=settings["max_event_bytes"],
+                open_mode="existing" if reopening else settings["open_mode"],
+                min_free_bytes=settings["min_free_bytes"],
+                expected_journal=expected,
+                diagnostic_context=context,
             )
             producer_instance_id = uuid4().hex
-            store.open()
+            expected_identity = (
+                self._journal_identity if db_path == self._journal_path else None
+            )
+            try:
+                if expected_identity is not None:
+                    file_status = db_path.stat()
+                    if (file_status.st_dev, file_status.st_ino) != expected_identity:
+                        raise LoggingStorageError(
+                            "The known journal file was replaced; use an explicitly "
+                            "selected new journal rather than silently resuming."
+                        )
+                store.open()
+                journal_info = store.get_journal_info()
+                if (
+                    db_path == self._journal_path
+                    and self._journal_info is not None
+                    and self._journal_info["journal_id"] is not None
+                    and journal_info != self._journal_info
+                ):
+                    raise LoggingStorageError(
+                        "The known journal identity or generation changed."
+                    )
+                file_status = db_path.stat()
+                identity = (file_status.st_dev, file_status.st_ino)
+                if expected_identity is not None and identity != expected_identity:
+                    raise LoggingStorageError(
+                        "The journal file changed while the logger was opening."
+                    )
+            except BaseException as error:
+                self._failed = True
+                try:
+                    store._report_failure(error, "open logger")
+                except BaseException:  # noqa: BLE001, S110 - Preserve original failure.
+                    pass
+                try:
+                    store.close()
+                except BaseException as failure:  # noqa: BLE001 - Preserve open failure.
+                    self._report_secondary_failure(
+                        error, failure, "closing a failed journal open"
+                    )
+                if isinstance(error, OSError):
+                    raise LoggingStorageError(
+                        f"Cannot reopen the known journal at {db_path}."
+                    ) from error
+                raise
             self._store = store
+            self._journal_path = db_path
+            self._journal_identity = identity
+            self._journal_info = journal_info
             self._context = context
             self._producer_instance_id = producer_instance_id
             self._sequence_number = 0
@@ -151,6 +214,8 @@ class OperationLogger:
         data: JsonObject,
         context: JsonObject,
         operation_id: str | None,
+        *,
+        persist: Callable[[JsonObject], str | None] | None = None,
     ) -> str:
         """Append under the caller's client lock; retain sequence order across threads."""
         self._require_open()
@@ -168,16 +233,40 @@ class OperationLogger:
             "data": data,
         }
         try:
-            self._store.append(event)
-            self._sequence_number = sequence
+            confirmed_id = (
+                self._store.append(event) if persist is None else persist(event)
+            )
+            if confirmed_id is None:
+                confirmed_id = event_id
+            if confirmed_id == event_id:
+                self._sequence_number = sequence
         except (TypeError, ValueError):
             # Input rejection happens before INSERT; the journal remains usable.
             raise
         except BaseException as error:
             self._failed = True
-            error.add_note(f"Unconfirmed event_id: {event_id}.")
+            try:
+                self._store._report_failure(error, "record event", event)
+            except BaseException:  # noqa: BLE001, S110 - Preserve original failure.
+                pass
+            try:
+                error.add_note(f"Unconfirmed event_id: {event_id}.")
+            except BaseException:  # noqa: BLE001, S110 - Preserve the write failure.
+                pass
             raise
-        return event_id
+        return confirmed_id
+
+    def _get_record_context(
+        self, operation: Operation | None, context: JsonObject | None
+    ) -> tuple[JsonObject, str | None]:
+        """Resolve explicit context while the caller holds the logger lock."""
+        self._require_open()
+        if operation is not None:
+            self._check_operation(operation)
+            if context is not None:
+                raise ValueError("An operation already owns its context; omit context.")
+            return dict(operation._context), operation._operation_id
+        return self._merge_context(context), None
 
     def _record(
         self,
@@ -185,21 +274,16 @@ class OperationLogger:
         data: JsonObject,
         operation: Operation | None,
         context: JsonObject | None,
+        *,
+        required_context: tuple[str, ...] = (),
     ) -> str:
         self._check_process()
         with self._lock:
             self._require_open()
-            if operation is not None:
-                self._check_operation(operation)
-                if context is not None:
-                    raise ValueError(
-                        "An operation already owns its context; omit context."
-                    )
-                event_context = dict(operation._context)
-                operation_id = operation._operation_id
-            else:
-                event_context = self._merge_context(context)
-                operation_id = None
+            event_context, operation_id = self._get_record_context(operation, context)
+            for name in required_context:
+                if event_context.get(name) is None:
+                    raise ValueError(f"This record requires context.{name}.")
             return self._append(event_type, data, event_context, operation_id)
 
     def operation(
@@ -327,10 +411,168 @@ class OperationLogger:
     ) -> str:
         """Persist an application-defined fact, such as a DAG edge or recovery observation."""
         require_text(event_type, "event_type")
-        if event_type in RESERVED_EVENT_TYPES:
-            raise ValueError("Use the dedicated method for this reserved event_type.")
         payload = copy_json_object({} if data is None else data, "data")
-        return self._record(event_type, payload, operation, context)
+        self._check_process()
+        with self._lock:
+            if event_type in RESERVED_EVENT_TYPES:
+                raise ValueError(
+                    "Use the dedicated method for this reserved event_type."
+                )
+            return self._record(event_type, payload, operation, context)
+
+    def record_template_applied(
+        self,
+        template: JsonObject,
+        *,
+        template_yaml: str,
+        template_revision_id: str,
+        previous_template_revision_id: str | None = None,
+        reason: str | None = None,
+        operation: Operation | None = None,
+        context: JsonObject | None = None,
+    ) -> str:
+        """Persist the full accepted template, even when no stage starts afterwards."""
+        require_text(template_revision_id, "template_revision_id")
+        require_text(template_yaml, "template_yaml")
+        for name, value in (
+            ("previous_template_revision_id", previous_template_revision_id),
+            ("reason", reason),
+        ):
+            if value is not None:
+                require_text(value, name)
+        if previous_template_revision_id == template_revision_id:
+            raise ValueError("A template revision cannot be its own predecessor.")
+        return self._record(
+            "template.applied",
+            {
+                "template_revision_id": template_revision_id,
+                "previous_template_revision_id": previous_template_revision_id,
+                "reason": reason,
+                "template": copy_json_object(template, "template"),
+                "template_yaml": template_yaml,
+            },
+            operation,
+            context,
+            required_context=("experiment_id",),
+        )
+
+    def record_attempt_parameters(
+        self,
+        template: JsonObject,
+        effective_settings: JsonObject,
+        *,
+        template_yaml: str,
+        operation: Operation | None = None,
+        context: JsonObject | None = None,
+    ) -> str:
+        """Confirm complete parameters before the caller is allowed to start a stage."""
+        require_text(template_yaml, "template_yaml")
+        return self._record(
+            "attempt.parameters",
+            {
+                "template": copy_json_object(template, "template"),
+                "template_yaml": template_yaml,
+                "effective_settings": copy_json_object(
+                    effective_settings, "effective_settings"
+                ),
+            },
+            operation,
+            context,
+            required_context=(
+                "experiment_id",
+                "run_id",
+                "stage_id",
+                "stage_execution_id",
+                "attempt_id",
+                "template_revision_id",
+                "cycle_number",
+                "attempt_number",
+                "module_name",
+                "module_version",
+                "module_hash",
+            ),
+        )
+
+    def record_command_result(
+        self,
+        request_id: str,
+        response: JsonObject,
+        *,
+        author: str,
+        outcome: str,
+        operation: Operation | None = None,
+        context: JsonObject | None = None,
+    ) -> str:
+        """Return the persisted observation ID; identical responses reuse an earlier ID."""
+        payload = validate_command_result(
+            {
+                "request_id": request_id,
+                "author": author,
+                "outcome": outcome,
+                "response": response,
+                "ignored": None,
+                "supersedes": [],
+            }
+        )
+        self._check_process()
+        with self._lock:
+            self._require_open()
+            event_context, operation_id = self._get_record_context(operation, context)
+            for name in ("experiment_id", "service_id"):
+                require_text(event_context.get(name), f"context.{name}")
+            if event_context.get("request_id") not in (None, request_id):
+                raise ValueError("request_id disagrees with the supplied context.")
+            event_context["request_id"] = request_id
+            return self._append(
+                "command.result",
+                payload,
+                event_context,
+                operation_id,
+                persist=self._store.append_command_result,
+            )
+
+    def read_command_result(self, request_id: str) -> JsonObject | None:
+        """Read the authoritative result and all recorded participant observations."""
+        self._check_process()
+        with self._lock:
+            if self._store is None:
+                raise LoggingStateError("Logger is closed.")
+            try:
+                return self._store.read_command_result(request_id)
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
+
+    def get_journal_info(self) -> JsonObject:
+        """Return the open journal's schema, logical identity and generation."""
+        self._check_process()
+        with self._lock:
+            if self._store is None:
+                raise LoggingStateError("Logger is closed.")
+            try:
+                return self._store.get_journal_info()
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
+
+    def export_snapshot(
+        self, destination: str | Path, *, min_free_bytes: int
+    ) -> JsonObject:
+        """Export a journal boundary, not a full experiment or a destructive rollback."""
+        self._check_process()
+        with self._lock:
+            if self._store is None:
+                raise LoggingStateError("Logger is closed.")
+            try:
+                return self._store.export_snapshot(
+                    destination, min_free_bytes=min_free_bytes
+                )
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
 
     def record_error(
         self,
@@ -400,17 +642,19 @@ class OperationLogger:
                 "attributes",
             }:
                 raise ValueError("Unknown resource measurement fields.")
-            require_number(measurement.get("value"), f"{name}.value")
+            if measurement.get("value") is not None:
+                require_number(measurement.get("value"), f"{name}.value")
+            else:
+                measurement["value"] = None
             require_text(measurement.get("unit"), f"{name}.unit")
             measurement.setdefault("kind", "delta")
             measurement.setdefault("scope", "operation")
             measurement.setdefault("estimated", False)
             if measurement["kind"] not in ("delta", "total", "gauge", "peak"):
                 raise ValueError("Resource kind must be delta, total, gauge, or peak.")
-            if measurement["scope"] not in ("operation", "process", "service"):
-                raise ValueError(
-                    "Resource scope must be operation, process, or service."
-                )
+            scopes = ("operation", "process", "service", "host")
+            if measurement["scope"] not in scopes:
+                raise ValueError(f"Resource scope must be one of: {', '.join(scopes)}.")
             if measurement["scope"] == "operation" and operation is None:
                 raise ValueError(
                     "Operation-scoped resources require an operation handle."
@@ -420,7 +664,10 @@ class OperationLogger:
             if "attributes" in measurement:
                 copy_json_object(measurement["attributes"], "resource attributes")
         return self._record(
-            "resources.recorded", {"resources": measurements}, operation, context
+            "resources.recorded",
+            {"resources": measurements},
+            operation,
+            context,
         )
 
     def record_progress(
@@ -500,14 +747,53 @@ class OperationLogger:
         return artifact_id
 
     def read_events(
-        self, *, after_cursor: int = 0, limit: int = 100
-    ) -> list[JsonObject]:
+        self,
+        checkpoint: JsonObject | None = None,
+        *,
+        limit: int = 100,
+        view: str = "raw",
+    ) -> JsonObject:
         """Read local committed events, including after a write failure, for reconciliation."""
         self._check_process()
         with self._lock:
             if self._store is None:
                 raise LoggingStateError("Logger is closed.")
-            return self._store.read_events(after_cursor=after_cursor, limit=limit)
+            try:
+                return self._store.read_events(checkpoint, limit=limit, view=view)
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
+
+    def read_changes(
+        self, checkpoint: JsonObject | None = None, *, limit: int = 100
+    ) -> JsonObject:
+        """Read committed transitions, including confirmations without a new event."""
+        self._check_process()
+        with self._lock:
+            if self._store is None:
+                raise LoggingStateError("Logger is closed.")
+            try:
+                return self._store.read_changes(checkpoint, limit=limit)
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
+
+    def export_diagnostics(
+        self, operation_ids: list[str], destination: str | Path
+    ) -> JsonObject:
+        """Preserve selected operations outside files that runner will restore."""
+        self._check_process()
+        with self._lock:
+            if self._store is None:
+                raise LoggingStateError("Logger is closed.")
+            try:
+                return self._store.export_diagnostics(operation_ids, destination)
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
 
     def _report_secondary_failure(
         self,
@@ -516,6 +802,13 @@ class OperationLogger:
         action: str,
     ) -> None:
         """Best-effort diagnostics that must never replace the application's exception."""
+        if self._store is not None and not isinstance(
+            failure, (TypeError, ValueError, LoggingStateError)
+        ):
+            try:
+                self._store._report_failure(failure, action)
+            except BaseException:  # noqa: BLE001, S110 - Preserve the body exception.
+                pass
         message = f"Journal failure while {action}: {type(failure).__name__}."
         try:
             original.add_note(message)

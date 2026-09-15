@@ -11,12 +11,17 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from core.logger import OperationLogger
-from core.logger_utils.events import LoggingStateError, LoggingStorageError
+from core.logger_utils.events import (
+    LoggingConfigurationError,
+    LoggingStateError,
+    LoggingStorageError,
+)
 from core.logger_utils.storage import SQLiteEventStore
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
     LoggingProcess,
     cleanup_directory,
+    existing_settings,
     read_database,
     write_settings,
 )
@@ -38,7 +43,9 @@ class LoggingCrashTests(unittest.TestCase):
         return process
 
     def read_in_new_process(self, config=None):
-        reader = self.start_process("read", config)
+        reader = self.start_process(
+            "read", existing_settings(self.config if config is None else config)
+        )
         result = reader.receive()
         self.assertEqual(reader.wait(), 0)
         self.assertEqual(result["integrity"], "ok")
@@ -109,7 +116,9 @@ class LoggingCrashTests(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 0)
             self.assertEqual(db.execute("PRAGMA application_id").fetchone()[0], 0)
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-        self.assertEqual(self.read_in_new_process(), [])
+        # A failed initializer leaves an unclaimed file; existing must reject it.
+        with self.assertRaises(LoggingConfigurationError):
+            OperationLogger(self.config).open()
 
     def test_failed_start_never_enters_body(self):
         """CRASH-03: write failure blocks execution and subsequent journal writes."""
@@ -351,7 +360,10 @@ class LoggingCrashTests(unittest.TestCase):
                 caught.exception.__cause__.sqlite_errorcode, sqlite3.SQLITE_FULL
             )
             self.assertEqual(
-                [record["event"]["event_id"] for record in logger.read_events()],
+                [
+                    record["event"]["event_id"]
+                    for record in logger.read_events()["events"]
+                ],
                 [confirmed_id],
             )
             with self.assertRaises(LoggingStateError):
@@ -364,7 +376,7 @@ class LoggingCrashTests(unittest.TestCase):
         """CRASH-07: an invalid header is reported without replacing the existing file."""
         contents = b"This is not a SQLite database." * 200
         self.db_path.write_bytes(contents)
-        with self.assertRaises(LoggingStorageError):
+        with self.assertRaises(LoggingConfigurationError):
             OperationLogger(self.config).open()
         self.assertEqual(self.db_path.read_bytes(), contents)
 

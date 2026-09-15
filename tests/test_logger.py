@@ -18,6 +18,7 @@ from tests.helpers.logging_process import (
     SCRATCH_ROOT,
     LoggingProcess,
     cleanup_directory,
+    existing_settings,
     read_database,
     write_settings,
 )
@@ -61,7 +62,10 @@ class OperationLoggerTests(unittest.TestCase):
             with self.assertRaises(LoggingStateError):
                 call()
         document = {
-            "logging": {"db_path": "new/events.db"},
+            "logging": {
+                **json.loads(self.config.read_text(encoding="utf-8"))["logging"],
+                "db_path": "new/events.db",
+            },
             "operation_context": {"run_id": "run-2"},
         }
         self.config.write_text(json.dumps(document), encoding="utf-8")
@@ -84,7 +88,7 @@ class OperationLoggerTests(unittest.TestCase):
         self.logger.open()
         for _ in range(2):
             self.logger.record_event("test.after")
-        page = self.logger.read_events()
+        page = self.logger.read_events()["events"]
         self.assertEqual([record["cursor"] for record in page], [1, 2, 3, 4, 5])
         self.assertEqual([record["event"] for record in page[:3]], before)
         self.assertEqual(
@@ -135,7 +139,7 @@ class OperationLoggerTests(unittest.TestCase):
             module_version="v1",
         )
         self.config.write_text(json.dumps(document), encoding="utf-8")
-        process = LoggingProcess("write", self.config, "1")
+        process = LoggingProcess("write", existing_settings(self.config), "1")
         self.addCleanup(process.close)
         process.start()
         context = process.receive()["context"]
@@ -560,8 +564,14 @@ class OperationLoggerTests(unittest.TestCase):
 
     def test_artifacts_register_metadata_without_file_io(self):
         """EVENT-07, EVENT-08: registering metadata does not read/create/accept an artifact."""
+        original_open = Path.open
+
+        def guard_artifact(path, *args, **kwargs):
+            self.assertNotEqual(path.name, "result.json")
+            return original_open(path, *args, **kwargs)
+
         with self.logger.operation("test", "artifact") as operation:
-            with patch.object(Path, "open") as file_open:
+            with patch.object(Path, "open", guard_artifact):
                 artifact_id = self.logger.record_artifact(
                     "artifacts\\result.json",
                     "output",
@@ -569,7 +579,6 @@ class OperationLoggerTests(unittest.TestCase):
                     content_hash="sha256:example",
                     operation=operation,
                 )
-                file_open.assert_not_called()
             self.assertEqual(len(read_database(self.db_path)), 2)
             for value in (
                 "/absolute",

@@ -17,6 +17,52 @@ from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRATCH_ROOT = PROJECT_ROOT / ".artifacts" / "tmp" / "logging-tests"
+STORE_OPTIONS = {
+    "busy_timeout_seconds": 5,
+    "max_event_bytes": None,
+    "min_free_bytes": 0,
+    "open_mode": "create",
+    "expected_journal": None,
+}
+
+
+def journal_identity(path: Path) -> dict:
+    """Read fixture identity independently of production validation/read methods."""
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        journal_id, generation = db.execute(
+            "SELECT journal_id, generation FROM journal_info"
+        ).fetchone()
+    return {"journal_id": journal_id, "generation": generation}
+
+
+def make_store(path: Path, **options):
+    from core.logger_utils.storage import SQLiteEventStore
+
+    settings = {**STORE_OPTIONS, **options}
+    if settings["open_mode"] == "existing" and "expected_journal" not in options:
+        settings["expected_journal"] = journal_identity(path)
+    return SQLiteEventStore(path, **settings)
+
+
+def existing_settings(config: Path) -> Path:
+    document = json.loads(config.read_text(encoding="utf-8"))
+    path = Path(document["logging"]["db_path"])
+    if not path.is_absolute():
+        path = config.parent / path
+    document["logging"].update(
+        open_mode="existing", expected_journal=journal_identity(path)
+    )
+    config.write_text(json.dumps(document), encoding="utf-8")
+    return config
+
+
+def checkpoint_for(client, cursor: int) -> dict:
+    info = client.get_journal_info()
+    return {
+        "journal_id": info["journal_id"],
+        "generation": info["generation"],
+        "cursor": cursor,
+    }
 
 
 def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
@@ -35,18 +81,36 @@ def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
             if os.name != "nt" or error.winerror != 145 or attempt == 2:
                 raise
             failed_path = Path(error.filename).resolve()
-            if not failed_path.is_relative_to(root) or any(failed_path.iterdir()):
+            if not failed_path.is_relative_to(root):
+                raise
+            # Give Windows a bounded chance to finish pending file deletions.
+            # Never retry if actual files remain or a file deletion itself failed.
+            time.sleep(0.05)
+            try:
+                has_entries = any(failed_path.iterdir())
+            except FileNotFoundError:
+                has_entries = False
+            if has_entries:
                 raise
 
 
-def write_settings(directory: Path, **settings) -> Path:
+def write_settings(directory: Path, *, context: dict | None = None, **settings) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     document = {
-        "logging": {"db_path": "events.db", **settings},
-        "operation_context": {"source": "module", "run_id": "run-1"},
+        "logging": {
+            "db_path": "events.db",
+            **STORE_OPTIONS,
+            "filtered_refresh_interval_seconds": 1,
+            **settings,
+        },
+        "operation_context": {"source": "module", "run_id": "run-1"}
+        if context is None
+        else context,
     }
     path = directory / "settings.json"
     path.write_text(json.dumps(document), encoding="utf-8")
+    if settings.get("open_mode") == "existing" and "expected_journal" not in settings:
+        existing_settings(path)
     return path
 
 
@@ -77,10 +141,17 @@ def read_database(path: Path) -> list[dict]:
 class LoggingProcess:
     """Launch through uv, then control the exact Python child identified by its handshake."""
 
-    def __init__(self, mode: str, config: Path, *arguments: str) -> None:
+    def __init__(
+        self,
+        mode: str,
+        config: Path,
+        *arguments: str,
+        module_name: str = "tests.helpers.logging_process",
+    ) -> None:
         self.mode = mode
         self.config = config
         self.arguments = arguments
+        self.module_name = module_name
         self.process = None
         self.pid = None
         self.output = queue.Queue()
@@ -104,7 +175,7 @@ class LoggingProcess:
                 "python",
                 "-u",
                 "-m",
-                "tests.helpers.logging_process",
+                self.module_name,
                 self.mode,
                 str(self.config),
                 *self.arguments,
@@ -155,10 +226,20 @@ class LoggingProcess:
         if self.process is not None:
             if self.process.poll() is None:
                 try:
+                    # uv can still be reaping a Python child whose stdout closed.
+                    self.process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
+            if self.process.poll() is None:
+                try:
                     if self.pid is not None:
                         self.kill_writer()
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    # Windows reports access denied for an already-exited PID.
+                    # Accept only proof that our own uv launcher has also exited.
+                    self.process.wait(timeout=2)
                 try:
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -200,7 +281,7 @@ def main() -> None:
             from core.logger_utils.storage import SQLiteEventStore
 
             OperationLogger(config)
-            SQLiteEventStore(config.parent / "not-created.db")
+            SQLiteEventStore(config.parent / "not-created.db", **STORE_OPTIONS)
         announce({"imported": True})
         return
 
@@ -208,7 +289,7 @@ def main() -> None:
 
     if mode == "read":
         with OperationLogger(config) as logger:
-            records = logger.read_events(limit=1000)
+            records = logger.read_events(limit=1000)["events"]
         with closing(sqlite3.connect(config.parent / "events.db")) as db:
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
         announce({"records": records, "integrity": integrity})
@@ -259,7 +340,8 @@ def main() -> None:
                 except LoggingStateError:
                     result["blocked_after_failure"] = True
                 result["read_ids"] = [
-                    record["event"]["event_id"] for record in logger.read_events()
+                    record["event"]["event_id"]
+                    for record in logger.read_events()["events"]
                 ]
                 blocker.execute("ROLLBACK")
             logger.close()
@@ -291,11 +373,19 @@ def main() -> None:
                 checkpoint({"before_insert": True})
             if mode == "during_insert":
                 connection = logger._store._connection
+                inserting_event = False
+
+                def trace_statement(sql: str) -> None:
+                    nonlocal inserting_event
+                    inserting_event = sql.startswith("INSERT INTO events")
 
                 def progress() -> int:
-                    checkpoint({"during_insert": True})
+                    if inserting_event:
+                        checkpoint({"during_insert": True})
                     return 0
 
+                # Health checks also execute SQL; stop inside INSERT, not those reads.
+                connection.set_trace_callback(trace_statement)
                 connection.set_progress_handler(progress, 1)
             event_id = logger.record_event("test.last", {"payload": "x" * 10000})
             checkpoint({"confirmed_last": event_id})

@@ -1,1 +1,1 @@
-"""Event validation and local storage supporting core.logger."""
+"""One event contract, durable SQLite storage and an explicitly scheduled projection."""

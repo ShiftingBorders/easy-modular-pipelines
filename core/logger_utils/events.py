@@ -4,6 +4,7 @@ import json
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 type JsonValue = (
     None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
@@ -19,10 +20,26 @@ RESERVED_EVENT_TYPES = frozenset(
         "resources.recorded",
         "progress.recorded",
         "artifact.recorded",
+        "template.applied",
+        "attempt.parameters",
+        "command.result",
     }
 )
 CONTEXT_TEXT_FIELDS = frozenset(
     {
+        "experiment_id",
+        "previous_experiment_id",
+        "previous_run_id",
+        "dag_revision_id",
+        "template_revision_id",
+        "stage_id",
+        "stage_execution_id",
+        "cycle_id",
+        "attempt_id",
+        "service_id",
+        "request_id",
+        "command_id",
+        "command_chain_id",
         "run_id",
         "node_id",
         "node_execution_id",
@@ -67,6 +84,43 @@ class LoggingStorageError(LoggingError):
 
 class LoggingStateError(LoggingError):
     """The client or operation is not in a state that permits this call."""
+
+
+class JournalGenerationChanged(LoggingStateError):
+    """A checkpoint or connection belongs to a different journal state."""
+
+    code = "journal_generation_changed"
+
+    def __init__(self, expected: JsonObject, actual: JsonObject) -> None:
+        super().__init__("Journal identity or generation changed; restart reading.")
+        self.expected = dict(expected)
+        self.actual = dict(actual)
+
+
+def validate_journal_identity(value: object) -> JsonObject:
+    identity = copy_json_object(value, "journal identity")
+    if identity.keys() != {"journal_id", "generation"}:
+        raise ValueError("Journal identity requires journal_id and generation.")
+    for name in identity:
+        identity[name] = UUID(require_text(identity[name], name)).hex
+    return identity
+
+
+def validate_checkpoint(value: object, key: str) -> JsonObject | None:
+    if value is None:
+        return None
+    checkpoint = copy_json_object(value, "checkpoint")
+    if checkpoint.keys() != {"journal_id", "generation", key}:
+        raise ValueError(f"Checkpoint requires journal_id, generation and {key}.")
+    if (
+        type(checkpoint[key]) is not int
+        or not 0 <= checkpoint[key] <= 9223372036854775807
+    ):
+        raise ValueError(f"{key} must be a nonnegative SQLite integer.")
+    identity = validate_journal_identity(
+        {name: checkpoint[name] for name in ("journal_id", "generation")}
+    )
+    return {**identity, key: checkpoint[key]}
 
 
 def require_text(value: object, name: str) -> str:
@@ -123,33 +177,45 @@ def copy_json_object(value: object, name: str) -> JsonObject:
 
 def validate_context(value: object) -> JsonObject:
     context = copy_json_object(value, "operation_context")
-    unknown = context.keys() - CONTEXT_TEXT_FIELDS - {"attempt_number", "process_id"}
+    text_fields = CONTEXT_TEXT_FIELDS
+    integer_fields = {"attempt_number", "process_id", "cycle_number", "stage_position"}
+    unknown = context.keys() - text_fields - integer_fields
     if unknown:
         raise ValueError(f"Unknown context fields: {', '.join(sorted(unknown))}.")
     for name, item in context.items():
         if item is None:
             continue
-        if name in CONTEXT_TEXT_FIELDS:
+        if name in text_fields:
             require_text(item, name)
         elif type(item) is not int or item < 1:
             raise ValueError(f"{name} must be a positive integer.")
     return context
 
 
-def load_logging_config(config_path: Path) -> tuple[Path, float, int, JsonObject]:
+def load_logging_settings(config_path: Path) -> tuple[JsonObject, JsonObject]:
     """Read one file; resolve its configured paths against that file's directory."""
     try:
+        if not config_path.is_absolute():
+            raise ValueError("config_path must be absolute.")
         with config_path.open(encoding="utf-8") as config_file:
             document = json.load(config_file)
         document = copy_json_object(document, "configuration")
         settings = document.get("logging")
         if not isinstance(settings, dict):
             raise TypeError("Configuration must contain a logging object.")
-        unknown = settings.keys() - {
+        required = {
             "db_path",
             "busy_timeout_seconds",
             "max_event_bytes",
+            "open_mode",
+            "min_free_bytes",
+            "expected_journal",
+            "filtered_refresh_interval_seconds",
         }
+        missing = required - settings.keys()
+        if missing:
+            raise ValueError(f"Missing logging fields: {', '.join(sorted(missing))}.")
+        unknown = settings.keys() - required
         if unknown:
             raise ValueError(f"Unknown logging fields: {', '.join(sorted(unknown))}.")
         configured_path = require_text(settings.get("db_path"), "logging.db_path")
@@ -159,25 +225,48 @@ def load_logging_config(config_path: Path) -> tuple[Path, float, int, JsonObject
             if db_path.drive or db_path.root:
                 raise ValueError("db_path must be absolute or relative to the config.")
             db_path = config_path.parent / db_path
-        timeout = require_number(settings.get("busy_timeout_seconds", 5), "timeout")
+        timeout = require_number(settings["busy_timeout_seconds"], "timeout")
         if not 0 < timeout <= 60:
             raise ValueError(
                 "busy_timeout_seconds must be greater than 0 and at most 60."
             )
-        max_bytes = settings.get("max_event_bytes", 1048576)
-        if type(max_bytes) is not int or not 1024 <= max_bytes <= 16777216:
-            raise ValueError(
-                "max_event_bytes must be an integer from 1024 to 16777216."
-            )
+        max_bytes = settings["max_event_bytes"]
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
+            raise ValueError("max_event_bytes must be a positive integer or null.")
+        open_mode = settings["open_mode"]
+        if open_mode not in ("create", "existing"):
+            raise ValueError("logging.open_mode must be create or existing.")
+        min_free_bytes = settings["min_free_bytes"]
+        if type(min_free_bytes) is not int or min_free_bytes < 0:
+            raise ValueError("logging.min_free_bytes must be a nonnegative integer.")
+        expected = settings["expected_journal"]
+        if open_mode == "existing":
+            expected = validate_journal_identity(expected)
+        elif expected is not None:
+            raise ValueError("create requires expected_journal=null.")
+        refresh = require_number(
+            settings["filtered_refresh_interval_seconds"], "refresh interval"
+        )
+        if refresh <= 0:
+            raise ValueError("filtered_refresh_interval_seconds must be positive.")
         context = validate_context(document.get("operation_context", {}))
+        settings = {
+            "db_path": str(db_path),
+            "busy_timeout_seconds": float(timeout),
+            "max_event_bytes": max_bytes,
+            "open_mode": open_mode,
+            "min_free_bytes": min_free_bytes,
+            "expected_journal": expected,
+            "filtered_refresh_interval_seconds": refresh,
+        }
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as error:
         raise LoggingConfigurationError(
             f"Cannot load logging configuration {config_path}: {error}"
         ) from error
-    return db_path, float(timeout), max_bytes, context
+    return settings, context
 
 
-def encode_event(event: object, max_bytes: int) -> str:
+def encode_event(event: object, max_bytes: int | None) -> str:
     """Validate the common envelope without depending on application event kinds."""
     event = copy_json_object(event, "event")
     if event.keys() != EVENT_FIELDS:
@@ -202,6 +291,42 @@ def encode_event(event: object, max_bytes: int) -> str:
     encoded = json.dumps(
         event, ensure_ascii=False, allow_nan=False, separators=(",", ":")
     )
-    if len(encoded.encode("utf-8")) > max_bytes:
+    if max_bytes is not None and len(encoded.encode("utf-8")) > max_bytes:
         raise ValueError(f"Encoded event exceeds max_event_bytes ({max_bytes}).")
     return encoded
+
+
+def validate_command_result(data: object) -> JsonObject:
+    """Validate a command observation without deciding runner/service precedence."""
+    result = copy_json_object(data, "command result")
+    if result.keys() != {
+        "request_id",
+        "author",
+        "outcome",
+        "response",
+        "ignored",
+        "supersedes",
+    }:
+        raise ValueError("Command result fields do not match the contract.")
+    require_text(result["request_id"], "request_id")
+    if result["author"] not in ("runner", "service"):
+        raise ValueError("Command result author must be runner or service.")
+    if result["outcome"] not in (
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "invalidated",
+    ):
+        raise ValueError("Unsupported command outcome.")
+    copy_json_object(result["response"], "response")
+    if result["ignored"] is not None:
+        require_text(result["ignored"], "ignored")
+    if type(result["supersedes"]) is not list:
+        raise TypeError("supersedes must be a list.")
+    for item in result["supersedes"]:
+        if type(item) is not dict or item.keys() != {"event_id", "ignored"}:
+            raise ValueError("Invalid superseded observation.")
+        require_text(item["event_id"], "supersedes.event_id")
+        require_text(item["ignored"], "supersedes.ignored")
+    return result

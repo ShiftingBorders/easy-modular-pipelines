@@ -1,0 +1,6 @@
+{
+  "busy_timeout_seconds": 5,
+  "max_event_bytes": null,
+  "min_free_bytes": 67108864,
+  "filtered_refresh_interval_seconds": 1
+}
