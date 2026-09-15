@@ -7,24 +7,29 @@ from core.validation_constants import MODULE_IDENTITY_CHARACTERS as ALLOWED_CHAR
 class ClearStringErr(Exception):
     pass
 
-def clear_str(*args) -> tuple[str,...]:
+
+def clear_str(*args) -> tuple[str, ...]:
     cleared_args = []
     for arg in args:
-        if not isinstance(arg,str):
+        if not isinstance(arg, str):
             raise StorageInputError(f"Provided argument {arg} is not a string")
         cleared_args.append(arg.strip())
     return tuple(cleared_args)
 
-def check_valid_characters(valid_characters:str, string_to_check:str) -> bool:
-    valid_characters_set, string_characters  = set(valid_characters), set(string_to_check)
-    return not any(character not in valid_characters_set for character in string_characters)
+
+def check_valid_characters(valid_characters: str, string_to_check: str) -> bool:
+    valid_characters_set, string_characters = (
+        set(valid_characters),
+        set(string_to_check),
+    )
+    return not any(
+        character not in valid_characters_set for character in string_characters
+    )
 
 
-def free_port_finder(n_tries: int, offset: int, binded_ip:str, *ports) -> tuple:
+def free_port_finder(n_tries: int, offset: int, binded_ip: str, *ports) -> tuple:
     for current_try in range(n_tries):
-        candidate_ports = tuple(
-            port + current_try * offset for port in ports
-        )
+        candidate_ports = tuple(port + current_try * offset for port in ports)
         service_ports = candidate_ports + tuple(
             port + 10000 for port in candidate_ports
         )
@@ -48,8 +53,15 @@ def free_port_finder(n_tries: int, offset: int, binded_ip:str, *ports) -> tuple:
 
     return ()
 
+
 def check_input_metadata(module_name: str, module_version: str):
     if module_name == "" or module_version == "":
-        raise StorageInputError(f"Module name ({module_name}) or module version ({module_version}) are empty")
-    if not check_valid_characters(ALLOWED_CHARACTERS,module_name) or not check_valid_characters(ALLOWED_CHARACTERS, module_version):
-        raise StorageInputError(f"Module name ({module_name}) or module version ({module_version}) contain invalid characters")
+        raise StorageInputError(
+            f"Module name ({module_name}) or module version ({module_version}) are empty"
+        )
+    if not check_valid_characters(
+        ALLOWED_CHARACTERS, module_name
+    ) or not check_valid_characters(ALLOWED_CHARACTERS, module_version):
+        raise StorageInputError(
+            f"Module name ({module_name}) or module version ({module_version}) contain invalid characters"
+        )

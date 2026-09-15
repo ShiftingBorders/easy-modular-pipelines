@@ -1,0 +1,10 @@
+schema_version: 1
+name: counter
+version: "1.0"
+role: stage
+implementation: full
+commands:
+  start: [python, -B, main.py]
+defaults:
+  ticks: 5
+  delay_seconds: 0.4

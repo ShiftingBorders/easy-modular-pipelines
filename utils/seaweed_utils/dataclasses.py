@@ -6,15 +6,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class ProcessArgs(BaseModel):
     model_config = ConfigDict(extra="allow")  # unknown fields tolerated
 
-    start_stop_sec: int = Field(gt=1,le=3600)
-    max_archive_gb: float = Field(gt=0,le=5)
+    start_stop_sec: int = Field(gt=1, le=3600)
+    max_archive_gb: float = Field(gt=0, le=5)
+
 
 class StartArgs(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     ip: str
     ip_bind: str = Field(alias="ip.bind")
-    master_port: int = Field(alias="master.port", gt=0, lt=55536) # SeaweedFS HTTP and derived gRPC ports must not overlap
+    master_port: int = Field(
+        alias="master.port", gt=0, lt=55536
+    )  # SeaweedFS HTTP and derived gRPC ports must not overlap
     volume_port: int = Field(alias="volume.port", gt=0, lt=55536)
     filer: bool
     filer_port: int = Field(alias="filer.port", gt=0, lt=55536)
@@ -39,10 +42,11 @@ class StartArgs(BaseModel):
 
     @field_validator("filer")
     @classmethod
-    def check_filer(cls,v):
+    def check_filer(cls, v):
         if v != True:
             raise ValueError("Filer argument is required to be set to true")
         return True
+
 
 class SeaWeedConfig(BaseModel):
     model_config = ConfigDict(extra="allow")

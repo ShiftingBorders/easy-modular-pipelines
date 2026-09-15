@@ -3,6 +3,7 @@ import lzma
 import shutil
 import tarfile
 import tempfile
+import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from core.storage_contracts import HashDatabase, ModuleAddResult, ModuleDatabase
@@ -568,7 +569,27 @@ class ModuleManager:
             raise
         finally:
             try:
-                temporary.cleanup()
+                for cleanup_attempt in range(3):
+                    cleanup_target = Path(work)
+                    if (
+                        cleanup_target.is_symlink()
+                        or cleanup_target.is_junction()
+                        or not cleanup_target.resolve().is_relative_to(work_root)
+                    ):
+                        raise ValueError(
+                            "Temporary cleanup target escaped its workspace."
+                        )
+                    try:
+                        temporary.cleanup()
+                        break
+                    except OSError as cleanup_error:
+                        # Retry only Windows' transient directory-not-empty condition.
+                        if (
+                            getattr(cleanup_error, "winerror", None) != 145
+                            or cleanup_attempt == 2
+                        ):
+                            raise
+                        time.sleep(0.02 * (cleanup_attempt + 1))
             except OSError as cleanup_error:
                 note = f"Temporary cleanup failed at {work}: {cleanup_error}"
                 if failure is not None:
