@@ -248,19 +248,33 @@ class ExperimentAssembler:
             "commands",
             "defaults",
         }
+        if module.get("role") == "service":
+            required.add("service_interface")
         if (
             module.keys() != required
             or type(module["schema_version"]) is not int
             or module["schema_version"] != 1
         ):
             raise ValueError("Invalid module schema.")
-        if module["role"] != "stage" or module["implementation"] not in (
+        if module["role"] not in ("stage", "service") or module[
+            "implementation"
+        ] not in (
             "full",
             "action",
         ):
             raise NotImplementedError(
-                "The initial runtime executes full/action stages."
+                "Modules require a stage/service role and full/action implementation."
             )
+        if module["role"] == "service":
+            if module["service_interface"] not in ("socket", "commands"):
+                raise ValueError("service_interface must be socket or commands.")
+            if (
+                module["service_interface"] == "commands"
+                and module["implementation"] != "action"
+            ):
+                raise ValueError(
+                    "Commands-only services require action start/stop commands."
+                )
         commands = copy_json_object(module["commands"], "commands")
         expected = (
             {"start", "stop"} if module["implementation"] == "action" else {"start"}

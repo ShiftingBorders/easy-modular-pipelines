@@ -13,13 +13,20 @@ from core.runner_utils.state import JsonObject
 
 
 class ParticipantConnection:
-    def __init__(self, endpoint_path: Path, expected_identity: JsonObject) -> None:
+    def __init__(
+        self,
+        endpoint_path: Path,
+        expected_identity: JsonObject,
+        *,
+        process_key: str = "executor",
+    ) -> None:
         self._endpoint_path = Path(endpoint_path)
         if not self._endpoint_path.is_absolute():
             raise ValueError("endpoint_path must be absolute.")
         self._expected_identity = copy_json_object(
             expected_identity, "expected_identity"
         )
+        self._process_key = process_key
         self._reader = None
         self._writer = None
         self._write_lock = asyncio.Lock()
@@ -32,10 +39,10 @@ class ParticipantConnection:
             if endpoint.get(name) != value:
                 raise ValueError(f"Participant identity mismatch: {name}")
         identity = await asyncio.to_thread(
-            process_identity, endpoint["executor"]["pid"]
+            process_identity, endpoint[self._process_key]["pid"]
         )
-        if identity != endpoint["executor"]:
-            raise ValueError("Executor OS identity differs from its endpoint file.")
+        if identity != endpoint[self._process_key]:
+            raise ValueError("Participant OS identity differs from its endpoint file.")
         address = endpoint["endpoint"]
         if address["host"] != "127.0.0.1" or type(address["port"]) is not int:
             raise ValueError("Participant must listen on loopback.")
@@ -105,6 +112,7 @@ class ParticipantConnection:
                         {
                             "protocol_version": 1,
                             "message_type": "request",
+                            **self._expected_identity,
                             "request_id": request_id,
                             "command": command,
                             "args": args,
@@ -129,7 +137,9 @@ class ParticipantConnection:
         writer, self._writer = self._writer, None
         self._reader = None
         if writer is not None:
-            writer.close()
+            # Closing abandons this channel, including any partially sent frame.
+            # A peer that stopped reading must not hold cancellation in drain.
+            writer.transport.abort()
             try:
                 await writer.wait_closed()
             except (ConnectionError, OSError):

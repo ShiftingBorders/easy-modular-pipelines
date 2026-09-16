@@ -140,6 +140,16 @@ class ServiceInstance:
         self.restart_count = 0
         self.pending_requests = []
         self.active_request = None
+        self.start_deadline: float | None = None
+        self.ever_ready = False
+        self.stopping = False
+        self.stopped = False
+        self.blocked_action: Literal["pause", "stop"] | None = None
+        self.failure: str | None = None
+        self.freeze_id: str | None = None
+        self.prepared_freeze_id: str | None = None
+        self.artifacts_directory: Path | None = None
+        self.implementation: Literal["full", "action"] = "full"
 
 
 class RunnerState:
@@ -267,10 +277,6 @@ class RunnerStateStore:
 
 def state_to_document(state: RunnerState) -> JsonObject:
     """Serialize known public records, never live tasks or control queues."""
-    if state.services:
-        raise NotImplementedError(
-            "Persistent services belong to the next runtime phase."
-        )
     root = state.experiment_directory.resolve()
     document = dict(vars(state))
     document.pop("experiment_directory")
@@ -286,6 +292,15 @@ def state_to_document(state: RunnerState) -> JsonObject:
         for key, value in state.stage_result_paths.items()
     }
     document["used_request_ids"] = sorted(state.used_request_ids)
+    document["services"] = {}
+    for service_id, instance in state.services.items():
+        saved = dict(vars(instance))
+        for name in ("endpoint_path", "artifacts_directory"):
+            path = saved[name]
+            saved[name] = (
+                None if path is None else path.resolve().relative_to(root).as_posix()
+            )
+        document["services"][service_id] = saved
     if state.active_attempt is not None:
         attempt = dict(vars(state.active_attempt))
         attempt["artifacts_directory"] = (
@@ -361,8 +376,11 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         "failed",
     ):
         raise ValueError("Invalid saved phase.")
-    if type(document["pause_requested"]) is not bool or document["services"] != {}:
-        raise ValueError("Invalid pause flag or unsupported service state.")
+    if (
+        type(document["pause_requested"]) is not bool
+        or type(document["services"]) is not dict
+    ):
+        raise ValueError("Invalid pause flag or service state.")
     for key in ("cycle_number", "stage_position", "unknown_state_recovery_count"):
         minimum = 0 if key == "unknown_state_recovery_count" else 1
         if type(document[key]) is not int or document[key] < minimum:
@@ -394,6 +412,92 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
     state.used_request_ids = set(document["used_request_ids"])
     if len(state.used_request_ids) != len(document["used_request_ids"]):
         raise ValueError("Duplicate saved request ID.")
+    service_request_ids = set()
+    for service_id, saved in document["services"].items():
+        saved = copy_json_object(saved, "service state")
+        instance = ServiceInstance(
+            saved["service_id"],
+            saved["service_instance_id"],
+            saved["definition"],
+            saved["interface"],
+        )
+        if service_id != instance.service_id or saved.keys() != vars(instance).keys():
+            raise ValueError("Invalid saved service fields or identity.")
+        for key in ("ready", "ever_ready", "stopping", "stopped"):
+            if type(saved[key]) is not bool:
+                raise TypeError(f"service.{key} must be a boolean.")
+        if type(saved["restart_count"]) is not int or saved["restart_count"] < 0:
+            raise ValueError("Invalid service restart count.")
+        if saved["blocked_action"] not in (None, "pause", "stop") or saved[
+            "implementation"
+        ] not in ("full", "action"):
+            raise ValueError("Invalid saved service mode.")
+        if saved["start_deadline"] is not None:
+            require_number(saved["start_deadline"], "service start deadline")
+        if saved["process_identity"] is not None:
+            identity = copy_json_object(
+                saved["process_identity"], "service process identity"
+            )
+            if identity.keys() != {"pid", "created_at_os", "host_id", "boot_id"}:
+                raise ValueError("Service requires complete OS identity.")
+            for name in ("pid", "created_at_os"):
+                if type(identity[name]) is not int or identity[name] < (
+                    1 if name == "pid" else 0
+                ):
+                    raise ValueError("Invalid service OS identity value.")
+            for name in ("host_id", "boot_id"):
+                require_text(identity[name], name)
+        for name in ("started_at", "failure"):
+            if saved[name] is not None:
+                require_text(saved[name], name)
+        if saved["last_status"] is not None:
+            copy_json_object(saved["last_status"], "service status")
+        for key in ("freeze_id", "prepared_freeze_id"):
+            if saved[key] is not None:
+                UUID(saved[key])
+        if type(saved["pending_requests"]) is not list:
+            raise TypeError("Service pending_requests must be an array.")
+        requests = [*saved["pending_requests"]]
+        if saved["active_request"] is not None:
+            requests.append(saved["active_request"])
+        for index, request in enumerate(requests):
+            request = copy_json_object(request, "service request")
+            request_id = require_text(request["request_id"], "request_id")
+            UUID(request_id)
+            if (
+                request_id not in state.used_request_ids
+                or request_id in service_request_ids
+            ):
+                raise ValueError("Service request ID is missing or duplicated.")
+            service_request_ids.add(request_id)
+            require_text(request["command"], "service command")
+            copy_json_object(request["args"], "service command arguments")
+            if request["sent_monotonic"] is not None:
+                require_number(request["sent_monotonic"], "service send time")
+            if index < len(saved["pending_requests"]):
+                if request["sent_monotonic"] is not None or request["timed_out"]:
+                    raise ValueError(
+                        "A sent service request cannot re-enter the pending queue."
+                    )
+            elif (
+                request["sent_monotonic"] is None
+                or request["service_instance_id"] != instance.service_instance_id
+            ):
+                raise ValueError(
+                    "Active service request has no matching send identity/time."
+                )
+            if type(request["timed_out"]) is not bool:
+                raise TypeError("Service timed_out must be a boolean.")
+        for name in ("endpoint_path", "artifacts_directory"):
+            if saved[name] is not None:
+                relative = Path(require_text(saved[name], name))
+                resolved = (root / relative).resolve()
+                if relative.anchor or not resolved.is_relative_to(root):
+                    raise ValueError("Saved service path escapes the experiment.")
+                saved[name] = resolved
+        for name, value in saved.items():
+            setattr(instance, name, value)
+        state.services[service_id] = instance
     if type(document["stage_result_paths"]) is not dict:
         raise TypeError("stage_result_paths must be an object.")
     paths = dict(document["stage_result_paths"])
