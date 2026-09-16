@@ -12,8 +12,9 @@ from core.logger import OperationLogger
 from core.logger_utils.events import LoggingStorageError
 from core.runner_utils.experimentrunner import ExperimentRunner
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
-from tests.helpers.archives import ArchiveCli, ArchiveTestCase
+from tests.helpers.archives import ArchiveTestCase
 from tests.helpers.dag import DagSession, wait_until
+from tests.helpers.http_runtime import HTTPCLI, HTTPServer
 
 
 class ArchiveDagTests(ArchiveTestCase):
@@ -378,52 +379,46 @@ class ArchiveCliTests(ArchiveTestCase):
     ):
         """I/G: real uv/CLI/queues/SQLite/HTTP round trip from an initially empty selection."""
         await self.source_archive()
-        cli = ArchiveCli(self.w)
+        server = HTTPServer(self.w, project=self.w.target)
+        self.addAsyncCleanup(server.close)
+        await server.start()
+        cli = HTTPCLI(self.w, server)
         self.addAsyncCleanup(cli.close)
-        await cli.start()
-        reply = await cli.send("state")
-        self.assertEqual(reply["data"]["phase"], "idle", reply)
-        checked = await cli.send(
-            "archive.inspect", {"archive_path": str(self.w.archive)}
-        )
+        await cli.start(["shell"])
+        reply = await cli.send("status")
+        self.assertEqual(reply["phase"], "idle", reply)
+        checked = await cli.send(f'archive inspect "{self.w.archive}" --wait')
         self.assertEqual(checked["result"], "success", checked)
         self.w.destination = self.w.target / "imports/эксперимент"
         installed = await cli.send(
-            "archive.install",
-            {
-                "archive_path": str(self.w.archive),
-                "destination": str(self.w.destination),
-            },
+            f'archive install "{self.w.archive}" "{self.w.destination}" --wait'
         )
         self.assertEqual(installed["result"], "success", installed)
         run = await cli.send(
-            "run",
-            {
-                "template_path": installed["data"]["template_path"],
-                "delayed_start": True,
-            },
+            f'run --template "{installed["data"]["template_path"]}" --delayed-start --wait'
         )
         self.assertEqual(run["result"], "success", run)
         async with asyncio.timeout(40):
             while True:
-                reply = await cli.send("state")
-                self.assertNotEqual(reply["data"]["phase"], "failed", reply)
-                if reply["data"]["phase"] == "waiting":
+                reply = await cli.send("status")
+                self.assertNotEqual(reply["phase"], "failed", reply)
+                if reply["phase"] == "waiting":
                     break
                 await asyncio.sleep(0.05)
-        step = await cli.send("step")
+        step = await cli.send("step --wait")
         self.assertEqual(step["result"], "success", step)
         logs = await cli.send("logs")
-        self.assertEqual(logs["result"], "success", logs)
-        self.assertEqual(logs["experiment_id"], run["experiment_id"])
-        created = await cli.send(
-            "archive.create",
-            {"archive_path": str(self.w.root / "повторный архив.tar.xz")},
+        self.assertTrue(logs["events"], logs)
+        self.assertEqual(
+            (await server.get("/state"))["experiment_id"], run["experiment_id"]
         )
+        output = self.w.root / "повторный архив.tar.xz"
+        created = await cli.send(f'archive create "{output}" --wait')
         self.assertEqual(created["result"], "success", created)
         self.assertTrue(Path(created["data"]["archive_path"]).is_file())
         await cli.close()
         self.assertEqual(cli.process.returncode, 0)
+        self.assertTrue((await server.get("/health"))["controller_alive"])
 
     async def test_cli_uses_explicit_archive_settings(self):
         """I/A: CLI configuration reaches the archiver rather than using silent defaults."""
@@ -431,9 +426,14 @@ class ArchiveCliTests(ArchiveTestCase):
         settings = read_json(self.w.config)
         tiny = self.w.root / "tiny-settings.json"
         write_json(tiny, {**settings, "max_archive_bytes": 1})
-        cli = ArchiveCli(self.w)
+        server = HTTPServer(
+            self.w, project=self.w.target, settings={"archive_config_path": str(tiny)}
+        )
+        self.addAsyncCleanup(server.close)
+        await server.start()
+        cli = HTTPCLI(self.w, server)
         self.addAsyncCleanup(cli.close)
-        await cli.start(config=tiny)
-        reply = await cli.send("archive.inspect", {"archive_path": str(self.w.archive)})
+        await cli.start(["shell"])
+        reply = await cli.send(f'archive inspect "{self.w.archive}" --wait')
         self.assertEqual(reply["error"]["code"], "storage_capacity", reply)
-        self.assertEqual((await cli.send("state"))["data"]["phase"], "idle")
+        self.assertEqual((await cli.send("status"))["phase"], "idle")

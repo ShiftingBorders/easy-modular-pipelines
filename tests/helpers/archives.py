@@ -1,7 +1,6 @@
 """Isolated real files, SQLite and loopback HTTP for archive test groups A-J."""
 
 import asyncio
-import codecs
 import copy
 import hashlib
 import io
@@ -427,87 +426,6 @@ class ArchiveTestCase(unittest.IsolatedAsyncioTestCase):
     def assert_work_clean(self):
         self.assertEqual(list(self.w.root.rglob("experiment-archive-*")), [])
         self.assertEqual(list(self.w.root.rglob("register-module-*")), [])
-
-
-class ArchiveCli:
-    """Own a real CLI process, its response reader and its shutdown."""
-
-    def __init__(self, workspace):
-        self.w = workspace
-        self.process = None
-        self.reader = self.stderr = None
-        self.responses = asyncio.Queue()
-        self.ownership = self.w.root / f"cli-{uuid4()}.json"
-
-    async def start(self, *, config=None):
-        self.process = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "--project",
-            str(REPOSITORY),
-            "--no-sync",
-            "python",
-            "-B",
-            "-u",
-            "-m",
-            "tests.helpers.dag_cli",
-            "--ownership",
-            str(self.ownership),
-            "--project-root",
-            str(self.w.target),
-            "--hash-config",
-            str(self.w.target / "hashes.json"),
-            "--filer-url",
-            self.w.filer.url,
-            "--archive-config",
-            str(config or self.w.config),
-            cwd=REPOSITORY,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        self.reader = asyncio.create_task(self.read())
-        self.stderr = asyncio.create_task(self.process.stderr.read())
-
-    async def read(self):
-        buffer = ""
-        decoder = codecs.getincrementaldecoder("utf-8")()
-        parser = json.JSONDecoder()
-        while chunk := await self.process.stdout.read(4096):
-            buffer += decoder.decode(chunk)
-            while "{" in buffer:
-                try:
-                    result, end = parser.raw_decode(buffer, buffer.index("{"))
-                except json.JSONDecodeError:
-                    break
-                buffer = buffer[end:]
-                if "command_id" in result:
-                    self.responses.put_nowait(result)
-
-    async def send(self, command, args=None):
-        text = (
-            command
-            if args is None
-            else json.dumps({"command": command, "args": args}, ensure_ascii=False)
-        )
-        self.process.stdin.write((text + "\n").encode("utf-8"))
-        await self.process.stdin.drain()
-        return await asyncio.wait_for(self.responses.get(), 45)
-
-    async def close(self):
-        if self.process is not None and self.process.returncode is None:
-            try:
-                self.process.stdin.write(b"quit\n")
-                await self.process.stdin.drain()
-                await asyncio.wait_for(self.process.wait(), 45)
-            except (OSError, ConnectionError, TimeoutError):
-                if self.ownership.exists():
-                    terminate_owned(read_json(self.ownership)["cli"])
-                await asyncio.wait_for(self.process.wait(), 15)
-        for task in (self.reader, self.stderr):
-            if task is not None:
-                await task
 
 
 def inventory(root):

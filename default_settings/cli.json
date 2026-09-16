@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "server_url": "http://127.0.0.1:8000/api",
+  "token_env": null,
+  "request_timeout_seconds": 15,
+  "wait_timeout_seconds": 60,
+  "poll_interval_seconds": 0.25,
+  "max_response_bytes": 33554432
+}

@@ -638,7 +638,12 @@ class ExperimentRunner:
         future = self._step_future
         self._wake.set()
         try:
-            return await asyncio.shield(future)
+            result = await asyncio.shield(future)
+            if result.get("phase") == "completed" and self._task is not None:
+                # A final step includes publishing its snapshot and closing the
+                # DAG task, so a following command can use the completed state.
+                await asyncio.shield(self._task)
+            return result
         except asyncio.CancelledError:
             future.cancel()
             if self._step_future is future:
@@ -1557,6 +1562,14 @@ class ExperimentRunner:
         )
         if state is not None:
             phase = state.phase
+            if (
+                phase == "completed"
+                and self._task is not None
+                and not self._task.done()
+            ):
+                # finalize serializes a terminal checkpoint before publishing its
+                # snapshot. Public completion must wait for publication/teardown.
+                phase = "snapshotting"
         elif self._error is not None:
             phase = "failed"
         elif self._stop_requested and self._requested_id is not None:

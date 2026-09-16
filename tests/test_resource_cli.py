@@ -1,154 +1,99 @@
-"""Approved resource_collector.md A/E: actual CLI settings and monitoring reads."""
+"""Approved D/F/H migration: monitoring belongs to the server, never to its CLI."""
 
 import asyncio
-import codecs
 import json
-import os
-import subprocess
-import unittest
 
-from tests.helpers.dag import (
-    REPOSITORY,
-    DagWorkspace,
-    process_running,
-    terminate_owned,
-    wait_until,
-)
+from core.runner_utils.runtimeio import read_json, write_json
+from tests.helpers.dag import process_running
+from tests.helpers.http_runtime import HTTPServer, ServerTestCase
 from tests.helpers.resources import write_settings
 
 
-class ResourceCliTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.workspace = DagWorkspace()
-        self.addCleanup(self.workspace.close)
-        self.process = None
-        self.reader = None
-        self.stderr = None
-        self.responses = asyncio.Queue()
-        self.ownership = self.workspace.root / "cli-owner.json"
-        self.collector_pid = None
-        self.addAsyncCleanup(self.close_cli)
-
-    async def start_cli(self, config):
-        template = self.workspace.write_template(self.workspace.template())
-        self.process = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "--project",
-            str(REPOSITORY),
-            "--no-sync",
-            "python",
-            "-B",
-            "-m",
-            "tests.helpers.dag_cli",
-            "--ownership",
-            str(self.ownership),
-            "--project-root",
-            str(self.workspace.root),
-            "--hash-config",
-            str(self.workspace.hash_config),
-            "--template",
-            str(template),
-            "--resource-config",
-            config.name,
-            cwd=self.workspace.root,
-            env={
-                **os.environ,
-                "PYTHONPATH": str(REPOSITORY),
-                "PYTHONIOENCODING": "utf-8",
-            },
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        self.reader = asyncio.create_task(self.read_responses())
-        self.stderr = asyncio.create_task(self.process.stderr.read())
-
-    async def read_responses(self):
-        decoder = codecs.getincrementaldecoder("utf-8")()
-        parser = json.JSONDecoder()
-        buffer = ""
-        while chunk := await self.process.stdout.read(4096):
-            buffer += decoder.decode(chunk)
-            while "{" in buffer:
-                start = buffer.index("{")
-                try:
-                    message, end = parser.raw_decode(buffer, start)
-                except json.JSONDecodeError:
-                    break
-                buffer = buffer[end:]
-                if "command_id" in message:
-                    self.responses.put_nowait(message)
-
-    async def command(self, name, args=None):
-        payload = json.dumps({"command": name, "args": args or {}})
-        self.process.stdin.write((payload + "\n").encode())
-        await self.process.stdin.drain()
-        return await asyncio.wait_for(self.responses.get(), 10)
-
-    async def close_cli(self):
-        if self.process is not None and self.process.returncode is None:
-            try:
-                self.process.stdin.write(b"quit\n")
-                await self.process.stdin.drain()
-                await asyncio.wait_for(self.process.wait(), 8)
-            except (OSError, ConnectionError, TimeoutError):
-                if self.ownership.exists():
-                    terminate_owned(json.loads(self.ownership.read_text())["cli"])
-                await asyncio.wait_for(self.process.wait(), 5)
-        if self.reader is not None:
-            await self.reader
-        if self.stderr is not None:
-            await self.stderr
-        for path in self.workspace.root.glob("experiments/**/process.json"):
-            record = json.loads(path.read_text())
-            for key in ("stage", "executor"):
-                if record.get(key):
-                    terminate_owned(record[key])
-                    await wait_until(
-                        lambda pid=record[key]["pid"]: not process_running(pid)
-                    )
-
-    async def test_relative_custom_config_and_real_resource_commands(self):
-        """A/E: CLI resolves its config against its invocation cwd and serves real samples."""
-        async with asyncio.timeout(30):
-            config = write_settings(self.workspace.root, history_seconds=123)
-            await self.start_cli(config)
+class ResourceCliTests(ServerTestCase):
+    async def test_idle_samples_stay_in_ram_and_stopped_journal_does_not_grow(self):
+        config = write_settings(self.w.root)
+        server = await self.start_server(settings={"resource_config_path": str(config)})
+        async with asyncio.timeout(15):
+            while not (await server.get("/resources/history"))["samples"]:
+                await asyncio.sleep(0.05)
+        self.assertFalse((self.w.source / "experiments.json").exists())
+        state = await server.launch(self.w.template())
+        path = "/experiments/" + state["experiment_id"] + "/events"
+        async with asyncio.timeout(15):
             while True:
-                status = await self.command("stats.resources")
-                self.assertEqual(status["result"], "success", status)
-                if status["data"]["latest"]:
+                page = await server.get(path, limit=1000)
+                records = [
+                    row
+                    for row in page["events"]
+                    if row["event"]["event_type"] == "resources.recorded"
+                ]
+                if records:
                     break
-            self.assertEqual(status["data"]["config_path"], str(config))
-            self.collector_pid = status["data"]["pid"]
-            self.assertTrue(process_running(self.collector_pid))
-            history = await self.command("stats.resources.history", {"limit": 2})
-            self.assertEqual(history["result"], "success")
-            self.assertTrue(history["data"]["samples"])
-            self.assertLessEqual(len(history["data"]["samples"]), 2)
-            self.assertEqual((await self.command("step"))["result"], "success")
-            await self.close_cli()
-            self.assertEqual(self.process.returncode, 0, (await self.stderr).decode())
-            self.assertFalse(process_running(self.collector_pid))
-
-    async def test_invalid_collector_config_does_not_prevent_cli_experiment_completion(
-        self,
-    ):
-        """A/E: a bad monitoring file is reported while the real CLI still executes its DAG."""
-        async with asyncio.timeout(30):
-            config = self.workspace.root / "invalid-collector.json"
-            config.write_text("{", encoding="utf-8")
-            await self.start_cli(config)
+                await asyncio.sleep(0.05)
+        self.assertEqual((await server.command("stop"))["result"], "success")
+        before = await server.get(path, limit=1000)
+        history = await server.get("/resources/history")
+        last = history["cursor"]
+        async with asyncio.timeout(15):
             while True:
-                status = await self.command("stats.resources")
-                self.assertEqual(status["result"], "success")
-                if status["data"]["state"] == "configuration_error":
+                later = await server.get("/resources/history", after=last)
+                if len(later["samples"]) >= 3:
                     break
-            self.assertTrue(status["data"]["error"])
-            self.assertEqual((await self.command("step"))["result"], "success")
-            self.assertEqual(
-                (await self.command("stats.state"))["data"]["phase"], "completed"
-            )
-            await self.close_cli()
-            self.assertEqual(self.process.returncode, 0)
+                await asyncio.sleep(0.05)
+        after = await server.get(path, limit=1000)
+        before_ids = [
+            row["event"]["event_id"]
+            for row in before["events"]
+            if row["event"]["event_type"] == "resources.recorded"
+        ]
+        after_ids = [
+            row["event"]["event_id"]
+            for row in after["events"]
+            if row["event"]["event_type"] == "resources.recorded"
+        ]
+        self.assertEqual(after_ids, before_ids)
+
+    async def test_relative_server_collector_config_and_real_cli_resource_reads(self):
+        server = HTTPServer(self.w)
+        self.addAsyncCleanup(server.close)
+        config = write_settings(server.control, history_seconds=123)
+        settings = read_json(server.config)
+        write_json(server.config, {**settings, "resource_config_path": config.name})
+        await server.start(cwd=self.w.target)
+        async with asyncio.timeout(20):
+            while not (status := await server.get("/resources"))["latest"]:
+                await asyncio.sleep(0.05)
+        client = await self.start_cli(server, ["resources"])
+        code, output, error = await client.finish()
+        self.assertEqual(code, 0, error)
+        status = json.loads(output)
+        self.assertEqual(status["config_path"], str(config))
+        collector = status["pid"]
+        self.assertTrue(process_running(collector))
+        history = await self.start_cli(server, ["resource-history", "--limit", "2"])
+        code, output, error = await history.finish()
+        self.assertEqual(code, 0, error)
+        self.assertTrue(json.loads(output)["samples"])
+        self.assertLessEqual(len(json.loads(output)["samples"]), 2)
+        self.assertTrue(process_running(collector))
+        (server.control / "stop").touch()
+        await asyncio.wait_for(server.process.wait(), 30)
+        self.assertFalse(process_running(collector))
+
+    async def test_invalid_collector_config_does_not_prevent_cli_dag_completion(self):
+        config = self.w.root / "invalid-collector.json"
+        config.write_text("{", encoding="utf-8")
+        server = await self.start_server(settings={"resource_config_path": str(config)})
+        await server.launch(self.w.template())
+        async with asyncio.timeout(15):
+            while (status := await server.get("/resources"))[
+                "state"
+            ] != "configuration_error":
+                await asyncio.sleep(0.05)
+        self.assertTrue(status["error"])
+        client = await self.start_cli(server, ["step"])
+        code, output, error = await client.finish()
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(output)["result"], "success")
+        self.assertEqual((await server.get("/state"))["phase"], "completed")
+        self.assertTrue((await server.get("/health"))["controller_alive"])

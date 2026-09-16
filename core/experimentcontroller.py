@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Coroutine
 from multiprocessing.queues import Queue
 from pathlib import Path
@@ -25,6 +26,8 @@ class ExperimentController:
         responses: Queue,
         *,
         resource_config_path: Path | None = None,
+        shutdown_requested: asyncio.Event | None = None,
+        recovery_required: list[str] | None = None,
     ) -> None:
         self._project_root = Path(project_root)
         if not self._project_root.is_absolute():
@@ -33,6 +36,10 @@ class ExperimentController:
         self._requests = requests
         self._responses = responses
         self._control_queue: asyncio.Queue[list[JsonObject]] = asyncio.Queue()
+        self._incoming: asyncio.Queue[object] = asyncio.Queue()
+        self._intake_stop = threading.Event()
+        self._intake_thread: threading.Thread | None = None
+        self._intake_error: Exception | None = None
         self._outbox: asyncio.Queue[JsonObject] = asyncio.Queue()
         self._current_command = None
         self._active_tail: list[JsonObject] = []
@@ -40,6 +47,8 @@ class ExperimentController:
         self._loops: list[asyncio.Task] = []
         self._reads: set[asyncio.Task] = set()
         self._closing = False
+        self._shutdown_requested = shutdown_requested
+        self._recovery_required = set(recovery_required or [])
         self.resources = ResourceCollector(
             Path(__file__).resolve().parents[1]
             / "default_settings"
@@ -51,6 +60,16 @@ class ExperimentController:
     async def serve(self) -> None:
         if self._loops or self._closing:
             raise RuntimeError("Controller is already running or closed.")
+        # A parent can die halfway through a multiprocessing queue frame. A
+        # dedicated daemon reader keeps that partial read out of the event loop
+        # and its executor, allowing the controller to stop its participants.
+        self._intake_thread = threading.Thread(
+            target=self._read_request_queue,
+            args=(asyncio.get_running_loop(),),
+            name="controller-command-reader",
+            daemon=True,
+        )
+        self._intake_thread.start()
         self._runner.set_resource_observer(
             self.resources.update,
             suspend=self.resources.suspend_experiment,
@@ -67,12 +86,32 @@ class ExperimentController:
         finally:
             await self.close()
 
+    def _read_request_queue(self, loop: asyncio.AbstractEventLoop) -> None:
+        try:
+            while not self._intake_stop.is_set():
+                try:
+                    request = self._requests.get(True, 0.1)
+                except Empty:
+                    continue
+                loop.call_soon_threadsafe(self._incoming.put_nowait, request)
+        except Exception as error:  # noqa: BLE001 - Wake the owner when the IPC transport fails.
+            if not self._intake_stop.is_set():
+                try:
+                    loop.call_soon_threadsafe(self._intake_failed, error)
+                except RuntimeError:
+                    pass
+
+    def _intake_failed(self, error: Exception) -> None:
+        self._intake_error = error
+        self._incoming.put_nowait(None)
+
     async def _receive_requests(self) -> None:
         while not self._closing:
-            try:
-                request = await asyncio.to_thread(self._requests.get, True, 0.1)
-            except Empty:
-                continue
+            request = await self._incoming.get()
+            if self._intake_error is not None:
+                raise RuntimeError(
+                    "Controller command channel failed."
+                ) from self._intake_error
             try:
                 request = copy_json_object(request, "request")
                 if (
@@ -101,6 +140,13 @@ class ExperimentController:
                 else:
                     UUID(require_text(request.get("command_id"), "command_id"))
                     name = require_text(request.get("command"), "command")
+                    if (
+                        name == "server.shutdown"
+                        and self._shutdown_requested is not None
+                    ):
+                        # Only the server owner sends this private queue message.
+                        self._shutdown_requested.set()
+                        return
                     if name.startswith(("stats.", "logs.")):
                         task = asyncio.create_task(self._answer_read(request))
                         self._reads.add(task)
@@ -176,6 +222,14 @@ class ExperimentController:
             if name.startswith(("stats.", "logs.")):
                 data = await self._read_request(command)
             else:
+                if self._recovery_required and name not in (
+                    "recover",
+                    "stop",
+                    "archive.inspect",
+                ):
+                    raise RuntimeError(
+                        f"Recover unfinished experiments before issuing control commands: {sorted(self._recovery_required)}"
+                    )
                 target = copy_json_object(command.get("target", {}), "target")
                 if target:
                     if target.keys() != {"kind", "position"} or target["kind"] not in (
@@ -222,6 +276,20 @@ class ExperimentController:
                 data = handlers[name](**args)
                 if isinstance(data, Coroutine):
                     data = await data
+                if name == "recover":
+                    self._recovery_required.discard(
+                        require_text(args.get("experiment_id"), "experiment_id")
+                    )
+                if (
+                    name == "stop"
+                    and isinstance(data, dict)
+                    and data.get("termination_confirmed")
+                ):
+                    identifier = data.get("experiment_id")
+                    if isinstance(identifier, str):
+                        # Confirmed shutdown also permits explicit rollback after
+                        # recovery reported an incomplete restoration transaction.
+                        self._recovery_required.discard(identifier)
                 if data is None:
                     data = {}
             return {
@@ -286,7 +354,14 @@ class ExperimentController:
             state = self._runner.get_state()
             if args.get("experiment_id") not in (None, state["experiment_id"]):
                 raise FileNotFoundError("The requested experiment is not selected.")
-            return {**state, "current_command": self._current_command}
+            return copy_json_object(
+                {
+                    **state,
+                    "current_command": self._current_command,
+                    "recovery_required": sorted(self._recovery_required),
+                },
+                "controller state",
+            )
         if request["command"] == "logs.read":
             if args.keys() - {"experiment_id", "cursor", "limit"}:
                 raise ValueError("Unknown logs.read arguments.")
@@ -341,6 +416,7 @@ class ExperimentController:
         if self._closing:
             return
         self._closing = True
+        self._intake_stop.set()
         tasks = [*self._loops, *self._reads]
         if self._active_task is not None:
             tasks.append(self._active_task)
@@ -354,3 +430,5 @@ class ExperimentController:
         self._active_tail.clear()
         self._runner.set_resource_observer(None)
         await self.resources.close()
+        if self._intake_thread is not None:
+            await asyncio.to_thread(self._intake_thread.join, 1)
