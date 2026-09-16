@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from core.logger_utils.events import LoggingError
@@ -43,7 +44,14 @@ class StageRunner:
         self._notify_resources = notify_resources
 
     async def execute(
-        self, state: RunnerState, *, manual: bool = False
+        self,
+        state: RunnerState,
+        *,
+        manual: bool = False,
+        wait_services: Callable[
+            [RunnerState], Awaitable[Literal["ready", "pause", "stop"]]
+        ]
+        | None = None,
     ) -> StageOutcome:
         definition = state.template["stages"][state.stage_position - 1]
         stage_id = definition["stage_id"]
@@ -91,6 +99,14 @@ class StageRunner:
             await asyncio.sleep(policy["retry_delay_seconds"])
             if state.pause_requested:
                 return StageOutcome(attempt, response, "pause")
+            # The owner supplies readiness; stage retry policy does not inspect or
+            # restart services and must not spend a retry while they are unavailable.
+            if wait_services is not None:
+                action = await wait_services(state)
+                if action != "ready":
+                    return StageOutcome(attempt, response, action)
+                if state.pause_requested:
+                    return StageOutcome(attempt, response, "pause")
             state.stage_retry_counts[stage_id] = used + 1
             self._save_state(state)
 

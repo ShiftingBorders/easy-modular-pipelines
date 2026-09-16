@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import tempfile
+import time
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -253,7 +254,16 @@ class DagWorkspace:
             or not self.root.resolve().is_relative_to(TEMP_ROOT.resolve())
         ):
             raise ValueError("Refusing to clean a workspace outside the test root.")
-        self.temporary.cleanup()
+        for attempt in range(10):
+            try:
+                self.temporary.cleanup()
+                break
+            except OSError as error:
+                # Windows may briefly retain delete-pending files after their last
+                # handle closes. Do not hide persistent or unrelated cleanup errors.
+                if getattr(error, "winerror", None) not in (32, 145) or attempt == 9:
+                    raise
+                time.sleep(0.1)
 
 
 class DagSession:

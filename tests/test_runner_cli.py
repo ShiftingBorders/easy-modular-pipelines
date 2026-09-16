@@ -176,12 +176,15 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 ("snapshot", {}),
                 ("rollback", {"snapshot_id": "absent"}),
                 ("reload_template", {}),
-                ("retry", {"position": 1}),
             ):
                 await self.write(json.dumps({"command": command, "args": args}))
                 response = await self.reply()
                 self.assertEqual(response["result"], "fail")
                 self.assertEqual(response["error"]["code"], "unsupported_feature")
+            await self.write(json.dumps({"command": "retry", "args": {"position": 1}}))
+            response = await self.reply()
+            self.assertEqual(response["result"], "fail")
+            self.assertEqual(response["error"]["code"], "invalid_request")
             await self.write("quit")
             await self.process.wait()
             self.assertEqual(self.process.returncode, 0)

@@ -1,4 +1,4 @@
-"""High-level orchestration for the initial sequential, stage-only runtime."""
+"""High-level orchestration of sequential stages and experiment services."""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from typing import Literal
 from uuid import uuid4
 
 from core.experimentassembler import ExperimentAssembler, find_experiment
+from core.logger_utils.events import copy_json_object
 from core.modulemanager import ModuleManager
 from core.runner_utils.journal import RunnerJournal
 from core.runner_utils.launch import ModuleLauncher
 from core.runner_utils.runtimeio import write_json
+from core.runner_utils.services import ServiceManager
 from core.runner_utils.stages import StageRunner
 from core.runner_utils.state import (
     JsonObject,
@@ -39,8 +41,15 @@ class ExperimentRunner:
         self._state_store = RunnerStateStore()
         self._resource_observer: Callable[[JsonObject], None] | None = None
         self._resource_error: str | None = None
+        self._launcher = ModuleLauncher(self._assembler, self._journal)
+        self._services = ServiceManager(
+            self._launcher,
+            self._journal,
+            self._state_store,
+            notify_resources=self._publish_resources,
+        )
         self._stages = StageRunner(
-            ModuleLauncher(self._assembler, self._journal),
+            self._launcher,
             self._journal,
             self._state_store,
             notify_resources=self._publish_resources,
@@ -48,6 +57,8 @@ class ExperimentRunner:
         self._state: RunnerState | None = None
         self._task = None
         self._stage_task = None
+        self._service_task = None
+        self._service_retrying = False
         self._step_future = None
         self._last_attempt = None
         self._error = None
@@ -76,7 +87,7 @@ class ExperimentRunner:
             raise RuntimeError("Runner is closed.")
         if not self._termination_confirmed:
             raise RuntimeError(
-                "Previous stage termination is unconfirmed; no new experiment may start."
+                "Previous participant termination is unconfirmed; no new experiment may start."
             )
         if type(delayed_start) is not bool or type(continue_run) is not bool:
             raise TypeError("Run flags must be booleans.")
@@ -101,6 +112,14 @@ class ExperimentRunner:
             raise FileExistsError(f"Experiment ID already exists: {experiment_id}")
         if template_path is None or not Path(template_path).is_absolute():
             raise ValueError("A new experiment requires an absolute template_path.")
+        await self._services.close()
+        self._services = ServiceManager(
+            self._launcher,
+            self._journal,
+            self._state_store,
+            notify_resources=self._publish_resources,
+        )
+        self._service_task = None
         self._journal.close()
         self._requested_id = experiment_id
         self._template_path = Path(template_path)
@@ -121,6 +140,8 @@ class ExperimentRunner:
         return {"experiment_id": experiment_id, "signaled": True}
 
     async def _advance_dag(self) -> None:
+        wake_task = None
+        readiness_task = None
         try:
             state = await self._assembler.assemble(
                 self._template_path, self._requested_id
@@ -133,13 +154,178 @@ class ExperimentRunner:
             self._assembler.check_modules(state)
             self._assembler.check_resources(state)
             state.mode = self._desired_mode
-            state.phase = "waiting"
+            state.phase = "starting"
+            self._save_state()
+            action = await self._services.start_all(state)
+            if action == "stop":
+                raise RuntimeError("Service startup requires experiment stop.")
+            if action == "pause":
+                self._desired_mode = "paused"
+            state.mode = self._desired_mode
+            state.phase = "waiting" if state.mode == "paused" else "starting"
             self._save_state()
             self._ready.set()
             self._idle.set()
+            wake_task = asyncio.create_task(self._wake.wait())
+            if state.template["services"]:
+                self._service_task = asyncio.create_task(self._services.monitor(state))
+
             while not self._stop_requested:
-                await self._wake.wait()
-                self._wake.clear()
+                waiting = [
+                    wake_task,
+                    self._service_task,
+                    self._stage_task,
+                    readiness_task,
+                ]
+                await asyncio.wait(
+                    [task for task in waiting if task is not None],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Apply service decisions even while a stage runs or the DAG is paused.
+                if self._service_task is not None and self._service_task.done():
+                    action = self._service_task.result()
+                    if action == "stop":
+                        raise RuntimeError(
+                            "Service supervision requires experiment stop."
+                        )
+                    state.mode = self._desired_mode = "paused"
+                    state.pause_requested = True
+                    if self._stage_task is None:
+                        state.phase = "waiting"
+                    self._save_state()
+                    if self._step_future is not None:
+                        future, self._step_future = self._step_future, None
+                        if not future.done():
+                            future.set_exception(
+                                RuntimeError("A service requires a pause.")
+                            )
+                    self._service_task = asyncio.create_task(
+                        self._services.monitor(state)
+                    )
+
+                if self._stage_task is not None and self._stage_task.done():
+                    outcome = self._stage_task.result()
+                    self._stage_task = None
+                    self._last_attempt = outcome.attempt
+                    state.active_attempt = None
+                    response = outcome.result
+                    if response is not None and response["result"] == "success":
+                        state.last_result = response["data"]
+                        state.last_result_path = outcome.attempt.result_path
+                        state.stage_result_paths[outcome.attempt.stage_id] = (
+                            outcome.attempt.result_path
+                        )
+                    else:
+                        state.last_result = None
+                        state.last_result_path = None
+                        state.stage_result_paths.pop(outcome.attempt.stage_id, None)
+                    self._pending_advance = outcome.action == "advance"
+                    if outcome.action == "stop":
+                        raise RuntimeError("Stage execution requires experiment stop.")
+                    if outcome.action == "pause":
+                        state.mode = self._desired_mode = "paused"
+                    final = (
+                        self._pending_advance
+                        and state.stage_position == len(state.template["stages"])
+                        and state.cycle_number == state.template["cycles"]
+                    )
+                    state.phase = "waiting"
+                    self._save_state()
+                    self._idle.set()
+                    # The final step also waits for confirmed service shutdown.
+                    if self._step_future is not None and not final:
+                        future, self._step_future = self._step_future, None
+                        if not future.done():
+                            if outcome.action == "advance":
+                                future.set_result(
+                                    {
+                                        "attempt_id": outcome.attempt.attempt_id,
+                                        "result": response,
+                                        "phase": state.phase,
+                                    }
+                                )
+                            else:
+                                future.set_exception(
+                                    RuntimeError(
+                                        "Stage did not complete or skip under its policy."
+                                    )
+                                )
+                    if state.mode == "running" or final:
+                        self._wake.set()
+
+                if wake_task.done():
+                    self._wake.clear()
+                    wake_task = asyncio.create_task(self._wake.wait())
+                    final = (
+                        self._pending_advance
+                        and state.stage_position == len(state.template["stages"])
+                        and state.cycle_number == state.template["cycles"]
+                    )
+                    if (
+                        self._stage_task is None
+                        and readiness_task is None
+                        and (
+                            state.mode == "running"
+                            or self._step_future is not None
+                            or final
+                        )
+                    ):
+                        readiness_task = asyncio.create_task(
+                            self._services.wait_ready(state)
+                        )
+
+                if readiness_task is None or not readiness_task.done():
+                    continue
+                action = readiness_task.result()
+                readiness_task = None
+                if action == "stop":
+                    raise RuntimeError("Service readiness requires experiment stop.")
+                if action == "pause":
+                    state.mode = self._desired_mode = "paused"
+                    state.pause_requested = True
+                    state.phase = "waiting"
+                    self._save_state()
+                    if self._step_future is not None:
+                        future, self._step_future = self._step_future, None
+                        if not future.done():
+                            future.set_exception(
+                                RuntimeError("Service readiness requires a pause.")
+                            )
+                    continue
+                # Manual recovery must finish before a new stage or final shutdown.
+                if self._service_retrying:
+                    continue
+                final = (
+                    self._pending_advance
+                    and state.stage_position == len(state.template["stages"])
+                    and state.cycle_number == state.template["cycles"]
+                )
+                if final:
+                    results = await self._services.stop_all(state)
+                    self._termination_confirmed = all(
+                        result["stopped"] for result in results.values()
+                    )
+                    if any(
+                        not result["stopped"] or result["error"]
+                        for result in results.values()
+                    ):
+                        raise RuntimeError(
+                            f"Service shutdown failed at completion: {results}"
+                        )
+                    await self._services.close()
+                    state.phase = "completed"
+                    self._save_state()
+                    if self._step_future is not None:
+                        future, self._step_future = self._step_future, None
+                        if not future.done():
+                            future.set_result(
+                                {
+                                    "attempt_id": self._last_attempt.attempt_id,
+                                    "result": outcome.result,
+                                    "phase": state.phase,
+                                }
+                            )
+                    break
                 if state.mode == "paused" and self._step_future is None:
                     continue
                 self._idle.clear()
@@ -152,69 +338,31 @@ class ExperimentRunner:
                         state.stage_attempt_numbers.clear()
                         state.last_result = None
                         state.last_result_path = None
+                        for instance in state.services.values():
+                            instance.restart_count = 0
                     self._pending_advance = False
                 state.pause_requested = False
                 state.phase = "stage_running"
                 self._save_state()
                 self._stage_task = asyncio.create_task(
-                    self._stages.execute(state, manual=self._manual)
+                    self._stages.execute(
+                        state,
+                        manual=self._manual,
+                        wait_services=self._services.wait_ready,
+                    )
                 )
                 self._manual = False
-                outcome = await self._stage_task
-                self._stage_task = None
-                self._last_attempt = outcome.attempt
-                state.active_attempt = None
-                response = outcome.result
-                if response is not None and response["result"] == "success":
-                    state.last_result = response["data"]
-                    state.last_result_path = outcome.attempt.result_path
-                    state.stage_result_paths[outcome.attempt.stage_id] = (
-                        outcome.attempt.result_path
-                    )
-                else:
-                    state.last_result = None
-                    state.last_result_path = None
-                    state.stage_result_paths.pop(outcome.attempt.stage_id, None)
-                self._pending_advance = outcome.action == "advance"
-                if outcome.action == "stop":
-                    raise RuntimeError(
-                        f"Stage {outcome.attempt.stage_id} exhausted its retry policy."
-                    )
-                if outcome.action == "pause":
-                    state.mode = "paused"
-                final = (
-                    self._pending_advance
-                    and state.stage_position == len(state.template["stages"])
-                    and state.cycle_number == state.template["cycles"]
-                )
-                state.phase = "completed" if final else "waiting"
-                self._save_state()
-                self._idle.set()
-                if self._step_future is not None:
-                    future, self._step_future = self._step_future, None
-                    if outcome.action == "advance":
-                        future.set_result(
-                            {
-                                "attempt_id": outcome.attempt.attempt_id,
-                                "result": response,
-                                "phase": state.phase,
-                            }
-                        )
-                    else:
-                        future.set_exception(
-                            RuntimeError(
-                                "Stage did not complete or skip under its policy."
-                            )
-                        )
-                if final:
-                    break
-                if state.mode == "running":
-                    self._wake.set()
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - Background failures become explicit experiment state.
             await self._fail(error, {})
         finally:
+            tasks = [wake_task, readiness_task, self._stage_task, self._service_task]
+            tasks = [task for task in tasks if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._stage_task = self._service_task = None
             self._publish_resources()
             self._ready.set()
             self._idle.set()
@@ -231,6 +379,8 @@ class ExperimentRunner:
         await self._idle.wait()
         self._require_active()
         self._state.mode = "paused"
+        if self._state.phase == "starting":
+            self._state.phase = "waiting"
         self._save_state()
 
     async def resume(self) -> None:
@@ -238,7 +388,18 @@ class ExperimentRunner:
             raise RuntimeError("There is no experiment to resume.")
         await self._ready.wait()
         state = self._require_active()
+        if (
+            any(
+                instance.blocked_action is not None
+                for instance in state.services.values()
+            )
+            or self._service_retrying
+        ):
+            raise RuntimeError(
+                "Resolve the blocked service before resuming the experiment."
+            )
         state.mode = "running"
+        self._desired_mode = "running"
         state.pause_requested = False
         self._save_state()
         self._wake.set()
@@ -252,6 +413,7 @@ class ExperimentRunner:
             state.mode != "paused"
             or not self._idle.is_set()
             or self._step_future is not None
+            or self._service_retrying
         ):
             raise RuntimeError(
                 "step requires a paused experiment without an active attempt."
@@ -273,13 +435,34 @@ class ExperimentRunner:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         if self._state is not None:
-            stopped = await self._stages.interrupt(self._state, "stop")
-            self._termination_confirmed = stopped
-            if not stopped:
-                await self._fail(
-                    RuntimeError("Could not confirm stage termination."), {}
+            failure = None
+            try:
+                stopped = await self._stages.interrupt(self._state, "stop")
+                if not stopped:
+                    failure = RuntimeError("Could not confirm stage termination.")
+            except Exception as error:  # noqa: BLE001 - Services must still receive stop after a stage error.
+                stopped = False
+                failure = error
+            try:
+                results = await self._services.stop_all(self._state)
+                stopped = stopped and all(
+                    result["stopped"] for result in results.values()
                 )
-                raise RuntimeError("Could not confirm stage termination.")
+                if any(
+                    not result["stopped"] or result["error"]
+                    for result in results.values()
+                ):
+                    failure = failure or RuntimeError(
+                        f"Service shutdown failed: {results}"
+                    )
+            except Exception as error:  # noqa: BLE001 - Preserve the first failure and report unconfirmed shutdown.
+                stopped = False
+                failure = failure or error
+            self._termination_confirmed = stopped
+            await self._services.close()
+            if failure is not None:
+                await self._fail(failure, {})
+                raise RuntimeError("Experiment shutdown failed.") from failure
             if self._state.phase not in ("completed", "failed"):
                 self._state.phase = "stopped"
             if self._state.active_attempt is not None:
@@ -287,7 +470,10 @@ class ExperimentRunner:
             self._state.active_attempt = None
             self._save_state()
         if self._step_future is not None:
-            self._step_future.set_exception(RuntimeError("Step was cancelled by stop."))
+            if not self._step_future.done():
+                self._step_future.set_exception(
+                    RuntimeError("Step was cancelled by stop.")
+                )
             self._step_future = None
         self._idle.set()
         return self.get_state()
@@ -315,9 +501,46 @@ class ExperimentRunner:
         return await self.step()
 
     async def retry(self, position: int) -> JsonObject:
-        raise NotImplementedError(
-            "Service modules are not part of the initial runtime."
-        )
+        state = self._require_active()
+        if state.mode != "paused" or self._service_retrying:
+            raise RuntimeError(
+                "retry requires a paused experiment without another service retry."
+            )
+        if type(position) is not int or not 1 <= position <= len(
+            state.template["services"]
+        ):
+            raise ValueError("Service position is outside the template.")
+        definition = state.template["services"][position - 1]
+        service_id = definition["service_id"]
+        instance = state.services.get(service_id)
+        if instance is None:
+            raise RuntimeError(
+                "Retry the failed preceding service before starting later services."
+            )
+        if instance.interface != "socket":
+            raise ValueError("Commands-only services have no restart policy.")
+        self._service_retrying = True
+        try:
+            action = await self._services.restart(state, service_id, automatic=False)
+            if action == "ready":
+                # Startup may have paused before reaching the rest of the template.
+                action = await self._services.reconcile(state, state.template)
+            if action == "stop":
+                raise RuntimeError("Service retry requires experiment stop.")
+            self._save_state()
+            return {
+                "service_id": service_id,
+                "action": action,
+                "service_instance_id": state.services[service_id].service_instance_id,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._fail(error, {"service_id": service_id})
+            raise
+        finally:
+            self._service_retrying = False
+            self._wake.set()
 
     def move(self, position: int) -> None:
         state = self._require_active()
@@ -333,8 +556,27 @@ class ExperimentRunner:
 
     def reset_retries(self, kind: ModuleRole, position: int) -> JsonObject:
         state = self._require_active()
-        if kind != "stage" or state.mode != "paused":
-            raise RuntimeError("reset_retries requires a paused stage.")
+        if kind not in ("stage", "service"):
+            raise ValueError("kind must be stage or service.")
+        if state.mode != "paused":
+            raise RuntimeError("reset_retries requires a paused experiment.")
+        if kind == "service":
+            if self._service_retrying:
+                raise RuntimeError(
+                    "Wait for the service retry before resetting counters."
+                )
+            if type(position) is not int or not 1 <= position <= len(
+                state.template["services"]
+            ):
+                raise ValueError("Service position is outside the template.")
+            service_id = state.template["services"][position - 1]["service_id"]
+            instance = state.services.get(service_id)
+            if instance is None or instance.interface != "socket":
+                raise ValueError("A started socket service is required.")
+            old = instance.restart_count
+            instance.restart_count = 0
+            self._save_state()
+            return {"service_id": service_id, "previous": old, "current": 0}
         if type(position) is not int or not 1 <= position <= len(
             state.template["stages"]
         ):
@@ -386,6 +628,9 @@ class ExperimentRunner:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         if self._state is not None:
+            if self._stage_task is not None and not self._stage_task.done():
+                self._stage_task.cancel()
+                await asyncio.gather(self._stage_task, return_exceptions=True)
             try:
                 self._termination_confirmed = await self._stages.interrupt(
                     self._state, "failure"
@@ -397,6 +642,23 @@ class ExperimentRunner:
             except Exception as interruption_error:  # noqa: BLE001 - Preserve both original and shutdown failures.
                 self._termination_confirmed = False
                 self._error["interruption_error"] = str(interruption_error)
+            try:
+                results = await self._services.stop_all(self._state)
+                self._termination_confirmed = self._termination_confirmed and all(
+                    result["stopped"] for result in results.values()
+                )
+                if any(
+                    not result["stopped"] or result["error"]
+                    for result in results.values()
+                ):
+                    self._error["service_shutdown"] = results
+            except Exception as service_error:  # noqa: BLE001 - Shutdown failures must not hide the experiment failure.
+                self._termination_confirmed = False
+                self._error["service_shutdown_error"] = (
+                    f"{type(service_error).__name__}: {service_error}"
+                )
+            finally:
+                await self._services.close()
             self._state.phase = "failed"
             self._publish_resources()
             try:
@@ -415,7 +677,8 @@ class ExperimentRunner:
                 {**self._error, "experiment_id": self._requested_id},
             )
         if self._step_future is not None:
-            self._step_future.set_exception(error)
+            if not self._step_future.done():
+                self._step_future.set_exception(error)
             self._step_future = None
         if self._notify is not None:
             self._notify(self.get_state())
@@ -510,6 +773,28 @@ class ExperimentRunner:
                     },
                 }
             )
+        for instance in state.services.values():
+            if (
+                instance.interface != "socket"
+                or instance.stopped
+                or instance.process_identity is None
+            ):
+                continue
+            module = instance.definition["module"]
+            targets.append(
+                {
+                    "series_id": instance.service_instance_id,
+                    "identity": dict(instance.process_identity),
+                    "context": {
+                        **context,
+                        "service_id": instance.service_id,
+                        "service_instance_id": instance.service_instance_id,
+                        "module_name": module["name"],
+                        "module_version": module["version"],
+                        "module_hash": module["hash"],
+                    },
+                }
+            )
         return {
             "context": context,
             "logging_config_path": str(path),
@@ -533,6 +818,47 @@ class ExperimentRunner:
             phase = "starting"
         else:
             phase = "idle"
+        services = []
+        if state is not None:
+            for position, definition in enumerate(state.template["services"], 1):
+                instance = state.services.get(definition["service_id"])
+                active = None if instance is None else instance.active_request
+                services.append(
+                    {
+                        "position": position,
+                        "service_id": definition["service_id"],
+                        "module": definition["module"],
+                        "service_instance_id": None
+                        if instance is None
+                        else instance.service_instance_id,
+                        "interface": None if instance is None else instance.interface,
+                        "ready": instance is not None and instance.ready,
+                        "stopping": instance is not None and instance.stopping,
+                        "stopped": instance is None or instance.stopped,
+                        "restart_count": 0
+                        if instance is None
+                        else instance.restart_count,
+                        "blocked_action": None
+                        if instance is None
+                        else instance.blocked_action,
+                        "failure": None if instance is None else instance.failure,
+                        "process": None
+                        if instance is None
+                        else instance.process_identity,
+                        "last_status": None
+                        if instance is None
+                        else instance.last_status,
+                        "active_request": None
+                        if active is None
+                        else {
+                            key: active[key]
+                            for key in ("request_id", "command", "timed_out")
+                        },
+                        "pending_requests": 0
+                        if instance is None
+                        else len(instance.pending_requests),
+                    }
+                )
         return {
             "experiment_id": self._requested_id,
             "phase": phase,
@@ -546,7 +872,7 @@ class ExperimentRunner:
             "source": "runner",
             "fresh": not self._closed,
             "observed_at": datetime.now(UTC).isoformat(),
-            "services": [],
+            "services": copy_json_object({"items": services}, "service state")["items"],
             "termination_confirmed": self._termination_confirmed,
             "resource_observer_error": self._resource_error,
         }
@@ -573,4 +899,5 @@ class ExperimentRunner:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         await self._stages.close()
+        await self._services.close()
         await asyncio.to_thread(self._journal.close)

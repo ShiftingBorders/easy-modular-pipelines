@@ -88,10 +88,10 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
             self.assembler.load_template(self.workspace.write_template(candidate))
 
     def test_rejects_empty_dag_and_unsupported_modes(self):
-        """A2: unavailable runtime modes fail before assembly."""
+        """A2/integration A1: empty DAG, malformed services and unavailable snapshots fail early."""
         for field, value, error in (
             ("stages", [], ValueError),
-            ("services", [{}], NotImplementedError),
+            ("services", [{}], ValueError),
             ("snapshots", {"mode": "after_epoch", "keep": 1}, NotImplementedError),
         ):
             with self.subTest(field=field):

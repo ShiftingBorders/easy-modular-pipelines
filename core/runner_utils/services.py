@@ -10,6 +10,7 @@ import asyncio
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -51,10 +52,13 @@ class ServiceManager:
         launcher: ModuleLauncher,
         journal: RunnerJournal,
         state_store: RunnerStateStore,
+        *,
+        notify_resources: Callable[[], None] | None = None,
     ) -> None:
         self._launcher = launcher
         self._journal = journal
         self._state_store = state_store
+        self._notify_resources = notify_resources
         self._connections = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._action_processes: list[subprocess.Popen] = []
@@ -247,6 +251,8 @@ class ServiceManager:
             instance.process_identity = (
                 process_identity(process.pid) if process.poll() is None else None
             )
+            if self._notify_resources is not None:
+                self._notify_resources()
             write_json(
                 directory / "process.json",
                 {
@@ -309,6 +315,8 @@ class ServiceManager:
                             )
                         )
                         instance.process_identity = declared
+                        if self._notify_resources is not None:
+                            self._notify_resources()
                         connected = True
                     request_id = str(uuid4())
                     if request_id in state.used_request_ids:
@@ -396,6 +404,8 @@ class ServiceManager:
             raise
         finally:
             self._starting.discard(service_id)
+            if self._notify_resources is not None:
+                self._notify_resources()
             self._changed.set()
 
     async def wait_ready(self, state: RunnerState) -> ServiceAction:
@@ -1052,6 +1062,8 @@ class ServiceManager:
                 del state.services[service_id]
         for definition in template["services"]:
             instance = state.services.get(definition["service_id"])
+            if instance is not None and instance.blocked_action is not None:
+                return instance.blocked_action
             if instance is not None and not instance.stopped:
                 if instance.definition != definition:
                     raise RuntimeError(
@@ -1063,7 +1075,16 @@ class ServiceManager:
                 and instance.definition["module"] != definition["module"]
             ):
                 instance.restart_count = 0
-            await self._start(state, definition)
+            try:
+                await self._start(state, definition)
+            except (OSError, ConnectionError) as error:
+                instance = state.services.get(definition["service_id"])
+                if instance is None or instance.interface == "commands":
+                    raise
+                instance.failure = f"{type(error).__name__}: {error}"
+                action = await self.restart(state, instance.service_id, automatic=True)
+                if action != "ready":
+                    return action
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self.monitor(state))
         return await self.wait_ready(state)
@@ -1447,6 +1468,15 @@ class ServiceManager:
             error_message = None
             shutdown_response = None
             deadline = time.monotonic() + state.template["start_timeout"]
+            owned_process = self._processes.get(service_id)
+            if (
+                instance.interface == "socket"
+                and owned_process is not None
+                and instance.process_identity is not None
+                and owned_process.pid == instance.process_identity["pid"]
+                and owned_process.poll() is not None
+            ):
+                instance.stopped = True
             request_id = str(uuid4())
             if request_id in state.used_request_ids:
                 raise RuntimeError("Request ID collision.")
@@ -1528,6 +1558,19 @@ class ServiceManager:
                         async with asyncio.timeout(
                             max(0.001, deadline - time.monotonic())
                         ):
+                            # Stop can interrupt startup after spawn but before the
+                            # new endpoint replaces the previous instance's file.
+                            while True:
+                                try:
+                                    endpoint = read_json(instance.endpoint_path)
+                                except (FileNotFoundError, PermissionError):
+                                    endpoint = {}
+                                if (
+                                    endpoint.get("service_instance_id")
+                                    == instance.service_instance_id
+                                ):
+                                    break
+                                await asyncio.sleep(0.05)
                             await connection.connect(
                                 timeout_seconds=max(0.001, deadline - time.monotonic())
                             )
@@ -1639,6 +1682,8 @@ class ServiceManager:
                 if future is not None and not future.done():
                     future.set_result({"request_id": entry["request_id"], **response})
             instance.stopping = False
+            if self._notify_resources is not None:
+                self._notify_resources()
             if process is not None:
                 process.poll()
             results[service_id] = {"stopped": instance.stopped, "error": error_message}
@@ -1657,9 +1702,15 @@ class ServiceManager:
                     else "failed",
                     context=context,
                 )
-                self._state_store.save(state)
-            except (LoggingError, OSError) as error:
+            except LoggingError as error:
                 results[service_id]["error"] = str(error)
+            try:
+                self._state_store.save(state)
+            except OSError as error:
+                try:
+                    self._journal.client.record_error(error, context=context)
+                except LoggingError as logging_error:
+                    results[service_id]["error"] = str(logging_error)
             self._changed.set()
         return results
 

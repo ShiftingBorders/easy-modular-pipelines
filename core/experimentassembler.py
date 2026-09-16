@@ -1,4 +1,4 @@
-"""Assembly and validation for the initial stage-only experiment runtime."""
+"""Assembly and validation of stage and service experiment definitions."""
 
 from __future__ import annotations
 
@@ -90,10 +90,8 @@ class ExperimentAssembler:
             require_number(template[key], key)
         if template["start_timeout"] <= 0:
             raise ValueError("start_timeout must be positive.")
-        if type(template["services"]) is not list or template["services"]:
-            raise NotImplementedError(
-                "The initial runtime supports stages without services."
-            )
+        if type(template["services"]) is not list:
+            raise TypeError("services must be an array.")
         snapshots = copy_json_object(template["snapshots"], "snapshots")
         if snapshots.keys() != {"mode", "keep"}:
             raise ValueError("snapshots requires mode and keep.")
@@ -152,26 +150,36 @@ class ExperimentAssembler:
         if type(stages) is not list or not stages:
             raise ValueError("stages must be a nonempty array.")
         seen = set()
-        for stage in stages:
-            stage = copy_json_object(stage, "stage")
-            if stage.keys() - {
-                "stage_id",
-                "module",
-                "settings",
-                "timeout_seconds",
-                "errors",
-            }:
-                raise ValueError("Unknown stage fields.")
-            if not {"module", "settings", "timeout_seconds", "errors"} <= stage.keys():
+        definitions = [("stage", item) for item in stages]
+        definitions.extend(("service", item) for item in template["services"])
+        socket_fields = {
+            "heartbeat",
+            "command_timeout_seconds",
+            "on_command_timeout",
+            "state_required",
+            "errors",
+        }
+        for role, definition in definitions:
+            copy_json_object(definition, role)
+            identity_key = f"{role}_id"
+            required = {"module", "settings"}
+            if role == "stage":
+                required.update({"timeout_seconds", "errors"})
+            elif definition.keys() & socket_fields:
+                required.update(socket_fields)
+            if definition.keys() - {identity_key} != required:
                 raise ValueError(
-                    "A stage requires module, settings, timeout_seconds, and errors."
+                    f"Invalid {role} fields; required: {sorted(required)}."
                 )
-            if "stage_id" in stage:
-                stage_id = str(UUID(require_text(stage["stage_id"], "stage_id")))
-                if stage_id in seen:
-                    raise ValueError("Duplicate stage_id.")
-                seen.add(stage_id)
-            module = copy_json_object(stage["module"], "module")
+            if identity_key in definition:
+                identifier = str(
+                    UUID(require_text(definition[identity_key], identity_key))
+                )
+                if identifier in seen:
+                    raise ValueError("Duplicate stage/service definition ID.")
+                seen.add(identifier)
+                definition[identity_key] = identifier
+            module = copy_json_object(definition["module"], "module")
             if module.keys() != {"name", "version", "hash"}:
                 raise ValueError("module requires name/version/hash.")
             for key in ("name", "version"):
@@ -183,14 +191,36 @@ class ExperimentAssembler:
                 c not in "0123456789abcdefABCDEF" for c in digest
             ):
                 raise ValueError("module.hash must be SHA-256.")
-            copy_json_object(stage["settings"], "stage settings")
-            if stage["timeout_seconds"] is not None:
-                require_number(stage["timeout_seconds"], "timeout_seconds")
-                if stage["timeout_seconds"] <= 0:
+            copy_json_object(definition["settings"], f"{role} settings")
+            if role == "stage" and definition["timeout_seconds"] is not None:
+                require_number(definition["timeout_seconds"], "timeout_seconds")
+                if definition["timeout_seconds"] <= 0:
                     raise ValueError("timeout_seconds must be positive or null.")
-            errors = copy_json_object(stage["errors"], "errors")
+            if role == "service" and "heartbeat" in definition:
+                heartbeat = copy_json_object(definition["heartbeat"], "heartbeat")
+                if heartbeat.keys() != {"interval_seconds", "grace_seconds"}:
+                    raise ValueError(
+                        "heartbeat requires interval_seconds and grace_seconds."
+                    )
+                for name, value in heartbeat.items():
+                    if require_number(value, name) <= 0:
+                        raise ValueError(f"{name} must be positive.")
+                if (
+                    require_number(
+                        definition["command_timeout_seconds"], "command_timeout_seconds"
+                    )
+                    <= 0
+                ):
+                    raise ValueError("command_timeout_seconds must be positive.")
+                if definition["on_command_timeout"] not in ("pause", "restart", "stop"):
+                    raise ValueError("Invalid on_command_timeout.")
+                if type(definition["state_required"]) is not bool:
+                    raise TypeError("state_required must be a boolean.")
+            if "errors" not in definition:
+                continue
+            errors = copy_json_object(definition["errors"], "errors")
             if errors.keys() != {"retries", "retry_delay_seconds", "on_exhausted"}:
-                raise ValueError("All stage error policy fields must be explicit.")
+                raise ValueError("All error policy fields must be explicit.")
             if type(errors["retries"]) is not int or errors["retries"] < 0:
                 raise ValueError("errors.retries must be nonnegative.")
             require_number(errors["retry_delay_seconds"], "retry_delay_seconds")
@@ -303,8 +333,9 @@ class ExperimentAssembler:
         folder = str(uuid4())
         directory = self._project_root / "experiments" / folder
         directory.mkdir(parents=True, exist_ok=False)
-        for stage in template["stages"]:
-            stage.setdefault("stage_id", str(uuid4()))
+        for role in ("stage", "service"):
+            for definition in template[f"{role}s"]:
+                definition.setdefault(f"{role}_id", str(uuid4()))
         template_yaml = yaml.safe_dump(template, allow_unicode=True, sort_keys=False)
         state = RunnerState(
             experiment_id,
@@ -329,12 +360,12 @@ class ExperimentAssembler:
                 "runner/logging",
             ):
                 (directory / name).mkdir(parents=True, exist_ok=True)
-            copied = set()
-            for stage in template["stages"]:
-                module = stage["module"]
+            copied = {}
+            definitions = [("stage", item) for item in template["stages"]]
+            definitions.extend(("service", item) for item in template["services"])
+            for role, item in definitions:
+                module = item["module"]
                 key = (module["name"], module["version"])
-                if key in copied:
-                    continue
                 source = self._project_root / "modules" / key[0] / key[1]
                 target = directory / "modules" / key[0] / key[1]
                 if (
@@ -346,15 +377,26 @@ class ExperimentAssembler:
                     )
                 ):
                     raise ValueError("Module code must not contain filesystem links.")
-                definition = self.read_module(source)
+                definition = copied.get(key) or self.read_module(source)
                 if (definition["name"], definition["version"]) != key:
                     raise ValueError("module.yaml identity differs from template.")
-                copy_task = asyncio.create_task(
-                    asyncio.to_thread(shutil.copytree, source, target)
-                )
-                await asyncio.shield(copy_task)
-                self.check_module(state, stage)
-                copied.add(key)
+                if definition["role"] != role:
+                    raise ValueError(f"Module {key} does not have role={role}.")
+                if role == "service" and (
+                    (definition["service_interface"] == "socket")
+                    != ("heartbeat" in item)
+                ):
+                    raise ValueError(
+                        "Service policies do not match module.service_interface."
+                    )
+                if key not in copied:
+                    copy_task = asyncio.create_task(
+                        asyncio.to_thread(shutil.copytree, source, target)
+                    )
+                    await asyncio.shield(copy_task)
+                    copied[key] = definition
+                # Every reference must match, including repeated uses of shared code.
+                self.check_module(state, item)
             for resource in template["resources"]:
                 source = Path(resource["path"])
                 target = directory / "shared_data" / "resources" / resource["name"]
@@ -400,7 +442,7 @@ class ExperimentAssembler:
         )
 
     def check_modules(self, state: RunnerState) -> None:
-        for definition in state.template["stages"]:
+        for definition in [*state.template["stages"], *state.template["services"]]:
             self.check_module(state, definition)
 
     def check_module(self, state: RunnerState, definition: JsonObject) -> None:
