@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import psutil
 
+from core.experimentarchiver import ExperimentArchiver
 from core.experimentassembler import ExperimentAssembler, find_experiment
 from core.logger import OperationLogger
 from core.logger_utils.events import LoggingError, copy_json_object, require_text
@@ -40,11 +41,15 @@ class ExperimentRunner:
         module_manager: ModuleManager,
         *,
         notify: Callable[[JsonObject], None] | None = None,
+        archive_config_path: Path | None = None,
     ) -> None:
         self._project_root = Path(project_root)
         if not self._project_root.is_absolute():
             raise ValueError("project_root must be absolute.")
         self._assembler = ExperimentAssembler(self._project_root, module_manager)
+        self._archiver = ExperimentArchiver(
+            self._project_root, module_manager, config_path=archive_config_path
+        )
         self._hash_module = module_manager.module_hash
         self._journal = RunnerJournal()
         self._state_store = RunnerStateStore()
@@ -898,6 +903,66 @@ class ExperimentRunner:
         finally:
             self._maintenance = False
             self._maintenance_task = None
+
+    async def create_archive(
+        self,
+        archive_path: Path,
+        experiment_id: str | None = None,
+    ) -> JsonObject:
+        """Export a stopped selection or an explicitly identified stopped experiment."""
+        state = self._state
+        if experiment_id is not None:
+            require_text(experiment_id, "experiment_id")
+            if state is None or state.experiment_id != experiment_id:
+                root = find_experiment(self._project_root, experiment_id)
+                state = self._state_store.load(root)
+                if state.owner_identity is not None:
+                    raise RuntimeError(
+                        "Recover and stop the experiment before archiving an owned state."
+                    )
+        if state is None:
+            raise RuntimeError("Select a stopped experiment or provide experiment_id.")
+        if state is self._state and not self._termination_confirmed:
+            raise RuntimeError("Participant shutdown is unconfirmed.")
+        return await self._run_archive(self._archiver.create(state, archive_path))
+
+    async def inspect_archive(self, archive_path: Path) -> JsonObject:
+        """Validate a portable archive without changing the selected experiment."""
+        return await self._run_archive(self._archiver.inspect(archive_path))
+
+    async def install_archive(
+        self, archive_path: Path, destination: Path
+    ) -> JsonObject:
+        """Install checked inputs while no DAG owns the local module store."""
+        return await self._run_archive(
+            self._archiver.install(archive_path, destination)
+        )
+
+    async def _run_archive(
+        self, operation: Coroutine[None, None, JsonObject]
+    ) -> JsonObject:
+        if (
+            self._closed
+            or self._maintenance
+            or not self._termination_confirmed
+            or (self._task is not None and not self._task.done())
+            or (
+                self._state is not None
+                and self._state.phase not in ("stopped", "completed", "failed")
+            )
+        ):
+            operation.close()
+            raise RuntimeError(
+                "Stop the experiment and finish maintenance before archive operations."
+            )
+        self._maintenance = True
+        self._maintenance_task = asyncio.current_task()
+        try:
+            return await operation
+        finally:
+            self._maintenance = False
+            self._maintenance_task = None
+            self._wake.set()
 
     async def rollback(self, snapshot_id: str) -> JsonObject:
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))

@@ -13,6 +13,7 @@ from core.logger_utils.events import LoggingError, copy_json_object, require_tex
 from core.resourcecollector import ResourceCollector
 from core.runner_utils.experimentrunner import ExperimentRunner
 from core.runner_utils.state import JsonObject
+from core.storage_errors import StorageCapacityError, StorageConflict, StorageError
 
 
 class ExperimentController:
@@ -159,6 +160,7 @@ class ExperimentController:
                         )
 
     async def _execute_command(self, command: JsonObject) -> JsonObject:
+        name = ""
         try:
             if command.keys() - {
                 "api_version",
@@ -193,10 +195,9 @@ class ExperimentController:
                         raise ValueError("This command does not accept target.")
                 if name == "run" and "continue" in args:
                     args["continue_run"] = args.pop("continue")
-                if "template_path" in args and args["template_path"] is not None:
-                    args["template_path"] = Path(
-                        require_text(args["template_path"], "template_path")
-                    )
+                for field in ("template_path", "archive_path", "destination"):
+                    if field in args and args[field] is not None:
+                        args[field] = Path(require_text(args[field], field))
                 handlers = {
                     "run": self._runner.run,
                     "pause": self._runner.pause,
@@ -212,6 +213,9 @@ class ExperimentController:
                     "snapshot": self._runner.snapshot,
                     "rollback": self._runner.rollback,
                     "recover": self._runner.recover,
+                    "archive.create": self._runner.create_archive,
+                    "archive.inspect": self._runner.inspect_archive,
+                    "archive.install": self._runner.install_archive,
                 }
                 if name not in handlers:
                     raise NotImplementedError(f"Unsupported command: {name}")
@@ -230,26 +234,40 @@ class ExperimentController:
                 "error": None,
             }
         except LoggingError as error:
-            if not name.startswith(("stats.", "logs.")) or getattr(
-                error, "journal_failed", False
+            if not name.startswith("archive.") and (
+                not name.startswith(("stats.", "logs."))
+                or getattr(error, "journal_failed", False)
             ):
                 await self._runner._fail(
                     error, {"command_id": command.get("command_id")}
                 )
-            return self._failure(command, "journal_unavailable", str(error))
+            return self._failure(command, "journal_unavailable", str(error), error)
         except NotImplementedError as error:
             return self._failure(command, "unsupported_feature", str(error))
         except FileExistsError as error:
-            return self._failure(command, "experiment_id_conflict", str(error))
+            return self._failure(
+                command,
+                "archive_conflict"
+                if name.startswith("archive.")
+                else "experiment_id_conflict",
+                str(error),
+                error,
+            )
+        except StorageConflict as error:
+            return self._failure(command, "storage_conflict", str(error), error)
+        except StorageCapacityError as error:
+            return self._failure(command, "storage_capacity", str(error), error)
+        except StorageError as error:
+            return self._failure(command, "storage_error", str(error), error)
         except FileNotFoundError as error:
-            return self._failure(command, "not_found", str(error))
+            return self._failure(command, "not_found", str(error), error)
         except (TypeError, ValueError, KeyError) as error:
-            return self._failure(command, "invalid_request", str(error))
+            return self._failure(command, "invalid_request", str(error), error)
         except RuntimeError as error:
-            return self._failure(command, "invalid_state", str(error))
+            return self._failure(command, "invalid_state", str(error), error)
         except Exception as error:  # noqa: BLE001 - Convert operation failures at the API boundary.
             return self._failure(
-                command, "operation_failed", f"{type(error).__name__}: {error}"
+                command, "operation_failed", f"{type(error).__name__}: {error}", error
             )
 
     async def _read_request(self, request: JsonObject) -> JsonObject:
@@ -296,7 +314,13 @@ class ExperimentController:
                 except Full:
                     continue
 
-    def _failure(self, command: JsonObject, code: str, message: str) -> JsonObject:
+    def _failure(
+        self,
+        command: JsonObject,
+        code: str,
+        message: str,
+        error: Exception | None = None,
+    ) -> JsonObject:
         return {
             "command_id": command.get("command_id"),
             "chain_id": command.get("chain_id"),
@@ -304,7 +328,13 @@ class ExperimentController:
             "result": "fail",
             "experiment_id": self._runner.get_state()["experiment_id"],
             "data": None,
-            "error": {"code": code, "message": message, "details": {}},
+            "error": {
+                "code": code,
+                "message": message,
+                "details": {"notes": list(getattr(error, "__notes__", []))}
+                if error is not None and getattr(error, "__notes__", None)
+                else {},
+            },
         }
 
     async def close(self) -> None:

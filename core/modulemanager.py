@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import lzma
 import shutil
@@ -477,6 +478,148 @@ class ModuleManager:
         Database operations are not a shared transaction. An upload error may
         still leave remote archive data; concurrent removal is not coordinated.
         """
+        module_name, source_folder, work_root = self._registration_source(
+            module_name, module_version, module_folder
+        )
+        module_hash = self.module_hash(module_name, source_folder)
+        archive_exists = self.module_db.check_module_stored(module_name, module_version)
+        if self._registration_exists(
+            module_name, module_version, module_hash, archive_exists
+        ):
+            return False
+        work_root.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(
+            prefix="register-module-", dir=work_root
+        )
+        failure = None
+        try:
+            archive_path = self._registration_package(
+                source_folder, Path(temporary.name), module_hash
+            )
+            result = self.hash_db.add_module_hash(
+                module_name, module_version, module_hash
+            )
+            if result != ModuleAddResult.module_added:
+                archive_exists = self.module_db.check_module_stored(
+                    module_name, module_version
+                )
+                if (
+                    result == ModuleAddResult.module_exists_err
+                    and self._registration_exists(
+                        module_name, module_version, module_hash, archive_exists
+                    )
+                ):
+                    return False
+                raise StorageConflict(
+                    "The hash database did not add the module record."
+                )
+            try:
+                self.module_db.save_module(module_name, module_version, archive_path)
+            except StorageError as upload_error:
+                self._rollback_registration_hash(
+                    module_name, module_version, upload_error
+                )
+                raise
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            self._cleanup_registration(temporary, work_root, failure)
+        return True
+
+    async def register_module_async(
+        self,
+        module_name: str,
+        module_version: str,
+        module_folder: str | Path | None = None,
+    ) -> bool:
+        """Register without blocking the event loop on compression or network I/O.
+
+        Hash storage stays on the calling thread. Archive storage must support
+        worker-thread calls (as SeaweedDB does). Serialize registrations just as
+        for register_module. Cancellation waits for the registration's outcome.
+        """
+        operation = asyncio.create_task(
+            self._register_module_async(module_name, module_version, module_folder)
+        )
+        while True:
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                if operation.cancelled():
+                    raise
+                # An upload may already have committed; report its actual result.
+                continue
+
+    async def _register_module_async(
+        self, module_name: str, module_version: str, module_folder: str | Path | None
+    ) -> bool:
+        module_name, source_folder, work_root = self._registration_source(
+            module_name, module_version, module_folder
+        )
+        module_hash = await asyncio.to_thread(
+            self.module_hash, module_name, source_folder
+        )
+        archive_exists = await asyncio.to_thread(
+            self.module_db.check_module_stored, module_name, module_version
+        )
+        if self._registration_exists(
+            module_name, module_version, module_hash, archive_exists
+        ):
+            return False
+        work_root.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(
+            prefix="register-module-", dir=work_root
+        )
+        failure = None
+        try:
+            archive_path = await asyncio.to_thread(
+                self._registration_package,
+                source_folder,
+                Path(temporary.name),
+                module_hash,
+            )
+            result = self.hash_db.add_module_hash(
+                module_name, module_version, module_hash
+            )
+            if result != ModuleAddResult.module_added:
+                archive_exists = await asyncio.to_thread(
+                    self.module_db.check_module_stored, module_name, module_version
+                )
+                if (
+                    result == ModuleAddResult.module_exists_err
+                    and self._registration_exists(
+                        module_name, module_version, module_hash, archive_exists
+                    )
+                ):
+                    return False
+                raise StorageConflict(
+                    "The hash database did not add the module record."
+                )
+            try:
+                await asyncio.to_thread(
+                    self.module_db.save_module,
+                    module_name,
+                    module_version,
+                    archive_path,
+                )
+            except StorageError as upload_error:
+                self._rollback_registration_hash(
+                    module_name, module_version, upload_error
+                )
+                raise
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            await asyncio.to_thread(
+                self._cleanup_registration, temporary, work_root, failure
+            )
+        return True
+
+    def _registration_source(
+        self, module_name: str, module_version: str, module_folder: str | Path | None
+    ) -> tuple[str, Path, Path]:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
@@ -503,105 +646,73 @@ class ModuleManager:
                 "Temporary folder must be outside the module source folder."
             )
 
-        module_hash = self.module_hash(module_name, source_folder)
+        return module_name, source_folder, work_root
+
+    def _registration_exists(
+        self,
+        module_name: str,
+        module_version: str,
+        module_hash: str,
+        archive_exists: bool,
+    ) -> bool:
         stored_hash = self.hash_db.get_module_hash(module_name, module_version)
-        archive_exists = self.module_db.check_module_stored(module_name, module_version)
         if stored_hash != "" or archive_exists:
             if (
                 stored_hash != ""
                 and archive_exists
                 and stored_hash.lower() == module_hash
             ):
-                return False
+                return True
             raise StorageConflict(
                 f"Cannot register module {module_name!r}, version {module_version!r}: "
                 "the stored hash differs or the hash/archive pair is incomplete."
             )
-        work_root.mkdir(parents=True, exist_ok=True)
-        temporary = tempfile.TemporaryDirectory(
-            prefix="register-module-", dir=work_root
-        )
-        work = temporary.name
-        failure = None
+        return False
+
+    def _registration_package(self, source: Path, work: Path, digest: str) -> Path:
+        package = work / "package"
+        self._compress_folder(source, package)
+        self._add_hash_file(digest, package)
+        return self._compress_folder(package, work / "archive", apply_ignores=False)
+
+    def _rollback_registration_hash(
+        self, name: str, version: str, error: StorageError
+    ) -> None:
         try:
-            package_folder = Path(work) / "package"
-            archive_folder = Path(work) / "archive"
-            self._compress_folder(source_folder, package_folder)
-            self._add_hash_file(module_hash, package_folder)
-            archive_path = self._compress_folder(
-                package_folder, archive_folder, apply_ignores=False
-            )
+            if not self.hash_db.remove_module_hash(name, version):
+                error.add_note("Hash rollback found no record to remove.")
+        except StorageError as rollback_error:
+            error.add_note(f"Hash rollback also failed: {rollback_error}")
 
-            result = self.hash_db.add_module_hash(
-                module_name, module_version, module_hash
-            )
-            if result != ModuleAddResult.module_added:
-                # Another registration may have completed after the initial lookup.
+    def _cleanup_registration(
+        self,
+        temporary: tempfile.TemporaryDirectory,
+        work_root: Path,
+        failure: BaseException | None,
+    ) -> None:
+        work = Path(temporary.name)
+        try:
+            for attempt in range(3):
                 if (
-                    result == ModuleAddResult.module_exists_err
-                    and self.hash_db.get_module_hash(
-                        module_name, module_version
-                    ).lower()
-                    == module_hash
-                    and self.module_db.check_module_stored(module_name, module_version)
+                    work.is_symlink()
+                    or work.is_junction()
+                    or not work.resolve().is_relative_to(work_root)
                 ):
-                    return False
-                raise StorageConflict(
-                    f"Could not register module {module_name!r}, version {module_version!r}: "
-                    "the hash database did not add the record."
-                )
-            try:
-                self.module_db.save_module(module_name, module_version, archive_path)
-            except StorageError as upload_error:
+                    raise ValueError("Temporary cleanup target escaped its workspace.")
                 try:
-                    if not self.hash_db.remove_module_hash(module_name, module_version):
-                        upload_error.add_note(
-                            "Hash rollback found no record to remove."
-                        )
-                except StorageError as rollback_error:
-                    upload_error.add_note(
-                        f"Hash rollback also failed: {rollback_error}"
-                    )
+                    temporary.cleanup()
+                    break
+                except OSError as error:
+                    if getattr(error, "winerror", None) != 145 or attempt == 2:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+        except OSError as error:
+            note = f"Temporary cleanup failed at {work}: {error}"
+            if failure is not None:
+                failure.add_note(note)
+            else:
+                error.add_note(f"Module is already registered. {note}")
                 raise
-
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
-            try:
-                for cleanup_attempt in range(3):
-                    cleanup_target = Path(work)
-                    if (
-                        cleanup_target.is_symlink()
-                        or cleanup_target.is_junction()
-                        or not cleanup_target.resolve().is_relative_to(work_root)
-                    ):
-                        raise ValueError(
-                            "Temporary cleanup target escaped its workspace."
-                        )
-                    try:
-                        temporary.cleanup()
-                        break
-                    except OSError as cleanup_error:
-                        # Retry only Windows' transient directory-not-empty condition.
-                        if (
-                            getattr(cleanup_error, "winerror", None) != 145
-                            or cleanup_attempt == 2
-                        ):
-                            raise
-                        time.sleep(0.02 * (cleanup_attempt + 1))
-            except OSError as cleanup_error:
-                note = f"Temporary cleanup failed at {work}: {cleanup_error}"
-                if failure is not None:
-                    failure.add_note(note)
-                else:
-                    cleanup_error.add_note(
-                        f"Module {module_name!r}, version {module_version!r}, "
-                        f"is already registered. {note}"
-                    )
-                    raise
-
-        return True
 
     def unregister_module(self, module_name: str, module_version: str) -> bool:
         """Remove the archive and hash, returning whether either was removed.

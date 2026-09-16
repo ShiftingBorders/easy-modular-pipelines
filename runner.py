@@ -7,6 +7,7 @@ import asyncio
 import json
 import multiprocessing
 import shutil
+import sys
 from pathlib import Path
 from queue import Empty
 from uuid import uuid4
@@ -120,14 +121,17 @@ async def automatic_demo(requests, pending: dict, experiment_id: str) -> None:
 
 async def control(
     project_root: Path,
-    template: Path,
+    template: Path | None,
     manager: ModuleManager,
     automatic: bool,
     resource_config_path: Path | None = None,
+    archive_config_path: Path | None = None,
 ) -> None:
     context = multiprocessing.get_context("spawn")
     requests, responses = context.Queue(), context.Queue()
-    runner = ExperimentRunner(project_root, manager)
+    runner = ExperimentRunner(
+        project_root, manager, archive_config_path=archive_config_path
+    )
     controller = ExperimentController(
         project_root,
         runner,
@@ -140,22 +144,25 @@ async def control(
     response_task = asyncio.create_task(receive_responses(responses, pending))
     display_tasks = []
     try:
-        response = await send_command(
-            requests,
-            pending,
-            "run",
-            {"template_path": str(template), "delayed_start": True},
-        )
-        if response["result"] != "success":
-            raise RuntimeError(response["error"])
-        experiment_id = response["experiment_id"]
-        print("Experiment:", experiment_id, flush=True)
+        experiment_id = None
+        if template is not None:
+            response = await send_command(
+                requests,
+                pending,
+                "run",
+                {"template_path": str(template), "delayed_start": True},
+            )
+            if response["result"] != "success":
+                raise RuntimeError(response["error"])
+            experiment_id = response["experiment_id"]
+            print("Experiment:", experiment_id, flush=True)
         if automatic:
             async with asyncio.timeout(60):
                 await automatic_demo(requests, pending, experiment_id)
         else:
             print(
-                "Commands: state, logs, step, pause, resume, stop, quit; or one command JSON.",
+                "Commands: state, logs, step, pause, resume, stop, quit; or one command JSON. "
+                "Archive commands: archive.create, archive.inspect, archive.install (JSON arguments).",
                 flush=True,
             )
             while True:
@@ -176,7 +183,12 @@ async def control(
                     command = {"state": "stats.state", "logs": "logs.read"}.get(
                         line, line
                     )
-                    args = {"experiment_id": experiment_id} if line == "logs" else {}
+                    args = {}
+                    if line == "logs":
+                        selected = await send_command(
+                            requests, pending, "stats.state", {}
+                        )
+                        args = {"experiment_id": selected["data"]["experiment_id"]}
                 display_tasks.append(
                     asyncio.create_task(
                         print_reply(requests, pending, command, args, target)
@@ -198,6 +210,11 @@ async def control(
 
 
 def main() -> None:
+    # Pipe encoding on Windows follows the legacy code page unless set explicitly.
+    # JSON replies and input paths must remain portable, including non-ASCII names.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--demo", action="store_true")
     parser.add_argument(
@@ -207,6 +224,9 @@ def main() -> None:
     )
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--template", type=Path)
+    parser.add_argument(
+        "--archive-config", type=Path, help="Experiment archiver settings JSON."
+    )
     parser.add_argument("--hash-config", type=Path)
     parser.add_argument("--filer-url", default="http://127.0.0.1:8888")
     parser.add_argument(
@@ -244,13 +264,9 @@ def main() -> None:
             storage_process.start()
             filer_url = storage_process.filer_url
         else:
-            if (
-                options.project_root is None
-                or options.template is None
-                or options.hash_config is None
-            ):
+            if options.project_root is None or options.hash_config is None:
                 parser.error(
-                    "Supply --demo or --project-root, --template, and --hash-config."
+                    "Supply --demo or --project-root and --hash-config; --template is optional."
                 )
             if options.auto:
                 parser.error("--auto is intended for --demo.")
@@ -310,7 +326,7 @@ def main() -> None:
                 encoding="utf-8",
             )
         else:
-            template = options.template.resolve()
+            template = None if options.template is None else options.template.resolve()
         asyncio.run(
             control(
                 project_root,
@@ -320,6 +336,9 @@ def main() -> None:
                 None
                 if options.resource_config is None
                 else options.resource_config.resolve(),
+                None
+                if options.archive_config is None
+                else options.archive_config.resolve(),
             )
         )
         print("Experiment files:", project_root / "experiments", flush=True)

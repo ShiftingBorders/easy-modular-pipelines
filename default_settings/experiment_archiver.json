@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "max_archive_bytes": 5368709120,
+  "max_unpacked_bytes": 21474836480,
+  "max_members": 100000,
+  "max_manifest_bytes": 16777216,
+  "max_decompression_memory_bytes": 134217728,
+  "min_free_bytes": 1073741824,
+  "compression_preset": 1
+}
