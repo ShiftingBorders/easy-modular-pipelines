@@ -556,8 +556,17 @@ class StageRunner:
                     },
                 )
                 timeout = state.template["unknown_state"]["timeout_seconds"]
-                async with asyncio.timeout(timeout):
-                    await self._connection.connect(timeout_seconds=timeout)
+                try:
+                    async with asyncio.timeout(timeout):
+                        await self._connection.connect(timeout_seconds=timeout)
+                except (OSError, EOFError):
+                    await self._connection.close()
+                    self._connection = None
+                    # Completion publishes the result before removing the endpoint.
+                    # Recovery can race that teardown just like a fresh launch;
+                    # collect and validate the saved attempt instead of losing it.
+                    if not result_path.is_file():
+                        raise
             self._journal.client.record_event("stage.reconnected", {}, context=context)
             return await self.execute(
                 state, wait_services=wait_services, recovered=attempt
