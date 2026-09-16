@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -10,11 +11,13 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+import psutil
+
 from core.logger_utils.events import LoggingError
 from core.runner_utils.connection import ParticipantConnection
 from core.runner_utils.journal import RunnerJournal
 from core.runner_utils.launch import ModuleLauncher
-from core.runner_utils.runtimeio import read_json, write_json
+from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.state import (
     JsonObject,
     JsonValue,
@@ -40,6 +43,7 @@ class StageRunner:
         self._connection = None
         self._process = None
         self._process_attempt_id = None
+        self._unstarted_attempt_id: str | None = None
         self._executor_processes = []
         self._notify_resources = notify_resources
 
@@ -52,17 +56,26 @@ class StageRunner:
             [RunnerState], Awaitable[Literal["ready", "pause", "stop"]]
         ]
         | None = None,
+        recovered: StageAttempt | None = None,
     ) -> StageOutcome:
         definition = state.template["stages"][state.stage_position - 1]
         stage_id = definition["stage_id"]
-        input_data = self.select_input(state)
+        input_data = (
+            self.select_input(state) if recovered is None else recovered.input_data
+        )
         if manual:
             state.stage_result_paths.pop(stage_id, None)
+            state.stage_result_origins.pop(stage_id, None)
             state.last_result = None
             state.last_result_path = None
         policy = definition["errors"]
         while True:
-            attempt = await self._start_attempt(state, input_data)
+            attempt = (
+                recovered
+                if recovered is not None and recovered.outcome != "unknown_stopped"
+                else await self._start_attempt(state, input_data)
+            )
+            recovered = None
             response = await self._collect_result(state, attempt)
             success = response is not None and response["result"] == "success"
             self._journal.client.record_event(
@@ -118,10 +131,9 @@ class StageRunner:
         if path is None or not path.is_file():
             return None
         result = read_json(path)
-        if (
-            result.get("stage_id") != previous
-            or result.get("experiment_id") != state.experiment_id
-        ):
+        if result.get("stage_id") != previous or result.get(
+            "experiment_id"
+        ) != state.stage_result_origins.get(previous, state.experiment_id):
             raise ValueError("Saved predecessor result has a different identity.")
         response = result.get("response")
         if (
@@ -137,6 +149,7 @@ class StageRunner:
         self, state: RunnerState, input_data: JsonValue
     ) -> StageAttempt:
         self._process_attempt_id = None
+        self._unstarted_attempt_id = None
         definition = state.template["stages"][state.stage_position - 1]
         module = definition["module"]
         stage_id = definition["stage_id"]
@@ -179,6 +192,7 @@ class StageRunner:
             definition["timeout_seconds"],
         )
         state.active_attempt = attempt
+        self._unstarted_attempt_id = attempt_id
         if self._notify_resources is not None:
             self._notify_resources()
         state.stage_attempt_numbers[stage_id] = number
@@ -198,6 +212,7 @@ class StageRunner:
         launch_path = directory / "launch.json"
         write_json(launch_path, launch)
         library_root = Path(__file__).resolve().parents[2]
+        self._unstarted_attempt_id = None
         spawn = asyncio.create_task(
             asyncio.to_thread(
                 subprocess.Popen,
@@ -264,6 +279,14 @@ class StageRunner:
                             timeout_seconds=max(0.001, deadline - time.monotonic())
                         )
                         return attempt
+                except PermissionError:
+                    if os.name != "nt":
+                        raise
+                    # Windows may briefly deny opens during endpoint publication
+                    # or deletion. Retry within the original startup deadline.
+                    if self._connection is not None:
+                        await self._connection.close()
+                        self._connection = None
                 except (OSError, EOFError):
                     # Completion publishes the result before deleting the endpoint.
                     # A short stage can finish between the existence check and read.
@@ -371,8 +394,15 @@ class StageRunner:
         attempt = state.active_attempt
         if attempt is None:
             return True
-        if self._process_attempt_id != attempt.attempt_id:
+        if self._unstarted_attempt_id == attempt.attempt_id:
+            # This owner never reached Popen; a refused mandatory record cannot
+            # leave a running executor that needs an RPC timeout to stop.
             return True
+        if self._process_attempt_id != attempt.attempt_id:
+            # A restored owner has no Popen handle, but may reconnect to the
+            # independently authenticated executor. Missing ownership is not success.
+            self._process_attempt_id = attempt.attempt_id
+            self._process = None
         # Cancelling the DAG may close a pending query while retaining its client.
         # Reconnect before sending the independent interruption command.
         if self._connection is not None:
@@ -462,12 +492,113 @@ class StageRunner:
                     await self._connection.close()
                 self._connection = None
             await asyncio.sleep(0.05)
+        if attempt.process_identity is not None:
+            try:
+                current = process_identity(attempt.process_identity["pid"])
+                if current != attempt.process_identity:
+                    return True
+                try:
+                    psutil.Process(current["pid"]).wait(timeout=0)
+                    return True
+                except psutil.TimeoutExpired:
+                    pass
+            except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+                return True
+            except OSError as error:
+                if getattr(error, "winerror", None) in (87, 1168):
+                    return True
+                raise
         return False
 
-    async def recover(self, state: RunnerState) -> StageOutcome | None:
-        raise NotImplementedError(
-            "Crash recovery is outside the initial stage runtime."
-        )
+    async def recover(
+        self,
+        state: RunnerState,
+        *,
+        wait_services: Callable[
+            [RunnerState], Awaitable[Literal["ready", "pause", "stop"]]
+        ]
+        | None = None,
+    ) -> StageOutcome | None:
+        attempt = state.active_attempt
+        if attempt is None:
+            return None
+        definition = state.template["stages"][state.stage_position - 1]
+        if (
+            definition["stage_id"] != attempt.stage_id
+            or attempt.cycle_number != state.cycle_number
+        ):
+            raise ValueError("Saved attempt does not match the DAG cursor.")
+        saved_context = read_json(attempt.artifacts_directory / "context.json")
+        if (
+            saved_context["context"]["attempt_id"] != attempt.attempt_id
+            or saved_context["input_data"] != attempt.input_data
+            or saved_context["settings"] != attempt.effective_settings
+        ):
+            raise ValueError("Saved attempt differs from its original launch context.")
+        if self._process_attempt_id != attempt.attempt_id:
+            self._process = None
+        self._process_attempt_id = attempt.attempt_id
+        result_path = attempt.artifacts_directory / "execution_result.json"
+        context = {
+            "experiment_id": state.experiment_id,
+            "run_id": state.run_id,
+            "stage_id": attempt.stage_id,
+            "attempt_id": attempt.attempt_id,
+        }
+        try:
+            if not result_path.is_file():
+                self._connection = ParticipantConnection(
+                    state.experiment_directory / "executor.lock.json",
+                    {
+                        "experiment_id": state.experiment_id,
+                        "stage_id": attempt.stage_id,
+                        "attempt_id": attempt.attempt_id,
+                    },
+                )
+                timeout = state.template["unknown_state"]["timeout_seconds"]
+                async with asyncio.timeout(timeout):
+                    await self._connection.connect(timeout_seconds=timeout)
+            self._journal.client.record_event("stage.reconnected", {}, context=context)
+            return await self.execute(
+                state, wait_services=wait_services, recovered=attempt
+            )
+        except (OSError, EOFError, ValueError, RuntimeError) as error:
+            if self._connection is not None:
+                await self._connection.close()
+                self._connection = None
+            state.unknown_state_recovery_count += 1
+            policy = state.template["unknown_state"]
+            action = (
+                policy["on_recovery_limit"]
+                if state.unknown_state_recovery_count >= policy["recovery_limit"]
+                else policy["on_timeout"]
+            )
+            self._journal.client.record_event(
+                "stage.recovery_failed",
+                {
+                    "action": action,
+                    "error": f"{type(error).__name__}: {error}",
+                    "count": state.unknown_state_recovery_count,
+                },
+                context=context,
+            )
+            self._save_state(state)
+            if action == "pause":
+                attempt.outcome = "unknown"
+                return StageOutcome(attempt, None, "pause")
+            if not await self.interrupt(state, "unknown_state"):
+                attempt.outcome = "unknown"
+                return StageOutcome(attempt, None, "stop")
+            attempt.outcome = "unknown_stopped"
+            if action == "rerun":
+                return await self.execute(
+                    state, wait_services=wait_services, recovered=attempt
+                )
+            return StageOutcome(
+                attempt,
+                {"result": "fail", "data": {"reason": "unknown_state"}},
+                "advance" if action == "skip" else "stop",
+            )
 
     def _prune_artifacts(self, state: RunnerState, attempt: StageAttempt) -> None:
         import shutil
@@ -494,7 +625,7 @@ class StageRunner:
                 error, context={"experiment_id": state.experiment_id}
             )
 
-    async def close(self) -> None:
+    async def close(self, state: RunnerState | None = None) -> None:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
@@ -506,3 +637,53 @@ class StageRunner:
             else:
                 await asyncio.to_thread(process.wait, timeout=timeout)
         self._executor_processes = remaining
+        if state is not None:
+            paths = list(state.stage_result_paths.values())
+            if state.active_attempt is not None:
+                paths.append(
+                    state.active_attempt.artifacts_directory / "execution_result.json"
+                )
+            deadline = time.monotonic() + state.template["start_timeout"]
+            for result_path in paths:
+                record_path = result_path.parent / "process.json"
+                if not record_path.is_file():
+                    if (
+                        state.active_attempt is not None
+                        and result_path.parent
+                        == state.active_attempt.artifacts_directory
+                        and self._unstarted_attempt_id
+                        != state.active_attempt.attempt_id
+                        and not (
+                            self._process_attempt_id == state.active_attempt.attempt_id
+                            and self._process is not None
+                            and self._process.poll() is not None
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Cannot confirm closure of the recovered executor writer."
+                        )
+                    continue
+                record = read_json(record_path)
+                if record.get("experiment_id") != state.experiment_id:
+                    continue
+                identity = record.get("executor")
+                if identity is None:
+                    raise RuntimeError(
+                        "Cannot identify a previous stage journal writer."
+                    )
+                try:
+                    if process_identity(identity["pid"]) != identity:
+                        continue
+                    await asyncio.to_thread(
+                        psutil.Process(identity["pid"]).wait,
+                        max(0.001, deadline - time.monotonic()),
+                    )
+                except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+                    continue
+                except OSError as error:
+                    if getattr(error, "winerror", None) not in (87, 1168):
+                        raise
+                except psutil.TimeoutExpired as error:
+                    raise RuntimeError(
+                        "A previous executor still owns runtime files."
+                    ) from error

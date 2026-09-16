@@ -52,11 +52,17 @@ class ExperimentAssembler:
         self._project_root = self._project_root.resolve()
         self._module_manager = module_manager
 
-    def load_template(self, template_path: Path) -> tuple[str, JsonObject]:
+    def load_template(
+        self, template_path: Path, *, template_yaml: str | None = None
+    ) -> tuple[str, JsonObject]:
         path = Path(template_path)
         if not path.is_absolute():
             raise ValueError("template_path must be absolute.")
-        text = path.read_text(encoding="utf-8")
+        text = (
+            path.read_text(encoding="utf-8")
+            if template_yaml is None
+            else require_text(template_yaml, "template YAML")
+        )
         template = copy_json_object(yaml.safe_load(text), "experiment template")
         fields = {
             "schema_version",
@@ -84,21 +90,23 @@ class ExperimentAssembler:
             raise ValueError("Only template schema_version 1 is supported.")
         require_text(template["name"], "name")
         for key in ("cycles", "keep_attempts"):
-            if type(template[key]) is not int or template[key] < 1:
+            value = template[key]
+            if type(value) is not int or value < 1:
                 raise ValueError(f"{key} must be a positive integer.")
-        for key in ("start_timeout", "runner_timeout_margin_seconds"):
-            require_number(template[key], key)
-        if template["start_timeout"] <= 0:
+        start_timeout = require_number(template["start_timeout"], "start_timeout")
+        require_number(
+            template["runner_timeout_margin_seconds"], "runner_timeout_margin_seconds"
+        )
+        if start_timeout <= 0:
             raise ValueError("start_timeout must be positive.")
-        if type(template["services"]) is not list:
+        services = template["services"]
+        if type(services) is not list:
             raise TypeError("services must be an array.")
         snapshots = copy_json_object(template["snapshots"], "snapshots")
         if snapshots.keys() != {"mode", "keep"}:
             raise ValueError("snapshots requires mode and keep.")
-        if snapshots["mode"] != "off":
-            raise NotImplementedError(
-                "Snapshots are not available in the initial runtime."
-            )
+        if snapshots["mode"] not in ("off", "after_stage", "after_epoch"):
+            raise ValueError("snapshots.mode must be off, after_stage, or after_epoch.")
         if type(snapshots["keep"]) is not int or snapshots["keep"] < 1:
             raise ValueError("snapshots.keep must be a positive integer.")
         storage = copy_json_object(template["storage"], "storage")
@@ -118,11 +126,11 @@ class ExperimentAssembler:
         }:
             raise ValueError("All four configurable logging fields must be explicit.")
         for key in ("busy_timeout_seconds", "filtered_refresh_interval_seconds"):
-            require_number(logging[key], key)
-            if logging[key] <= 0:
+            number = require_number(logging[key], key)
+            if number <= 0:
                 raise ValueError(f"logging.{key} must be positive.")
-        if logging["busy_timeout_seconds"] > 60:
-            raise ValueError("logging.busy_timeout_seconds must not exceed 60.")
+            if key == "busy_timeout_seconds" and number > 60:
+                raise ValueError("logging.busy_timeout_seconds must not exceed 60.")
         for key in ("max_event_bytes", "min_free_bytes"):
             value = logging[key]
             if key == "max_event_bytes" and value is None:
@@ -137,8 +145,10 @@ class ExperimentAssembler:
             "on_recovery_limit",
         }:
             raise ValueError("All unknown_state fields must be explicit.")
-        require_number(unknown["timeout_seconds"], "unknown_state.timeout_seconds")
-        if unknown["timeout_seconds"] <= 0:
+        if (
+            require_number(unknown["timeout_seconds"], "unknown_state.timeout_seconds")
+            <= 0
+        ):
             raise ValueError("unknown_state.timeout_seconds must be positive.")
         if unknown["on_timeout"] not in ("stop", "pause", "rerun", "skip"):
             raise ValueError("Invalid unknown_state.on_timeout.")
@@ -151,7 +161,7 @@ class ExperimentAssembler:
             raise ValueError("stages must be a nonempty array.")
         seen = set()
         definitions = [("stage", item) for item in stages]
-        definitions.extend(("service", item) for item in template["services"])
+        definitions.extend(("service", item) for item in services)
         socket_fields = {
             "heartbeat",
             "command_timeout_seconds",
@@ -160,7 +170,8 @@ class ExperimentAssembler:
             "errors",
         }
         for role, definition in definitions:
-            copy_json_object(definition, role)
+            if type(definition) is not dict:
+                raise TypeError(f"{role} must be a JSON object.")
             identity_key = f"{role}_id"
             required = {"module", "settings"}
             if role == "stage":
@@ -192,10 +203,13 @@ class ExperimentAssembler:
             ):
                 raise ValueError("module.hash must be SHA-256.")
             copy_json_object(definition["settings"], f"{role} settings")
-            if role == "stage" and definition["timeout_seconds"] is not None:
-                require_number(definition["timeout_seconds"], "timeout_seconds")
-                if definition["timeout_seconds"] <= 0:
-                    raise ValueError("timeout_seconds must be positive or null.")
+            if (
+                role == "stage"
+                and definition["timeout_seconds"] is not None
+                and require_number(definition["timeout_seconds"], "timeout_seconds")
+                <= 0
+            ):
+                raise ValueError("timeout_seconds must be positive or null.")
             if role == "service" and "heartbeat" in definition:
                 heartbeat = copy_json_object(definition["heartbeat"], "heartbeat")
                 if heartbeat.keys() != {"interval_seconds", "grace_seconds"}:
@@ -244,8 +258,7 @@ class ExperimentAssembler:
             ):
                 raise ValueError("Resource names must be unique safe path components.")
             resource_names.add(name)
-            require_text(resource["path"], "resource.path")
-            configured = Path(resource["path"])
+            configured = Path(require_text(resource["path"], "resource.path"))
             if not configured.is_absolute():
                 if configured.drive or configured.root:
                     raise ValueError("Ambiguous resource path.")
@@ -333,9 +346,18 @@ class ExperimentAssembler:
         folder = str(uuid4())
         directory = self._project_root / "experiments" / folder
         directory.mkdir(parents=True, exist_ok=False)
+        # load_template has validated every definition; preserve the same objects
+        # so generated IDs also appear in the template written to the experiment.
+        definitions: list[tuple[str, JsonObject]] = []
         for role in ("stage", "service"):
-            for definition in template[f"{role}s"]:
+            entries = template[f"{role}s"]
+            if not isinstance(entries, list):
+                raise TypeError(f"{role}s must be an array.")
+            for definition in entries:
+                if not isinstance(definition, dict):
+                    raise TypeError(f"{role} must be a JSON object.")
                 definition.setdefault(f"{role}_id", str(uuid4()))
+                definitions.append((role, definition))
         template_yaml = yaml.safe_dump(template, allow_unicode=True, sort_keys=False)
         state = RunnerState(
             experiment_id,
@@ -361,11 +383,12 @@ class ExperimentAssembler:
             ):
                 (directory / name).mkdir(parents=True, exist_ok=True)
             copied = {}
-            definitions = [("stage", item) for item in template["stages"]]
-            definitions.extend(("service", item) for item in template["services"])
             for role, item in definitions:
-                module = item["module"]
-                key = (module["name"], module["version"])
+                module = copy_json_object(item["module"], "module")
+                key = (
+                    require_text(module["name"], "module.name"),
+                    require_text(module["version"], "module.version"),
+                )
                 source = self._project_root / "modules" / key[0] / key[1]
                 target = directory / "modules" / key[0] / key[1]
                 if (
@@ -397,9 +420,15 @@ class ExperimentAssembler:
                     copied[key] = definition
                 # Every reference must match, including repeated uses of shared code.
                 self.check_module(state, item)
-            for resource in template["resources"]:
-                source = Path(resource["path"])
-                target = directory / "shared_data" / "resources" / resource["name"]
+            resources = template["resources"]
+            if not isinstance(resources, list):
+                raise TypeError("resources must be an array.")
+            for resource in resources:
+                if not isinstance(resource, dict):
+                    raise TypeError("resource must be a JSON object.")
+                source = Path(require_text(resource["path"], "resource.path"))
+                resource_name = require_text(resource["name"], "resource.name")
+                target = directory / "shared_data" / "resources" / resource_name
                 if source.is_dir():
                     copy_task = asyncio.create_task(
                         asyncio.to_thread(shutil.copytree, source, target)
@@ -438,49 +467,57 @@ class ExperimentAssembler:
         self, state: RunnerState, template_yaml: str, template: JsonObject
     ) -> None:
         raise NotImplementedError(
-            "Rebuilding requires the snapshot phase of the runtime."
+            "Protected rebuilding of an existing experiment is not implemented."
         )
 
     def check_modules(self, state: RunnerState) -> None:
-        for definition in [*state.template["stages"], *state.template["services"]]:
-            self.check_module(state, definition)
+        for role in ("stage", "service"):
+            definitions = state.template[f"{role}s"]
+            if not isinstance(definitions, list):
+                raise TypeError(f"{role}s must be an array.")
+            for definition in definitions:
+                if not isinstance(definition, dict):
+                    raise TypeError(f"{role} must be a JSON object.")
+                self.check_module(state, definition)
 
     def check_module(self, state: RunnerState, definition: JsonObject) -> None:
-        module = definition["module"]
-        directory = (
-            state.experiment_directory / "modules" / module["name"] / module["version"]
-        )
-        actual = self._module_manager.module_hash(
-            module["name"], target_folder=directory
-        )
-        registered = self._module_manager.hash_db.get_module_hash(
-            module["name"], module["version"]
-        )
+        module = copy_json_object(definition["module"], "module")
+        name = require_text(module["name"], "module.name")
+        version = require_text(module["version"], "module.version")
+        expected_hash = require_text(module["hash"], "module.hash")
+        for key, component in (("name", name), ("version", version)):
+            if component in (".", "..") or any(
+                character in component for character in '/\\:*?"<>|'
+            ):
+                raise ValueError(f"Unsafe module {key}.")
+        directory = state.experiment_directory / "modules" / name / version
+        if not directory.resolve().is_relative_to(state.experiment_directory.resolve()):
+            raise ValueError("Module code escapes the experiment.")
+        actual = self._module_manager.module_hash(name, target_folder=directory)
+        registered = self._module_manager.hash_db.get_module_hash(name, version)
         if (
             not registered
             or actual.lower() != registered.lower()
-            or actual.lower() != module["hash"].lower()
+            or actual.lower() != expected_hash.lower()
         ):
-            raise ValueError(
-                f"Module integrity check failed: {module['name']} / {module['version']}"
-            )
+            raise ValueError(f"Module integrity check failed: {name} / {version}")
 
     def check_resources(self, state: RunnerState) -> None:
-        for resource in state.template["resources"]:
+        resources = state.template["resources"]
+        if not isinstance(resources, list):
+            raise TypeError("resources must be an array.")
+        for resource in resources:
+            if not isinstance(resource, dict):
+                raise TypeError("resource must be a JSON object.")
             if resource["hash"] is None:
                 continue
-            path = (
-                state.experiment_directory
-                / "shared_data"
-                / "resources"
-                / resource["name"]
-            )
+            name = require_text(resource["name"], "resource.name")
+            expected_hash = require_text(resource["hash"], "resource.hash")
+            path = state.experiment_directory / "shared_data" / "resources" / name
             if path.is_dir():
-                actual = self._module_manager.module_hash(
-                    resource["name"], target_folder=path
-                )
+                actual = self._module_manager.module_hash(name, target_folder=path)
             else:
                 with path.open("rb") as stream:
                     actual = hashlib.file_digest(stream, "sha256").hexdigest()
-            if actual.lower() != resource["hash"].lower():
-                raise ValueError(f"Resource integrity check failed: {resource['name']}")
+            if actual.lower() != expected_hash.lower():
+                raise ValueError(f"Resource integrity check failed: {name}")

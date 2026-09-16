@@ -172,15 +172,20 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
             )
             reply = await self.reply()
             self.assertEqual(reply["result"], "success", reply)
-            for command, args in (
-                ("snapshot", {}),
-                ("rollback", {"snapshot_id": "absent"}),
-                ("reload_template", {}),
+            await self.write(
+                json.dumps({"command": "snapshot", "args": {"label": "cli"}})
+            )
+            snapshot = await self.reply()
+            self.assertEqual(snapshot["result"], "success", snapshot)
+            self.assertTrue(snapshot["data"]["valid"])
+            for command, args, code in (
+                ("rollback", {"snapshot_id": "absent"}, "invalid_request"),
+                ("reload_template", {}, "unsupported_feature"),
             ):
                 await self.write(json.dumps({"command": command, "args": args}))
                 response = await self.reply()
                 self.assertEqual(response["result"], "fail")
-                self.assertEqual(response["error"]["code"], "unsupported_feature")
+                self.assertEqual(response["error"]["code"], code)
             await self.write(json.dumps({"command": "retry", "args": {"position": 1}}))
             response = await self.reply()
             self.assertEqual(response["result"], "fail")

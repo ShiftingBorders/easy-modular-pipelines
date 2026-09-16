@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from core.runner_utils.runtimeio import read_json, write_json
+from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.state import RunnerState, RunnerStateStore, StageAttempt
 from tests.helpers.dag import DagWorkspace
 
@@ -90,7 +90,8 @@ class RunnerStateTests(unittest.TestCase):
         valid = read_json(path)
         for key, value in (
             ("schema_version", True),
-            ("schema_version", 2),
+            ("schema_version", 1),
+            ("schema_version", 3),
             ("mode", "unknown"),
             ("cycle_number", True),
             ("stage_position", 0),
@@ -107,6 +108,53 @@ class RunnerStateTests(unittest.TestCase):
         path.write_text('{"schema_version":', encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):
             self.store.load(self.root)
+
+    def test_snapshot_cursor_owner_checkpoint_and_origins_survive_relocation(self):
+        """Snapshots A1/A3: version 2 preserves progress and experiment-relative paths."""
+        stage_id = str(uuid4())
+        self.state.pending_advance = True
+        self.state.checkpoint_id = str(uuid4())
+        self.state.owner_identity = process_identity(os.getpid())
+        self.state.stage_result_paths[stage_id] = self.root / "result.json"
+        self.state.stage_result_origins[stage_id] = "source-experiment"
+        self.store.save(self.state)
+        relocated = self.root / "relocated"
+        relocated.mkdir()
+        write_json(
+            relocated / "runner/state.json", read_json(self.root / "runner/state.json")
+        )
+        restored = self.store.load(relocated)
+        self.assertEqual(restored.template_path, relocated / "experiment.yaml")
+        self.assertTrue(restored.pending_advance)
+        self.assertEqual(restored.checkpoint_id, self.state.checkpoint_id)
+        self.assertEqual(restored.owner_identity, self.state.owner_identity)
+        self.assertEqual(
+            restored.stage_result_paths[stage_id], relocated / "result.json"
+        )
+        self.assertEqual(restored.stage_result_origins[stage_id], "source-experiment")
+        self.state.template_path = self.workspace.root / "external.yaml"
+        self.store.save(self.state)
+        self.assertEqual(
+            self.store.load(self.root).template_path, self.state.template_path
+        )
+
+    def test_invalid_snapshot_fields_never_replace_valid_state(self):
+        """Snapshots A2/A5: malformed ownership, origins and checkpoint are rejected."""
+        self.store.save(self.state)
+        path = self.root / "runner/state.json"
+        document = read_json(path)
+        for key, value in (
+            ("pending_advance", 1),
+            ("checkpoint_id", "bad"),
+            ("owner_identity", {"pid": os.getpid()}),
+            ("owner_identity", {**process_identity(os.getpid()), "pid": True}),
+            ("stage_result_origins", {str(uuid4()): "unmatched-result"}),
+            ("stage_result_origins", []),
+        ):
+            with self.subTest(key=key, value=value):
+                write_json(path, {**document, key: value})
+                with self.assertRaises((TypeError, ValueError)):
+                    self.store.load(self.root)
 
     def test_validation_precedes_replacement_of_persisted_state(self):
         """D1/D2: invalid in-memory counts do not overwrite the previous document."""

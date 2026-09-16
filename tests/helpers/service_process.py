@@ -272,6 +272,17 @@ class PythonService:
                 else:
                     self.frozen = False
                     data = {"frozen": False}
+            elif command == "set_value":
+                if self.frozen:
+                    result, data = "fail", {"reason": "writes are frozen"}
+                elif type(args.get("value")) is not int:
+                    result, data = "fail", {"reason": "value must be an integer"}
+                else:
+                    self.counter = args["value"]
+                    await self.publish_counter()
+                    data = {"value": self.counter}
+            elif command == "get_value":
+                data = {"value": self.counter}
             elif command == "fail":
                 result, data = "fail", {"reason": "work rejected"}
             response = {"result": result, "data": data}
@@ -304,7 +315,7 @@ class PythonService:
     async def ticks(self) -> None:
         while not self.finished.is_set():
             self.fault("idle")
-            if not self.frozen:
+            if not self.frozen and self.context["settings"].get("auto_increment", True):
                 self.counter += 1
                 await self.publish_counter()
             await asyncio.sleep(0.25)
@@ -353,6 +364,18 @@ def main() -> None:
     context = read_json(options.emp_context)
     controls = Path(context["settings"]["controls"])
     if context["service_interface"] == "commands":
+        with (controls / "actions.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "action": options.action,
+                        "pid": os.getpid(),
+                        "at": time.monotonic(),
+                        **context["context"],
+                    }
+                )
+                + "\n"
+            )
         write_json(
             controls / f"action-{options.action}.json",
             {"pid": os.getpid(), "context": context},

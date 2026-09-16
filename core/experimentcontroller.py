@@ -50,7 +50,11 @@ class ExperimentController:
     async def serve(self) -> None:
         if self._loops or self._closing:
             raise RuntimeError("Controller is already running or closed.")
-        self._runner.set_resource_observer(self.resources.update)
+        self._runner.set_resource_observer(
+            self.resources.update,
+            suspend=self.resources.suspend_experiment,
+            resume=self.resources.resume_experiment,
+        )
         self._loops = [
             asyncio.create_task(self._receive_requests()),
             asyncio.create_task(self._execute_commands()),
@@ -207,6 +211,7 @@ class ExperimentController:
                     "reload_template": self._runner.reload_template,
                     "snapshot": self._runner.snapshot,
                     "rollback": self._runner.rollback,
+                    "recover": self._runner.recover,
                 }
                 if name not in handlers:
                     raise NotImplementedError(f"Unsupported command: {name}")

@@ -88,11 +88,11 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
             self.assembler.load_template(self.workspace.write_template(candidate))
 
     def test_rejects_empty_dag_and_unsupported_modes(self):
-        """A2/integration A1: empty DAG, malformed services and unavailable snapshots fail early."""
+        """A2/snapshots A4: empty DAG, malformed services and invalid modes fail early."""
         for field, value, error in (
             ("stages", [], ValueError),
             ("services", [{}], ValueError),
-            ("snapshots", {"mode": "after_epoch", "keep": 1}, NotImplementedError),
+            ("snapshots", {"mode": "unknown", "keep": 1}, ValueError),
         ):
             with self.subTest(field=field):
                 candidate = {**self.template, field: value}
@@ -100,6 +100,16 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
                     self.assembler.load_template(
                         self.workspace.write_template(candidate)
                     )
+
+    def test_accepts_all_snapshot_modes(self):
+        """Snapshots A4: each supported mode survives template validation."""
+        for mode in ("off", "after_stage", "after_epoch"):
+            with self.subTest(mode=mode):
+                candidate = {**self.template, "snapshots": {"mode": mode, "keep": 2}}
+                _, loaded = self.assembler.load_template(
+                    self.workspace.write_template(candidate)
+                )
+                self.assertEqual(loaded["snapshots"], candidate["snapshots"])
 
     async def test_paths_resolve_from_config_in_another_cwd(self):
         """A3: config-relative and absolute resources work from an unrelated cwd."""

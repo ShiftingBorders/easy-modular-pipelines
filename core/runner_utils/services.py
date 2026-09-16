@@ -1090,8 +1090,23 @@ class ServiceManager:
         return await self.wait_ready(state)
 
     async def recover(self, state: RunnerState) -> ServiceAction:
+        if set(state.services) != {
+            item["service_id"] for item in state.template["services"]
+        }:
+            raise RuntimeError(
+                "Saved service ownership is incomplete; automatic launch is unsafe."
+            )
         if self._closed:
-            raise RuntimeError("Service manager is closed.")
+            if self._connections or self._receivers or self._sends or self._waiters:
+                raise RuntimeError(
+                    "Finish closing the previous service channels before recovery."
+                )
+            self._closed = False
+            self._monitor_task = None
+            self._pending_action = None
+            self._probes.clear()
+            self._next_probe.clear()
+            self._bad_replies.clear()
         markers = {
             item.prepared_freeze_id or item.freeze_id
             for item in state.services.values()
@@ -1105,12 +1120,60 @@ class ServiceManager:
                 for key, item in state.services.items()
                 if item.prepared_freeze_id or item.freeze_id
             }
+        # A failed optional state write can leave an already sent request queued.
+        # Consult the mandatory send record before the monitor can dispatch it.
+        pending_ids = {
+            entry["request_id"]
+            for instance in state.services.values()
+            for entry in instance.pending_requests
+        }
+        sent_ids = set()
+        checkpoint = boundary = None
+        while pending_ids:
+            page = await asyncio.to_thread(
+                self._journal.client.read_events, checkpoint, limit=1000
+            )
+            if boundary is None:
+                boundary = page["boundary"]["cursor"]
+            for entry in page["events"]:
+                if entry["cursor"] > boundary:
+                    break
+                event = entry["event"]
+                if (
+                    event["event_type"] == "service.send_started"
+                    and event["context"].get("experiment_id") == state.experiment_id
+                    and event["data"].get("request_id") in pending_ids
+                ):
+                    sent_ids.add(event["data"]["request_id"])
+            checkpoint = page["checkpoint"]
+            if checkpoint["cursor"] >= boundary or not page["has_more"]:
+                break
+        for instance in state.services.values():
+            for entry in list(instance.pending_requests):
+                if entry["request_id"] not in sent_ids:
+                    continue
+                recorded = self._journal.client.read_command_result(entry["request_id"])
+                if (
+                    recorded is not None
+                    and recorded["author"] == "runner"
+                    and recorded["outcome"] in ("succeeded", "failed")
+                ):
+                    instance.pending_requests.remove(entry)
+                    continue
+                instance.failure = "Saved queue contains an already sent request with an unresolved outcome."
+                instance.blocked_action = self._pending_action = "stop"
+                return "stop"
         self._starting.update(state.services)
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self.monitor(state))
         for service_id, instance in state.services.items():
             try:
-                if instance.interface == "commands" or instance.stopped:
+                if instance.stopped:
+                    instance.blocked_action = self._pending_action = "pause"
+                    # Still reconnect the remaining live services so a partial
+                    # shutdown cannot disable their supervision during recovery.
+                    continue
+                if instance.interface == "commands":
                     continue
                 instance.ready = False
                 if instance.process_identity is None or instance.endpoint_path is None:
@@ -1118,6 +1181,28 @@ class ServiceManager:
                     instance.blocked_action = "stop"
                     self._pending_action = "stop"
                     return "stop"
+                try:
+                    announced = read_json(instance.endpoint_path)
+                except FileNotFoundError:
+                    announced = {}
+                if (
+                    announced
+                    and announced.get("service_instance_id")
+                    != instance.service_instance_id
+                ):
+                    # A stale state file must not authorize a second copy while a
+                    # newer, unaccounted-for instance owns the endpoint.
+                    peer = announced.get("process")
+                    if isinstance(peer, dict):
+                        try:
+                            peer_alive = process_identity(peer["pid"]) == peer
+                        except OSError:
+                            peer_alive = False
+                        if peer_alive and instance.ever_ready:
+                            instance.process_identity = None
+                            instance.failure = "Endpoint belongs to an unaccounted-for service instance."
+                            instance.blocked_action = self._pending_action = "stop"
+                            return "stop"
                 try:
                     actual = process_identity(instance.process_identity["pid"])
                 except OSError as error:
@@ -1713,6 +1798,41 @@ class ServiceManager:
                     results[service_id]["error"] = str(logging_error)
             self._changed.set()
         return results
+
+    async def reset(self, state: RunnerState) -> None:
+        """Release a stopped generation before binding restored experiment state."""
+        if any(
+            not item.stopped or item.active_request or item.pending_requests
+            for item in state.services.values()
+        ):
+            raise RuntimeError(
+                "Service reset requires confirmed stops and empty queues."
+            )
+        await self.close()
+        deadline = time.monotonic() + state.template["start_timeout"]
+        for process in [*self._processes.values(), *self._action_processes]:
+            if process.poll() is None:
+                try:
+                    await asyncio.to_thread(
+                        process.wait, max(0.001, deadline - time.monotonic())
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError(
+                        "A service command still owns runtime files."
+                    ) from error
+        self._processes.clear()
+        self._action_processes.clear()
+        self._probes.clear()
+        self._next_probe.clear()
+        self._bad_replies.clear()
+        self._starting.clear()
+        self._frozen_instances.clear()
+        self._snapshot_id = None
+        for instance in state.services.values():
+            instance.freeze_id = instance.prepared_freeze_id = None
+        self._pending_action = None
+        self._monitor_task = None
+        self._closed = False
 
     async def close(self) -> None:
         self._closed = True

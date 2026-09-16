@@ -223,6 +223,10 @@ class RunnerState:
         self.used_request_ids = set()
         self.stable_snapshot_id = None
         self.pending_rebuild = None
+        self.pending_advance = False
+        self.stage_result_origins: dict[str, str] = {}
+        self.checkpoint_id: str | None = None
+        self.owner_identity: JsonObject | None = None
 
 
 class StageOutcome:
@@ -280,8 +284,13 @@ def state_to_document(state: RunnerState) -> JsonObject:
     root = state.experiment_directory.resolve()
     document = dict(vars(state))
     document.pop("experiment_directory")
-    document["schema_version"] = 1
-    document["template_path"] = str(state.template_path)
+    document["schema_version"] = 2
+    template_path = state.template_path.resolve()
+    document["template_path"] = (
+        template_path.relative_to(root).as_posix()
+        if template_path.is_relative_to(root)
+        else str(template_path)
+    )
     document["last_result_path"] = (
         None
         if state.last_result_path is None
@@ -343,11 +352,15 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         "used_request_ids",
         "stable_snapshot_id",
         "pending_rebuild",
+        "pending_advance",
+        "stage_result_origins",
+        "checkpoint_id",
+        "owner_identity",
     }
     if (
         document.keys() != fields
         or type(document["schema_version"]) is not int
-        or document["schema_version"] != 1
+        or document["schema_version"] != 2
     ):
         raise ValueError("Unsupported runner state schema.")
     template_path = Path(document["template_path"])
@@ -412,6 +425,31 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
     state.used_request_ids = set(document["used_request_ids"])
     if len(state.used_request_ids) != len(document["used_request_ids"]):
         raise ValueError("Duplicate saved request ID.")
+    if type(document["pending_advance"]) is not bool:
+        raise TypeError("pending_advance must be a boolean.")
+    state.pending_advance = document["pending_advance"]
+    if document["checkpoint_id"] is not None:
+        UUID(require_text(document["checkpoint_id"], "checkpoint_id"))
+    state.checkpoint_id = document["checkpoint_id"]
+    if document["owner_identity"] is not None:
+        owner = copy_json_object(document["owner_identity"], "runner owner")
+        if owner.keys() != {"pid", "created_at_os", "host_id", "boot_id"}:
+            raise ValueError("Runner owner requires complete OS identity.")
+        for key in ("pid", "created_at_os"):
+            if type(owner[key]) is not int or owner[key] < (1 if key == "pid" else 0):
+                raise ValueError("Invalid runner owner identity.")
+        require_text(owner["host_id"], "owner host_id")
+        require_text(owner["boot_id"], "owner boot_id")
+        state.owner_identity = owner
+    origins = copy_json_object(document["stage_result_origins"], "stage result origins")
+    if type(document["stage_result_paths"]) is not dict:
+        raise TypeError("stage_result_paths must be an object.")
+    if origins.keys() - document["stage_result_paths"].keys():
+        raise ValueError("A result origin requires a saved stage result.")
+    for stage_id, origin in origins.items():
+        UUID(stage_id)
+        require_text(origin, "result experiment ID")
+    state.stage_result_origins = origins
     service_request_ids = set()
     for service_id, saved in document["services"].items():
         saved = copy_json_object(saved, "service state")
