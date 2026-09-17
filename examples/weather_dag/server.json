@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "project_root": ".",
+  "server_mode": "run",
+  "host": "127.0.0.1",
+  "port": 8010
+}

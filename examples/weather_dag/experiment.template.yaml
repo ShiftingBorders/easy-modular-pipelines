@@ -1,0 +1,85 @@
+# Replace the two hash markers with data.module.hash from CLI module add.
+schema_version: 2
+name: weather-dag
+cycles: 1
+keep_attempts: 1
+start_timeout: 30
+runner_timeout_margin_seconds: 2
+services:
+  - service_id: "f7cd487d-26f8-4142-974e-9029fbb30b01"
+    module:
+      name: weather_service
+      version: "1.1"
+      hash: "__WEATHER_SERVICE_HASH__"
+    settings: {}
+    heartbeat:
+      interval_seconds: 1
+      grace_seconds: 10
+    command_timeout_seconds: 30
+    on_command_timeout: pause
+    state_required: true
+    errors:
+      retries: 1
+      retry_delay_seconds: 1
+      on_exhausted: pause
+stages:
+  - stage_id: "f7cd487d-26f8-4142-974e-9029fbb30b11"
+    module:
+      name: weather_stage
+      version: "1.1"
+      hash: "__WEATHER_STAGE_HASH__"
+    settings:
+      operation: wait
+    timeout_seconds: 90
+    errors:
+      retries: 0
+      retry_delay_seconds: 1
+      on_exhausted: pause
+  - stage_id: "f7cd487d-26f8-4142-974e-9029fbb30b12"
+    service_id: "f7cd487d-26f8-4142-974e-9029fbb30b01"
+    settings: {}
+    timeout_seconds: 15
+    errors:
+      retries: 1
+      retry_delay_seconds: 1
+      on_exhausted: pause
+  - stage_id: "f7cd487d-26f8-4142-974e-9029fbb30b13"
+    module:
+      name: weather_stage
+      version: "1.1"
+      hash: "__WEATHER_STAGE_HASH__"
+    settings:
+      operation: format
+    timeout_seconds: 30
+    errors:
+      retries: 0
+      retry_delay_seconds: 1
+      on_exhausted: pause
+  - stage_id: "f7cd487d-26f8-4142-974e-9029fbb30b14"
+    module:
+      name: weather_stage
+      version: "1.1"
+      hash: "__WEATHER_STAGE_HASH__"
+    settings:
+      operation: write
+    timeout_seconds: 30
+    errors:
+      retries: 0
+      retry_delay_seconds: 1
+      on_exhausted: pause
+resources: []
+unknown_state:
+  timeout_seconds: 10
+  on_timeout: pause
+  recovery_limit: 3
+  on_recovery_limit: stop
+snapshots:
+  mode: "off"
+  keep: 2
+storage:
+  min_snapshot_free_bytes: 67108864
+logging:
+  busy_timeout_seconds: 5
+  max_event_bytes: null
+  min_free_bytes: 67108864
+  filtered_refresh_interval_seconds: 1

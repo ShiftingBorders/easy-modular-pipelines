@@ -1,0 +1,8 @@
+schema_version: 2
+name: weather_stage
+version: "1.1"
+role: stage
+implementation: full
+commands:
+  start: [python, -B, main.py]
+defaults: {}

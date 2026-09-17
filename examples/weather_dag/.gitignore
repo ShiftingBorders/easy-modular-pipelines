@@ -1,0 +1,9 @@
+/hash_db/*
+!/hash_db/.gitkeep
+/seaweedfs/
+/experiments/*
+!/experiments/.gitkeep
+/experiments.json
+/experiment.yaml
+/controller/
+/snapshots/
