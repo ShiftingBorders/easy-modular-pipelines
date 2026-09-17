@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import sys
 import time
@@ -34,6 +35,10 @@ class CollectorSettings:
     stable_reset_seconds: float
     logging_busy_timeout_seconds: float
     logging_retry_seconds: float
+    disk_path: str | None = None
+    network_interface: str | None = None
+    network_reference_address: str = "1.1.1.1"
+    gpu_interval_seconds: float = 5  # Reserved; GPU/VRAM collection is unfinished.
 
     @classmethod
     def load(cls, path: Path) -> CollectorSettings:
@@ -45,6 +50,21 @@ class CollectorSettings:
                 "Collector settings require exactly the documented fields."
             )
         for name, value in document.items():
+            if name == "disk_path":
+                configured = Path(require_text(value, name))
+                document[name] = str(
+                    configured
+                    if configured.is_absolute()
+                    else (path.parent / configured).resolve()
+                )
+                continue
+            if name == "network_interface":
+                if value is not None:
+                    require_text(value, name)
+                continue
+            if name == "network_reference_address":
+                ipaddress.IPv4Address(require_text(value, name))
+                continue
             if name == "restart_delays_seconds":
                 if type(value) is not list or not value:
                     raise ValueError("restart_delays_seconds must be a nonempty array.")

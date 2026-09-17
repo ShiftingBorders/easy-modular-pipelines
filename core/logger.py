@@ -39,7 +39,10 @@ from core.logger_utils.storage import SQLiteEventStore
 class OperationLogger:
     """Create a client from an absolute settings path; open explicitly or in a with block."""
 
-    def __init__(self, config_path: str | Path) -> None:
+    def __init__(self, config_path: str | Path, *, read_only: bool = False) -> None:
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a boolean.")
+        self._read_only = read_only
         if not isinstance(config_path, (str, Path)):
             raise TypeError("config_path must be a string or Path.")
         path = Path(config_path)
@@ -73,6 +76,10 @@ class OperationLogger:
                     "Logger is already open; close it before reopening."
                 )
             settings, context = load_logging_settings(self._config_path)
+            if self._read_only and settings["open_mode"] != "existing":
+                raise LoggingStateError(
+                    "A read-only client requires an existing journal."
+                )
             db_path = Path(settings["db_path"])
             context.setdefault("source", "library")
             # A context exported by a parent process must not identify this writer as it.
@@ -94,6 +101,7 @@ class OperationLogger:
                 min_free_bytes=settings["min_free_bytes"],
                 expected_journal=expected,
                 diagnostic_context=context,
+                read_only=self._read_only,
             )
             producer_instance_id = uuid4().hex
             expected_identity = (
@@ -219,6 +227,8 @@ class OperationLogger:
     ) -> str:
         """Append under the caller's client lock; retain sequence order across threads."""
         self._require_open()
+        if self._read_only:
+            raise LoggingStateError("Cannot record events through a read-only logger.")
         event_id = uuid4().hex
         sequence = self._sequence_number + 1
         event: JsonObject = {

@@ -91,7 +91,13 @@ class SQLiteEventStore:
         min_free_bytes: int,
         expected_journal: JsonObject | None,
         diagnostic_context: JsonObject | None = None,
+        read_only: bool = False,
     ) -> None:
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a boolean.")
+        if read_only and open_mode != "existing":
+            raise ValueError("Read-only access requires an existing journal.")
+        self._read_only = read_only
         if not isinstance(db_path, (str, Path)):
             raise TypeError("db_path must be a string or Path.")
         path = Path(db_path)
@@ -136,6 +142,8 @@ class SQLiteEventStore:
             raise LoggingStateError("Create a new journal client in this process.")
 
     def _require_open(self, *, writing: bool = False) -> None:
+        if writing and self._read_only:
+            raise LoggingStateError("This journal client is read-only.")
         if self._connection is None:
             raise LoggingStateError("Journal is closed.")
         if writing and self._failed:
@@ -229,6 +237,8 @@ class SQLiteEventStore:
         self, error: BaseException, action: str, event: JsonObject | None = None
     ) -> None:
         """One independent best-effort diagnostic; never reenter the primary journal."""
+        if self._read_only:
+            return
         try:
             if getattr(error, "_logging_diagnostic_attempted", False):
                 return
@@ -368,7 +378,8 @@ class SQLiteEventStore:
                         raise LoggingConfigurationError(
                             "create requires a new journal path."
                         )
-                self._check_free_space(self.db_path.parent, self._min_free_bytes)
+                if not self._read_only:
+                    self._check_free_space(self.db_path.parent, self._min_free_bytes)
                 if previous_identity is None:
                     # Reserve the name exclusively; a racing creator cannot be adopted.
                     with self.db_path.open("xb"):
@@ -376,7 +387,8 @@ class SQLiteEventStore:
                     status = self.db_path.stat()
                     previous_identity = (status.st_dev, status.st_ino)
                 connection = sqlite3.connect(
-                    self.db_path.as_uri() + "?mode=rw",
+                    self.db_path.as_uri()
+                    + ("?mode=ro" if self._read_only else "?mode=rw"),
                     timeout=self._timeout,
                     isolation_level=None,
                     check_same_thread=False,
@@ -397,27 +409,37 @@ class SQLiteEventStore:
                     if actual != self._expected_journal:
                         raise JournalGenerationChanged(self._expected_journal, actual)
                 connection.execute("PRAGMA foreign_keys=ON")
-                connection.execute("PRAGMA synchronous=EXTRA")
-                connection.execute("BEGIN IMMEDIATE")
-                if self._check_schema(connection):
-                    if self._file_identity is not None or self._open_mode == "existing":
-                        raise LoggingStorageError("The known journal lost its schema.")
-                    self._create_tables(connection)
-                    connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
-                    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                connection.execute("COMMIT")
-                if (
-                    connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
-                    != "wal"
-                ):
-                    raise LoggingConfigurationError(
-                        "The journal requires SQLite WAL mode."
-                    )
-                connection.execute("PRAGMA synchronous=FULL")
-                if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
-                    raise LoggingConfigurationError(
-                        "SQLite FULL synchronization is required."
-                    )
+                if self._read_only:
+                    connection.execute("PRAGMA query_only=ON")
+                else:
+                    connection.execute("PRAGMA synchronous=EXTRA")
+                    connection.execute("BEGIN IMMEDIATE")
+                    if self._check_schema(connection):
+                        if (
+                            self._file_identity is not None
+                            or self._open_mode == "existing"
+                        ):
+                            raise LoggingStorageError(
+                                "The known journal lost its schema."
+                            )
+                        self._create_tables(connection)
+                        connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
+                        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    connection.execute("COMMIT")
+                    if (
+                        connection.execute("PRAGMA journal_mode=WAL")
+                        .fetchone()[0]
+                        .lower()
+                        != "wal"
+                    ):
+                        raise LoggingConfigurationError(
+                            "The journal requires SQLite WAL mode."
+                        )
+                    connection.execute("PRAGMA synchronous=FULL")
+                    if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
+                        raise LoggingConfigurationError(
+                            "SQLite FULL synchronization is required."
+                        )
                 if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
                     raise LoggingStorageError("Journal integrity check failed.")
                 info = self._read_journal_info(connection)
@@ -1792,6 +1814,10 @@ class SQLiteEventStore:
         diagnostics: str | Path | None = None,
     ) -> JsonObject:
         """Finalize an already restored journal; runner owns the file/process barrier."""
+        if self._read_only:
+            raise LoggingStateError(
+                "A read-only journal cannot finalize a restoration."
+            )
         self._check_process()
         manifest = copy_json_object(snapshot_manifest, "snapshot manifest")
         if manifest.keys() != {

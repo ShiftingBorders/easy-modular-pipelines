@@ -21,7 +21,12 @@ from core.runner_utils.runtimeio import process_identity, write_json
 class ResourceSampler:
     """Keep CPU baselines per process instance, independently of journal writes."""
 
-    def __init__(self, collector_id: str) -> None:
+    def __init__(
+        self, collector_id: str, settings: CollectorSettings | None = None
+    ) -> None:
+        from core.resource_utils.hardware import HardwareSampler
+
+        self._hardware = None if settings is None else HardwareSampler(settings)
         self.collector_id = collector_id
         self.host = process_identity(os.getpid())
         self._host_previous: float | None = None
@@ -117,6 +122,20 @@ class ResourceSampler:
                 observed_at,
                 reason=memory_reason,
             )
+        if self._hardware is not None:
+            for name, sample in self._hardware.sample().items():
+                measured = self._measurement(
+                    sample["value"],
+                    sample["unit"],
+                    "host",
+                    observed_at,
+                    reason=sample.get("reason"),
+                )
+                measured["attributes"].update(sample.get("attributes", {}))
+                measured["attributes"]["source"] = sample.get("attributes", {}).get(
+                    "provider", "psutil"
+                )
+                resources[name] = measured
         return {
             "series_id": f"host:{self.host['host_id']}:{self.host['boot_id']}",
             "context": context,
@@ -283,7 +302,7 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
     """Child entry point: only serializable settings and an owned pipe cross spawn."""
     collector_id = str(uuid4())
     writer = ResourceWriter(settings, collector_id)
-    sampler = ResourceSampler(collector_id)
+    sampler = ResourceSampler(collector_id, settings)
     revision = -1
     received_notice = False
     snapshot: JsonObject = {"context": {}, "logging_config_path": None, "targets": []}

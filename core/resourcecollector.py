@@ -98,7 +98,11 @@ class ResourceCollector:
                 self._failures += 1
                 self._restarts += 1
                 self._next_restart = time.monotonic() + delay
-                await asyncio.sleep(delay)
+                # Windows timers may wake before the requested delay has elapsed.
+                while time.monotonic() < self._next_restart:
+                    await asyncio.sleep(
+                        max(0.001, self._next_restart - time.monotonic())
+                    )
         except Exception as error:  # noqa: BLE001 - Even supervision failures are isolated from the controller.
             self._state = "unavailable"
             self._error = f"{type(error).__name__}: {error}"

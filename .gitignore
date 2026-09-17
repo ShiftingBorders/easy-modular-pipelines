@@ -17,5 +17,6 @@ wheels/
 
 # Private documentation
 private_docs
+/docs_private/
 
 TODO.md
