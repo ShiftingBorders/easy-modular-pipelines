@@ -12,6 +12,17 @@ wheels/
 # Disposable local and agent-generated artifacts
 .artifacts/
 
+# Generated experiment artifacts and runtime output
+shared_artifacts/
+/experiments/*
+!/experiments/.gitkeep
+/snapshots/
+/controller/
+/examples/**/experiments/*
+!/examples/**/experiments/.gitkeep
+/examples/**/snapshots/
+/examples/**/controller/
+
 # Local runtime databases
 *.db
 
