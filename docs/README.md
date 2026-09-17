@@ -16,6 +16,7 @@ experiments. Commands in these guides use the source checkout and its
 
 | Document | Contents |
 | --- | --- |
+| [CLI reference](cli.md) | Commands, server modes, configuration, waiting, shell, paths and exit codes. |
 | [Experiment template](experiment_template.md) | Required YAML fields, module and service references, settings, policies, and paths. |
 | [Service authoring](instructions/python_bridges.md) | ParticipantServer handlers, external processes, readiness, shutdown, and snapshots. |
 | [Participant API and protocol](instructions/participant_protocol.md) | StageClient, shared service API, identities, versioning, and result semantics. |

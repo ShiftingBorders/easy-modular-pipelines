@@ -58,6 +58,7 @@ above for now.
 | Task | Guide |
 | --- | --- |
 | Run your first experiment | [Quickstart](docs/quickstart.md) |
+| Use commands, configuration and the interactive shell | [CLI reference](docs/cli.md) |
 | Create a stage module | [Module authoring](docs/instructions/modules.md) |
 | Create a service or external-process proxy | [Service authoring](docs/instructions/python_bridges.md) |
 | Configure and run experiments | [Experiment guide](docs/basic_dag.md) |
