@@ -1,0 +1,13 @@
+{
+  "experiment_id": "exp-test",
+  "journal": {"journal_id": "journal-test", "generation": "generation-a"},
+  "observed_at": "2026-09-15T10:00:00+00:00",
+  "next_cursor": {"generation": "generation-a", "cursor": 1},
+  "items": [{
+    "event_id": "event-a", "event_type": "resources.recorded",
+    "occurred_at": "2026-09-15T10:00:00+00:00",
+    "context": {"experiment_id": "exp-test", "run_id": "run-test", "module_name": "prepare"},
+    "data": {"message": "Literal <script> and \"quotes\""},
+    "confirmation": "confirmed", "ignored": null
+  }]
+}

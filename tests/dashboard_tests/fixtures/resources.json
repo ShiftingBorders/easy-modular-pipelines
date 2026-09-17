@@ -1,0 +1,12 @@
+{
+  "observed_at": "2026-09-15T10:00:00+00:00",
+  "host_id": "runtime-fixture",
+  "metrics": {
+    "cpu": {"value": 31, "fresh": true, "exceeded": false},
+    "ram": {"value": 62, "fresh": true, "exceeded": false},
+    "vram": {"value": null, "fresh": false, "exceeded": false},
+    "disk": {"value": 91, "fresh": true, "exceeded": true},
+    "internet": {"receive_mbps": 5.2, "transmit_mbps": 1.1}
+  },
+  "history": {"cpu": [{"observed_at": "2026-09-15T10:00:00+00:00", "value": 31}]}
+}

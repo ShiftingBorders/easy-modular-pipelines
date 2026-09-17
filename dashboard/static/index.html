@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>EMP Dashboard</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" type="module"></script>
+</head>
+<body>
+  <header class="global-header">
+    <a class="brand" href="/?page=overview"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>EMP <small>Observability</small></a>
+    <div class="global-search"><span aria-hidden="true">⌕</span><input id="global-search" type="search" placeholder="Find experiments, screens or modules" aria-label="Search navigation" role="combobox" aria-controls="search-results" aria-expanded="false" aria-autocomplete="list" autocomplete="off"><kbd>Ctrl K</kbd><div id="search-results" role="listbox" hidden></div></div>
+    <div class="header-tools"><span class="connection" id="connection-status" role="status">Connecting</span><a class="bell" href="/?page=alerts" aria-label="Alerts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 0112 0v7l2 3H4l2-3zM10 21h4"/></svg><span id="alert-count">—</span></a></div>
+  </header>
+  <aside class="sidebar"><div class="nav-caption">OBSERVATION</div><nav id="navigation" aria-label="Main navigation"></nav><div class="quick-access"><div class="nav-caption">QUICK ACCESS</div><nav id="bookmarks" aria-label="Quick access"></nav></div></aside>
+  <main id="main" tabindex="-1"><div class="loading" role="status">Loading dashboard…</div></main>
+  <div id="toast" role="status" hidden></div>
+  <dialog id="details-dialog"><div class="dialog-head"><h2 id="detail-title">Details</h2><button class="icon-button" data-action="close-dialog" aria-label="Close details">×</button></div><div id="detail-content"></div></dialog>
+  <noscript>This dashboard requires JavaScript to display observations.</noscript>
+</body>
+</html>
