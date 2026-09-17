@@ -1,0 +1,84 @@
+# Testing
+
+Use Python 3.12, the project's `uv` environment, and standard-library
+`unittest`. Run commands from the repository root.
+
+## Existing suite
+
+```text
+uv sync --locked
+uv run python -m unittest discover -s tests -p "test_*.py" -v
+uv run python -m compileall core cli.py webserver.py dashboard
+uv run --with ruff ruff check core tests dashboard
+```
+
+The full suite includes filesystem, SQLite, subprocess, local HTTP/TCP, and
+resource-collector scenarios. Some integration cases take several minutes.
+Temporary outputs belong under `.artifacts/`.
+
+The repository's VS Code configuration uses `unittest`, the `tests` directory,
+and the `test_*.py` discovery pattern.
+
+## Selected suites
+
+| Area | Command |
+| --- | --- |
+| Module storage | `uv run python -m unittest tests.test_hashdb tests.test_modulemanager tests.test_seaweed -v` |
+| Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
+| Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
+| Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
+| Dashboard | `uv run python -m unittest discover -s tests/dashboard_tests -t . -p "test_*.py" -v` |
+
+The weather suite includes real timing intervals, processes, and journal
+behavior; do not assume that all scenarios finish immediately.
+
+An additional integration entry point is outside normal `test_*.py` discovery:
+
+```text
+uv run python -m unittest tests.integration_cli -v
+```
+
+It requires an available SeaweedFS executable and permission to start a local
+service. Do not point integration checks at valuable runtime data.
+
+## Dashboard
+
+Dashboard backend tests are included in the normal suite.
+`tests/dashboard_tests/test_browser.py` uses headless Edge and CDP through Node
+on Windows. It explicitly skips when prerequisites are unavailable.
+It does not add an external browser-test framework.
+
+The live external ICMP scenario is opt-in. In PowerShell:
+
+```powershell
+$env:EMP_DASHBOARD_LIVE_ICMP = "1"
+try {
+    uv run --locked python -B -m unittest discover -s tests/dashboard_tests -t . -p "test_*.py" -v
+} finally {
+    Remove-Item Env:EMP_DASHBOARD_LIVE_ICMP
+}
+```
+
+This scenario needs an actual Echo Reply from `www.google.com`.
+Automated tests do not display desktop notifications or play audio.
+For manual UI inspection, use a separate runtime project and configure both
+`project_root` and `system_api_url`.
+
+## Platform and environment requirements
+
+Platform-specific cases select the actual host OS; a Windows run does not
+validate Linux or WSL. Symbolic-link tests may skip on Windows without the
+required privilege; junction checks do not replace file-symlink checks.
+External ICMP availability depends on the network.
+
+A successful process test or SQLite commit is not proof of durability under
+power loss or storage failure. Report the command, OS, skips, and dependencies
+alongside any validation result rather than relying on an old test count.
+
+## Changing tests
+
+Follow [AGENTS.md](../AGENTS.md). Before adding or modifying tests, finalize the
+feature and create its Markdown plan under `.artifacts/test-plans/`.
+Describe affected files, observable behavior, relevant boundaries and errors,
+and open questions. Write test code only after the maintainer explicitly
+confirms the plan. Existing approval does not authorize new cases automatically.

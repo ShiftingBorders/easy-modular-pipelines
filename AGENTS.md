@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Python 3.12 library-first project managed with `uv`. Core pipeline code lives in `core/`; when the maintainer defines or authorizes new structure, keep reusable classes and services there, with one focused module per concern (for example, `core/modulemanager.py` and `core/hashdb.py`). `experimentrunner.py` and `webserver.py` are top-level entry points for batch and FastAPI workflows. Default, version-controlled configuration belongs in `default_settings/`, while tests belong in `tests/` and should mirror the source layout. Do not commit generated databases, caches, virtual environments, or build output.
+This is a Python 3.12 library-first project managed with `uv`. Core pipeline code lives in `core/`; when the maintainer defines or authorizes new structure, keep reusable classes and services there, with one focused module per concern (for example, `core/modulemanager.py` and `core/hashdb.py`). `webserver.py` owns the HTTP runtime and `cli.py` is its client; the separate dashboard starts with `uv run python -m dashboard`. Default, version-controlled configuration belongs in `default_settings/`, while tests belong in `tests/` and should mirror the source layout. Do not commit generated databases, caches, virtual environments, or build output.
 
 Library behavior must not depend on the caller's current working directory.
 Resolve relative paths stored in configuration files against the directory of
@@ -13,13 +13,14 @@ the configuration file that contains them. Preserve absolute configured paths.
 Use only the project environment managed by `uv` for project-related Python execution. Run scripts, approved tests, linters, formatters, and Python utilities supplied by skills or agents with `uv run <command>`. Do not invoke the system Python directly, activate or create a separate environment, or install project dependencies outside `uv`. Run `uv sync` first when the locked environment is unavailable or outdated.
 
 - `uv sync`: create or update `.venv` from `pyproject.toml` and `uv.lock`.
-- `uv run python -m compileall core experimentrunner.py webserver.py`: perform a quick syntax check.
+- `uv run python -m compileall core cli.py webserver.py dashboard`: perform a quick syntax check.
 - `uv run python -m unittest discover -s tests -p "test_*.py" -v`: run the
   approved standard-library test suite.
 - `uv run --with ruff ruff check core tests`: run Ruff without adding it as a
   project dependency.
-- `uv run python experimentrunner.py`: run the experiment entry point once implemented.
-- `uv run fastapi dev webserver.py`: start the development API after `webserver.py` exposes a FastAPI application.
+- `uv run python -B webserver.py --config <server.json> --mode maintenance`: start the module-registration server.
+- `uv run python -B webserver.py --config <server.json> --mode run`: start the experiment server after stopping maintenance mode.
+- `uv run python -B cli.py --config <cli.json> health`: check the selected server; wait for readiness before sending work.
 
 There is currently no packaging backend or external automated test dependency.
 The approved test framework is Python's standard-library `unittest`. When the
@@ -99,4 +100,47 @@ The repository has no commit history from which to infer a convention. Use short
 ## Security & Configuration
 
 Never commit credentials, local databases, or machine-specific paths. Validate JSON schemas before modifying persistent data.
+
+## Module Authoring and Framework Workflows
+
+Before developing modules or working with the framework, read the applicable
+public guides. They must remain usable from a fresh checkout without private files:
+
+- [Module authoring](docs/instructions/modules.md)
+- [Service and process-proxy authoring](docs/instructions/python_bridges.md)
+- [StageClient, ParticipantServer, and participant protocol](docs/instructions/participant_protocol.md)
+- [Quickstart](docs/quickstart.md)
+- [Creating and running experiments](docs/basic_dag.md)
+- [Experiment template reference](docs/experiment_template.md)
+- [Module registration and storage](docs/storage.md)
+- [Debugging experiments](docs/debugging.md)
+- [Logging and artifact paths](docs/logging.md)
+- [System HTTP API](docs/http_api.md)
+- [Dashboard](docs/dashboard.md)
+- [Existing tests and test approval](docs/testing.md)
+
+Use maintenance mode for `module add/validate/remove` and run mode for DAG
+execution. Switching modes requires restarting the server. `template create`
+is a local draft-generation command; it does not register modules or fill hashes.
+CLI filesystem arguments for remote operations refer to the server's machine.
+Do not confuse command admission or `--wait` completion with DAG completion.
+
+Use StageClient for ordinary Python stages and ParticipantServer for services;
+keep service handlers focused on their actual effects. The runner owns retry,
+snapshot, and recovery policies. Register changed module contents as a new
+version, including changes to a packaged README, and update template hashes.
+
+Keep public Markdown documentation in English and verify commands and examples
+against the current implementation. Keep internal design notes and historical
+validation reports in ignored `docs_private/`; public guides and required agent
+instructions must not link to or depend on those files.
+
+Keep module code directories immutable; write only to the runtime directories
+provided by the runner. Return experiment-relative paths for internal artifacts.
+A stage succeeds only with exit code 0 and one valid result JSON on stdout;
+send diagnostics through the library logger or captured stderr. Each process
+uses its own logger client for the shared journal. Runner owns DAG policies and
+experiment restoration; bridges report actual state and operate their assigned
+processes or services. These guides do not expand the implementation or test
+authorization boundaries above.
 

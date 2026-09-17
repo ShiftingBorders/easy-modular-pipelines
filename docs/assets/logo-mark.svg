@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="322" height="292" viewBox="448 186 644 584" role="img" aria-labelledby="logo-title logo-description">
+  <title id="logo-title">Easy Modular Pipelines</title>
+  <desc id="logo-description">Three square modules, with a hand placing the raised middle module. Easy Modular Pipelines.</desc>
+  <metadata>Hand and square geometry drawn as vectors. Lettering outlined from the bundled Manrope font, copyright 2018 The Manrope Project Authors, SIL Open Font License 1.1. No external fonts or raster images.</metadata>
+  <defs>
+    <mask id="hand-grip" maskUnits="userSpaceOnUse" x="650" y="470" width="240" height="240">
+      <rect x="650" y="470" width="240" height="240" fill="#fff"/>
+      <path d="M842 206 C816 236 758 255 704 279 C694 283 688 290 684 301 L639 391 C634 401 635 410 638 420 L660 503 C663 514 675 517 683 508 C695 494 696 474 691 453 L688 412 C703 401 712 391 718 382 L726 367 C733 367 740 364 746 360 C758 355 770 346 781 340 C806 353 831 365 842 381 C853 400 847 424 843 448 C839 470 839 490 847 506 C852 517 867 518 874 507 C883 478 891 460 900 437 C906 417 906 394 911 372 C916 346 925 317 928 290 C930 272 940 249 951 231 Z" fill="#000" stroke="#000" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <g id="mark" fill="none" stroke="#263238" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="468" y="570" width="180" height="180" rx="12"/>
+    <rect x="678" y="494" width="180" height="180" rx="12" stroke="#467695" mask="url(#hand-grip)"/>
+    <rect x="888" y="570" width="180" height="180" rx="12"/>
+    <path d="M842 206 C816 236 758 255 704 279 C694 283 688 290 684 301 L639 391 C634 401 635 410 638 420 L660 503 C663 514 675 517 683 508 C695 494 696 474 691 453 L688 412 C703 401 712 391 718 382 L726 367 C733 367 740 364 746 360 C758 355 770 346 781 340 C806 353 831 365 842 381 C853 400 847 424 843 448 C839 470 839 490 847 506 C852 517 867 518 874 507 C883 478 891 460 900 437 C906 417 906 394 911 372 C916 346 925 317 928 290 C930 272 940 249 951 231"/>
+    <path d="M746 360 C746 367 741 373 741 380 C758 380 774 387 774 400 C774 410 767 416 759 415 M718 382 L726 404 C741 402 756 409 761 419 C767 430 762 440 750 442 L715 442 C702 440 691 429 688 412"/>
+    <path d="M657 354 C675 334 690 312 703 301"/>
+  </g>
+</svg>
