@@ -207,11 +207,21 @@ class SQLiteEventStore:
         identity = (status.st_dev, status.st_ino)
         if self._file_identity is not None and identity != self._file_identity:
             raise LoggingStorageError("The journal file was replaced.")
-        with self.db_path.open("rb") as source:
-            if source.read(16) != b"SQLite format 3\x00":
-                raise LoggingStorageError(
-                    "The journal file has an invalid SQLite header."
-                )
+        if status.st_size < 16:
+            raise LoggingStorageError("The journal file has an invalid SQLite header.")
+        # A raw open/read/close would release this process's SQLite locks on
+        # POSIX. A fresh SQLite connection checks the disk header without
+        # bypassing SQLite's file-descriptor and lock management.
+        reader = sqlite3.connect(
+            self.db_path.as_uri() + "?mode=ro",
+            timeout=self._timeout,
+            isolation_level=None,
+            uri=True,
+        )
+        try:
+            reader.execute("PRAGMA schema_version").fetchone()
+        finally:
+            reader.close()
         return identity
 
     def _check_health(self, *, writing: bool = False) -> None:
@@ -2082,7 +2092,10 @@ class SQLiteEventStore:
                     (restoration_id, parameters, json.dumps(result, sort_keys=True)),
                 )
                 self._validate_snapshot_source(connection)
-                if self._check_file() != file_identity:
+                # Content was checked through this transaction. A second SQLite
+                # reader here could wait on our own write lock after cache spill.
+                status = self.db_path.stat()
+                if (status.st_dev, status.st_ino) != file_identity:
                     raise LoggingStorageError("Restored file changed before commit.")
                 connection.execute("COMMIT")
                 self._journal_id, self._generation = (

@@ -103,6 +103,14 @@ class ServerRecoveryTests(ServerTestCase):
         server.observe_children()
         (server.control / "interrupt").touch()
         await asyncio.wait_for(server.process.wait(), 20)
+        # Python's resource tracker can finish just after the HTTP owner exits.
+        await wait_until(
+            lambda: all(
+                not process_running(identity["pid"])
+                for identity in server.owned.values()
+            ),
+            timeout=15,
+        )
         for identity in server.owned.values():
             self.assertFalse(process_running(identity["pid"]), identity)
         self.assertEqual(recovery_candidates(self.w.source), [])

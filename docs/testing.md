@@ -7,6 +7,7 @@ Use Python 3.12, the project's `uv` environment, and standard-library
 
 ```text
 uv sync --locked
+uv run python scripts/download_seaweedfs.py
 uv run python -m unittest discover -s tests -p "test_*.py" -v
 uv run python -m compileall core cli.py webserver.py dashboard
 uv run --with ruff ruff check core tests dashboard

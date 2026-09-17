@@ -7,7 +7,7 @@ import shutil
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from core.logger import OperationLogger
 from core.logger_utils.events import LoggingStorageError
@@ -96,17 +96,19 @@ class ArchiveFailureTests(ArchiveTestCase):
     async def test_primary_error_survives_failed_staging_cleanup(self):
         """F: the original copy error remains primary and the leftover path is reported."""
         await self.w.prepare()
-        original = shutil.rmtree
+        original = self.w.archiver._workspace
 
         def fail_cleanup(path, *args, **kwargs):
-            if Path(path).name.startswith("experiment-archive-"):
-                raise OSError("cleanup failed")
-            return original(path, *args, **kwargs)
+            temporary = original(path, *args, **kwargs)
+            # Keep real cleanup for teardown; only this workspace fails during creation.
+            self.addCleanup(temporary.cleanup)
+            temporary.cleanup = Mock(side_effect=OSError("cleanup failed"))
+            return temporary
 
         primary = OSError("primary copy failure")
         with (
             patch.object(self.w.archiver, "_copy", side_effect=primary),
-            patch("shutil.rmtree", side_effect=fail_cleanup),
+            patch.object(self.w.archiver, "_workspace", side_effect=fail_cleanup),
             self.assertRaises(OSError) as raised,
         ):
             await self.w.create()
@@ -122,15 +124,16 @@ class ArchiveFailureTests(ArchiveTestCase):
     async def test_cleanup_failure_after_publication_reports_completed_archive(self):
         """F: cleanup failure does not claim the already published archive is absent."""
         await self.w.prepare()
-        original = shutil.rmtree
+        original = self.w.archiver._workspace
 
         def fail_cleanup(path, *args, **kwargs):
-            if Path(path).name.startswith("experiment-archive-"):
-                raise OSError("cleanup failed")
-            return original(path, *args, **kwargs)
+            temporary = original(path, *args, **kwargs)
+            self.addCleanup(temporary.cleanup)
+            temporary.cleanup = Mock(side_effect=OSError("cleanup failed"))
+            return temporary
 
         with (
-            patch("shutil.rmtree", side_effect=fail_cleanup),
+            patch.object(self.w.archiver, "_workspace", side_effect=fail_cleanup),
             self.assertRaises(OSError) as raised,
         ):
             await self.w.create()

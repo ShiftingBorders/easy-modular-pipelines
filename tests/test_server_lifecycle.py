@@ -2,6 +2,7 @@
 
 import asyncio
 import multiprocessing
+import os
 from unittest.mock import patch
 
 from core.runner_utils.runtimeio import read_json
@@ -51,7 +52,8 @@ class ServerLifecycleTests(ServerTestCase):
         self.addAsyncCleanup(competing.close)
         await competing.start(expect_ready=False)
         self.assertNotEqual(await asyncio.wait_for(competing.process.wait(), 15), 0)
-        self.assertIn("PermissionError", (competing.control / "server.log").read_text())
+        expected_error = "PermissionError" if os.name == "nt" else "BlockingIOError"
+        self.assertIn(expected_error, (competing.control / "server.log").read_text())
         await runtime.close()
         self.assertFalse(process_running(identity["pid"]))
         fresh = await self.start_server()
