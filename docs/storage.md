@@ -24,7 +24,28 @@ the server uses a different address.
 By default the server creates missing HashDB configuration and schema, initializes
 the database, and owns a local SeaweedFS process with data under the project's
 `seaweedfs/`. The executable is `core/seaweedfs/weed.exe` on Windows or
-`core/seaweedfs/weed` on Linux; the latter needs execute permission.
+`core/seaweedfs/weed` on Linux. Install it from the repository root before
+starting the server:
+
+```text
+uv run python scripts/download_seaweedfs.py
+```
+
+The standalone script installs SeaweedFS **4.45**, pinned to the exact original
+binaries: `windows_amd64.zip` for Windows and `linux_amd64_full.tar.gz` for Linux
+from the [official release](https://github.com/seaweedfs/seaweedfs/releases/tag/4.45).
+Both builds are amd64; automatic selection rejects other operating systems and
+architectures. Use `--platform windows`, `--platform linux`, or `--platform all`
+to prepare binaries for another machine or both supported platforms.
+
+The script checks fixed SHA-256 hashes for both the archive and executable,
+sets Linux execute permissions, and installs into this checkout regardless of
+the caller's working directory. Matching installed files are verified and reused
+without network access. A different existing binary causes an error; move it
+aside before retrying. Downloads are staged under `.artifacts/tmp/` and cleaned
+up on success or failure; a binary is installed only after verification.
+The library does not download anything automatically. These two executables
+are ignored by Git; the script requires only Python's standard library.
 
 Defaults are in [webserver.json](../default_settings/webserver.json) and
 [seaweed_args.json](../default_settings/seaweed_args.json). For an existing Filer,
