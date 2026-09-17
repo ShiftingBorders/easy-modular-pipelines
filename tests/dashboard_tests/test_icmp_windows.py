@@ -18,6 +18,7 @@ from dashboard import icmp_worker
 from dashboard.icmp import ICMPMonitor
 from tests.dashboard_tests.helpers import (
     FIXTURES,
+    cleanup_directory,
     icmp_settings,
     probe_result,
     temporary_directory,
@@ -173,7 +174,7 @@ class WindowsProbeTests(unittest.TestCase):
 class WindowsProcessCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
         self.monitor.settings = icmp_settings()

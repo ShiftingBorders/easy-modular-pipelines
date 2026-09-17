@@ -17,6 +17,53 @@ from tests.dashboard_tests.helpers import FIXTURES, ResponseStream, settings_doc
 
 
 class SystemAPIClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_accepts_receipt_and_preserves_upstream_error_code(self):
+        self.responses.append(
+            httpx.Response(202, json={"command_id": "id", "state": "pending"})
+        )
+        receipt = await self.client.submit({"command": "pause"})
+        self.assertEqual(receipt["state"], "pending")
+        self.assertEqual(self.requests[-1].method, "POST")
+        self.assertEqual(json.loads(self.requests[-1].content), {"command": "pause"})
+        for status in (401, 403, 409):
+            self.responses.append(
+                httpx.Response(
+                    status,
+                    json={"error": {"code": "runtime_policy", "message": "rejected"}},
+                )
+            )
+            with self.assertRaises(SystemAPIError) as failure:
+                await self.client.submit({"command": "pause"})
+            self.assertEqual(failure.exception.status_code, status)
+            self.assertEqual(failure.exception.upstream_code, "runtime_policy")
+
+    async def test_token_is_loaded_from_environment_and_sent_only_as_header(self):
+        await self.client.close()
+        self.client.token_env = "EMP_DASHBOARD_TEST_TOKEN"
+        actual = httpx.AsyncClient
+
+        def create(**options):
+            return actual(transport=httpx.MockTransport(self.respond), **options)
+
+        with (
+            patch.dict(os.environ, {"EMP_DASHBOARD_TEST_TOKEN": "test-only-secret"}),
+            patch("dashboard.api_client.httpx.AsyncClient", side_effect=create),
+        ):
+            await self.client.open()
+        self.responses.append(httpx.Response(200, json={"fresh": True}))
+        await self.client.read("state")
+        self.assertEqual(
+            self.requests[-1].headers["Authorization"], "Bearer test-only-secret"
+        )
+        self.assertNotIn("test-only-secret", str(self.requests[-1].url))
+        await self.client.close()
+        for token in ("", "bad token", "bad\nvalue"):
+            with (
+                patch.dict(os.environ, {"EMP_DASHBOARD_TEST_TOKEN": token}),
+                self.assertRaises(ValueError),
+            ):
+                await self.client.open()
+
     async def asyncSetUp(self) -> None:
         self.requests = []
         self.responses = []

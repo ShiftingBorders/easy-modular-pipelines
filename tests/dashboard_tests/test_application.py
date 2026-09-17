@@ -13,23 +13,51 @@ import httpx
 from dashboard.application import create_app
 from tests.dashboard_tests.helpers import (
     DASHBOARD,
-    FIXTURES,
     ProbeProcess,
+    cleanup_directory,
     icmp_settings,
     temporary_directory,
     write_settings,
 )
+from tests.dashboard_tests.integration_helpers import JournalWorkspace, resource_status
 
 WRITE_HEADERS = {"X-Dashboard-Request": "1", "Origin": "http://dashboard.test"}
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_page_success_does_not_change_global_runtime_connection(self):
+        self.app.state.views._live = {
+            "available": False,
+            "fresh": False,
+            "connection_error": "offline",
+        }
+        for page in ("overview", "experiments", "modules", "compute", "alerts"):
+            self.assertEqual(
+                (await self.http.get("/api/system/" + page)).status_code, 200
+            )
+            self.assertFalse(
+                (await self.http.get("/api/application")).json()["system_connection"][
+                    "connected"
+                ]
+            )
+        self.app.state.views._live_at = 0
+        await self.app.state.views.state(refresh=True)
+        self.assertTrue(
+            (await self.http.get("/api/application")).json()["system_connection"][
+                "connected"
+            ]
+        )
+
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
+        self.workspace = JournalWorkspace(self.directory / "project")
+        self.addCleanup(self.workspace.close)
         self.config = write_settings(
-            self.directory, system_api_url="http://upstream.test/api/"
+            self.directory,
+            system_api_url="http://upstream.test/api/",
+            project_root=str(self.workspace.root),
         )
         self.upstream_requests = []
         self.action = None
@@ -55,6 +83,16 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.app.router.lifespan_context(self.app)
             )
 
+        for task in self.app.state.views._source_tasks:
+            task.cancel()
+        await asyncio.gather(
+            *self.app.state.views._source_tasks, return_exceptions=True
+        )
+        self.app.state.views._source_tasks.clear()
+        await self.app.state.views.state(refresh=True)
+        await self.app.state.views._refresh_resources()
+        self.upstream_requests.clear()
+
     async def spawn(self, *args, **kwargs):
         process = ProbeProcess()
         self.probes.append((args, process))
@@ -64,7 +102,24 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.upstream_requests.append(request)
         if self.action:
             return await self.action(request)
-        return httpx.Response(200, json={"items": []})
+        if request.url.path == "/api/state":
+            return httpx.Response(
+                200,
+                json={
+                    "experiment_id": "exp-test",
+                    "fresh": True,
+                    "phase": "waiting",
+                    "mode": "paused",
+                    "cycle_number": 3,
+                    "services": [],
+                },
+            )
+        if request.url.path == "/api/resources":
+            return httpx.Response(200, json=resource_status())
+        return httpx.Response(
+            200,
+            json={"samples": [], "cursor": 0, "history_id": "history", "gap": False},
+        )
 
     async def test_application_information_identifies_dashboard_host(self) -> None:
         response = await self.http.get("/api/application")
@@ -96,7 +151,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             (await self.http.get("/static/../settings.json")).status_code, 404
         )
 
-    async def test_root_resource_routes_pass_to_expected_upstream_path(self) -> None:
+    async def test_root_routes_combine_local_history_and_cached_live_sources(self):
         for resource in [
             "overview",
             "experiments",
@@ -107,24 +162,22 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(resource=resource):
                 response = await self.http.get(f"/api/system/{resource}")
-                self.assertEqual(response.status_code, 200)
-                self.assertEqual(
-                    self.upstream_requests[-1].url.path, f"/api/{resource}"
-                )
+                self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.upstream_requests, [])
+        self.assertEqual(
+            (await self.http.get("/api/system/experiments")).json()["items"][0][
+                "experiment_id"
+            ],
+            "exp-test",
+        )
+        self.assertEqual(
+            (await self.http.get("/api/system/compute")).json()["metrics"]["cpu"][
+                "value"
+            ],
+            25,
+        )
 
-    async def test_experiment_routes_keep_identifier_and_paging_query(self) -> None:
-        expected = json.loads((FIXTURES / "events.json").read_text())
-
-        async def respond(request):
-            return httpx.Response(200, json=expected)
-
-        self.action = respond
-        parameters = {
-            "run_id": "run-test",
-            "view": "effective",
-            "limit": "100",
-            "cursor": '{"cursor":12,"generation":"g"}',
-        }
+    async def test_experiment_routes_read_real_local_journal_and_page_it(self):
         for view in [
             "summary",
             "runs",
@@ -141,17 +194,26 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(view=view):
                 response = await self.http.get(
-                    f"/api/system/experiments/exp-test/{view}", params=parameters
+                    f"/api/system/experiments/exp-test/{view}",
+                    params={"run_id": "run-test", "limit": 1},
                 )
-                self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json(), expected)
-                self.assertEqual(
-                    dict(self.upstream_requests[-1].url.params), parameters
-                )
-                self.assertEqual(
-                    self.upstream_requests[-1].url.path,
-                    f"/api/experiments/exp-test/{view}",
-                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["experiment_id"], "exp-test")
+        first = (
+            await self.http.get(
+                "/api/system/experiments/exp-test/events", params={"limit": 1}
+            )
+        ).json()
+        second = (
+            await self.http.get(
+                "/api/system/experiments/exp-test/events",
+                params={"limit": 1, "cursor": json.dumps(first["next_cursor"])},
+            )
+        ).json()
+        self.assertNotEqual(
+            first["items"][0]["event_id"], second["items"][0]["event_id"]
+        )
+        self.assertEqual(self.upstream_requests, [])
 
     async def test_unknown_resources_and_bad_identifiers_never_reach_upstream(
         self,
@@ -194,9 +256,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 200,
             )
 
-    async def test_nonfinite_and_corrupted_resource_responses_remain_errors(
-        self,
-    ) -> None:
+    async def test_nonfinite_and_corrupt_resources_are_visible_without_fake_zero(self):
         for response in [
             httpx.Response(200, content=b'{"cpu":NaN}'),
             httpx.Response(200, content=b'{"metrics":'),
@@ -215,59 +275,62 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 return response
 
             self.action = respond
-            result = await self.http.get("/api/system/compute")
-            self.assertEqual(result.status_code, 502)
-            self.assertFalse(result.json()["available"])
-            self.assertIn("error", result.json())
-            self.assertNotIn("metrics", result.json())
-            self.assertEqual(result.headers["cache-control"], "no-store")
+            self.app.state.views._resource_at = 0
+            await self.app.state.views._refresh_resources()
+            result = (await self.http.get("/api/system/compute")).json()
+            self.assertTrue(result["error"])
+            self.assertFalse(result["metrics"]["cpu"]["fresh"])
+            self.assertEqual(result["metrics"]["cpu"]["value"], 25)
             self.assertEqual((await self.http.get("/api/icmp")).status_code, 200)
 
-    async def test_resource_disconnect_and_recovery_do_not_restart_dashboard(
-        self,
-    ) -> None:
-        fail = False
-        expected = json.loads((FIXTURES / "resources.json").read_text())
+    async def test_resource_disconnect_and_recovery_preserve_dashboard(self):
+        async def fail(request):
+            raise httpx.ReadError("source disconnected")
 
-        async def respond(request):
-            if fail:
-                raise httpx.ReadError("resource source disconnected")
-            return httpx.Response(200, json=expected)
+        self.action = fail
+        self.app.state.views._resource_at = 0
+        await self.app.state.views._refresh_resources()
+        result = (await self.http.get("/api/system/compute")).json()
+        self.assertFalse(result["metrics"]["cpu"]["fresh"])
+        self.assertIn("connect", result["error"])
+        self.action = None
+        self.app.state.views._resource_at = 0
+        await self.app.state.views._refresh_resources()
+        self.assertTrue(
+            (await self.http.get("/api/system/compute")).json()["metrics"]["cpu"][
+                "fresh"
+            ]
+        )
 
-        self.action = respond
-        self.assertEqual((await self.http.get("/api/system/compute")).json(), expected)
-        fail = True
-        unavailable = await self.http.get("/api/system/compute")
-        self.assertEqual(unavailable.status_code, 503)
-        self.assertEqual(unavailable.json()["error"]["code"], "connection_error")
-        fail = False
-        self.assertEqual((await self.http.get("/api/system/compute")).json(), expected)
-
-    async def test_pending_resource_request_does_not_block_local_icmp(self) -> None:
+    async def test_pending_source_does_not_block_pages_or_local_icmp(self):
         started, release = asyncio.Event(), asyncio.Event()
 
         async def respond(request):
             started.set()
             await release.wait()
-            raise httpx.ReadTimeout("resource timeout")
+            raise httpx.ReadTimeout("source timeout")
 
         self.action = respond
-        await self.http.put(
-            "/api/icmp/settings", headers=WRITE_HEADERS, json=icmp_settings()
-        )
-        pending = asyncio.create_task(self.http.get("/api/system/compute"))
+        self.app.state.views._resource_at = 0
+        pending = asyncio.create_task(self.app.state.views._refresh_resources())
         try:
             await asyncio.wait_for(started.wait(), 1)
+            page = await asyncio.wait_for(self.http.get("/api/system/compute"), 1)
+            self.assertEqual(page.status_code, 200)
+            await self.http.put(
+                "/api/icmp/settings", headers=WRITE_HEADERS, json=icmp_settings()
+            )
             result = await asyncio.wait_for(
                 self.http.post("/api/icmp/probe", headers=WRITE_HEADERS), 1
             )
-            self.assertEqual(result.status_code, 200)
             self.assertEqual(result.json()["status"], "reply")
             self.assertFalse(pending.done())
         finally:
             release.set()
-            response = await pending
-        self.assertEqual(response.status_code, 504)
+            await pending
+        self.assertIn(
+            "deadline", (await self.http.get("/api/system/compute")).json()["error"]
+        )
 
     async def test_icmp_configuration_and_probe_persist_on_dashboard_host(self) -> None:
         response = await self.http.put(

@@ -9,13 +9,17 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from dashboard.__main__ import main
-from tests.dashboard_tests.helpers import temporary_directory, write_settings
+from tests.dashboard_tests.helpers import (
+    cleanup_directory,
+    temporary_directory,
+    write_settings,
+)
 
 
 class CommandLineTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = temporary_directory()
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.config = write_settings(self.directory)
         self.server = SimpleNamespace(run=Mock())

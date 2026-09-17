@@ -41,6 +41,10 @@ class ResourceStateTests(unittest.TestCase):
             "stable_reset_seconds": 60,
             "logging_busy_timeout_seconds": 0.05,
             "logging_retry_seconds": 5,
+            "disk_path": str(DEFAULT_CONFIG.parent.parent.resolve()),
+            "network_interface": None,
+            "network_reference_address": "1.1.1.1",
+            "gpu_interval_seconds": 5,
         }
         path = write_settings(self.root, history_seconds=42)
         before = Path.cwd()
@@ -62,9 +66,17 @@ class ResourceStateTests(unittest.TestCase):
             {key: value for key, value in valid.items() if key != removed}
             for removed in valid
         )
-        for key in valid:
+        for key in valid.keys() - {
+            "disk_path",
+            "network_interface",
+            "network_reference_address",
+        }:
             for value in (True, None, "1", -1, 0, float("inf"), float("nan")):
                 documents.append({**valid, key: value})
+        for key in ("disk_path", "network_interface", "network_reference_address"):
+            for value in (True, 1, [], {}, ""):
+                documents.append({**valid, key: value})
+        documents.append({**valid, "network_reference_address": "not-an-ip"})
         for key, value in (
             ("sample_interval_seconds", 0.01),
             ("max_buffer_bytes", 4095),

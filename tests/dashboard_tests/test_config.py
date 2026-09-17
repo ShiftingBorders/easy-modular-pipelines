@@ -10,6 +10,7 @@ from unittest.mock import patch
 from dashboard.config import load_settings
 from dashboard.icmp import ICMPMonitor
 from tests.dashboard_tests.helpers import (
+    cleanup_directory,
     settings_document,
     temporary_directory,
     write_settings,
@@ -17,9 +18,37 @@ from tests.dashboard_tests.helpers import (
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_project_paths_overrides_and_history_limits(self):
+        path = write_settings(
+            self.directory,
+            project_root="project",
+            history_max_events=12,
+            history_max_bytes=4096,
+            system_api_token_env="EMP_TEST_TOKEN",
+        )
+        config = load_settings(path)
+        self.assertEqual(config["project_root"], self.directory / "project")
+        self.assertEqual(config["history_max_events"], 12)
+        absolute = str(self.directory / "other")
+        self.assertEqual(
+            load_settings(path, {"project_root": absolute})["project_root"],
+            Path(absolute),
+        )
+        for options in (
+            {"history_max_events": True},
+            {"history_max_bytes": 0},
+            {"project_root": []},
+            {"system_api_token_env": "bad name"},
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                load_settings(path, options)
+
     def setUp(self) -> None:
         temporary = temporary_directory()
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
 
     def test_import_does_not_start_processes_or_create_runtime_files(self) -> None:

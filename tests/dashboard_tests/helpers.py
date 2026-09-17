@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import os
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -16,6 +18,35 @@ def temporary_directory() -> tempfile.TemporaryDirectory:
     parent = PROJECT_ROOT / ".artifacts" / "tmp" / "dashboard" / "test-runs"
     parent.mkdir(parents=True, exist_ok=True)
     return tempfile.TemporaryDirectory(dir=parent)
+
+
+def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
+    """Allow Windows to finish pending directory deletion, never hide a locked file."""
+    root = Path(directory.name).resolve()
+    parent = (PROJECT_ROOT / ".artifacts/tmp/dashboard/test-runs").resolve()
+    if root.parent != parent:
+        raise ValueError("Dashboard test cleanup escaped its scratch directory.")
+    for attempt in range(5):
+        try:
+            directory.cleanup()
+            return
+        except OSError as error:
+            if (
+                os.name != "nt"
+                or getattr(error, "winerror", None) != 145
+                or attempt == 4
+            ):
+                raise
+            failed = Path(error.filename).resolve()
+            if not failed.is_relative_to(root):
+                raise
+            time.sleep(0.05)
+            try:
+                has_entries = any(failed.iterdir())
+            except FileNotFoundError:
+                has_entries = False
+            if has_entries:
+                raise
 
 
 def settings_document(**changes) -> dict:

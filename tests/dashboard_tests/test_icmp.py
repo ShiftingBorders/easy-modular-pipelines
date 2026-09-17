@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 from dashboard.icmp import ICMPMonitor, validate_icmp_settings
 from tests.dashboard_tests.helpers import (
     ProbeProcess,
+    cleanup_directory,
     icmp_settings,
     probe_result,
     temporary_directory,
@@ -88,7 +89,7 @@ class ICMPSettingsTests(unittest.TestCase):
 class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
         # Exercise explicit probe calls independently of the periodic scheduler.

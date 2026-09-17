@@ -441,12 +441,13 @@ document.addEventListener("submit", async event => {
         return;
     }
     const form=event.target;
-    if (!["run-form","alert-rule-form","notification-form"].includes(form.id)) return;
+    const formId=form.getAttribute("id");
+    if (!["run-form","alert-rule-form","notification-form"].includes(formId)) return;
     event.preventDefault();
     const fields=new FormData(form);
     try {
-        if (form.id === "run-form") { await sendCommand("run", {experiment_id:fields.get("experiment_id"),template_path:fields.get("template_path")}); return; }
-        if (form.id === "notification-form") {
+        if (formId === "run-form") { await sendCommand("run", {experiment_id:fields.get("experiment_id"),template_path:fields.get("template_path")}); return; }
+        if (formId === "notification-form") {
             await request("/api/alerts/notifications",{method:"PUT",headers:{"Content-Type":"application/json","X-Dashboard-Request":"1"},body:JSON.stringify({desktop:fields.has("desktop"),sound:fields.has("sound"),on_recovery:fields.has("on_recovery"),repeat_seconds:Number(fields.get("repeat_seconds"))})});
         } else {
             const rule={name:fields.get("name"),enabled:fields.has("enabled"),kind:fields.get("kind"),metric:fields.get("metric"),operator:fields.get("operator"),threshold:Number(fields.get("threshold")),duration_seconds:Number(fields.get("duration_seconds")),window_seconds:Number(fields.get("window_seconds")),experiment_id:fields.get("experiment_id")||null};

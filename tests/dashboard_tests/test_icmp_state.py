@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 from dashboard.icmp import ICMPMonitor
 from tests.dashboard_tests.helpers import (
     ProbeProcess,
+    cleanup_directory,
     icmp_settings,
     temporary_directory,
 )
@@ -24,7 +25,7 @@ from tests.dashboard_tests.helpers import (
 class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
         self.addAsyncCleanup(self.monitor.close)

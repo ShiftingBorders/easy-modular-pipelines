@@ -264,7 +264,7 @@ def experiment_views(
         {"from": left["stage_id"], "to": right["stage_id"]}
         for left, right in pairwise(stages)
     ]
-    if stages and template.get("cycles", 1) > 1:
+    if stages and isinstance(template.get("cycles"), int) and template["cycles"] > 1:
         edges.append(
             {
                 "from": stages[-1]["stage_id"],
@@ -324,7 +324,10 @@ def experiment_views(
     valid_cycles = {}
     grouped = defaultdict(list)
     for attempt in attempts.values():
-        if attempt.get("template_revision_id") == revision_id:
+        if (
+            attempt.get("template_revision_id") == revision_id
+            and attempt.get("run_id") == current_run
+        ):
             grouped[attempt.get("cycle_number")].append(attempt)
     stage_ids = {stage["stage_id"] for stage in stages}
     for cycle, members in grouped.items():
@@ -348,7 +351,7 @@ def experiment_views(
                     "finished_at": max(ends),
                 }
     measurements = cycle_measurements(
-        effective, attempts, operations, valid_cycles, revision_id
+        effective, attempts, operations, valid_cycles, revision_id, current_run
     )
     total_cycles = template.get("cycles")
     completed = max(0, (observed.get("cycle_number") or 1) - 1)
@@ -470,6 +473,7 @@ def cycle_measurements(
     operations: dict,
     cycles: dict,
     revision_id: str | None,
+    run_id: str | None = None,
 ) -> list[dict]:
     buckets = defaultdict(list)
     for event in events:
@@ -483,6 +487,7 @@ def cycle_measurements(
             context.get("cycle_number") not in cycles
             or context.get("template_revision_id") != revision_id
             or not context.get("module_name")
+            or (run_id is not None and context.get("run_id") != run_id)
         ):
             continue
         for name, measurement in event["data"]["resources"].items():
