@@ -55,6 +55,7 @@ class ModuleManagerTestCase(unittest.TestCase):
         self.root = Path(self.workspace.name).resolve()
         self.source = self.root / "source"
         self.source.mkdir()
+        self._write_manifest(self.source, "demo", "1")
         (self.source / "main.py").write_bytes(b"print('module')\n")
         (self.source / "nested").mkdir()
         (self.source / "nested" / "data.bin").write_bytes(b"\x00\xff\x01")
@@ -91,6 +92,23 @@ class ModuleManagerTestCase(unittest.TestCase):
         self.addCleanup(self.archives.close)
         self.manager = ModuleManager(
             self.storage, self.hashes, self.archives, self.work
+        )
+
+    def _write_manifest(self, folder, name, version):
+        """Provide a real module contract without bypassing production validation."""
+        (folder / "module.yaml").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "name": name,
+                    "version": version,
+                    "role": "stage",
+                    "implementation": "full",
+                    "commands": {"start": ["python", "-B", "main.py"]},
+                    "defaults": {},
+                }
+            ),
+            encoding="utf-8",
         )
 
     def _handle_filer(self, request):
@@ -812,7 +830,7 @@ class FileAndPackageTests(ModuleManagerTestCase):
                 )
                 self.assertEqual(
                     manager._collect_module_files(self.source),
-                    [Path("empty.txt"), Path("main.py")],
+                    [Path("empty.txt"), Path("main.py"), Path("module.yaml")],
                 )
                 before = manager.module_hash("demo", self.source)
                 (self.source / "nested" / "data.bin").write_bytes(b"ignored change")
@@ -1020,7 +1038,10 @@ class RegistrationRepeatTests(ModuleManagerTestCase):
     def test_versions_names_and_reregistration_are_independent(self):
         """FLOW-08, FLOW-09."""
         for name, version in (("demo", "1"), ("demo", "2"), ("other", "1")):
-            self.assertIs(self._register(name, version), True)
+            source = self.root / f"source-{name}-{version}"
+            shutil.copytree(self.source, source)
+            self._write_manifest(source, name, version)
+            self.assertIs(self.manager.register_module(name, version, source), True)
         self.manager.unregister_module("demo", "1")
         self.assertEqual(set(self.objects), {"/modules/demo/2", "/modules/other/1"})
         self.assertTrue(self.hashes.get_module_hash("demo", "2"))
@@ -1139,6 +1160,9 @@ class ReplacementAndCleanupTests(ModuleManagerTestCase):
         valid_archive = self.root / "input.tar.xz"
         valid_archive.write_bytes(self._archive_bytes([("data", b"data")]))
         self._store_package()
+        other_source = self.root / "other-source"
+        shutil.copytree(self.source, other_source)
+        self._write_manifest(other_source, "other", "1")
         original_cleanup = tempfile.TemporaryDirectory.cleanup
         cases = (
             (
@@ -1163,7 +1187,11 @@ class ReplacementAndCleanupTests(ModuleManagerTestCase):
                 "write_text",
                 lambda: self.manager._add_hash_file("a" * 64, self.source),
             ),
-            ("register-module-", "_compress_folder", lambda: self._register("other")),
+            (
+                "register-module-",
+                "_compress_folder",
+                lambda: self.manager.register_module("other", "1", other_source),
+            ),
             (
                 "extract-module-",
                 "retrieve_module",
@@ -1293,7 +1321,8 @@ class PlatformTests(ModuleManagerTestCase):
         archive_path = self.manager._compress_folder(self.source, self.root / "out")
         with tarfile.open(archive_path, "r:xz") as archive:
             self.assertEqual(
-                set(archive.getnames()), {"main.py", "empty.txt", "nested/data.bin"}
+                set(archive.getnames()),
+                {"main.py", "module.yaml", "empty.txt", "nested/data.bin"},
             )
         with self.assertRaises(ValueError):
             self.manager._replace_folder(self.root / "target", self.source)

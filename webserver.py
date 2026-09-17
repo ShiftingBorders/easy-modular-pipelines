@@ -138,7 +138,13 @@ async def health(request: Request) -> JSONResponse:
 
 
 async def submit_command(request: Request) -> JSONResponse:
-    """Submit command/args/target, with an optional UUID command_id. HTTP 202 is admission."""
+    """Submit a command; HTTP 202 is admission, not completion.
+
+    Maintenance accepts module.add {folder}, module.validate {folder} or
+    {name, version}, and module.remove {name, version}. Successful add and
+    stored validation return data.module with name/version/hash for templates.
+    Module folders are absolute paths on the server. Run mode rejects module.*.
+    """
     runtime = runtime_for(request)
     document = await request_document(request, runtime)
     try:
@@ -187,6 +193,7 @@ async def read_controller(
             "invalid_request": 400,
             "not_found": 404,
             "invalid_state": 409,
+            "invalid_mode": 409,
             "unsupported_feature": 501,
             "journal_unavailable": 503,
             "response_too_large": 502,
@@ -336,9 +343,17 @@ def main() -> None:
         "--project-root", type=Path, help="Project directory owned by this server."
     )
     parser.add_argument(
-        "--hash-config", type=Path, help="Existing HashDB JSON configuration."
+        "--mode", choices=("run", "maintenance"), help="Server operating mode."
     )
-    parser.add_argument("--filer-url", help="URL of an existing SeaweedFS Filer.")
+    parser.add_argument(
+        "--hash-config",
+        type=Path,
+        help="Existing HashDB JSON configuration; otherwise initialize project hash_db.",
+    )
+    parser.add_argument(
+        "--filer-url",
+        help="Use an external Filer instead of the owned local SeaweedFS.",
+    )
     parser.add_argument(
         "--resource-config", type=Path, help="Resource collector settings JSON."
     )
@@ -357,6 +372,8 @@ def main() -> None:
     )
     options = parser.parse_args()
     overrides: JsonObject = {}
+    if options.mode is not None:
+        overrides["server_mode"] = options.mode
     for name, value in (
         ("project_root", options.project_root),
         ("hash_config_path", options.hash_config),

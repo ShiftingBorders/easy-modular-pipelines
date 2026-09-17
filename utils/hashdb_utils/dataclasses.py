@@ -31,9 +31,10 @@ class HashDBConfig(BaseModel):
     @field_validator("db_path")
     @classmethod
     def validate_db_path(cls, value: Path) -> Path:
-        """Require a file path whose parent directory already exists."""
+        """Validate the destination; HashDB creates parents after schema validation."""
         if value.exists() and not value.is_file():
             raise ValueError("must not reference a directory")
-        if not value.parent.is_dir():
-            raise ValueError("parent directory must exist")
+        for parent in value.parents:
+            if parent.exists() and not parent.is_dir():
+                raise ValueError("a parent path is not a directory")
         return value

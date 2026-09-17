@@ -7,6 +7,8 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from core.logger_utils.events import JsonObject
+from core.modulemanifest import read_module_manifest
 from core.storage_contracts import HashDatabase, ModuleAddResult, ModuleDatabase
 from core.storage_errors import StorageConflict, StorageError, StoredObjectNotFound
 from core.validation_constants import (
@@ -481,6 +483,11 @@ class ModuleManager:
         module_name, source_folder, work_root = self._registration_source(
             module_name, module_version, module_folder
         )
+        manifest = read_module_manifest(source_folder)
+        if (manifest["name"], manifest["version"]) != (module_name, module_version):
+            raise ValueError(
+                "module.yaml name/version differ from registration arguments."
+            )
         module_hash = self.module_hash(module_name, source_folder)
         archive_exists = self.module_db.check_module_stored(module_name, module_version)
         if self._registration_exists(
@@ -557,6 +564,11 @@ class ModuleManager:
         module_name, source_folder, work_root = self._registration_source(
             module_name, module_version, module_folder
         )
+        manifest = await asyncio.to_thread(read_module_manifest, source_folder)
+        if (manifest["name"], manifest["version"]) != (module_name, module_version):
+            raise ValueError(
+                "module.yaml name/version differ from registration arguments."
+            )
         module_hash = await asyncio.to_thread(
             self.module_hash, module_name, source_folder
         )
@@ -714,6 +726,191 @@ class ModuleManager:
                 error.add_note(f"Module is already registered. {note}")
                 raise
 
+    def _download_verified_module(
+        self, name: str, version: str, digest: str, work: Path
+    ) -> Path:
+        """Verify the stored package into an isolated directory without installing it."""
+        if not self.module_db.check_module_stored(name, version):
+            raise StoredObjectNotFound(f"No archive stored for {name}/{version}.")
+        archive = work / "package.tar.xz"
+        if not self.module_db.retrieve_module(name, version, archive):
+            raise StorageError(f"Failed to download {name}/{version}.")
+        package = self._uncompress_folder(archive, work / "package", package=True)
+        package_hash = (
+            (package / "hash.txt").read_text(encoding="utf-8").strip().lower()
+        )
+        if package_hash != digest:
+            raise HashMismatch("The package hash does not match the database hash.")
+        code_archive = next(package.glob("*.tar.xz"))
+        code = self._uncompress_folder(code_archive, work / "code")
+        if self.module_hash(name, code) != digest:
+            raise HashMismatch("The extracted module does not match the database hash.")
+        return code
+
+    def _verify_stored_module(self, name: str, version: str, digest: str) -> JsonObject:
+        self.temp_folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="validate-module-", dir=self.temp_folder
+        ) as work:
+            code = self._download_verified_module(name, version, digest, Path(work))
+            manifest = read_module_manifest(code)
+            if (manifest["name"], manifest["version"]) != (name, version):
+                raise ValueError(
+                    "Stored module.yaml identity differs from its registration."
+                )
+        return {"name": name, "version": version, "hash": digest}
+
+    async def validate_stored_module_async(self, name: str, version: str) -> JsonObject:
+        """Return a verified template reference, reading HashDB on its owning thread."""
+        digest = self.hash_db.get_module_hash(name, version)
+        if not digest:
+            raise StoredObjectNotFound(f"No hash registered for {name}/{version}.")
+        if len(digest) != 64 or any(
+            character not in HEX_DIGITS for character in digest
+        ):
+            raise ValueError("The registered module hash is not a SHA-256 digest.")
+        operation = asyncio.create_task(
+            asyncio.to_thread(self._verify_stored_module, name, version, digest.lower())
+        )
+        # Never release the databases while a worker still uses their clients.
+        while True:
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                if operation.cancelled():
+                    raise
+
+    def _copy_module_source(self, source: Path, destination: Path) -> None:
+        destination.mkdir()
+        for relative in self._collect_module_files(source):
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / relative, target)
+
+    async def register_and_install_module_async(
+        self, module_folder: Path
+    ) -> JsonObject:
+        """Register an arbitrary source and publish an immutable version in this project."""
+        operation = asyncio.create_task(
+            self._register_and_install_module(module_folder)
+        )
+        while True:
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                if operation.cancelled():
+                    raise
+
+    async def _register_and_install_module(self, module_folder: Path) -> JsonObject:
+        manifest = await asyncio.to_thread(read_module_manifest, Path(module_folder))
+        source = self._validate_folder_path(module_folder)
+        name, version = manifest["name"], manifest["version"]
+        target = self.module_storage_path / name / version
+        for path in (target, *target.parents):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError(
+                    "Installation path must not traverse filesystem links."
+                )
+        if not target.resolve().is_relative_to(self.module_storage_path):
+            raise ValueError("Installation path escapes module storage.")
+        work_root = self.temp_folder
+        if work_root == source or source in work_root.parents:
+            raise ValueError(
+                "Temporary folder must be outside the module source folder."
+            )
+        work_root.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="install-module-", dir=work_root)
+        failure = None
+        registered = None
+        installed = False
+        try:
+            staged = Path(temporary.name) / "source"
+            await asyncio.to_thread(self._copy_module_source, source, staged)
+            copied = await asyncio.to_thread(read_module_manifest, staged)
+            if copied != manifest:
+                raise ValueError("Module manifest changed while copying the source.")
+            digest = await asyncio.to_thread(self.module_hash, name, staged)
+            target_exists = target.exists()
+            if target_exists:
+                await asyncio.to_thread(read_module_manifest, target)
+                if await asyncio.to_thread(self.module_hash, name, target) != digest:
+                    raise StorageConflict(
+                        f"A different module is installed at {target}."
+                    )
+            registered = await self.register_module_async(name, version, staged)
+            reference = await self.validate_stored_module_async(name, version)
+            if reference["hash"] != digest:
+                raise HashMismatch(
+                    "Registered module differs from the prepared installation."
+                )
+            if not target_exists:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # Stage on the destination filesystem so publication is one rename.
+                with tempfile.TemporaryDirectory(
+                    prefix=".install-", dir=target.parent
+                ) as local:
+                    publish = Path(local) / "code"
+                    await asyncio.to_thread(shutil.copytree, staged, publish)
+                    if (
+                        await asyncio.to_thread(self.module_hash, name, publish)
+                        != digest
+                    ):
+                        raise HashMismatch("Installation changed during copying.")
+                    if target.exists():
+                        raise StorageConflict(
+                            f"Installation destination appeared: {target}."
+                        )
+                    publish.rename(target)
+                    installed = True
+            return {
+                "module": reference,
+                "status": "registered" if registered else "already_registered",
+                "installation_path": str(target),
+                "installed": installed,
+            }
+        except BaseException as error:
+            failure = error
+            if registered is not None:
+                error.add_note(
+                    f"Registration exists for {name}/{version}; installation={installed}. "
+                    "Retry module add with the same content and a new command_id."
+                )
+            raise
+        finally:
+            await asyncio.to_thread(
+                self._cleanup_registration, temporary, work_root, failure
+            )
+
+    def _remove_archive_if_present(self, name: str, version: str) -> bool:
+        # Filer can acknowledge DELETE with 2xx even when the entry is absent.
+        if not self.module_db.check_module_stored(name, version):
+            return False
+        return self.module_db.delete_module(name, version)
+
+    async def unregister_module_async(self, name: str, version: str) -> bool:
+        """Remove the archive in a worker; keep SQLite on the calling thread."""
+        # Validate both identifiers before deleting anything remotely.
+        self.hash_db.get_module_hash(name, version)
+        operation = asyncio.create_task(
+            asyncio.to_thread(self._remove_archive_if_present, name, version)
+        )
+        while True:
+            try:
+                removed = await asyncio.shield(operation)
+                break
+            except asyncio.CancelledError:
+                if operation.cancelled():
+                    raise
+        try:
+            hash_removed = self.hash_db.remove_module_hash(name, version)
+        except StorageError as error:
+            if removed:
+                error.add_note(
+                    "Archive removed; hash removal failed. Retry module remove."
+                )
+            raise
+        return removed or hash_removed
+
     def unregister_module(self, module_name: str, module_version: str) -> bool:
         """Remove the archive and hash, returning whether either was removed.
 
@@ -834,37 +1031,9 @@ class ModuleManager:
         failure = None
         try:
             work_path = Path(work)
-            package_archive = work_path / "package.tar.xz"
-            if not self.module_db.retrieve_module(
-                module_name, module_version, package_archive
-            ):
-                raise StorageError(
-                    f"Failed to download module {module_name!r}, version {module_version!r}."
-                )
-
-            package_folder = self._uncompress_folder(
-                package_archive, work_path / "package", package=True
+            code_folder = self._download_verified_module(
+                module_name, module_version, stored_hash, work_path
             )
-            hash_file = package_folder / "hash.txt"
-            if not hash_file.is_file():
-                raise ValueError("Module package must contain hash.txt at its root.")
-            package_hash = hash_file.read_text(encoding="UTF-8").strip().lower()
-            if package_hash != stored_hash:
-                raise HashMismatch("The package hash does not match the database hash.")
-
-            code_archives = [
-                path for path in package_folder.glob("*.tar.xz") if path.is_file()
-            ]
-            if len(code_archives) != 1:
-                raise ValueError(
-                    "Module package must contain exactly one code archive."
-                )
-            code_folder = self._uncompress_folder(code_archives[0], work_path / "code")
-            actual_hash = self.module_hash(module_name, target_folder=code_folder)
-            if actual_hash != stored_hash:
-                raise HashMismatch(
-                    "The extracted module does not match the database hash."
-                )
 
             self._replace_folder(target, code_folder)
         except BaseException as error:

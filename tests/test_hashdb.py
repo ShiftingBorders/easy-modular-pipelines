@@ -172,12 +172,27 @@ class HashDBConfigTests(HashDBTestCase):
         with self.assertRaises(StorageConfigurationError):
             HashDB(config_path)
 
-    def test_rejects_database_path_with_missing_parent(self) -> None:
-        """The parent directory of a new database must already exist."""
-        config_path = self._write_config(db_path="missing/hash.db")
+    def test_creates_database_path_with_missing_parents(self) -> None:
+        """Initialization creates parents and a usable, persistent SQLite database."""
+        config_path = self._write_config(db_path="missing/nested/hash.db")
+        database_path = self.temp_path / "missing/nested/hash.db"
+        self.assertFalse(database_path.parent.exists())
 
-        with self.assertRaises(StorageConfigurationError):
-            HashDB(config_path)
+        hash_db = HashDB(config_path)
+        self.addCleanup(hash_db.close_connection)
+        self.assertTrue(database_path.is_file())
+        self.assertIs(
+            hash_db.add_module_hash("module", "1", "hash-1"),
+            ModuleAddResult.module_added,
+        )
+        hash_db.close_connection()
+        with closing(sqlite3.connect(database_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    'SELECT "Mname", "MVersion", "MHash" FROM "MAIN"'
+                ).fetchall(),
+                [("module", "1", "hash-1")],
+            )
 
     def test_creates_missing_database_file_in_existing_directory(self) -> None:
         """Initialization creates a missing database in a valid directory."""

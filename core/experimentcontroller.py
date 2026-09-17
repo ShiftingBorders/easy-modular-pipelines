@@ -357,6 +357,7 @@ class ExperimentController:
             return copy_json_object(
                 {
                     **state,
+                    "server_mode": "run",
                     "current_command": self._current_command,
                     "recovery_required": sorted(self._recovery_required),
                 },

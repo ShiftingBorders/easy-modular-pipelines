@@ -13,6 +13,7 @@ import yaml
 
 from core.logger_utils.events import copy_json_object, require_number, require_text
 from core.modulemanager import ModuleManager
+from core.modulemanifest import read_module_manifest
 from core.runner_utils.state import JsonObject, RunnerState
 
 
@@ -317,48 +318,7 @@ class ExperimentAssembler:
         self.validate_errors(definition["errors"])
 
     def read_module(self, module_directory: Path) -> JsonObject:
-        directory = Path(module_directory)
-        if not directory.is_absolute():
-            raise ValueError("module_directory must be absolute.")
-        module = copy_json_object(
-            yaml.safe_load((directory / "module.yaml").read_text(encoding="utf-8")),
-            "module",
-        )
-        required = {
-            "schema_version",
-            "name",
-            "version",
-            "role",
-            "implementation",
-            "commands",
-            "defaults",
-        }
-        if (
-            module.keys() != required
-            or type(module["schema_version"]) is not int
-            or module["schema_version"] != 2
-        ):
-            raise ValueError("Invalid module schema.")
-        if module["role"] not in ("stage", "service") or module[
-            "implementation"
-        ] not in (
-            "full",
-            "action",
-        ):
-            raise NotImplementedError(
-                "Modules require a stage/service role and full/action implementation."
-            )
-        commands = copy_json_object(module["commands"], "commands")
-        expected = {"start"}
-        if commands.keys() != expected:
-            raise ValueError("Module commands do not match its implementation.")
-        for argv in commands.values():
-            if not isinstance(argv, list) or not argv:
-                raise ValueError("Each module command must be a nonempty argv array.")
-            for argument in argv:
-                require_text(argument, "command argument")
-        copy_json_object(module["defaults"], "module defaults")
-        return module
+        return read_module_manifest(module_directory)
 
     async def assemble(self, template_path: Path, experiment_id: str) -> RunnerState:
         require_text(experiment_id, "experiment_id")

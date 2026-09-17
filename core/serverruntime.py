@@ -9,8 +9,10 @@ import logging
 import multiprocessing
 import os
 import signal
+import tempfile
 import threading
 import time
+import tomllib
 from collections import OrderedDict
 from contextlib import ExitStack
 from datetime import UTC, datetime
@@ -32,7 +34,10 @@ SETTING_FIELDS = frozenset(
         "schema_version",
         "project_root",
         "hash_config_path",
+        "server_mode",
         "filer_url",
+        "seaweed_config_path",
+        "seaweed_min_free_gb",
         "resource_config_path",
         "archive_config_path",
         "host",
@@ -77,9 +82,23 @@ class ServerSettings:
         self.project_root = Path(
             require_text(document["project_root"], "project_root (required)")
         )
-        self.hash_config_path = Path(
-            require_text(document["hash_config_path"], "hash_config_path (required)")
+        self.default_hash_config = document["hash_config_path"] is None
+        self.hash_config_path = (
+            self.project_root / "hash_db/config.json"
+            if self.default_hash_config
+            else Path(require_text(document["hash_config_path"], "hash_config_path"))
         )
+        self.server_mode = require_text(document["server_mode"], "server_mode")
+        if self.server_mode not in ("run", "maintenance"):
+            raise ValueError("server_mode must be run or maintenance.")
+        self.seaweed_config_path = Path(
+            require_text(document["seaweed_config_path"], "seaweed_config_path")
+        )
+        self.seaweed_min_free_gb = require_number(
+            document["seaweed_min_free_gb"], "seaweed_min_free_gb"
+        )
+        if self.seaweed_min_free_gb <= 0:
+            raise ValueError("seaweed_min_free_gb must be positive.")
         self.resource_config_path = Path(
             require_text(document["resource_config_path"], "resource_config_path")
         )
@@ -91,13 +110,18 @@ class ServerSettings:
             self.hash_config_path,
             self.resource_config_path,
             self.archive_config_path,
+            self.seaweed_config_path,
         ):
             if not path.is_absolute():
                 raise ValueError(
                     "Server settings paths must be absolute after resolution."
                 )
-        self.filer_url = require_text(document["filer_url"], "filer_url")
-        url = urlsplit(self.filer_url)
+        self.filer_url = (
+            None
+            if document["filer_url"] is None
+            else require_text(document["filer_url"], "filer_url")
+        )
+        url = urlsplit(self.filer_url or "http://127.0.0.1")
         if (
             url.scheme not in ("http", "https")
             or not url.hostname
@@ -174,6 +198,7 @@ def load_server_settings(
         "hash_config_path",
         "resource_config_path",
         "archive_config_path",
+        "seaweed_config_path",
     }
     for path in files:
         values = read_json(path)
@@ -237,6 +262,157 @@ class ProjectLock:
             # Closing releases the OS lock even when cleanup raised an exception.
             self.stream.close()
             self.stream = None
+
+
+def write_initial_config(path: Path, text: str) -> None:
+    """Publish a complete initial file without replacing a user's existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".prepare-", dir=path.parent) as work:
+        staged = Path(work) / "config"
+        with staged.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(staged, path)
+
+
+def prepare_work_directory(settings: ServerSettings) -> tuple[Path, Path | None]:
+    """Prepare missing project files under the caller's ProjectLock, before opening DBs."""
+    from utils.hashdb_utils.dataclasses import HashDBConfig
+    from utils.seaweed_utils.dataclasses import SeaWeedConfig
+
+    expected_schema = read_json(DEFAULT_CONFIG.with_name("hash_db_schema.json"))
+    if list(expected_schema.items()) != [
+        ("Mname", "VARCHAR(255) NOT NULL"),
+        ("MVersion", "VARCHAR(255) NOT NULL"),
+        ("MHash", "VARCHAR(255) NOT NULL"),
+    ]:
+        raise ValueError("The bundled HashDB schema is invalid.")
+    config_path = settings.hash_config_path
+    new_config = not config_path.exists()
+    if new_config:
+        if not settings.default_hash_config:
+            raise FileNotFoundError(
+                f"Explicit HashDB configuration does not exist: {config_path}"
+            )
+        db_path = config_path.parent / "modules.db"
+        schema_path = config_path.parent / "schema.json"
+        if db_path.exists():
+            raise ValueError(
+                "HashDB exists without its configuration; restore config.json first."
+            )
+    else:
+        document = read_json(config_path)
+        for key in ("schema_path", "db_path"):
+            configured = config_path.parent / Path(require_text(document.get(key), key))
+            for path in (configured, *configured.parents):
+                if path.is_symlink() or path.is_junction():
+                    raise ValueError(
+                        f"HashDB paths must not traverse filesystem links: {path}"
+                    )
+            document[key] = str(configured.resolve())
+        validated = HashDBConfig.model_validate(document)
+        db_path, schema_path = validated.db_path, validated.schema_path
+    if schema_path.exists() and list(read_json(schema_path).items()) != list(
+        expected_schema.items()
+    ):
+        raise ValueError(f"Incompatible HashDB schema: {schema_path}")
+    if not new_config and not schema_path.is_file():
+        raise FileNotFoundError(f"Missing HashDB schema: {schema_path}")
+    seaweed_root = None
+    seaweed_document = None
+    if settings.filer_url is None:
+        seaweed_root = db_path.parent.parent / "seaweedfs"
+        if (
+            seaweed_root == db_path.parent
+            or seaweed_root in db_path.parent.parents
+            or db_path.parent in seaweed_root.parents
+        ):
+            raise ValueError(
+                "HashDB and SeaweedFS must use distinct sibling directories."
+            )
+        seaweed_config = seaweed_root / "config/seaweed.json"
+        if seaweed_config.exists():
+            seaweed_document = read_json(seaweed_config)
+        else:
+            seaweed_document = read_json(settings.seaweed_config_path)
+            for key in ("dir", "master.dir", "volume.dir.idx"):
+                if key in seaweed_document["start_args"]:
+                    raise ValueError(
+                        f"Local storage manages {key}; remove it from SeaweedFS defaults."
+                    )
+            seaweed_document["start_args"]["master.dir"] = "../master"
+        SeaWeedConfig.model_validate(seaweed_document)
+        if seaweed_document["start_args"].get("master.dir") != "../master":
+            raise ValueError("Local SeaweedFS requires master.dir=../master.")
+        if any(
+            key in seaweed_document["start_args"] for key in ("dir", "volume.dir.idx")
+        ):
+            raise ValueError("Local SeaweedFS volume paths are managed by the server.")
+        filer_config = seaweed_root / "config/filer.toml"
+        if filer_config.exists():
+            filer = tomllib.loads(filer_config.read_text(encoding="utf-8"))
+            if filer != {"leveldb2": {"enabled": True, "dir": "../filer"}}:
+                raise ValueError(
+                    "Local filer.toml must use only leveldb2 with dir=../filer."
+                )
+    paths = [
+        config_path,
+        schema_path,
+        db_path,
+        settings.project_root / "modules",
+        settings.project_root / "experiments",
+        settings.project_root / "controller/module_work",
+    ]
+    if seaweed_root is not None:
+        paths.extend(
+            seaweed_root / name
+            for name in (
+                "master",
+                "volume",
+                "filer",
+                "config/seaweed.json",
+                "config/filer.toml",
+            )
+        )
+    for target in paths:
+        for path in (target, *target.parents):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError(
+                    f"Project storage must not traverse filesystem links: {path}"
+                )
+    # All configuration checks precede new persistent configuration/data files.
+    for name in ("modules", "experiments", "controller/module_work"):
+        (settings.project_root / name).mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if new_config:
+        if not schema_path.exists():
+            write_initial_config(
+                schema_path, json.dumps(expected_schema, indent=2) + "\n"
+            )
+        write_initial_config(
+            config_path,
+            json.dumps(
+                {
+                    "schema_path": "schema.json",
+                    "db_path": "modules.db",
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+    if seaweed_root is not None:
+        for name in ("config", "master", "volume", "filer"):
+            (seaweed_root / name).mkdir(parents=True, exist_ok=True)
+        if not seaweed_config.exists():
+            write_initial_config(
+                seaweed_config, json.dumps(seaweed_document, indent=2) + "\n"
+            )
+        if not filer_config.exists():
+            write_initial_config(
+                filer_config, '[leveldb2]\nenabled = true\ndir = "../filer"\n'
+            )
+    return db_path, seaweed_root
 
 
 def recovery_candidates(project_root: Path) -> list[str]:
@@ -339,13 +515,16 @@ async def controller_main(
     from core.experimentcontroller import ExperimentController
     from core.hashdb import HashDB
     from core.logger import OperationLogger
+    from core.maintenancecontroller import MaintenanceController
     from core.modulemanager import ModuleManager
     from core.runner_utils.experimentrunner import ExperimentRunner
     from core.runner_utils.runtimeio import process_identity
     from core.seaweed import SeaweedDB
+    from core.seaweed_process import SeaweedProcess
 
     with ExitStack() as stack:
         stack.enter_context(ProjectLock(settings.project_root))
+        db_path, seaweed_root = prepare_work_directory(settings)
         directory = settings.project_root / "controller/server" / instance_id
         logging_settings = read_json(DEFAULT_CONFIG.with_name("logging.json"))
         logging_settings.update(
@@ -381,31 +560,59 @@ async def controller_main(
             },
         )
         try:
+            process_resources = stack.enter_context(ExitStack())
             hashes = HashDB(settings.hash_config_path)
             stack.callback(hashes.close_connection)
-            storage = SeaweedDB(settings.filer_url)
+            if seaweed_root is not None:
+                seaweed = SeaweedProcess(
+                    seaweed_root / "volume",
+                    settings.seaweed_min_free_gb,
+                    seaweed_root / "config/seaweed.json",
+                )
+                process_resources.callback(seaweed.stop)
+                await asyncio.to_thread(seaweed.start)
+                storage = SeaweedDB(
+                    seaweed.filer_url,
+                    max_archive_gb=seaweed.max_archive_gb,
+                    before_upload=seaweed.check_upload_space,
+                )
+            else:
+                storage = SeaweedDB(settings.filer_url)
             stack.callback(storage.close)
+            # A reachable storage service may legitimately have no modules yet.
+            await asyncio.to_thread(storage.check_module_stored, "startup_probe", "1")
             manager = ModuleManager(
                 settings.project_root / "modules",
                 hashes,
                 storage,
                 settings.project_root / "controller/module_work",
             )
-            runner = ExperimentRunner(
-                settings.project_root,
-                manager,
-                archive_config_path=settings.archive_config_path,
-            )
             shutdown_requested = asyncio.Event()
-            controller = ExperimentController(
-                settings.project_root,
-                runner,
-                requests,
-                responses,
-                resource_config_path=settings.resource_config_path,
-                shutdown_requested=shutdown_requested,
-                recovery_required=recovery_candidates(settings.project_root),
-            )
+            runner = None
+            if settings.server_mode == "maintenance":
+                controller = MaintenanceController(
+                    manager,
+                    logger,
+                    requests,
+                    responses,
+                    shutdown_requested=shutdown_requested,
+                    recovery_required=recovery_candidates(settings.project_root),
+                )
+            else:
+                runner = ExperimentRunner(
+                    settings.project_root,
+                    manager,
+                    archive_config_path=settings.archive_config_path,
+                )
+                controller = ExperimentController(
+                    settings.project_root,
+                    runner,
+                    requests,
+                    responses,
+                    resource_config_path=settings.resource_config_path,
+                    shutdown_requested=shutdown_requested,
+                    recovery_required=recovery_candidates(settings.project_root),
+                )
             serving = asyncio.create_task(controller.serve())
             try:
                 await asyncio.sleep(0)
@@ -417,7 +624,23 @@ async def controller_main(
                     "server.controller_started",
                     {"server_instance_id": instance_id, "process": identity},
                 )
-                responses.put_nowait({"_runtime": "ready", "process": identity})
+                responses.put_nowait(
+                    {
+                        "_runtime": "ready",
+                        "process": identity,
+                        "storage": {
+                            "initialized": True,
+                            "hash_db_path": str(db_path),
+                            "seaweed_path": None
+                            if seaweed_root is None
+                            else str(seaweed_root),
+                            "filer_url": seaweed.filer_url
+                            if seaweed_root is not None
+                            else settings.filer_url,
+                            "checked_at": datetime.now(UTC).isoformat(),
+                        },
+                    }
+                )
                 parent = multiprocessing.parent_process()
                 while not shutdown_requested.is_set():
                     if serving.done():
@@ -432,9 +655,11 @@ async def controller_main(
                     await controller.close()
                 finally:
                     try:
-                        await runner.stop()
+                        if runner is not None:
+                            await runner.stop()
                     finally:
-                        await runner.close()
+                        if runner is not None:
+                            await runner.close()
                         await asyncio.gather(serving, return_exceptions=True)
             logger.record_event("server.controller_stopped", {})
             responses.put_nowait({"_runtime": "stopped"})
@@ -510,6 +735,7 @@ class ServerRuntime:
         self._closing = False
         self._last_response_at: str | None = None
         self._identity: JsonObject | None = None
+        self._storage: JsonObject | None = None
 
     async def start(self) -> None:
         if self._state != "new":
@@ -554,6 +780,8 @@ class ServerRuntime:
         alive = self._process is not None and self._process.is_alive()
         return {
             "server_instance_id": self.instance_id,
+            "server_mode": self.settings.server_mode,
+            "storage_initialization": self._storage,
             "state": self._state,
             "controller_alive": alive,
             "controller": self._identity,
@@ -585,6 +813,10 @@ class ServerRuntime:
         if type(version) is not int or version != 1:
             raise ValueError("Only api_version 1 is supported.")
         name = require_text(command.get("command"), "command")
+        if name.startswith("module.") and self.settings.server_mode != "maintenance":
+            raise ServerError(
+                "invalid_mode", "Module commands require --mode maintenance.", 409
+            )
         if name.startswith("server."):
             raise ValueError("Server lifecycle messages are not public commands.")
         command["api_version"] = 1
@@ -836,6 +1068,9 @@ class ServerRuntime:
                     return
                 self._identity = copy_json_object(
                     response.get("process"), "process identity"
+                )
+                self._storage = copy_json_object(
+                    response.get("storage", {}), "storage initialization"
                 )
                 self._state = "ready"
                 if self._ready is not None and not self._ready.done():

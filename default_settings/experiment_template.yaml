@@ -1,0 +1,25 @@
+schema_version: 2
+name: experiment
+cycles: 1
+keep_attempts: 1
+start_timeout: 30
+runner_timeout_margin_seconds: 2
+# Fill stages before running this draft.
+stages: []
+services: []
+resources: []
+unknown_state:
+  timeout_seconds: 10
+  on_timeout: pause
+  recovery_limit: 3
+  on_recovery_limit: stop
+snapshots:
+  mode: "off"
+  keep: 2
+storage:
+  min_snapshot_free_bytes: 67108864
+logging:
+  busy_timeout_seconds: 5
+  max_event_bytes: null
+  min_free_bytes: 67108864
+  filtered_refresh_interval_seconds: 1

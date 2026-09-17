@@ -12,6 +12,7 @@ from core.storage_errors import (
     StorageConfigurationError,
     StorageConflict,
     StorageError,
+    StorageIOError,
     StorageUnavailable,
 )
 from utils.dataloading import load_json
@@ -229,9 +230,17 @@ class HashDB:
         with db:
             db.execute(create_statement)
 
-    def _load_db(self, db_file_path: Path, db_schema):
+    def _load_db(self, db_file_path: Path | str, db_schema):
         """Open storage and validate its schema before any persistent changes."""
         self._connection_closed = True
+        try:
+            if str(db_file_path) != ":memory:":
+                db_file_path = Path(db_file_path)
+                db_file_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise StorageIOError(
+                f"Cannot create hash storage directory for {db_file_path}."
+            ) from error
         try:
             self.hash_db = sqlite3.connect(db_file_path)
         except (sqlite3.ProgrammingError, sqlite3.InterfaceError):

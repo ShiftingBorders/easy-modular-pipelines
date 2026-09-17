@@ -356,6 +356,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON output; watch/follow produces JSON Lines.",
     )
     commands = parser.add_subparsers(dest="action", required=True)
+    template = commands.add_parser("template", help="Create a local experiment draft.")
+    template_actions = template.add_subparsers(dest="template_action", required=True)
+    create = template_actions.add_parser("create")
+    create.add_argument("destination", type=Path)
+    create.add_argument("--name", required=True)
+    module = commands.add_parser(
+        "module", help="Manage modules on a maintenance server."
+    )
+    module_actions = module.add_subparsers(dest="module_action", required=True)
+    add = module_actions.add_parser("add", help="Register and install a source folder.")
+    add.add_argument(
+        "--folder", required=True, help="Absolute source folder on the server."
+    )
+    execution_options(add)
+    validate = module_actions.add_parser(
+        "validate", help="Check a source or a stored package."
+    )
+    source = validate.add_mutually_exclusive_group(required=True)
+    source.add_argument("--folder", help="Absolute source folder on the server.")
+    source.add_argument("--name")
+    validate.add_argument("--version")
+    execution_options(validate)
+    remove = module_actions.add_parser(
+        "remove", help="Remove the archive and registered hash."
+    )
+    remove.add_argument("--name", required=True)
+    remove.add_argument("--version", required=True)
+    execution_options(remove)
     commands.add_parser("health", help="Read server and controller-process health.")
     status = commands.add_parser(
         "status", aliases=["state"], help="Read current experiment state."
@@ -468,7 +496,19 @@ def command_document(options: argparse.Namespace) -> JsonObject:
     name = options.action
     args: JsonObject = {}
     target: JsonObject | None = None
-    if name == "run":
+    if name == "module":
+        name = "module." + options.module_action
+        folder = getattr(options, "folder", None)
+        version = getattr(options, "version", None)
+        if folder is not None:
+            if version is not None:
+                raise ValueError("--folder cannot be combined with --version.")
+            args["folder"] = folder
+        else:
+            if version is None:
+                raise ValueError("--name requires --version.")
+            args.update({"name": options.name, "version": version})
+    elif name == "run":
         args["delayed_start"] = options.delayed_start
         if options.continue_from is not None:
             if options.experiment_id is not None:
@@ -742,6 +782,19 @@ async def run_command(
     as_json: bool,
     interactive: bool = False,
 ) -> int:
+    if options.action == "template":
+        from core.experimenttemplate import create_template
+
+        path = create_template(options.destination.absolute(), options.name)
+        display(
+            {
+                "path": str(path),
+                "status": "draft",
+                "message": "Fill stages before running.",
+            },
+            as_json=as_json,
+        )
+        return 0
     async with APIClient(settings) as client:
         return await execute(options, client, as_json=as_json, interactive=interactive)
 
@@ -832,6 +885,12 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8")
     parser = build_parser()
     options = parser.parse_args()
+    if options.action == "template":
+        try:
+            code = asyncio.run(run_command(options, {}, as_json=options.json))
+        except (OSError, TypeError, ValueError) as error:
+            code = report_error(error, as_json=options.json)
+        raise SystemExit(code)
     overrides: JsonObject = {}
     for name, value in (
         ("server_url", options.url),
