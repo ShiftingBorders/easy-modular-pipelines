@@ -2,15 +2,19 @@
 
 import json
 import sqlite3
+import subprocess
+import sys
+import textwrap
 import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.runner_utils.runtimeio import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
-from dashboard.journals import LocalJournals
+from dashboard.journals import LocalJournals, read_object
 from dashboard.views import DashboardViews
 from tests.dashboard_tests.helpers import (
     cleanup_directory,
@@ -31,6 +35,62 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
         self.settings = load_settings(config)
         self.reader = LocalJournals(self.settings)
         self.views = DashboardViews(self.settings, SystemAPIClient(self.settings))
+
+    def test_metadata_byte_limits_and_invalid_reads_release_handles(self):
+        path = self.root / "metadata.json"
+        with self.assertRaises(FileNotFoundError):
+            read_object(path)
+        encoded = json.dumps({"text": "погода"}, ensure_ascii=False).encode("utf-8")
+        path.write_bytes(encoded)
+        self.assertEqual(read_object(path, len(encoded)), {"text": "погода"})
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            read_object(path, len(encoded) - 1)
+        for payload, error in ((b'{"unfinished":', ValueError), (b"[]", TypeError)):
+            path.write_bytes(payload)
+            with self.assertRaises(error):
+                read_object(path)
+            write_json(path, {"readers_closed": True})
+            self.assertEqual(read_object(path), {"readers_closed": True})
+
+    def test_separate_dashboard_reader_observes_only_complete_publications(self):
+        """Use real processes and file sharing on both Windows and Linux."""
+        path = self.root / "metadata.json"
+        write_json(path, {"sequence": 0, "payload": "0" * 1024})
+        code = textwrap.dedent('''
+            import json
+            import sys
+            import time
+            from pathlib import Path
+            from dashboard.journals import read_object
+            path = Path(sys.argv[1])
+            print("ready", flush=True)
+            for _ in range(500):
+                document = read_object(path)
+                if document["payload"] != str(document["sequence"]) * 1024:
+                    raise RuntimeError("Mixed or partial publication")
+                time.sleep(0.001)
+            sys.stdin.readline()
+            print(json.dumps(read_object(path)), flush=True)
+        ''')
+        process = subprocess.Popen(
+            [sys.executable, "-B", "-c", code, str(path)],
+            cwd=Path(__file__).resolve().parents[2],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            for sequence in range(1, 151):
+                write_json(path, {"sequence": sequence, "payload": str(sequence) * 1024})
+            output, errors = process.communicate("done\n", timeout=20)
+            self.assertEqual(process.returncode, 0, errors)
+            self.assertEqual(json.loads(output), {"sequence": 150, "payload": "150" * 1024})
+            self.assertEqual(list(self.root.glob(".publish-*")), [])
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
 
     async def test_readonly_snapshot_is_reused_and_not_mutated_by_later_ingestion(self):
         before = self.reader.load("exp-test")

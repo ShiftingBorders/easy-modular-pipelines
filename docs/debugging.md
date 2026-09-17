@@ -73,6 +73,14 @@ prove that a process is currently alive.
 | Journal write fails | Check free space, permissions, expected journal identity, and the original error. Do not replace it with an empty database. |
 | Missing artifact | Check experiment-relative vs attempt-relative paths and attempt retention. A journal entry can outlive its file. |
 | Dashboard shows history but no live connection | Verify both `project_root` and `system_api_url` refer to the same runtime. |
+| Windows access denied while publishing `state.json` | Shared JSON readers permit delete sharing; publication falls back to an atomic native rename when `os.replace` rejects an open reader. Transient read/write conflicts are retried for at most one second. Persistent errors still require checking permissions, external file locks and filesystem support. |
+
+JSON readers close the file before parsing its contents. On Linux, publication
+uses the normal atomic `os.replace`: an existing reader may finish reading the
+old file while new readers see the new file. POSIX permission errors are not
+treated as transient Windows sharing failures. The previous published JSON is
+retained if publication fails; the runner also records its checkpoint in the
+journal before updating the optional `state.json` copy.
 
 A source-only `module validate --folder` validates the manifest, not runtime
 behavior or stored archives. Use stored validation in maintenance mode when

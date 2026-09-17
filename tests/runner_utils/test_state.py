@@ -1,8 +1,11 @@
 """Approved basic_dag.md D1/D2/D7: durable state and publication failures."""
 
 import copy
+import errno
 import json
 import os
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -196,6 +199,122 @@ class RunnerStateTests(unittest.TestCase):
             write_json(path, {"value": "new"})
         self.assertEqual(read_json(path), {"value": "new"})
         self.assertEqual(list(self.root.glob(".publish-*")), [])
+
+    def test_json_readers_close_before_decoding_on_both_platforms(self):
+        """Parsing a complete old document does not keep its file locked."""
+        from dashboard.journals import read_object
+
+        path = self.root / "document.json"
+        for read in (read_json, read_object):
+            with self.subTest(reader=read.__name__):
+                write_json(path, {"value": "old"})
+                original_loads = json.loads
+                replaced = False
+
+                def decode(*args, original_loads=original_loads, **kwargs):
+                    nonlocal replaced
+                    if not replaced:
+                        replaced = True
+                        write_json(path, {"value": "new"})
+                    return original_loads(*args, **kwargs)
+
+                with patch("core.runner_utils.runtimeio.json.loads", side_effect=decode):
+                    self.assertEqual(read(path), {"value": "old"})
+                self.assertTrue(replaced)
+                self.assertEqual(read(path), {"value": "new"})
+                self.assertEqual(list(self.root.glob(".publish-*")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows deny-delete file sharing")
+    def test_windows_shared_reader_keeps_old_unicode_path_contents(self):
+        from dashboard.journals import read_object
+
+        path = self.root / "состояние-🌦.json"
+        original_open = os.fdopen
+        for read in (read_json, read_object):
+            with self.subTest(reader=read.__name__):
+                write_json(path, {"value": "old"})
+
+                def opened(*args, **kwargs):
+                    stream = original_open(*args, **kwargs)
+                    try:
+                        write_json(path, {"value": "new"})
+                    except BaseException:
+                        stream.close()
+                        raise
+                    return stream
+
+                with patch("core.runner_utils.runtimeio.os.fdopen", side_effect=opened):
+                    self.assertEqual(read(path), {"value": "old"})
+                self.assertEqual(read(path), {"value": "new"})
+                self.assertEqual(list(self.root.glob(".publish-*")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows deny-delete file sharing")
+    def test_short_external_reader_lock_is_retried(self):
+        path = self.root / "document.json"
+        write_json(path, {"value": "old"})
+        with path.open("rb") as reader:
+            release = threading.Timer(0.04, reader.close)
+            release.start()
+            try:
+                write_json(path, {"value": "new"})
+            finally:
+                release.cancel()
+                release.join()
+        self.assertEqual(read_json(path), {"value": "new"})
+        self.assertEqual(list(self.root.glob(".publish-*")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows deny-delete file sharing")
+    def test_persistent_reader_lock_is_bounded_and_preserves_old_json(self):
+        path = self.root / "document.json"
+        write_json(path, {"value": "old"})
+        started = time.monotonic()
+        with path.open("rb"), self.assertRaises(PermissionError) as raised:
+            write_json(path, {"value": "new"})
+        self.assertIn(raised.exception.winerror, (5, 32, 33))
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(read_json(path), {"value": "old"})
+        self.assertEqual(list(self.root.glob(".publish-*")), [])
+        write_json(path, {"value": "after unlock"})
+        self.assertEqual(read_json(path), {"value": "after unlock"})
+
+    def test_unrelated_access_error_is_not_retried(self):
+        path = self.root / "document.json"
+        write_json(path, {"value": "old"})
+        denied = PermissionError(errno.EACCES, "access denied", str(path))
+        with (
+            patch("core.runner_utils.runtimeio.os.replace", side_effect=denied) as replace,
+            patch("core.runner_utils.runtimeio.time.sleep") as sleep,
+            self.assertRaises(PermissionError) as raised,
+        ):
+            write_json(path, {"value": "new"})
+        self.assertIs(raised.exception, denied)
+        replace.assert_called_once()
+        sleep.assert_not_called()
+        self.assertEqual(read_json(path), {"value": "old"})
+        self.assertEqual(list(self.root.glob(".publish-*")), [])
+
+    def test_reader_permission_failure_is_bounded_and_not_hidden(self):
+        path = self.root / "document.json"
+        write_json(path, {"value": "old"})
+        denied = PermissionError(errno.EACCES, "access denied", str(path))
+        target = "os.fdopen" if os.name == "nt" else "pathlib.Path.open"
+        started = time.monotonic()
+        with patch(target, side_effect=denied), self.assertRaises(PermissionError) as error:
+            read_json(path)
+        self.assertIs(error.exception, denied)
+        self.assertLess(time.monotonic() - started, 5)
+        write_json(path, {"value": "after denial"})
+        self.assertEqual(read_json(path), {"value": "after denial"})
+
+    @unittest.skipUnless(os.name != "nt", "POSIX open-file replacement")
+    def test_posix_external_reader_does_not_prevent_replacement(self):
+        path = self.root / "document.json"
+        write_json(path, {"value": "old"})
+        with path.open("rb") as reader:
+            write_json(path, {"value": "new"})
+            self.assertEqual(json.load(reader), {"value": "old"})
+        self.assertEqual(read_json(path), {"value": "new"})
 
     def test_write_fsync_and_replace_failures_preserve_the_previous_json(self):
         """D2: all publication failure points leave the old document readable."""

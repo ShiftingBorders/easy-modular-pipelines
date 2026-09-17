@@ -11,18 +11,12 @@ from pathlib import Path
 
 from core.logger import OperationLogger
 from core.logger_utils.events import LoggingError
+from core.runner_utils.runtimeio import read_json
 from dashboard.api_client import SystemAPIError
 
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
-    with path.open("rb") as stream:
-        encoded = stream.read(maximum + 1)
-    if len(encoded) > maximum:
-        raise ValueError(f"Metadata exceeds its size limit: {path.name}")
-    document = json.loads(encoded)
-    if not isinstance(document, dict):
-        raise TypeError(f"Expected an object in {path.name}.")
-    return document
+    return read_json(path, max_bytes=maximum)
 
 
 class LocalJournals:
