@@ -108,26 +108,26 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(accepted["author"], "runner")
             self.assertEqual(accepted["outcome"], "failed")
 
-    async def test_action_socket_and_commands_only_lifecycles(self):
-        """A/D: action stop is called; commands-only readiness never waits for command exit."""
+    async def test_action_services_wait_for_full_readiness_and_confirm_shutdown(self):
+        """D10/D11: command preparation precedes readiness; shutdown confirms exit."""
         async with asyncio.timeout(120):
             w = self.workspace
             socket = w.service(implementation="action")
             commands = w.service(interface="commands", implementation="action")
             control = w.controls[commands["service_id"]]
             (control / "hold-start").touch()
-            self.assertEqual(await w.manager.start_all(w.state), "ready")
+            starting = asyncio.create_task(w.manager.start_all(w.state))
             await wait_for(lambda: (control / "action-start.json").exists())
             command_pid = read_json(control / "action-start.json")["pid"]
             self.assertTrue(process_running(command_pid))
-            with self.assertRaises(ValueError):
-                await w.manager.restart(w.state, commands["service_id"], automatic=True)
+            self.assertFalse(starting.done())
+            (control / "hold-start").unlink()
+            self.assertEqual(await starting, "ready")
             results = await w.manager.stop_all(w.state)
             self.assertTrue(results[socket["service_id"]]["stopped"], results)
             self.assertTrue(results[commands["service_id"]]["stopped"], results)
             await wait_for(lambda: (control / "action-stop.json").exists())
-            self.assertTrue(process_running(command_pid))
-            (control / "hold-start").unlink()
+            self.assertFalse(process_running(command_pid))
 
     async def test_real_crash_restarts_with_new_instance_and_preserves_pending_requests(
         self,

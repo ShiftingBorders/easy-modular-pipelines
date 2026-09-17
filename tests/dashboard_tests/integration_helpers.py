@@ -35,7 +35,7 @@ def history(durations=((2, 3600), (4, 7200)), *, total=4):
     def add(kind, seconds, data, context=None, operation_id=None):
         entries.append(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "event_id": uuid4().hex,
                 "producer_instance_id": "fixture",
                 "sequence_number": len(entries) + 1,
@@ -81,7 +81,7 @@ def history(durations=((2, 3600), (4, 7200)), *, total=4):
             add(
                 "stage.process_started",
                 clock,
-                {"started_at": timestamp(clock), "identity": {}},
+                {"started_at": timestamp(clock), "process": {}},
                 context,
             )
             clock += duration

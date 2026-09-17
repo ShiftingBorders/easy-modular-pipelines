@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import codecs
 import ctypes
 import json
 import os
@@ -13,7 +15,40 @@ from typing import TYPE_CHECKING
 from core.logger_utils.events import copy_json_object
 
 if TYPE_CHECKING:
+    from core.logger import OperationLogger
     from core.runner_utils.state import JsonObject
+
+
+async def capture_stream(
+    stream: asyncio.StreamReader,
+    name: str,
+    logger: OperationLogger,
+    context: JsonObject,
+    output: bytearray | None = None,
+) -> None:
+    """Drain a child stream in its owning process and record complete text chunks."""
+    if name not in ("stdout", "stderr"):
+        raise ValueError("Captured stream must be stdout or stderr.")
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    while chunk := await stream.read(65536):
+        if output is not None:
+            output.extend(chunk)
+        text = decoder.decode(chunk)
+        if text:
+            await asyncio.to_thread(
+                logger.record_event,
+                "command.output",
+                {"stream": name, "text": text},
+                context=context,
+            )
+    remaining = decoder.decode(b"", final=True)
+    if remaining:
+        await asyncio.to_thread(
+            logger.record_event,
+            "command.output",
+            {"stream": name, "text": remaining},
+            context=context,
+        )
 
 
 def read_json(path: Path) -> JsonObject:
@@ -53,6 +88,36 @@ def write_json(path: Path, data: JsonObject) -> None:
                 if failure is None:
                     raise
                 failure.add_note(f"Temporary JSON cleanup failed: {cleanup_error}")
+
+
+def process_running(pid: int) -> bool:
+    """Check actual termination, including Windows processes with retained handles."""
+    if os.name != "nt":
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            return state not in ("Z", "X")
+        except FileNotFoundError:
+            return False
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x100000, False, pid)
+    if not handle:
+        if ctypes.get_last_error() in (87, 1168):
+            return False
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        status = kernel.WaitForSingleObject(handle, 0)
+        if status == 0xFFFFFFFF:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return status == 258
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def process_identity(pid: int) -> JsonObject:

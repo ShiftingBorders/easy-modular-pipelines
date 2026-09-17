@@ -1,0 +1,8 @@
+schema_version: 2
+name: command_proxy
+version: "1.0"
+role: service
+implementation: action
+commands:
+  start: [python, -B, main.py]
+defaults: {}

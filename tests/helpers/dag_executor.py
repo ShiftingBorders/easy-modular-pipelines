@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from core.logger import OperationLogger
+from core.logger_utils.events import LoggingStorageError
 from core.runner_utils import executor
 
 
@@ -16,32 +18,32 @@ def main() -> None:
     parser.add_argument("--launch", type=Path, required=True)
     parser.add_argument(
         "--fault",
-        choices=("before_result", "after_result", "write_failure"),
+        choices=("before_result", "after_result", "write_failure", "no_execute"),
         required=True,
     )
     args = parser.parse_args()
-    original = executor.write_json
+    original = OperationLogger.record_command_result
     directory = args.launch.parent
 
-    def publish(path, data):
-        if path.name != "execution_result.json":
-            return original(path, data)
+    def publish(logger, request_id, response, **kwargs):
+        if args.fault == "no_execute" or kwargs.get("author") != "participant":
+            return original(logger, request_id, response, **kwargs)
         if args.fault == "after_result":
-            original(path, data)
+            original(logger, request_id, response, **kwargs)
         marker = directory / "checkpoint.pending"
         marker.write_text(
             json.dumps({"pid": os.getpid(), "point": args.fault}), encoding="utf-8"
         )
         marker.replace(directory / "checkpoint.json")
         if args.fault == "write_failure":
-            raise OSError("injected result publication failure")
+            raise LoggingStorageError("injected result publication failure")
         while not (directory / "release-executor").exists():
             time.sleep(0.01)
         if args.fault == "before_result":
-            original(path, data)
+            return original(logger, request_id, response, **kwargs)
         return None
 
-    with patch.object(executor, "write_json", side_effect=publish):
+    with patch.object(OperationLogger, "record_command_result", publish):
         asyncio.run(executor.StageExecutor(args.launch).run())
 
 

@@ -151,7 +151,7 @@ class JournalReadingTests(unittest.TestCase):
     def test_confirmation_has_its_own_change_without_a_second_event(self):
         """C3/C8/D5: historical service state and runner confirmation remain observable."""
         event_id = self.logger.record_command_result(
-            "request", {"n": 1}, author="service", outcome="succeeded"
+            "request", {"n": 1}, author="participant", outcome="succeeded"
         )
         first = self.logger.read_changes()
         self.assertEqual(len(first["changes"]), 1)
@@ -168,7 +168,7 @@ class JournalReadingTests(unittest.TestCase):
         self.assertEqual(change["effective_author"], "runner")
         self.assertFalse(change["provisional"])
         self.assertTrue(change["result_changed"])
-        self.assertEqual(change["entry"]["event"]["data"]["author"], "service")
+        self.assertEqual(change["entry"]["event"]["data"]["author"], "participant")
         self.assertEqual(change["observation"]["author"], "runner")
         history = self.logger.read_changes()["changes"]
         self.assertEqual([item["provisional"] for item in history], [True, False])
@@ -184,7 +184,7 @@ class JournalReadingTests(unittest.TestCase):
         )
         checkpoint = self.logger.read_changes()["checkpoint"]
         service = self.logger.record_command_result(
-            "request", {"late": True}, author="service", outcome="succeeded"
+            "request", {"late": True}, author="participant", outcome="succeeded"
         )
         changes = self.logger.read_changes(checkpoint)["changes"]
         self.assertEqual(len(changes), 1)
@@ -218,7 +218,7 @@ class JournalReadingTests(unittest.TestCase):
                         elif mutation == "bad-state":
                             data["provisional"] = "yes"
                         elif mutation == "bad-owner":
-                            data["observation"]["context"]["service_id"] = "other"
+                            data["observation"]["context"]["participant_id"] = "other"
                         db.execute(
                             "UPDATE journal_changes SET change_json=?",
                             ("{" if mutation == "json" else json.dumps(data),),
@@ -246,7 +246,7 @@ class JournalReadingTests(unittest.TestCase):
         """D3/D4: an entire skipped scan must still expose a resumable checkpoint."""
         for number in range(1000):
             self.logger.record_command_result(
-                str(number), {}, author="service", outcome="succeeded"
+                str(number), {}, author="participant", outcome="succeeded"
             )
         winners = [
             self.logger.record_command_result(

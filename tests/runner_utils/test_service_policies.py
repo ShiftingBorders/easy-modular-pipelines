@@ -178,25 +178,16 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
             if w.manager._monitor_task.done():
                 self.assertIn(w.manager._monitor_task.result(), ("pause", "stop"))
 
-    async def test_bad_stop_command_does_not_claim_commands_only_service_was_disabled(
+    async def test_internal_stop_failure_is_reported_even_if_proxy_is_forcibly_reaped(
         self,
     ):
-        """D: actual command spawn failure remains a failed stop despite exited start command."""
+        """D11: process termination cannot turn a rejected internal stop into success."""
         async with asyncio.timeout(120):
             w = self.w
-            definition = w.service(interface="commands", implementation="action")
+            definition = w.service(implementation="action")
             await w.manager.start_all(w.state)
-            module = definition["module"]
-            code = w.experiment / "modules" / module["name"] / module["version"]
-            import yaml
-
-            config = yaml.safe_load((code / "module.yaml").read_text())
-            config["commands"]["stop"] = [str(w.root / "missing-stop-command.exe")]
-            (code / "module.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
-            module["hash"] = w.modules.module_hash(module["name"], target_folder=code)
-            w.hashes.remove_module_hash(module["name"], module["version"])
-            w.hashes.add_module_hash(module["name"], module["version"], module["hash"])
-            w.state.services[definition["service_id"]].definition["module"] = module
+            sid = definition["service_id"]
+            (w.controls[sid] / "fail-stop").touch()
             result = await w.manager.stop_all(w.state)
-            self.assertFalse(result[definition["service_id"]]["stopped"])
-            self.assertTrue(result[definition["service_id"]]["error"])
+            self.assertIn("shutdown reported failure", result[sid]["error"])
+            self.assertTrue((w.controls[sid] / "action-stop.json").exists())

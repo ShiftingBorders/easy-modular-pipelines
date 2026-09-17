@@ -179,22 +179,28 @@ class SnapshotFailureTests(unittest.IsolatedAsyncioTestCase):
                 await w.close()
 
     async def test_reset_refuses_live_participants_and_waits_for_commands_process(self):
-        """D5/F2: start/stop action handles must be reaped before replacing runtime files."""
+        """D5/F2: unconfirmed service shutdown must not replace runtime files."""
         w = SnapshotWorkspace()
         self.addAsyncCleanup(w.close)
         controls = w.files.files.controls[w.commands["service_id"]]
-        (controls / "hold-start").touch()
         runner = await w.launch()
         with self.assertRaises(RuntimeError):
             await runner._services.reset(runner._state)
         snapshot = await runner.snapshot()
         sentinel = runner._state.experiment_directory / "shared_data/keep"
         sentinel.write_bytes(b"original")
+        (controls / "hold-stop").touch()
+        process = runner._services._processes[w.commands["service_id"]]
         started = time.monotonic()
         try:
-            with self.assertRaisesRegex(RuntimeError, "runtime files"):
+            with (
+                patch.object(
+                    process, "kill", side_effect=PermissionError("owned stop denied")
+                ),
+                self.assertRaises((RuntimeError, asyncio.CancelledError)),
+            ):
                 await asyncio.wait_for(runner.rollback(snapshot["snapshot_id"]), 90)
             self.assertGreaterEqual(time.monotonic() - started, 30)
             self.assertEqual(sentinel.read_bytes(), b"original")
         finally:
-            (controls / "hold-start").unlink(missing_ok=True)
+            (controls / "hold-stop").unlink(missing_ok=True)

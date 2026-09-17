@@ -320,17 +320,18 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 experiment_id = runner._state.experiment_id
                 await runner.close()
                 await asyncio.gather(step, return_exceptions=True)
-                gate.touch()
-                result = original.artifacts_directory / "execution_result.json"
-                await wait_for(result.is_file, 30)
                 record = read_json(original.artifacts_directory / "process.json")
+                # Lose both participants before result publication; a missing file
+                # can no longer simulate unknown state in the journal protocol.
+                terminate_owned(record["executor"])
+                terminate_owned(record["stage"])
                 await wait_for(
                     lambda record=record: (
                         not process_running(record["executor"]["pid"])
                     ),
                     30,
                 )
-                result.unlink()
+                gate.touch()
                 runner = w.replacement()
                 await runner.recover(experiment_id)
                 await wait_for(

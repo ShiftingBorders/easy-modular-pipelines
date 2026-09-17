@@ -10,7 +10,9 @@ stages/services: runner-side participant lifecycles.
 journal: experiment journal setup and template history.
 snapshots: consistent snapshots and restoration.
 
-The initial runtime executes stages; services and snapshots remain skeletons.
-They receive state explicitly and never call back into ExperimentRunner.
+participant_server: shared server and durable participant observations.
+stage_client: synchronous module-side context, progress and cancellation client.
+results: validated references to results in the shared journal.
+StageRunner owns DAG calls; ServiceManager owns service process lifecycles.
 core.experimentcontroller provides web-facing control and calls the runner.
 """

@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -28,7 +29,7 @@ class LoggerSnapshotTests(unittest.TestCase):
         self.addCleanup(cleanup_directory, temporary)
         self.folder = Path(temporary.name)
         self.config = write_context_settings(
-            self.folder, context={**BASE_CONTEXT, "source": "service"}
+            self.folder, context={**BASE_CONTEXT, "source": "participant"}
         )
         self.path = self.folder / "events.db"
         self.logger = OperationLogger(self.config)
@@ -53,7 +54,7 @@ class LoggerSnapshotTests(unittest.TestCase):
 
     def test_export_is_a_standalone_copy_with_identified_committed_boundary(self):
         self.logger.record_command_result(
-            "request", {"value": 3}, author="service", outcome="succeeded"
+            "request", {"value": 3}, author="participant", outcome="succeeded"
         )
         original = read_database(self.path)
         identity = self.logger.get_journal_info()
@@ -67,8 +68,15 @@ class LoggerSnapshotTests(unittest.TestCase):
         self.assertEqual(UUID(manifest["generation"]).hex, manifest["generation"])
         self.assertEqual(manifest["cursor"], len(original))
         self.assertEqual(manifest["event_count"], len(original))
-        self.assertEqual(manifest["storage_schema_version"], 1)
+        self.assertEqual(manifest["storage_schema_version"], 2)
         self.assertEqual(manifest["database"], "journal.sqlite")
+        # Windows may briefly expose SQLite's delete-pending temporary journal.
+        deadline = time.monotonic() + 1
+        while {p.name for p in target.iterdir()} != {
+            "journal.sqlite",
+            "manifest.json",
+        } and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertEqual(
             {p.name for p in target.iterdir()}, {"journal.sqlite", "manifest.json"}
         )
@@ -87,7 +95,7 @@ class LoggerSnapshotTests(unittest.TestCase):
 
     def test_snapshot_pins_events_and_result_index_while_another_process_commits(self):
         event_id = self.logger.record_command_result(
-            "shared-request", {"value": 7}, author="service", outcome="succeeded"
+            "shared-request", {"value": 7}, author="participant", outcome="succeeded"
         )
         before = read_database(self.path)
         worker = self.start_worker()
@@ -134,10 +142,10 @@ class LoggerSnapshotTests(unittest.TestCase):
             sqlite3.connect((target / "journal.sqlite").as_uri() + "?mode=ro", uri=True)
         ) as db:
             indexed = db.execute(
-                "SELECT effective_author, runner_event_id, service_event_id "
+                "SELECT effective_author, runner_event_id, participant_event_id "
                 "FROM command_results WHERE request_id='shared-request'"
             ).fetchone()
-            self.assertEqual(indexed, ("service", None, event_id))
+            self.assertEqual(indexed, ("participant", None, event_id))
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_another_process_can_commit_between_backup_page_steps(self):

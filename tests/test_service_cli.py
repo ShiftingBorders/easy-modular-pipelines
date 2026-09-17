@@ -12,7 +12,7 @@ class ServiceCliTests(ServerTestCase):
         server = await self.start_server()
         state = await server.launch(template)
         socket = next(
-            item for item in state["services"] if item["interface"] == "socket"
+            item for item in state["services"] if item["implementation"] == "full"
         )
         self.assertTrue(process_running(socket["process"]["pid"]))
         client = await self.start_cli(server, ["shell"])

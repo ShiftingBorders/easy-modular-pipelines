@@ -159,7 +159,7 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 all(item["stopped"] for item in runner.get_state()["services"])
             )
             for item in runner._state.services.values():
-                if item.interface == "socket":
+                if item.implementation == "full":
                     self.assertFalse(process_running(item.process_identity["pid"]))
             await wait_for(
                 lambda: (
@@ -417,9 +417,11 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 reset["data"], {"service_id": sid, "previous": 1, "current": 0}
             )
             self.assertIs(runner._state.services[sid], current)
-            for position in (0, 3, True, 2):
+            for position in (0, 3, True):
                 response = await w.session.send("retry", {"position": position})
                 self.assertEqual(response["result"], "fail", response)
+            response = await w.session.send("retry", {"position": 2})
+            self.assertEqual(response["result"], "success", response)
             self.assertEqual(runner.get_state()["mode"], "paused")
             self.assertEqual(w.stage_trace(), [])
             self.assertIn(commands["service_id"], runner._state.services)
@@ -521,7 +523,7 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 "changed",
             )
-            self.assertEqual(len(runner.get_resource_snapshot()["targets"]), 1)
+            self.assertEqual(len(runner.get_resource_snapshot()["targets"]), 2)
             terminate_owned(first.process_identity)
             await wait_for(
                 lambda: (

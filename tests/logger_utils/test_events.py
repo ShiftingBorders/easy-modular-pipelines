@@ -295,7 +295,7 @@ class LoggingEventValidationTests(unittest.TestCase):
                 "node_id",
                 "node_execution_id",
                 "runner_session_id",
-                "service_instance_id",
+                "participant_instance_id",
                 "module_name",
                 "module_version",
                 "module_hash",
@@ -335,7 +335,7 @@ class LoggingEventValidationTests(unittest.TestCase):
         event = event_fixture()
         self.assertEqual(json.loads(encode_event(event, 4096)), event)
         for field, value in (
-            ("schema_version", 2),
+            ("schema_version", 1),
             ("schema_version", True),
             ("event_id", ""),
             ("producer_instance_id", 1),

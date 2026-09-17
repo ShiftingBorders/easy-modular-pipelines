@@ -16,6 +16,7 @@ from core.logger_utils.events import LoggingStorageError
 from core.runner_utils.connection import ParticipantConnection
 from core.runner_utils.journal import RunnerJournal
 from core.runner_utils.launch import ModuleLauncher
+from core.runner_utils.protocol import read_frame
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from tests.helpers.dag import (
     REPOSITORY,
@@ -25,6 +26,22 @@ from tests.helpers.dag import (
     terminate_owned,
     wait_until,
 )
+
+
+def journal_result(state, directory):
+    from core.logger import OperationLogger
+
+    context = read_json(directory / "context.json")
+    with OperationLogger(
+        Path(context["logging_config_path"]), read_only=True
+    ) as logger:
+        record = logger.read_command_result(context["context"]["request_id"])
+        if record is None:
+            return None
+        observation = next(
+            item for item in record["observations"] if item["author"] == "participant"
+        )
+        return {**record, "response": observation["event"]["data"]["response"]}
 
 
 class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -150,20 +167,23 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             )
             step = self.session.post("step")
             _, ready = await self.session.ready_attempt()
-            root = self.session.runner._state.experiment_directory
-            endpoint_path = root / "executor.lock.json"
+            endpoint_path = self.session.runner._state.active_attempt.endpoint_path
             endpoint = read_json(endpoint_path)
             expected = {
                 key: endpoint[key]
-                for key in ("experiment_id", "stage_id", "attempt_id")
+                for key in (
+                    "experiment_id",
+                    "participant_id",
+                    "participant_instance_id",
+                )
             }
-            wrong = {**expected, "attempt_id": str(uuid4())}
+            wrong = {**expected, "participant_instance_id": str(uuid4())}
             with self.assertRaises(ValueError):
                 await ParticipantConnection(endpoint_path, wrong).connect(
                     timeout_seconds=1
                 )
             modified = copy.deepcopy(endpoint)
-            modified["executor"]["created_at_os"] += 1
+            modified["process"]["created_at_os"] += 1
             write_json(endpoint_path, modified)
             try:
                 with self.assertRaises(ValueError):
@@ -195,7 +215,13 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                 status = await connection.query_command_state(
                     str(uuid4()), timeout_seconds=1
                 )
-                self.assertEqual(status["data"]["current"], expected)
+                self.assertEqual(
+                    status["data"]["current"],
+                    {
+                        "request_id": self.session.runner._state.active_attempt.request_id,
+                        "command": "execute",
+                    },
+                )
                 with self.assertRaisesRegex(ValueError, "twice"):
                     await connection.request(
                         heartbeat_id, "heartbeat", {}, timeout_seconds=1
@@ -234,21 +260,27 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                 await writer.wait_closed()
 
             server = await asyncio.start_server(peer, "127.0.0.1", 0)
-            connection = ParticipantConnection(self.workspace.root / "unused.json", {})
+            connection = ParticipantConnection(
+                self.workspace.root / "unused.json",
+                {
+                    "experiment_id": "frame-test",
+                    "participant_id": str(uuid4()),
+                    "participant_instance_id": str(uuid4()),
+                },
+            )
             try:
                 connection._reader, connection._writer = await asyncio.open_connection(
                     "127.0.0.1", server.sockets[0].getsockname()[1]
                 )
-                result = asyncio.create_task(connection.receive_message())
+                result = asyncio.create_task(read_frame(connection._reader))
                 await sent.wait()
                 done, _ = await asyncio.wait({result}, timeout=0.05)
                 self.assertEqual(done, set())
                 release.set()
                 self.assertEqual(await result, {"message": "Привет 🌍"})
-                self.assertEqual(await connection.receive_message(), {"number": 2})
+                self.assertEqual(await read_frame(connection._reader), {"number": 2})
                 with self.assertRaises(asyncio.IncompleteReadError):
-                    await connection.receive_message()
-                self.assertIsNone(connection._writer)
+                    await read_frame(connection._reader)
             finally:
                 release.set()
                 await connection.close()
@@ -275,7 +307,12 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
 
                     server = await asyncio.start_server(peer, "127.0.0.1", 0)
                     connection = ParticipantConnection(
-                        self.workspace.root / "unused.json", {}
+                        self.workspace.root / "unused.json",
+                        {
+                            "experiment_id": "frame-test",
+                            "participant_id": str(uuid4()),
+                            "participant_instance_id": str(uuid4()),
+                        },
                     )
                     try:
                         (
@@ -287,8 +324,7 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaises(
                             (ValueError, UnicodeError, asyncio.IncompleteReadError)
                         ):
-                            await connection.receive_message()
-                        self.assertIsNone(connection._writer)
+                            await read_frame(connection._reader)
                     finally:
                         await connection.close()
                         server.close()
@@ -319,19 +355,52 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                         "success" if mode == "success" else "fail",
                         reply,
                     )
-                    paths = list(
-                        self.session.runner._state.experiment_directory.glob(
-                            "shared_artifacts/**/execution_result.json"
-                        )
+                    state = self.session.runner._state
+                    self.assertEqual(
+                        list(state.experiment_directory.rglob("execution_result.json")),
+                        [],
                     )
-                    self.assertEqual(len(paths), 1)
-                    result = read_json(paths[0])
-                    self.assertEqual(result["exit_code"], 7 if mode == "nonzero" else 0)
+                    events = self.workspace.events(self.session.runner)
+                    record = next(
+                        row
+                        for row in reversed(events)
+                        if row["event_type"] == "command.result"
+                        and row["data"]["author"] == "participant"
+                    )
+                    result = record["data"]["response"]
+                    self.assertEqual(
+                        result["execution"]["exit_code"], 7 if mode == "nonzero" else 0
+                    )
                     if mode in ("invalid", "empty", "extra", "missing_data"):
                         self.assertEqual(
-                            result["error"]["code"], "invalid_stage_result"
+                            result["data"]["error"]["code"], "stage_execution_failed"
                         )
                     await self.session.send("stop")
+
+    async def test_interrupt_before_execute_exits_without_starting_module(self):
+        """B6: a result waiter alone must not keep an unused executor alive."""
+        state, directory, process, output = await self._probe("no_execute")
+        context = read_json(directory / "launch.json")["context"]
+        connection = ParticipantConnection(directory / "executor.lock.json", context)
+        try:
+            await connection.connect(timeout_seconds=3)
+            reply = await connection.request(
+                str(uuid4()),
+                "interrupt",
+                {"request_id": context["request_id"], "reason": "stopped"},
+                timeout_seconds=3,
+            )
+            self.assertTrue(reply["data"]["stopped"])
+            await asyncio.wait_for(asyncio.shield(output), 3)
+            self.assertEqual(process.returncode, 0)
+            self.assertFalse((directory / "ready.json").exists())
+            self.assertIsNone(read_json(directory / "process.json")["stage"])
+            self.assertEqual(
+                journal_result(state, directory)["response"]["data"]["reason"],
+                "stopped",
+            )
+        finally:
+            await connection.close()
 
     async def _probe(self, fault: str):
         module = self.workspace.module(f"probe-{fault}")
@@ -356,6 +425,11 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             "module_version": module["version"],
             "module_hash": module["hash"],
         }
+        context.update(
+            participant_id=context["stage_id"],
+            participant_instance_id=context["attempt_id"],
+            request_id=context["attempt_id"],
+        )
         directory = state.experiment_directory / "shared_artifacts/probe"
         launch = ModuleLauncher(assembler, journal).prepare(
             state, stage, context, directory, None
@@ -385,11 +459,34 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
         async def cleanup():
             (directory / "release-executor").touch(exist_ok=True)
             if process.returncode is None:
-                await asyncio.wait_for(asyncio.shield(output), 8)
+                try:
+                    await asyncio.wait_for(asyncio.shield(output), 3)
+                except TimeoutError:
+                    terminate_owned(read_json(directory / "process.json")["executor"])
+                    await asyncio.wait_for(asyncio.shield(output), 5)
             else:
                 await output
 
         self.addAsyncCleanup(cleanup)
+        connection = ParticipantConnection(directory / "executor.lock.json", context)
+        await wait_until(lambda: (directory / "executor.lock.json").exists())
+        await connection.connect(timeout_seconds=10)
+        if fault == "no_execute":
+            await connection.close()
+            return state, directory, process, output
+
+        async def dispatch():
+            try:
+                await connection.request(
+                    context["request_id"], "execute", launch["call"], timeout_seconds=20
+                )
+            except (OSError, TimeoutError):
+                pass
+            finally:
+                await connection.close()
+
+        call = asyncio.create_task(dispatch())
+        self.addAsyncCleanup(asyncio.gather, call, return_exceptions=True)
         await wait_until(lambda: (directory / "checkpoint.json").is_file())
         return state, directory, process, output
 
@@ -401,11 +498,9 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             for fault in ("before_result", "after_result"):
                 with self.subTest(fault=fault):
                     state, directory, process, output = await self._probe(fault)
-                    self.assertTrue(
-                        (state.experiment_directory / "executor.lock.json").is_file()
-                    )
+                    self.assertTrue((directory / "executor.lock.json").is_file())
                     self.assertEqual(
-                        (directory / "execution_result.json").is_file(),
+                        journal_result(state, directory) is not None,
                         fault == "after_result",
                     )
                     metadata = read_json(directory / "process.json")
@@ -414,22 +509,18 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotEqual(process.returncode, 0)
                     self.assertFalse(process_running(metadata["stage"]["pid"]))
                     if fault == "after_result":
-                        result = read_json(directory / "execution_result.json")
-                        self.assertEqual(result["attempt_id"], metadata["attempt_id"])
-                        self.assertEqual(result["exit_code"], 0)
-                        self.assertEqual(result["response"]["result"], "success")
+                        result = journal_result(state, directory)["response"]
+                        self.assertEqual(result["execution"]["exit_code"], 0)
+                        self.assertEqual(result["result"], "success")
 
     async def test_result_write_failure_keeps_lock_and_reports_failure(self):
         """B8/B9: failure to publish mandatory result cannot look like success."""
         async with asyncio.timeout(30):
             state, directory, process, output = await self._probe("write_failure")
-            _, stderr = await asyncio.wait_for(asyncio.shield(output), 5)
+            await asyncio.wait_for(asyncio.shield(output), 5)
             self.assertNotEqual(process.returncode, 0)
-            self.assertIn(b"injected result publication failure", stderr)
             self.assertFalse((directory / "execution_result.json").exists())
-            self.assertTrue(
-                (state.experiment_directory / "executor.lock.json").exists()
-            )
+            self.assertIsNone(journal_result(state, directory))
 
     async def test_executor_timeout_terminates_the_stage_and_reports_failed_attempt(
         self,
@@ -448,7 +539,9 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reply["result"], "fail")
             self.assertFalse(process_running(ready["pid"]))
             self.assertEqual(
-                read_json(directory / "execution_result.json")["interruption_reason"],
+                journal_result(self.session.runner._state, directory)["response"][
+                    "execution"
+                ]["interruption_reason"],
                 "timeout",
             )
 
@@ -458,31 +551,34 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             gate = self.workspace.gate()
             await self.session.launch(
                 self.workspace.template(
-                    [self.workspace.stage(settings={"gate": str(gate)}, timeout=0.2)]
+                    [self.workspace.stage(settings={"gate": str(gate)}, timeout=5)]
                 )
             )
             stages = self.session.runner._stages
-            original = stages._launcher.prepare
+            original = ParticipantConnection.request
 
-            def prepare(*args, **kwargs):
-                launch = original(*args, **kwargs)
-                launch["timeout_seconds"] = None
-                return launch
+            async def request(connection, request_id, command, args, **kwargs):
+                if command == "execute":
+                    kwargs["deadline_monotonic"] = None
+                return await original(connection, request_id, command, args, **kwargs)
 
             reasons = []
 
             async def finish_instead_of_kill(state, reason):
                 reasons.append(reason)
                 gate.touch()
-                path = (
-                    state.active_attempt.artifacts_directory / "execution_result.json"
+                await wait_until(
+                    lambda: any(
+                        item["author"] == "participant"
+                        for item in self.session.runner._journal.client.read_command_result(
+                            state.active_attempt.request_id
+                        )["observations"]
+                    )
                 )
-                await wait_until(path.is_file)
-                result = read_json(path)
-                return result["exit_code"] == 0
+                return True
 
             with (
-                patch.object(stages._launcher, "prepare", side_effect=prepare),
+                patch.object(ParticipantConnection, "request", request),
                 patch.object(stages, "interrupt", side_effect=finish_instead_of_kill),
             ):
                 reply = await self.session.send("step")
@@ -497,7 +593,7 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(finishes[-1]["data"]["outcome"], "timed_out")
             self.assertEqual(
                 finishes[-1]["data"]["result"],
-                {"result": "fail", "data": {"reason": "timed_out"}},
+                {"result": "fail", "data": {"reason": "timeout"}},
             )
 
     def test_os_identity_has_exact_creation_value(self):

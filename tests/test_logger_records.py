@@ -94,12 +94,12 @@ class OperationLoggerRecordsTests(unittest.TestCase):
 
     def service_client(self):
         config = write_context_settings(
-            self.folder / "service",
+            self.folder / "participant",
             db_path=str(self.db_path),
             open_mode="existing",
             context={
                 **BASE_CONTEXT,
-                "source": "service",
+                "source": "participant",
                 "host_name": "wrong-host",
                 "process_id": 1,
             },
@@ -291,8 +291,8 @@ class OperationLoggerRecordsTests(unittest.TestCase):
 
     def test_matching_responses_in_both_orders_share_an_event_and_keep_authors(self):
         service = self.service_client()
-        clients = {"runner": self.logger, "service": service}
-        for first, second in (("runner", "service"), ("service", "runner")):
+        clients = {"runner": self.logger, "participant": service}
+        for first, second in (("runner", "participant"), ("participant", "runner")):
             with self.subTest(first=first):
                 request = "equal-" + first
                 response = {"data": {"a": 1, "b": [None, False]}, "result": "success"}
@@ -312,7 +312,7 @@ class OperationLoggerRecordsTests(unittest.TestCase):
                 self.assertEqual(result["event"]["data"]["author"], first)
                 self.assertEqual(result["event"]["context"]["source"], first)
                 self.assertEqual(
-                    {o["author"] for o in result["observations"]}, {"runner", "service"}
+                    {o["author"] for o in result["observations"]}, {"runner", "participant"}
                 )
                 self.assertTrue(
                     all(o["ignored"] is None for o in result["observations"])
@@ -334,16 +334,16 @@ class OperationLoggerRecordsTests(unittest.TestCase):
         service = self.service_client()
         self.assertIsNone(self.logger.read_command_result("unknown"))
         service.record_command_result(
-            "provisional", {}, author="service", outcome="succeeded"
+            "provisional", {}, author="participant", outcome="succeeded"
         )
         result = self.logger.read_command_result("provisional")
         self.assertTrue(result["provisional"])
-        self.assertEqual(result["author"], "service")
+        self.assertEqual(result["author"], "participant")
 
     def test_conflicting_responses_keep_runner_and_retain_ignored_service_payload(self):
         service = self.service_client()
-        clients = {"runner": self.logger, "service": service}
-        for first, second in (("runner", "service"), ("service", "runner")):
+        clients = {"runner": self.logger, "participant": service}
+        for first, second in (("runner", "participant"), ("participant", "runner")):
             with self.subTest(first=first):
                 request = "conflict-" + first
                 ids = {}
@@ -351,14 +351,14 @@ class OperationLoggerRecordsTests(unittest.TestCase):
                     request,
                     {"origin": first},
                     author=first,
-                    outcome="succeeded" if first == "service" else "failed",
+                    outcome="succeeded" if first == "participant" else "failed",
                 )
                 initial = read_database(self.db_path)
                 ids[second] = clients[second].record_command_result(
                     request,
                     {"origin": second},
                     author=second,
-                    outcome="succeeded" if second == "service" else "failed",
+                    outcome="succeeded" if second == "participant" else "failed",
                 )
                 records = read_database(self.db_path)
                 self.assertEqual(records[: len(initial)], initial)
@@ -366,19 +366,19 @@ class OperationLoggerRecordsTests(unittest.TestCase):
                 self.assertEqual(result["event_id"], ids["runner"])
                 self.assertEqual(result["outcome"], "failed")
                 ignored = next(
-                    o for o in result["observations"] if o["author"] == "service"
+                    o for o in result["observations"] if o["author"] == "participant"
                 )
                 self.assertEqual(ignored["ignored"], "runner_result_precedence")
                 self.assertEqual(
-                    ignored["event"]["data"]["response"], {"origin": "service"}
+                    ignored["event"]["data"]["response"], {"origin": "participant"}
                 )
-                if first == "service":
+                if first == "participant":
                     self.assertIsNone(ignored["event"]["data"]["ignored"])
                     self.assertEqual(
                         result["event"]["data"]["supersedes"],
                         [
                             {
-                                "event_id": ids["service"],
+                                "event_id": ids["participant"],
                                 "ignored": "runner_result_precedence",
                             }
                         ],
@@ -402,7 +402,7 @@ class OperationLoggerRecordsTests(unittest.TestCase):
                 service.record_command_result(
                     outcome,
                     {"result": "success"},
-                    author="service",
+                    author="participant",
                     outcome="succeeded",
                 )
                 result = self.logger.read_command_result(outcome)
@@ -415,14 +415,14 @@ class OperationLoggerRecordsTests(unittest.TestCase):
             request = f"types-{index}"
             with self.subTest(values=(left, right)):
                 first = service.record_command_result(
-                    request, {"value": left}, author="service", outcome="succeeded"
+                    request, {"value": left}, author="participant", outcome="succeeded"
                 )
                 second = self.logger.record_command_result(
                     request, {"value": right}, author="runner", outcome="succeeded"
                 )
                 self.assertNotEqual(first, second)
         first = service.record_command_result(
-            "outcome", {}, author="service", outcome="succeeded"
+            "outcome", {}, author="participant", outcome="succeeded"
         )
         second = self.logger.record_command_result(
             "outcome", {}, author="runner", outcome="failed"
@@ -440,8 +440,8 @@ class OperationLoggerRecordsTests(unittest.TestCase):
         for options in (
             {"response": {"x": 2}},
             {"context": {"experiment_id": "other"}},
-            {"context": {"service_id": "other"}},
-            {"context": {"service_instance_id": "other"}},
+            {"context": {"participant_id": "other"}},
+            {"context": {"participant_instance_id": "other"}},
             {"context": {"request_id": "different"}},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -461,7 +461,7 @@ class OperationLoggerRecordsTests(unittest.TestCase):
             {"outcome": "success"},
             {"response": []},
             {"context": {"experiment_id": None}},
-            {"context": {"service_id": None}},
+            {"context": {"participant_id": None}},
         ):
             with (
                 self.subTest(options=options),

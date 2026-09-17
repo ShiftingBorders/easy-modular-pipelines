@@ -4,13 +4,78 @@ import copy
 import os
 import unittest
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from core.experimentassembler import ExperimentAssembler
 from tests.helpers.service_integration import ServiceDagWorkspace
 
 
 class ServiceAssemblyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_service_reference_nodes_share_code_and_keep_call_settings_separate(
+        self,
+    ):
+        """F14-F16: a service is declared once and may own several DAG calls."""
+        service = self.w.service()
+        service["settings"]["startup_only"] = 1
+        nodes = []
+        for value in (2, 3):
+            nodes.append(
+                {
+                    "stage_id": str(uuid4()),
+                    "service_id": service["service_id"],
+                    "settings": {"call_only": value},
+                    "timeout_seconds": 10,
+                    "errors": {
+                        "retries": 1,
+                        "retry_delay_seconds": 0.1,
+                        "on_exhausted": "pause",
+                    },
+                }
+            )
+        state = await self.assembler.assemble(
+            self.w.write_template(self.w.template(nodes)), "service-nodes"
+        )
+        self.assertEqual(
+            len(list((state.experiment_directory / "modules").glob("*/*/module.yaml"))),
+            1,
+        )
+        self.assertEqual(
+            [node["settings"] for node in state.template["stages"]],
+            [{"call_only": 2}, {"call_only": 3}],
+        )
+        self.assertEqual(state.template["services"][0]["settings"]["startup_only"], 1)
+        self.assembler.check_modules(state)
+
+    async def test_invalid_service_references_and_old_template_have_no_assembly_side_effects(
+        self,
+    ):
+        """F15/H21: reject old schema, unknown reference and duplicate module fields early."""
+        service = self.w.service()
+        node = {
+            "stage_id": str(uuid4()),
+            "service_id": service["service_id"],
+            "settings": {},
+            "timeout_seconds": 10,
+            "errors": {
+                "retries": 0,
+                "retry_delay_seconds": 0.1,
+                "on_exhausted": "pause",
+            },
+        }
+        template = self.w.template([node])
+        candidates = []
+        for update in ({"service_id": str(uuid4())}, {"module": service["module"]}):
+            changed = copy.deepcopy(template)
+            changed["stages"][0].update(update)
+            candidates.append(changed)
+        candidates.append({**template, "schema_version": 1})
+        for index, candidate in enumerate(candidates):
+            with self.subTest(index=index), self.assertRaises((ValueError, TypeError)):
+                await self.assembler.assemble(
+                    self.w.write_template(candidate), f"rejected-{index}"
+                )
+        self.assertFalse((self.w.root / "experiments.json").exists())
+
     async def asyncSetUp(self):
         self.w = ServiceDagWorkspace()
         self.addAsyncCleanup(self.w.close)

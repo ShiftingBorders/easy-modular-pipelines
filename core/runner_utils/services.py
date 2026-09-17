@@ -1,6 +1,6 @@
 """Runner-side service supervision and persistent working-request queues.
 
-Socket/commands interface differences stay here. External service internals
+External service internals
 belong to their Python proxies. Global pause/stop decisions return to the runner.
 """
 
@@ -22,6 +22,8 @@ from core.logger_utils.events import LoggingError, copy_json_object, require_tex
 from core.runner_utils.connection import ParticipantConnection
 from core.runner_utils.journal import RunnerJournal
 from core.runner_utils.launch import ModuleLauncher
+from core.runner_utils.protocol import PROTOCOL_VERSION, error_details
+from core.runner_utils.results import read_result
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.state import (
     JsonObject,
@@ -61,8 +63,7 @@ class ServiceManager:
         self._notify_resources = notify_resources
         self._connections = {}
         self._processes: dict[str, subprocess.Popen] = {}
-        self._action_processes: list[subprocess.Popen] = []
-        self._receivers: dict[str, asyncio.Task] = {}
+        self._launch_processes: list[subprocess.Popen] = []
         self._restarts: dict[str, asyncio.Task] = {}
         self._connecting: dict[str, asyncio.Task] = {}
         self._probes: dict[str, JsonObject] = {}
@@ -103,9 +104,11 @@ class ServiceManager:
                     await self._start(state, definition)
                 except (OSError, ConnectionError) as error:
                     instance = state.services.get(definition["service_id"])
-                    if instance is None or instance.interface == "commands":
+                    if instance is None:
                         raise
-                    instance.failure = f"{type(error).__name__}: {error}"
+                    instance.failure = error_details(
+                        "service_failure", f"{type(error).__name__}: {error}"
+                    )
                     action = await self.restart(
                         state, instance.service_id, automatic=True
                     )
@@ -132,65 +135,44 @@ class ServiceManager:
         self, state: RunnerState, definition: JsonObject
     ) -> ServiceInstance:
         service_id = require_text(definition["service_id"], "service_id")
-        UUID(service_id)
         old = state.services.get(service_id)
         if old is not None and not old.stopped:
             raise RuntimeError(
-                "The previous service instance must be stopped before launch."
+                "The previous service must be confirmed stopped before launch."
             )
         instance_id = str(uuid4())
-        context = {
-            "experiment_id": state.experiment_id,
-            "run_id": state.run_id,
-            "service_id": service_id,
-            "service_instance_id": instance_id,
-            "cycle_number": state.cycle_number,
-        }
+        context = self._context(state, service_id, instance_id)
         directory = (
             state.experiment_directory
-            / "shared_artifacts"
-            / "services"
+            / "shared_artifacts/services"
             / service_id
             / instance_id
         )
-        # ModuleManager's caller-owned HashDB connection belongs to this thread.
         launch = self._launcher.prepare(state, definition, context, directory, None)
-        module = launch["module"]
-        instance = ServiceInstance(
-            service_id, instance_id, definition, module["service_interface"]
-        )
-        instance.implementation = module["implementation"]
+        instance = ServiceInstance(service_id, instance_id, definition)
+        instance.implementation = launch["module"]["implementation"]
         instance.artifacts_directory = directory
-        instance.endpoint_path = (
-            state.experiment_directory / "runner" / "endpoints" / f"{service_id}.json"
-        )
-        instance.endpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        instance.endpoint_path = Path(launch["endpoint_path"])
         if old is not None:
             instance.restart_count = old.restart_count
             for entry in old.pending_requests:
-                expected = entry.get("expected_instance")
-                if expected is not None and expected != instance_id:
-                    response = {
-                        "result": "fail",
-                        "data": {"reason": "service_instance_changed"},
-                    }
-                    self._journal.client.record_command_result(
-                        entry["request_id"],
-                        response,
-                        author="runner",
-                        outcome="invalidated",
-                        context={**context, "service_instance_id": expected},
+                if entry.get("expected_instance") is not None:
+                    self._finish_request(
+                        state,
+                        old,
+                        entry,
+                        {
+                            "result": "fail",
+                            "data": {"reason": "service_instance_changed"},
+                        },
+                        "invalidated",
                     )
-                    future = self._waiters.pop(entry["request_id"], None)
-                    if future is not None and not future.done():
-                        future.set_result(
-                            {"request_id": entry["request_id"], **response}
-                        )
                 else:
                     instance.pending_requests.append(entry)
         state.services[service_id] = instance
         self._starting.add(service_id)
-        spawn: asyncio.Task | None = None
+        instance.start_deadline = time.monotonic() + state.template["start_timeout"]
+        spawn = None
         try:
             self._journal.client.record_event(
                 "service.parameters",
@@ -206,18 +188,14 @@ class ServiceManager:
                 {"action": "start_service", "argv": launch["argv"]},
                 context=context,
             )
-            # File-backed streams survive runner death. Services use their own logger
-            # for structured events; these files preserve any additional diagnostics.
             with (
                 (directory / "stdout.log").open("ab") as stdout,
                 (directory / "stderr.log").open("ab") as stderr,
             ):
                 environment = dict(os.environ)
                 library = str(Path(__file__).resolve().parents[2])
-                environment["PYTHONPATH"] = library + (
-                    os.pathsep + environment["PYTHONPATH"]
-                    if environment.get("PYTHONPATH")
-                    else ""
+                environment["PYTHONPATH"] = os.pathsep.join(
+                    filter(None, (library, environment.get("PYTHONPATH")))
                 )
                 spawn = asyncio.create_task(
                     asyncio.to_thread(
@@ -236,144 +214,82 @@ class ServiceManager:
                 except asyncio.CancelledError:
                     process = await spawn
                     self._processes[service_id] = process
+                    self._launch_processes.append(process)
                     instance.process_identity = (
                         process_identity(process.pid)
                         if process.poll() is None
                         else None
                     )
                     raise
-            previous_process = self._processes.get(service_id)
-            if previous_process is not None and previous_process.poll() is None:
-                self._action_processes.append(previous_process)
             self._processes[service_id] = process
+            self._launch_processes.append(process)
             instance.started_at = datetime.now(UTC).isoformat()
-            instance.start_deadline = time.monotonic() + state.template["start_timeout"]
             instance.process_identity = (
                 process_identity(process.pid) if process.poll() is None else None
             )
-            if self._notify_resources is not None:
-                self._notify_resources()
             write_json(
                 directory / "process.json",
                 {
                     **context,
                     "process": instance.process_identity,
                     "started_at": instance.started_at,
-                    "start_deadline": instance.start_deadline,
                 },
             )
-            try:
-                self._state_store.save(state)
-            except OSError as error:
-                self._journal.client.record_error(error, context=context)
-            if instance.interface == "commands":
-                instance.ready = instance.ever_ready = True
-            else:
-                connected = False
-                malformed = 0
-                while time.monotonic() < instance.start_deadline:
-                    if not connected:
-                        if (
-                            process.poll() is not None
-                            and instance.process_identity is None
-                        ):
-                            raise ConnectionError(
-                                "Service exited before publishing its identity."
-                            )
-                        try:
-                            endpoint = read_json(instance.endpoint_path)
-                        except (FileNotFoundError, PermissionError):
-                            await asyncio.sleep(0.05)
-                            continue
-                        if endpoint.get("service_instance_id") != instance_id:
-                            await asyncio.sleep(0.05)
-                            continue
-                        declared = endpoint["process"]
-                        if declared != instance.process_identity:
-                            ancestors = await asyncio.to_thread(
-                                psutil.Process(declared["pid"]).parents
-                            )
-                            if process.poll() is not None or process.pid not in {
-                                parent.pid for parent in ancestors
-                            }:
-                                raise ValueError(
-                                    "Service endpoint is not owned by the launched process."
-                                )
-                        connection = ParticipantConnection(
-                            instance.endpoint_path,
-                            {
-                                "experiment_id": state.experiment_id,
-                                "service_id": service_id,
-                                "service_instance_id": instance_id,
-                            },
-                            process_key="process",
-                        )
-                        self._connections[service_id] = connection
-                        await connection.connect(
-                            timeout_seconds=max(
-                                0.001, instance.start_deadline - time.monotonic()
-                            )
-                        )
-                        instance.process_identity = declared
-                        if self._notify_resources is not None:
-                            self._notify_resources()
-                        connected = True
-                    request_id = str(uuid4())
-                    if request_id in state.used_request_ids:
-                        raise RuntimeError("Request ID collision.")
-                    state.used_request_ids.add(request_id)
-                    self._probes[service_id] = {
-                        "request_id": request_id,
-                        "sent_monotonic": time.monotonic(),
-                    }
-                    self._journal.client.record_event(
-                        "control.intent",
-                        {"action": "heartbeat", "request_id": request_id},
-                        context=context,
+            self._save(state)
+            while time.monotonic() < instance.start_deadline:
+                if process.poll() is not None:
+                    raise ConnectionError("Service process exited before readiness.")
+                try:
+                    endpoint = read_json(instance.endpoint_path)
+                except (FileNotFoundError, PermissionError):
+                    await asyncio.sleep(0.05)
+                    continue
+                if endpoint.get("participant_instance_id") != instance_id:
+                    await asyncio.sleep(0.05)
+                    continue
+                declared = endpoint["process"]
+                if declared != instance.process_identity:
+                    ancestors = await asyncio.to_thread(
+                        psutil.Process(declared["pid"]).parents
                     )
-                    await connection.send_message(
-                        {
-                            "protocol_version": 1,
-                            "message_type": "request",
-                            "request_id": request_id,
-                            **{
-                                key: context[key]
-                                for key in (
-                                    "experiment_id",
-                                    "service_id",
-                                    "service_instance_id",
-                                )
-                            },
-                            "command": "heartbeat",
-                            "args": {},
-                        }
-                    )
-                    try:
-                        async with asyncio.timeout(
-                            max(0.001, instance.start_deadline - time.monotonic())
-                        ):
-                            message = await connection.receive_message()
-                        await self._handle_message(state, service_id, message)
-                    except (ValueError, TypeError, KeyError, EOFError) as error:
-                        malformed += 1
-                        await connection.close()
-                        connected = False
-                        if malformed >= 2:
-                            raise ConnectionError(
-                                "Service returned two invalid startup replies."
-                            ) from error
-                        continue
-                    if instance.failure is not None:
-                        raise ConnectionError(instance.failure)
-                    if instance.ready:
-                        self._receivers[service_id] = asyncio.create_task(
-                            connection.receive_message()
+                    if process.poll() is not None or process.pid not in {
+                        parent.pid for parent in ancestors
+                    }:
+                        raise ValueError(
+                            "Service endpoint is not owned by the launched process."
                         )
-                        break
+                connection = ParticipantConnection(instance.endpoint_path, context)
+                self._connections[service_id] = connection
+                remaining = max(0.001, instance.start_deadline - time.monotonic())
+                await connection.connect(timeout_seconds=remaining)
+                remaining = max(0.001, instance.start_deadline - time.monotonic())
+                instance.process_identity = declared
+                request_id = str(uuid4())
+                state.used_request_ids.add(request_id)
+                self._probes[service_id] = {
+                    "request_id": request_id,
+                    "sent_monotonic": time.monotonic(),
+                }
+                self._journal.client.record_event(
+                    "control.intent",
+                    {"action": "heartbeat", "request_id": request_id},
+                    context=context,
+                )
+                reply = await self._exchange(
+                    service_id, request_id, "heartbeat", {}, timeout=remaining
+                )
+                await self._handle_message(state, service_id, reply)
                 if not instance.ready:
-                    raise TimeoutError(
-                        f"Service {service_id} did not become ready before start_timeout."
+                    raise ConnectionError(
+                        instance.failure["message"]
+                        if instance.failure
+                        else "Service did not confirm full readiness."
                     )
+                break
+            if not instance.ready:
+                raise TimeoutError(
+                    f"Service {service_id} readiness exceeded start_timeout."
+                )
             write_json(
                 directory / "process.json",
                 {
@@ -384,13 +300,13 @@ class ServiceManager:
             )
             self._journal.client.record_event(
                 "service.started",
-                {"process": instance.process_identity, "interface": instance.interface},
+                {
+                    "process": instance.process_identity,
+                    "implementation": instance.implementation,
+                },
                 context=context,
             )
-            try:
-                self._state_store.save(state)
-            except OSError as error:
-                self._journal.client.record_error(error, context=context)
+            self._save(state)
             return instance
         except BaseException:
             if (
@@ -399,7 +315,6 @@ class ServiceManager:
                 and not spawn.cancelled()
                 and spawn.exception() is not None
             ):
-                # A rejected intent or failed Popen did not create a service process.
                 instance.stopped = True
             raise
         finally:
@@ -451,15 +366,45 @@ class ServiceManager:
             if self._pending_action is not None:
                 action, self._pending_action = self._pending_action, None
                 return action
-            for request_id, (owner, sending) in list(self._sends.items()):
-                if sending.done():
-                    del self._sends[request_id]
-                    try:
-                        sending.result()
-                    except (OSError, RuntimeError) as error:
-                        state.services[
-                            owner
-                        ].failure = f"{type(error).__name__}: {error}"
+            for request_id, (service_id, task) in list(self._sends.items()):
+                if not task.done():
+                    continue
+                self._sends.pop(request_id, None)
+                instance = state.services[service_id]
+                try:
+                    await self._handle_message(state, service_id, task.result())
+                except (OSError, EOFError, ValueError, TypeError, KeyError) as error:
+                    if (
+                        service_id in self._connecting
+                        or instance.stopping
+                        or instance.stopped
+                    ):
+                        continue
+                    instance.ready = False
+                    self._probes.pop(service_id, None)
+                    self._bad_replies[service_id] = (
+                        self._bad_replies.get(service_id, 0) + 1
+                    )
+                    self._journal.client.record_error(
+                        error,
+                        context=self._context(
+                            state, service_id, instance.service_instance_id
+                        ),
+                    )
+                    if self._bad_replies[service_id] >= 2:
+                        instance.failure = error_details(
+                            "connection_failed",
+                            f"Participant communication failed: {error}",
+                        )
+                    else:
+                        self._connecting[service_id] = asyncio.create_task(
+                            self._connections[service_id].connect(
+                                timeout_seconds=instance.definition["heartbeat"][
+                                    "grace_seconds"
+                                ]
+                            )
+                        )
+                        self._next_probe[service_id] = 0
             for service_id, instance in list(state.services.items()):
                 restart = self._restarts.get(service_id)
                 if restart is not None:
@@ -472,62 +417,30 @@ class ServiceManager:
                         return action
                     continue
                 if (
-                    instance.interface == "commands"
-                    or instance.stopped
+                    instance.stopped
                     or instance.stopping
                     or service_id in self._starting
                 ):
                     continue
-                context = {
-                    "experiment_id": state.experiment_id,
-                    "run_id": state.run_id,
-                    "service_id": service_id,
-                    "service_instance_id": instance.service_instance_id,
-                }
                 connecting = self._connecting.get(service_id)
                 if connecting is not None and connecting.done():
-                    del self._connecting[service_id]
+                    self._connecting.pop(service_id, None)
                     try:
                         connecting.result()
-                        self._receivers[service_id] = asyncio.create_task(
-                            self._connections[service_id].receive_message()
-                        )
                     except (OSError, EOFError, ValueError) as error:
-                        instance.failure = f"{type(error).__name__}: {error}"
-                receiver = self._receivers.get(service_id)
-                if receiver is not None and receiver.done():
-                    del self._receivers[service_id]
-                    try:
-                        await self._handle_message(state, service_id, receiver.result())
-                        self._receivers[service_id] = asyncio.create_task(
-                            self._connections[service_id].receive_message()
+                        instance.failure = error_details(
+                            "connection_failed", f"Reconnect failed: {error}"
                         )
-                    except (
-                        OSError,
-                        EOFError,
-                        ValueError,
-                        TypeError,
-                        KeyError,
-                    ) as error:
-                        self._bad_replies[service_id] = (
-                            self._bad_replies.get(service_id, 0) + 1
-                        )
-                        self._journal.client.record_error(error, context=context)
-                        instance.ready = False
-                        self._probes.pop(service_id, None)
-                        if self._bad_replies[service_id] >= 2:
-                            instance.failure = "Service returned two invalid replies."
-                        else:
-                            self._connecting[service_id] = asyncio.create_task(
-                                self._connections[service_id].connect(
-                                    timeout_seconds=instance.definition["heartbeat"][
-                                        "grace_seconds"
-                                    ]
-                                )
-                            )
-                            self._next_probe[service_id] = 0
-                if service_id in self._restarts:
-                    continue
+                await self._poll_result(state, service_id)
+                if (
+                    not instance.ever_ready
+                    and instance.start_deadline is not None
+                    and time.monotonic() >= instance.start_deadline
+                ):
+                    instance.failure = error_details(
+                        "startup_timeout",
+                        "The original service startup deadline expired.",
+                    )
                 process = self._processes.get(service_id)
                 if (
                     process is not None
@@ -535,21 +448,19 @@ class ServiceManager:
                     and process.pid == instance.process_identity["pid"]
                     and process.poll() is not None
                 ):
-                    instance.failure = "Service process exited unexpectedly."
+                    instance.failure = error_details(
+                        "process_exited", "Service process exited unexpectedly."
+                    )
                 probe = self._probes.get(service_id)
-                if (
-                    not instance.ever_ready
-                    and instance.start_deadline is not None
-                    and time.monotonic() >= instance.start_deadline
-                ):
-                    instance.failure = "Service startup deadline expired."
                 if (
                     probe is not None
                     and instance.ever_ready
                     and time.monotonic() - probe["sent_monotonic"]
                     >= instance.definition["heartbeat"]["grace_seconds"]
                 ):
-                    instance.failure = "Service heartbeat grace period expired."
+                    instance.failure = error_details(
+                        "heartbeat_timeout", "Service heartbeat grace period expired."
+                    )
                 if instance.failure is not None:
                     instance.ready = False
                     if instance.blocked_action is None:
@@ -560,6 +471,7 @@ class ServiceManager:
                 active = instance.active_request
                 if (
                     active is not None
+                    and active.get("owner") != "caller"
                     and not active["timed_out"]
                     and time.monotonic() - active["sent_monotonic"]
                     >= instance.definition["command_timeout_seconds"]
@@ -580,13 +492,13 @@ class ServiceManager:
                     and time.monotonic() >= self._next_probe.get(service_id, 0)
                 ):
                     request_id = str(uuid4())
-                    if request_id in state.used_request_ids:
-                        raise RuntimeError("Request ID collision.")
                     state.used_request_ids.add(request_id)
                     self._journal.client.record_event(
                         "control.intent",
                         {"action": "heartbeat", "request_id": request_id},
-                        context=context,
+                        context=self._context(
+                            state, service_id, instance.service_instance_id
+                        ),
                     )
                     self._probes[service_id] = {
                         "request_id": request_id,
@@ -595,30 +507,27 @@ class ServiceManager:
                     self._sends[request_id] = (
                         service_id,
                         asyncio.create_task(
-                            self._connections[service_id].send_message(
-                                {
-                                    "protocol_version": 1,
-                                    "message_type": "request",
-                                    **{
-                                        key: context[key]
-                                        for key in (
-                                            "experiment_id",
-                                            "service_id",
-                                            "service_instance_id",
-                                        )
-                                    },
-                                    "request_id": request_id,
-                                    "command": "heartbeat",
-                                    "args": {},
-                                }
+                            self._exchange(
+                                service_id,
+                                request_id,
+                                "heartbeat",
+                                {},
+                                timeout=(
+                                    max(
+                                        0.001,
+                                        instance.start_deadline - time.monotonic(),
+                                    )
+                                    if not instance.ever_ready
+                                    and instance.start_deadline is not None
+                                    else instance.definition["heartbeat"][
+                                        "grace_seconds"
+                                    ]
+                                ),
                             )
                         ),
                     )
                 if instance.ready and instance.blocked_action is None:
                     await self._send_next(state, service_id)
-            self._action_processes = [
-                process for process in self._action_processes if process.poll() is None
-            ]
             await asyncio.sleep(0.05)
         raise asyncio.CancelledError
 
@@ -626,13 +535,12 @@ class ServiceManager:
         self, state: RunnerState, service_id: str, *, automatic: bool
     ) -> ServiceAction:
         instance = state.services[service_id]
-        if instance.interface != "socket":
-            raise ValueError("Commands-only services have no restart policy.")
         retry = instance.active_request
         retry = (
             retry
             if retry is not None
             and retry["timed_out"]
+            and retry.get("owner") != "caller"
             and instance.definition["on_command_timeout"] == "restart"
             else None
         )
@@ -696,7 +604,9 @@ class ServiceManager:
                 raise
             except (OSError, ConnectionError) as error:
                 instance = state.services[service_id]
-                instance.failure = f"{type(error).__name__}: {error}"
+                instance.failure = error_details(
+                    "service_failure", f"{type(error).__name__}: {error}"
+                )
                 if not automatic:
                     if waiter is not None and not waiter.done():
                         waiter.set_exception(error)
@@ -744,61 +654,14 @@ class ServiceManager:
     async def request(
         self, state: RunnerState, service_id: str, command: str, args: JsonObject
     ) -> JsonObject:
-        if self._closed:
-            raise RuntimeError("Service manager is closed.")
-        instance = state.services[service_id]
-        if instance.interface != "socket" or instance.stopped or instance.stopping:
-            raise RuntimeError("Working requests require an active socket service.")
-        require_text(command, "service command")
-        if command in ("heartbeat", "shutdown", "command_state"):
-            raise ValueError("Control commands do not belong in the working queue.")
-        args = copy_json_object(args, "service arguments")
-        if self._snapshot_id is not None and (
-            command not in ("freeze_writes", "save_state", "unfreeze_writes")
-            or args.get("snapshot_id") != self._snapshot_id
-        ):
-            raise RuntimeError("Ordinary service requests are frozen for a snapshot.")
         request_id = str(uuid4())
-        if request_id in state.used_request_ids:
-            raise RuntimeError("Request ID collision.")
-        state.used_request_ids.add(request_id)
-        entry = {
-            "request_id": request_id,
-            "command": command,
-            "args": args,
-            "sent_monotonic": None,
-            "sent_at": None,
-            "service_instance_id": None,
-            "timed_out": False,
-        }
-        if command in ("freeze_writes", "save_state", "unfreeze_writes", "load_state"):
-            entry["expected_instance"] = instance.service_instance_id
-        context = {
-            "experiment_id": state.experiment_id,
-            "run_id": state.run_id,
-            "service_id": service_id,
-        }
-        self._journal.client.record_event(
-            "service.request_queued", entry, context=context
+        future = self.enqueue(
+            state, service_id, request_id, command, args, owner="service"
         )
-        instance.pending_requests.append(entry)
-        try:
-            self._state_store.save(state)
-        except OSError as error:
-            self._journal.client.record_error(error, context=context)
-        future = asyncio.get_running_loop().create_future()
-        self._waiters[request_id] = future
-        if self._monitor_task is None or self._monitor_task.done():
-            self._monitor_task = asyncio.create_task(self.monitor(state))
-        # Cancelling a waiter does not withdraw or replay a potentially sent command.
         monitor = self._monitor_task
         await asyncio.wait((future, monitor), return_when=asyncio.FIRST_COMPLETED)
-        if future.done():
-            return future.result()
-        # Propagate a failed observer instead of leaving callers awaiting forever.
-        monitor.result()
-        # A policy pause is not a command result. The owner applies the action and
-        # rearms monitoring; an already sent request remains owned until its outcome.
+        if not future.done():
+            monitor.result()
         return await asyncio.shield(future)
 
     async def _send_next(self, state: RunnerState, service_id: str) -> None:
@@ -807,18 +670,28 @@ class ServiceManager:
             not instance.ready
             or instance.stopping
             or instance.active_request is not None
-            or not instance.pending_requests
         ):
             return
+        while instance.pending_requests:
+            entry = instance.pending_requests[0]
+            if (
+                entry.get("deadline_monotonic") is None
+                or time.monotonic() < entry["deadline_monotonic"]
+            ):
+                break
+            instance.pending_requests.pop(0)
+            self._finish_request(
+                state,
+                instance,
+                entry,
+                {"result": "fail", "data": {"reason": "queue_timeout"}},
+                "timed_out",
+            )
+            self._save(state)
+        if not instance.pending_requests:
+            return
         entry = instance.pending_requests[0]
-        context = {
-            "experiment_id": state.experiment_id,
-            "run_id": state.run_id,
-            "service_id": service_id,
-            "service_instance_id": instance.service_instance_id,
-        }
-        if entry["sent_monotonic"] is not None:
-            raise RuntimeError("A previously sent request cannot be queued again.")
+        context = self._context(state, service_id, instance.service_instance_id)
         self._journal.client.record_event(
             "control.intent", {"action": "service_request", **entry}, context=context
         )
@@ -827,32 +700,19 @@ class ServiceManager:
         entry["service_instance_id"] = instance.service_instance_id
         entry["sent_at"] = datetime.now(UTC).isoformat()
         entry["sent_monotonic"] = time.monotonic()
-        try:
-            self._state_store.save(state)
-        except OSError as error:
-            self._journal.client.record_error(error, context=context)
+        self._save(state)
         self._journal.client.record_event(
             "service.send_started", entry, context=context
         )
         self._sends[entry["request_id"]] = (
             service_id,
             asyncio.create_task(
-                self._connections[service_id].send_message(
-                    {
-                        "protocol_version": 1,
-                        "message_type": "request",
-                        **{
-                            key: context[key]
-                            for key in (
-                                "experiment_id",
-                                "service_id",
-                                "service_instance_id",
-                            )
-                        },
-                        "request_id": entry["request_id"],
-                        "command": entry["command"],
-                        "args": entry["args"],
-                    }
+                self._exchange(
+                    service_id,
+                    entry["request_id"],
+                    entry["command"],
+                    entry["args"],
+                    deadline=entry.get("deadline_monotonic"),
                 )
             ),
         )
@@ -867,12 +727,14 @@ class ServiceManager:
             "run_id": state.run_id,
             "service_id": service_id,
             "service_instance_id": instance.service_instance_id,
+            "participant_id": service_id,
+            "participant_instance_id": instance.service_instance_id,
         }
         if (
             type(message.get("protocol_version")) is not int
-            or message["protocol_version"] != 1
+            or message["protocol_version"] != PROTOCOL_VERSION
         ):
-            raise ValueError("Service protocol_version must be 1.")
+            raise ValueError(f"Service protocol_version must be {PROTOCOL_VERSION}.")
         request_id = require_text(message.get("request_id"), "request_id")
         UUID(request_id)
         for key in ("experiment_id", "service_id", "service_instance_id"):
@@ -885,7 +747,7 @@ class ServiceManager:
                 return
         if message.get("result") not in ("success", "fail") or "data" not in message:
             raise ValueError("Service replies require result=success/fail and data.")
-        kind = message.get("message_type")
+        kind = "status" if message.get("command") == "heartbeat" else "command_result"
         if kind not in ("status", "command_result", "command_state"):
             raise ValueError("Unknown service message_type.")
         self._journal.client.record_event("service.message", message, context=context)
@@ -903,14 +765,19 @@ class ServiceManager:
                 and instance.start_deadline is not None
                 and time.monotonic() >= instance.start_deadline
             ):
-                instance.failure = "Service replied after its startup deadline."
+                instance.failure = error_details(
+                    "startup_timeout", "Service replied after its startup deadline."
+                )
                 instance.ready = False
             elif (
                 instance.ever_ready
                 and time.monotonic() - probe["sent_monotonic"]
                 >= instance.definition["heartbeat"]["grace_seconds"]
             ):
-                instance.failure = "Service replied after heartbeat grace expired."
+                instance.failure = error_details(
+                    "heartbeat_timeout",
+                    "Service replied after heartbeat grace expired.",
+                )
                 instance.ready = False
             else:
                 instance.last_status = {
@@ -920,8 +787,9 @@ class ServiceManager:
                 }
                 instance.ready = message["result"] == "success"
                 instance.ever_ready = instance.ever_ready or instance.ready
-                instance.failure = (
-                    None if instance.ready else "Service requested a full restart."
+                instance.failure = error_details(
+                    "service_failure",
+                    None if instance.ready else "Service requested a full restart.",
                 )
                 self._bad_replies[service_id] = 0
             self._probes.pop(service_id, None)
@@ -937,9 +805,15 @@ class ServiceManager:
                     context=context,
                 )
                 return
-            response = {"result": message["result"], "data": message["data"]}
+            response = {
+                key: value
+                for key, value in message.items()
+                if key
+                not in ("protocol_version", "message_type", "request_id", "command")
+            }
             if (
-                not active["timed_out"]
+                active.get("owner") != "caller"
+                and not active["timed_out"]
                 and time.monotonic() - active["sent_monotonic"]
                 >= instance.definition["command_timeout_seconds"]
             ):
@@ -951,8 +825,14 @@ class ServiceManager:
                     context=context,
                 )
                 # A late result releases actual work, never changes its timed-out outcome.
-                if instance.definition["on_command_timeout"] == "restart":
-                    instance.failure = "Timed-out command requires an explicit restart."
+                if (
+                    active.get("owner") != "caller"
+                    and instance.definition["on_command_timeout"] == "restart"
+                ):
+                    instance.failure = error_details(
+                        "service_failure",
+                        "Timed-out command requires an explicit restart.",
+                    )
                     self._restarts[service_id] = asyncio.create_task(
                         self.restart(state, service_id, automatic=True)
                     )
@@ -960,18 +840,13 @@ class ServiceManager:
                 if instance.blocked_action == "pause":
                     instance.blocked_action = None
             else:
-                self._journal.client.record_command_result(
-                    request_id,
+                self._finish_request(
+                    state,
+                    instance,
+                    active,
                     response,
-                    author="runner",
-                    outcome="succeeded"
-                    if response["result"] == "success"
-                    else "failed",
-                    context=context,
+                    "succeeded" if response["result"] == "success" else "failed",
                 )
-                future = self._waiters.pop(request_id, None)
-                if future is not None and not future.done():
-                    future.set_result({"request_id": request_id, **response})
             instance.active_request = None
         try:
             self._state_store.save(state)
@@ -999,6 +874,8 @@ class ServiceManager:
                     "run_id": state.run_id,
                     "service_id": service_id,
                     "service_instance_id": instance.service_instance_id,
+                    "participant_id": service_id,
+                    "participant_instance_id": instance.service_instance_id,
                 },
             )
             active["timed_out"] = True
@@ -1026,10 +903,12 @@ class ServiceManager:
         old_modules = {
             (item["module"]["name"], item["module"]["version"]): item["module"]["hash"]
             for item in [*state.template["stages"], *state.template["services"]]
+            if "module" in item
         }
         new_modules = {
             (item["module"]["name"], item["module"]["version"]): item["module"]["hash"]
             for item in [*template["stages"], *template["services"]]
+            if "module" in item
         }
         changed_code = {
             key for key, digest in old_modules.items() if new_modules.get(key) != digest
@@ -1079,9 +958,11 @@ class ServiceManager:
                 await self._start(state, definition)
             except (OSError, ConnectionError) as error:
                 instance = state.services.get(definition["service_id"])
-                if instance is None or instance.interface == "commands":
+                if instance is None:
                     raise
-                instance.failure = f"{type(error).__name__}: {error}"
+                instance.failure = error_details(
+                    "service_failure", f"{type(error).__name__}: {error}"
+                )
                 action = await self.restart(state, instance.service_id, automatic=True)
                 if action != "ready":
                     return action
@@ -1097,7 +978,7 @@ class ServiceManager:
                 "Saved service ownership is incomplete; automatic launch is unsafe."
             )
         if self._closed:
-            if self._connections or self._receivers or self._sends or self._waiters:
+            if self._connections or self._sends or self._waiters:
                 raise RuntimeError(
                     "Finish closing the previous service channels before recovery."
                 )
@@ -1152,7 +1033,17 @@ class ServiceManager:
             for entry in list(instance.pending_requests):
                 if entry["request_id"] not in sent_ids:
                     continue
-                recorded = self._journal.client.read_command_result(entry["request_id"])
+                recorded = read_result(
+                    self._journal.client,
+                    entry["request_id"],
+                    expected={
+                        "experiment_id": state.experiment_id,
+                        "participant_id": instance.service_id,
+                        "participant_instance_id": entry.get(
+                            "expected_instance", instance.service_instance_id
+                        ),
+                    },
+                )
                 if (
                     recorded is not None
                     and recorded["author"] == "runner"
@@ -1160,7 +1051,10 @@ class ServiceManager:
                 ):
                     instance.pending_requests.remove(entry)
                     continue
-                instance.failure = "Saved queue contains an already sent request with an unresolved outcome."
+                instance.failure = error_details(
+                    "service_failure",
+                    "Saved queue contains an already sent request with an unresolved outcome.",
+                )
                 instance.blocked_action = self._pending_action = "stop"
                 return "stop"
         self._starting.update(state.services)
@@ -1173,11 +1067,12 @@ class ServiceManager:
                     # Still reconnect the remaining live services so a partial
                     # shutdown cannot disable their supervision during recovery.
                     continue
-                if instance.interface == "commands":
-                    continue
                 instance.ready = False
                 if instance.process_identity is None or instance.endpoint_path is None:
-                    instance.failure = "Cannot identify the previous service process."
+                    instance.failure = error_details(
+                        "service_failure",
+                        "Cannot identify the previous service process.",
+                    )
                     instance.blocked_action = "stop"
                     self._pending_action = "stop"
                     return "stop"
@@ -1187,7 +1082,7 @@ class ServiceManager:
                     announced = {}
                 if (
                     announced
-                    and announced.get("service_instance_id")
+                    and announced.get("participant_instance_id")
                     != instance.service_instance_id
                 ):
                     # A stale state file must not authorize a second copy while a
@@ -1200,7 +1095,10 @@ class ServiceManager:
                             peer_alive = False
                         if peer_alive and instance.ever_ready:
                             instance.process_identity = None
-                            instance.failure = "Endpoint belongs to an unaccounted-for service instance."
+                            instance.failure = error_details(
+                                "ownership_unknown",
+                                "Endpoint belongs to an unaccounted-for service instance.",
+                            )
                             instance.blocked_action = self._pending_action = "stop"
                             return "stop"
                 try:
@@ -1212,7 +1110,9 @@ class ServiceManager:
                         raise
                     actual = None
                 if actual != instance.process_identity:
-                    instance.failure = "Previous service process no longer exists."
+                    instance.failure = error_details(
+                        "service_failure", "Previous service process no longer exists."
+                    )
                     action = await self.restart(state, service_id, automatic=True)
                     if action != "ready":
                         return action
@@ -1225,8 +1125,9 @@ class ServiceManager:
                         )
                     timeout = max(0, instance.start_deadline - time.monotonic())
                     if timeout == 0:
-                        instance.failure = (
-                            "Service startup expired while runner was unavailable."
+                        instance.failure = error_details(
+                            "startup_timeout",
+                            "Service startup expired while runner was unavailable.",
                         )
                         action = await self.restart(state, service_id, automatic=True)
                         if action != "ready":
@@ -1236,10 +1137,10 @@ class ServiceManager:
                     "experiment_id": state.experiment_id,
                     "service_id": service_id,
                     "service_instance_id": instance.service_instance_id,
+                    "participant_id": service_id,
+                    "participant_instance_id": instance.service_instance_id,
                 }
-                connection = ParticipantConnection(
-                    instance.endpoint_path, context, process_key="process"
-                )
+                connection = ParticipantConnection(instance.endpoint_path, context)
                 self._connections[service_id] = connection
                 reconnect_deadline = time.monotonic() + timeout
                 await asyncio.wait_for(
@@ -1261,9 +1162,8 @@ class ServiceManager:
                 observed = copy_json_object(reply["data"], "service command state")
                 if (
                     type(reply.get("protocol_version")) is not int
-                    or reply["protocol_version"] != 1
-                    or reply.get("message_type")
-                    not in ("command_state", "command_result")
+                    or reply["protocol_version"] != PROTOCOL_VERSION
+                    or reply.get("message_type") != "response"
                 ):
                     raise ValueError("Invalid service command_state envelope.")
                 if reply.get("result") != "success" or not {
@@ -1292,42 +1192,18 @@ class ServiceManager:
                     or item.get("request_id") != active["request_id"]
                     for item in participant_work
                 ):
-                    instance.failure = "Participant reports work not matched to the saved sent request."
+                    instance.failure = error_details(
+                        "service_failure",
+                        "Participant reports work not matched to the saved sent request.",
+                    )
                     # Unknown work needs an owner decision, not an automatic restart
                     # that would destroy the very evidence recovery must reconcile.
                     instance.blocked_action = "stop"
                     self._pending_action = "stop"
                     return "stop"
-                if active is not None:
-                    recorded = self._journal.client.read_command_result(
-                        active["request_id"]
-                    )
-                    if (
-                        recorded is not None
-                        and recorded["outcome"] in ("succeeded", "failed")
-                        and not active["timed_out"]
-                    ):
-                        if recorded["author"] == "runner":
-                            # A previously accepted result is not made late by downtime.
-                            instance.active_request = None
-                        else:
-                            await self._handle_message(
-                                state,
-                                service_id,
-                                {
-                                    "protocol_version": 1,
-                                    "message_type": "command_result",
-                                    "request_id": active["request_id"],
-                                    **recorded["response"],
-                                },
-                            )
-                    # Absence at the participant is not evidence of non-execution.
-                    # Keep an unknown sent request occupied, with its original deadline.
+                await self._poll_result(state, service_id)
                 self._probes.pop(service_id, None)
                 self._next_probe[service_id] = 0
-                self._receivers[service_id] = asyncio.create_task(
-                    connection.receive_message()
-                )
             finally:
                 self._starting.discard(service_id)
         action = await self.wait_ready(state)
@@ -1349,7 +1225,11 @@ class ServiceManager:
                 for instance in state.services.values()
             ):
                 if any(
-                    instance.blocked_action is not None
+                    (
+                        instance.blocked_action is not None
+                        or instance.active_request is not None
+                        and instance.active_request["timed_out"]
+                    )
                     for instance in state.services.values()
                 ):
                     raise RuntimeError(
@@ -1358,12 +1238,8 @@ class ServiceManager:
                 self._changed.clear()
                 await self._changed.wait()
             for service_id, instance in state.services.items():
-                if instance.interface == "commands":
-                    continue
                 if not instance.ready:
-                    raise RuntimeError(
-                        "Snapshot requires all socket services to be ready."
-                    )
+                    raise RuntimeError("Snapshot requires all services to be ready.")
                 self._frozen_instances[service_id] = instance.service_instance_id
                 instance.prepared_freeze_id = snapshot_id
                 reply = await self.request(
@@ -1442,12 +1318,6 @@ class ServiceManager:
         root = state.experiment_directory.resolve()
         for service_id, instance in state.services.items():
             supplied = service_states.get(service_id)
-            if instance.interface == "commands":
-                if supplied is not None:
-                    raise ValueError(
-                        "Commands-only services cannot restore exported state."
-                    )
-                continue
             if supplied is None:
                 if instance.definition["state_required"]:
                     raise ValueError(f"Required service state is missing: {service_id}")
@@ -1529,9 +1399,10 @@ class ServiceManager:
                 "run_id": state.run_id,
                 "service_id": service_id,
                 "service_instance_id": instance.service_instance_id,
+                "participant_id": service_id,
+                "participant_instance_id": instance.service_instance_id,
             }
             tasks = [
-                self._receivers.pop(service_id, None),
                 self._connecting.pop(service_id, None),
             ]
             restart = self._restarts.get(service_id)
@@ -1555,8 +1426,7 @@ class ServiceManager:
             deadline = time.monotonic() + state.template["start_timeout"]
             owned_process = self._processes.get(service_id)
             if (
-                instance.interface == "socket"
-                and owned_process is not None
+                owned_process is not None
                 and instance.process_identity is not None
                 and owned_process.pid == instance.process_identity["pid"]
                 and owned_process.poll() is not None
@@ -1586,104 +1456,59 @@ class ServiceManager:
                         f"Emergency service-stop recording failed: {secondary}"
                     )
             try:
-                if not instance.stopped:
-                    if instance.implementation == "action":
-                        output = instance.artifacts_directory / f"stop-{uuid4()}"
-                        launch = self._launcher.prepare(
-                            state,
-                            instance.definition,
-                            context,
-                            output,
-                            None,
-                            command="stop",
-                        )
-                        with (
-                            (output / "stdout.log").open("ab") as stdout,
-                            (output / "stderr.log").open("ab") as stderr,
-                        ):
-                            environment = dict(os.environ)
-                            library = str(Path(__file__).resolve().parents[2])
-                            environment["PYTHONPATH"] = library + (
-                                os.pathsep + environment["PYTHONPATH"]
-                                if environment.get("PYTHONPATH")
-                                else ""
-                            )
-                            spawn = asyncio.create_task(
-                                asyncio.to_thread(
-                                    subprocess.Popen,
-                                    launch["argv"],
-                                    cwd=launch["code_directory"],
-                                    env=environment,
-                                    stdin=subprocess.DEVNULL,
-                                    stdout=stdout,
-                                    stderr=stderr,
-                                    creationflags=getattr(
-                                        subprocess, "CREATE_NO_WINDOW", 0
-                                    ),
-                                )
-                            )
+                if not instance.stopped and instance.endpoint_path is not None:
+                    connection = ParticipantConnection(
+                        instance.endpoint_path,
+                        {
+                            "experiment_id": state.experiment_id,
+                            "service_id": service_id,
+                            "service_instance_id": instance.service_instance_id,
+                            "participant_id": service_id,
+                            "participant_instance_id": instance.service_instance_id,
+                        },
+                    )
+                    async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
+                        # Stop can interrupt startup after spawn but before the
+                        # new endpoint replaces the previous instance's file.
+                        while True:
                             try:
-                                process = await asyncio.shield(spawn)
-                            except asyncio.CancelledError:
-                                self._action_processes.append(await spawn)
-                                raise
-                            self._action_processes.append(process)
-                        if instance.interface == "commands":
-                            instance.stopped = True
-                    elif instance.endpoint_path is not None:
-                        connection = ParticipantConnection(
-                            instance.endpoint_path,
-                            {
-                                "experiment_id": state.experiment_id,
-                                "service_id": service_id,
-                                "service_instance_id": instance.service_instance_id,
-                            },
-                            process_key="process",
-                        )
-                        async with asyncio.timeout(
-                            max(0.001, deadline - time.monotonic())
-                        ):
-                            # Stop can interrupt startup after spawn but before the
-                            # new endpoint replaces the previous instance's file.
-                            while True:
-                                try:
-                                    endpoint = read_json(instance.endpoint_path)
-                                except (FileNotFoundError, PermissionError):
-                                    endpoint = {}
-                                if (
-                                    endpoint.get("service_instance_id")
-                                    == instance.service_instance_id
-                                ):
-                                    break
-                                await asyncio.sleep(0.05)
-                            await connection.connect(
-                                timeout_seconds=max(0.001, deadline - time.monotonic())
-                            )
-                            reply = await connection.request(
-                                request_id,
-                                "shutdown",
-                                {},
-                                timeout_seconds=max(0.001, deadline - time.monotonic()),
-                            )
+                                endpoint = read_json(instance.endpoint_path)
+                            except (FileNotFoundError, PermissionError):
+                                endpoint = {}
                             if (
-                                reply.get("message_type") != "command_result"
-                                or reply.get("result") not in ("success", "fail")
-                                or "data" not in reply
+                                endpoint.get("participant_instance_id")
+                                == instance.service_instance_id
                             ):
-                                raise ValueError("Invalid shutdown result.")
-                            shutdown_response = {
-                                "result": reply["result"],
-                                "data": reply["data"],
-                            }
-                            if reply["result"] == "fail":
-                                error_message = "Service shutdown reported failure."
+                                break
+                            await asyncio.sleep(0.05)
+                        await connection.connect(
+                            timeout_seconds=max(0.001, deadline - time.monotonic())
+                        )
+                        reply = await connection.request(
+                            request_id,
+                            "shutdown",
+                            {},
+                            timeout_seconds=max(0.001, deadline - time.monotonic()),
+                        )
+                        if (
+                            reply.get("message_type") != "response"
+                            or reply.get("result") not in ("success", "fail")
+                            or "data" not in reply
+                        ):
+                            raise ValueError("Invalid shutdown result.")
+                        shutdown_response = {
+                            "result": reply["result"],
+                            "data": reply["data"],
+                        }
+                        if reply["result"] == "fail":
+                            error_message = "Service shutdown reported failure."
             except Exception as error:  # noqa: BLE001 - One failed stop must not leave other services untouched.
                 error_message = str(error)
             finally:
                 if connection is not None:
                     await connection.close()
             process = self._processes.get(service_id)
-            while not instance.stopped and instance.interface == "socket":
+            while not instance.stopped:
                 try:
                     if (
                         process is not None
@@ -1724,7 +1549,6 @@ class ServiceManager:
                 await asyncio.sleep(0.05)
             if (
                 not instance.stopped
-                and instance.interface == "socket"
                 and process is not None
                 and instance.process_identity is not None
                 and process.pid == instance.process_identity["pid"]
@@ -1739,7 +1563,7 @@ class ServiceManager:
                 instance.stopped = process.poll() is not None
             if not instance.stopped:
                 error_message = error_message or "Service termination is unconfirmed."
-                instance.failure = error_message
+                instance.failure = error_details("service_failure", error_message)
                 instance.blocked_action = "stop"
                 self._pending_action = "stop"
             cancelled = [] if preserve_pending else instance.pending_requests[:]
@@ -1749,23 +1573,16 @@ class ServiceManager:
                 cancelled.insert(0, instance.active_request)
                 instance.active_request = None
             for entry in cancelled:
-                response = {"result": "fail", "data": {"reason": "service_stopped"}}
-                if not entry["timed_out"]:
-                    try:
-                        self._journal.client.record_command_result(
-                            entry["request_id"],
-                            response,
-                            author="runner",
-                            outcome="cancelled"
-                            if entry["sent_monotonic"] is None
-                            else "failed",
-                            context=context,
-                        )
-                    except LoggingError as error:
-                        error_message = str(error)
-                future = self._waiters.pop(entry["request_id"], None)
-                if future is not None and not future.done():
-                    future.set_result({"request_id": entry["request_id"], **response})
+                try:
+                    self._finish_request(
+                        state,
+                        instance,
+                        entry,
+                        {"result": "fail", "data": {"reason": "service_stopped"}},
+                        "cancelled" if entry["sent_monotonic"] is None else "failed",
+                    )
+                except LoggingError as error:
+                    error_message = str(error)
             instance.stopping = False
             if self._notify_resources is not None:
                 self._notify_resources()
@@ -1810,7 +1627,7 @@ class ServiceManager:
             )
         await self.close()
         deadline = time.monotonic() + state.template["start_timeout"]
-        for process in [*self._processes.values(), *self._action_processes]:
+        for process in self._launch_processes:
             if process.poll() is None:
                 try:
                     await asyncio.to_thread(
@@ -1821,7 +1638,7 @@ class ServiceManager:
                         "A service command still owns runtime files."
                     ) from error
         self._processes.clear()
-        self._action_processes.clear()
+        self._launch_processes.clear()
         self._probes.clear()
         self._next_probe.clear()
         self._bad_replies.clear()
@@ -1838,7 +1655,6 @@ class ServiceManager:
         self._closed = True
         tasks = [
             self._monitor_task,
-            *self._receivers.values(),
             *self._restarts.values(),
             *self._connecting.values(),
             *(task for _, task in self._sends.values()),
@@ -1854,17 +1670,259 @@ class ServiceManager:
         for connection in self._connections.values():
             await connection.close()
         self._connections.clear()
-        self._receivers.clear()
         self._restarts.clear()
         self._connecting.clear()
         self._sends.clear()
         for future in self._waiters.values():
             future.cancel()
         self._waiters.clear()
-        for process in self._processes.values():
-            process.poll()
-        # Observe/reap already exited launch commands, but preserve live services.
-        self._action_processes = [
-            process for process in self._action_processes if process.poll() is None
+        self._launch_processes = [
+            process for process in self._launch_processes if process.poll() is None
         ]
         self._changed.set()
+
+    def _context(
+        self, state: RunnerState, service_id: str, instance_id: str
+    ) -> JsonObject:
+        return {
+            "experiment_id": state.experiment_id,
+            "run_id": state.run_id,
+            "service_id": service_id,
+            "service_instance_id": instance_id,
+            "participant_id": service_id,
+            "participant_instance_id": instance_id,
+        }
+
+    def _save(self, state: RunnerState) -> None:
+        try:
+            self._state_store.save(state)
+        except OSError as error:
+            self._journal.client.record_error(
+                error, context={"experiment_id": state.experiment_id}
+            )
+
+    async def _exchange(
+        self,
+        service_id: str,
+        request_id: str,
+        command: str,
+        args: JsonObject,
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> JsonObject:
+        reply = await self._connections[service_id].request(
+            request_id,
+            command,
+            args,
+            timeout_seconds=timeout,
+            deadline_monotonic=deadline,
+        )
+        return {**reply, "command": command}
+
+    def _finish_request(
+        self,
+        state: RunnerState,
+        instance: ServiceInstance,
+        entry: JsonObject,
+        response: JsonObject,
+        outcome: str,
+    ) -> None:
+        context = self._context(
+            state, instance.service_id, instance.service_instance_id
+        )
+        if entry.get("owner") != "caller" and not entry["timed_out"]:
+            self._journal.client.record_command_result(
+                entry["request_id"],
+                response,
+                author="runner",
+                outcome=outcome,
+                context=context,
+            )
+        elif entry.get("owner") == "caller":
+            self._journal.client.record_event(
+                "service.request_retired",
+                {"request_id": entry["request_id"], "response": response},
+                context=context,
+            )
+        future = self._waiters.pop(entry["request_id"], None)
+        if future is not None and not future.done():
+            future.set_result({"request_id": entry["request_id"], **response})
+        self._changed.set()
+
+    def enqueue(
+        self,
+        state: RunnerState,
+        service_id: str,
+        request_id: str,
+        command: str,
+        args: JsonObject,
+        *,
+        owner: str = "caller",
+        deadline: float | None = None,
+    ) -> asyncio.Future:
+        instance = state.services[service_id]
+        if self._closed or instance.stopped or instance.stopping:
+            raise RuntimeError("Working requests require an active service.")
+        require_text(command, "service command")
+        if command in ("heartbeat", "shutdown", "command_state", "interrupt"):
+            raise ValueError("Control commands do not belong in the working queue.")
+        if self._snapshot_id is not None and (
+            command not in ("freeze_writes", "save_state", "unfreeze_writes")
+            or args.get("snapshot_id") != self._snapshot_id
+        ):
+            raise RuntimeError("Ordinary work is frozen for a snapshot.")
+        UUID(request_id)
+        if owner not in ("caller", "service"):
+            raise ValueError("Request owner must be caller or service.")
+        if request_id in state.used_request_ids:
+            raise ValueError("Request ID was already allocated.")
+        if request_id in self._waiters or any(
+            entry["request_id"] == request_id
+            for item in state.services.values()
+            for entry in [
+                *item.pending_requests,
+                *([] if item.active_request is None else [item.active_request]),
+            ]
+        ):
+            raise ValueError("A queued or sent request cannot be submitted again.")
+        state.used_request_ids.add(request_id)
+        entry = {
+            "request_id": request_id,
+            "command": command,
+            "args": copy_json_object(args, "args"),
+            "owner": owner,
+            "deadline_monotonic": deadline,
+            "queued_monotonic": time.monotonic(),
+            "sent_monotonic": None,
+            "sent_at": None,
+            "service_instance_id": None,
+            "timed_out": False,
+        }
+        if owner == "caller" or command in (
+            "freeze_writes",
+            "save_state",
+            "unfreeze_writes",
+            "load_state",
+        ):
+            entry["expected_instance"] = instance.service_instance_id
+        self._journal.client.record_event(
+            "service.request_queued",
+            entry,
+            context=self._context(state, service_id, instance.service_instance_id),
+        )
+        instance.pending_requests.append(entry)
+        future = asyncio.get_running_loop().create_future()
+        self._waiters[request_id] = future
+        self._save(state)
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self.monitor(state))
+        return future
+
+    async def cancel_request(
+        self,
+        state: RunnerState,
+        service_id: str,
+        request_id: str,
+        *,
+        interrupt: bool = False,
+    ) -> bool:
+        instance = state.services[service_id]
+        for entry in list(instance.pending_requests):
+            if entry["request_id"] == request_id:
+                instance.pending_requests.remove(entry)
+                self._finish_request(
+                    state,
+                    instance,
+                    entry,
+                    {"result": "fail", "data": {"reason": "cancelled_before_send"}},
+                    "cancelled",
+                )
+                self._save(state)
+                return True
+        active = instance.active_request
+        if active is None or active["request_id"] != request_id:
+            return True
+        active["timed_out"] = True
+        future = self._waiters.pop(request_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        self._save(state)
+        if instance.stopped:
+            return True
+        if not interrupt:
+            return False
+        control_id = str(uuid4())
+        state.used_request_ids.add(control_id)
+        self._journal.client.record_event(
+            "control.intent",
+            {
+                "action": "interrupt_request",
+                "request_id": control_id,
+                "target_request_id": request_id,
+            },
+            context=self._context(state, service_id, instance.service_instance_id),
+        )
+        try:
+            reply = await self._exchange(
+                service_id,
+                control_id,
+                "interrupt",
+                {"request_id": request_id},
+                timeout=state.template["start_timeout"],
+            )
+            if reply["result"] == "success":
+                instance.active_request = None
+                self._save(state)
+                return True
+        except (OSError, TimeoutError):
+            pass
+        return False
+
+    async def _poll_result(self, state: RunnerState, service_id: str) -> None:
+        instance = state.services[service_id]
+        active = instance.active_request
+        if active is None:
+            return
+        record = read_result(
+            self._journal.client,
+            active["request_id"],
+            expected={
+                "experiment_id": state.experiment_id,
+                "participant_id": service_id,
+                "participant_instance_id": instance.service_instance_id,
+            },
+        )
+        if record is None:
+            return
+        if (
+            record["author"] == "runner"
+            and not active["timed_out"]
+            and active.get("owner") != "caller"
+        ):
+            self._finish_request(
+                state, instance, active, record["response"], record["outcome"]
+            )
+            instance.active_request = None
+            self._save(state)
+            return
+        participant = next(
+            (
+                item
+                for item in record["observations"]
+                if item["author"] == "participant"
+            ),
+            None,
+        )
+        if participant is not None:
+            await self._handle_message(
+                state,
+                service_id,
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "message_type": "response",
+                    "command": active["command"],
+                    "request_id": active["request_id"],
+                    **participant["event"]["data"]["response"],
+                },
+            )

@@ -1,12 +1,13 @@
-"""Runner-side execution of sequential stage attempts through an independent executor."""
+"""Runner-owned DAG attempts through the common participant call protocol."""
 
 from __future__ import annotations
 
 import asyncio
-import os
+import json
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -17,6 +18,7 @@ from core.logger_utils.events import LoggingError
 from core.runner_utils.connection import ParticipantConnection
 from core.runner_utils.journal import RunnerJournal
 from core.runner_utils.launch import ModuleLauncher
+from core.runner_utils.results import read_result
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.state import (
     JsonObject,
@@ -35,17 +37,24 @@ class StageRunner:
         journal: RunnerJournal,
         state_store: RunnerStateStore,
         *,
+        services=None,
         notify_resources: Callable[[], None] | None = None,
     ) -> None:
         self._launcher = launcher
         self._journal = journal
         self._state_store = state_store
+        self._services = services
         self._connection = None
+        self._call_future = None
         self._process = None
         self._process_attempt_id = None
-        self._unstarted_attempt_id: str | None = None
+        self._unstarted_attempt_id = None
         self._executor_processes = []
+        self._executor_identities = {}
         self._notify_resources = notify_resources
+
+    def bind_services(self, services) -> None:
+        self._services = services
 
     async def execute(
         self,
@@ -64,10 +73,9 @@ class StageRunner:
             self.select_input(state) if recovered is None else recovered.input_data
         )
         if manual:
-            state.stage_result_paths.pop(stage_id, None)
+            state.stage_result_ids.pop(stage_id, None)
             state.stage_result_origins.pop(stage_id, None)
-            state.last_result = None
-            state.last_result_path = None
+            state.last_result = state.last_result_id = None
         policy = definition["errors"]
         while True:
             attempt = (
@@ -77,43 +85,34 @@ class StageRunner:
             )
             recovered = None
             response = await self._collect_result(state, attempt)
-            success = response is not None and response["result"] == "success"
             self._journal.client.record_event(
                 "stage.finished",
                 {
                     "result": response,
                     "outcome": attempt.outcome,
-                    "result_path": str(
-                        attempt.result_path.relative_to(state.experiment_directory)
-                    ),
+                    "result_request_id": attempt.result_request_id,
                 },
-                context={
-                    "experiment_id": state.experiment_id,
-                    "run_id": state.run_id,
-                    "stage_id": stage_id,
-                    "attempt_id": attempt.attempt_id,
-                    "cycle_number": state.cycle_number,
-                    "attempt_number": attempt.attempt_number,
-                },
+                context=self._context(state, attempt),
             )
             self._save_state(state)
-            if success:
+            if attempt.outcome == "unknown":
+                return StageOutcome(attempt, response, "stop")
+            if response is not None and response["result"] == "success":
                 return StageOutcome(attempt, response, "advance")
             if state.pause_requested:
                 return StageOutcome(attempt, response, "pause")
             used = state.stage_retry_counts.get(stage_id, 0)
             if used >= policy["retries"]:
-                action = (
+                return StageOutcome(
+                    attempt,
+                    response,
                     "advance"
                     if policy["on_exhausted"] == "skip"
-                    else policy["on_exhausted"]
+                    else policy["on_exhausted"],
                 )
-                return StageOutcome(attempt, response, action)
             await asyncio.sleep(policy["retry_delay_seconds"])
             if state.pause_requested:
                 return StageOutcome(attempt, response, "pause")
-            # The owner supplies readiness; stage retry policy does not inspect or
-            # restart services and must not spend a retry while they are unavailable.
             if wait_services is not None:
                 action = await wait_services(state)
                 if action != "ready":
@@ -127,35 +126,64 @@ class StageRunner:
         if state.stage_position == 1:
             return None
         previous = state.template["stages"][state.stage_position - 2]["stage_id"]
-        path = state.stage_result_paths.get(previous)
-        if path is None or not path.is_file():
+        request_id = state.stage_result_ids.get(previous)
+        if request_id is None:
             return None
-        result = read_json(path)
-        if result.get("stage_id") != previous or result.get(
-            "experiment_id"
-        ) != state.stage_result_origins.get(previous, state.experiment_id):
-            raise ValueError("Saved predecessor result has a different identity.")
-        response = result.get("response")
-        if (
-            result.get("exit_code") == 0
-            and not result.get("interruption_reason")
-            and isinstance(response, dict)
-            and response.get("result") == "success"
-        ):
-            return response["data"]
-        return None
+        record = read_result(
+            self._journal.client,
+            request_id,
+            expected={
+                "experiment_id": state.stage_result_origins.get(
+                    previous, state.experiment_id
+                ),
+                "stage_id": previous,
+            },
+            accepted=True,
+        )
+        if record is None:
+            raise ValueError("Predecessor result is missing from the journal.")
+        return (
+            record["response"]["data"]
+            if record["outcome"] == "succeeded"
+            and record["response"]["result"] == "success"
+            else None
+        )
+
+    def _context(self, state: RunnerState, attempt: StageAttempt) -> JsonObject:
+        definition = next(
+            item
+            for item in state.template["stages"]
+            if item["stage_id"] == attempt.stage_id
+        )
+        module = self._launcher._assembler.module_reference(state.template, definition)
+        return {
+            "experiment_id": state.experiment_id,
+            "run_id": state.run_id,
+            "stage_id": attempt.stage_id,
+            "attempt_id": attempt.attempt_id,
+            "stage_execution_id": attempt.stage_execution_id,
+            "request_id": attempt.request_id,
+            "service_id": attempt.service_id,
+            "service_instance_id": None
+            if attempt.service_id is None
+            else attempt.participant["participant_instance_id"],
+            "cycle_number": attempt.cycle_number,
+            "attempt_number": attempt.attempt_number,
+            "module_name": module["name"],
+            "module_version": module["version"],
+            "module_hash": module["hash"],
+            "template_revision_id": state.template_revision_id,
+            **(attempt.participant or {}),
+        }
 
     async def _start_attempt(
         self, state: RunnerState, input_data: JsonValue
     ) -> StageAttempt:
-        self._process_attempt_id = None
-        self._unstarted_attempt_id = None
         definition = state.template["stages"][state.stage_position - 1]
-        module = definition["module"]
+        module = self._launcher._assembler.module_reference(state.template, definition)
         stage_id = definition["stage_id"]
         number = state.stage_attempt_numbers.get(stage_id, 0) + 1
         attempt_id = str(uuid4())
-        execution_id = str(uuid4())
         directory = (
             state.experiment_directory
             / "shared_artifacts"
@@ -164,15 +192,33 @@ class StageRunner:
             / stage_id
             / f"attempt_{number}"
         )
-        context = {
+        attempt = StageAttempt(
+            attempt_id,
+            stage_id,
+            str(uuid4()),
+            state.cycle_number,
+            number,
+            directory,
+            input_data,
+            {},
+            definition["timeout_seconds"],
+        )
+        attempt.service_id = definition.get("service_id")
+        instance = (
+            None if attempt.service_id is None else state.services[attempt.service_id]
+        )
+        attempt.participant = {
             "experiment_id": state.experiment_id,
-            "run_id": state.run_id,
+            "participant_id": stage_id if instance is None else instance.service_id,
+            "participant_instance_id": attempt_id
+            if instance is None
+            else instance.service_instance_id,
+        }
+        attempt.queued_at = datetime.now(UTC).isoformat()
+        attempt.queued_monotonic = time.monotonic()
+        context = {
+            **self._context(state, attempt),
             "template_revision_id": state.template_revision_id,
-            "stage_id": stage_id,
-            "stage_execution_id": execution_id,
-            "attempt_id": attempt_id,
-            "cycle_number": state.cycle_number,
-            "attempt_number": number,
             "module_name": module["name"],
             "module_version": module["version"],
             "module_hash": module["hash"],
@@ -180,22 +226,29 @@ class StageRunner:
         launch = self._launcher.prepare(
             state, definition, context, directory, input_data
         )
-        attempt = StageAttempt(
-            attempt_id,
-            stage_id,
-            execution_id,
-            state.cycle_number,
-            number,
-            directory,
-            input_data,
-            launch["effective_settings"],
-            definition["timeout_seconds"],
+        attempt.endpoint_path = Path(launch["endpoint_path"])
+        attempt.effective_settings = launch["effective_settings"]
+        launch["runtime_context"].update(
+            {
+                "queued_at": attempt.queued_at,
+                "queued_monotonic": attempt.queued_monotonic,
+                "service_id": attempt.service_id,
+            }
         )
+        write_json(directory / "context.json", launch["runtime_context"])
         state.active_attempt = attempt
-        self._unstarted_attempt_id = attempt_id
-        if self._notify_resources is not None:
-            self._notify_resources()
         state.stage_attempt_numbers[stage_id] = number
+        if attempt.request_id in state.used_request_ids:
+            raise RuntimeError("Attempt request ID collision.")
+        if instance is None:
+            state.used_request_ids.add(attempt.request_id)
+        self._unstarted_attempt_id = attempt_id
+        self._process_attempt_id = attempt_id
+        self._process = None
+        self._call_future = None
+        if self._connection is not None:
+            await self._connection.close()
+        self._connection = None
         self._journal.client.record_attempt_parameters(
             state.template,
             attempt.effective_settings,
@@ -204,11 +257,37 @@ class StageRunner:
         )
         self._journal.client.record_event(
             "control.intent",
-            {"action": "start_stage", "argv": launch["argv"]},
+            {
+                "action": "start_stage",
+                "argv": None if instance is not None else launch["argv"],
+                "service_id": attempt.service_id,
+                "queued_monotonic": attempt.queued_monotonic,
+                "queued_at": attempt.queued_at,
+            },
             context=context,
         )
         self._save_state(state)
         self._prune_artifacts(state, attempt)
+        if self._notify_resources is not None:
+            self._notify_resources()
+        deadline = self._deadline(attempt)
+        if deadline is not None and time.monotonic() >= deadline:
+            return attempt
+        if instance is not None:
+            if self._services is None:
+                raise RuntimeError("Service attempts require a bound ServiceManager.")
+            if state.services[instance.service_id] is not instance:
+                return attempt
+            self._call_future = self._services.enqueue(
+                state,
+                instance.service_id,
+                attempt.request_id,
+                "execute",
+                launch["call"],
+                deadline=deadline,
+            )
+            self._unstarted_attempt_id = None
+            return attempt
         launch_path = directory / "launch.json"
         write_json(launch_path, launch)
         library_root = Path(__file__).resolve().parents[2]
@@ -240,274 +319,344 @@ class StageRunner:
             self._process = await asyncio.shield(spawn)
         except asyncio.CancelledError:
             self._process = await spawn
-            self._process_attempt_id = attempt_id
-            self._executor_processes.append(
-                (
-                    self._process,
-                    directory / "execution_result.json",
-                    launch["control_timeout_seconds"] + launch["stop_timeout_seconds"],
-                )
-            )
+            self._executor_processes.append((self._process, attempt.request_id))
             raise
-        self._process_attempt_id = attempt_id
-        self._executor_processes.append(
-            (
-                self._process,
-                directory / "execution_result.json",
-                launch["control_timeout_seconds"] + launch["stop_timeout_seconds"],
-            )
-        )
-        self._connection = None
-        deadline = time.monotonic() + launch["control_timeout_seconds"]
-        lock = state.experiment_directory / "executor.lock.json"
-        while time.monotonic() < deadline:
-            if (directory / "execution_result.json").is_file():
+        except OSError:
+            self._unstarted_attempt_id = attempt_id
+            raise
+        self._executor_processes.append((self._process, attempt.request_id))
+        startup_deadline = time.monotonic() + launch["control_timeout_seconds"]
+        if deadline is not None:
+            startup_deadline = min(startup_deadline, deadline)
+        while time.monotonic() < startup_deadline:
+            if self._journal.client.read_command_result(attempt.request_id) is not None:
                 return attempt
-            if lock.is_file():
+            if attempt.endpoint_path.is_file():
                 try:
-                    metadata = read_json(lock)
-                    if metadata.get("attempt_id") == attempt_id:
-                        self._connection = ParticipantConnection(
-                            lock,
-                            {
-                                "experiment_id": state.experiment_id,
-                                "stage_id": stage_id,
-                                "attempt_id": attempt_id,
-                            },
+                    endpoint = read_json(attempt.endpoint_path)
+                    if endpoint.get("participant_instance_id") != attempt_id:
+                        await asyncio.sleep(0.02)
+                        continue
+                    await self._connect(
+                        attempt, max(0.001, startup_deadline - time.monotonic())
+                    )
+                    self._call_future = asyncio.create_task(
+                        self._connection.request(
+                            attempt.request_id,
+                            "execute",
+                            launch["call"],
+                            deadline_monotonic=deadline,
                         )
-                        await self._connection.connect(
-                            timeout_seconds=max(0.001, deadline - time.monotonic())
-                        )
-                        return attempt
-                except PermissionError:
-                    if os.name != "nt":
-                        raise
-                    # Windows may briefly deny opens during endpoint publication
-                    # or deletion. Retry within the original startup deadline.
-                    if self._connection is not None:
-                        await self._connection.close()
-                        self._connection = None
+                    )
+                    return attempt
                 except (OSError, EOFError):
-                    # Completion publishes the result before deleting the endpoint.
-                    # A short stage can finish between the existence check and read.
-                    if not (directory / "execution_result.json").is_file():
+                    if (
+                        self._journal.client.read_command_result(attempt.request_id)
+                        is not None
+                    ):
+                        return attempt
+                    if self._process.poll() is not None:
                         raise
-                    if self._connection is not None:
-                        await self._connection.close()
-                        self._connection = None
-                    return attempt
             if self._process.poll() is not None:
-                if (directory / "execution_result.json").is_file():
-                    return attempt
                 raise RuntimeError(
-                    f"Executor exited before publishing a result (exit {self._process.returncode})."
+                    "Executor exited before publishing its endpoint or journal result."
                 )
             await asyncio.sleep(0.02)
-        raise TimeoutError(
-            "Executor did not publish its endpoint before the startup deadline."
+        if deadline is not None and time.monotonic() >= deadline:
+            return attempt
+        raise TimeoutError("Executor startup deadline expired.")
+
+    def _deadline(self, attempt: StageAttempt) -> float | None:
+        return (
+            None
+            if attempt.timeout_seconds is None
+            else attempt.queued_monotonic + attempt.timeout_seconds
         )
 
-    async def _collect_result(
-        self, state: RunnerState, attempt: StageAttempt
-    ) -> JsonObject | None:
-        path = attempt.artifacts_directory / "execution_result.json"
-        while not path.is_file():
-            if self._connection is None:
-                raise RuntimeError("Executor connection is unavailable.")
-            request_id = str(uuid4())
-            state.used_request_ids.add(request_id)
-            try:
-                reply = await self._connection.query_command_state(
-                    request_id,
-                    timeout_seconds=state.template["unknown_state"]["timeout_seconds"],
-                )
-            except (OSError, EOFError):
-                if path.is_file():
-                    break
-                raise
-            status = reply["data"]
-            first_observation = (
-                attempt.started_at is None and status["started_at"] is not None
-            )
-            attempt.executor_status = status
-            attempt.process_identity = status["process"]
-            attempt.started_at = status["started_at"]
-            if first_observation:
-                self._save_state(state)
-                if self._notify_resources is not None:
-                    self._notify_resources()
-            started = status.get("started_monotonic")
-            if attempt.timeout_seconds is not None and started is not None:
-                deadline = (
-                    started
-                    + attempt.timeout_seconds
-                    + state.template["runner_timeout_margin_seconds"]
-                )
-                if time.monotonic() >= deadline:
-                    if not await self.interrupt(state, "timeout"):
-                        raise RuntimeError(
-                            "Could not confirm timed-out stage termination."
-                        )
-                    attempt.outcome = "timed_out"
-            await asyncio.sleep(0.1)
-        result = read_json(path)
-        for key, value in (
-            ("attempt_id", attempt.attempt_id),
-            ("stage_id", attempt.stage_id),
-            ("experiment_id", state.experiment_id),
-        ):
-            if result.get(key) != value:
-                raise ValueError(f"Result identity mismatch: {key}")
-        attempt.result_path = path
-        attempt.started_at = result["started_at"]
+    async def _connect(self, attempt: StageAttempt, timeout: float) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+        self._connection = ParticipantConnection(
+            attempt.endpoint_path, attempt.participant
+        )
+        await self._connection.connect(timeout_seconds=timeout)
+
+    def _accept(
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        response: JsonObject,
+        outcome: str,
+    ) -> JsonObject:
+        state.used_request_ids.add(attempt.request_id)
+        self._journal.client.record_command_result(
+            attempt.request_id,
+            response,
+            author="runner",
+            outcome=outcome,
+            context=self._context(state, attempt),
+        )
+        attempt.result_request_id = attempt.request_id
+        attempt.outcome = outcome
+        execution = response.get("execution", {})
+        if execution:
+            attempt.executor_status = execution
+            attempt.process_identity = execution.get("process")
+            attempt.started_at = execution.get("started_at")
         attempt.executor_status = {
             **(attempt.executor_status or {}),
             "finished": True,
             "current": None,
             "pending": [],
-            "exit_code": result["exit_code"],
         }
+        self._save_state(state)
         if self._notify_resources is not None:
             self._notify_resources()
-        if self._connection is not None:
-            await self._connection.close()
-            self._connection = None
-        response = result["response"]
-        if attempt.outcome == "timed_out" or result["interruption_reason"] is not None:
-            attempt.outcome = (
-                "timed_out"
-                if attempt.outcome == "timed_out"
-                or result["interruption_reason"] == "timeout"
-                else "interrupted"
-            )
-            return {"result": "fail", "data": {"reason": attempt.outcome}}
-        if result["error"] is not None or result["exit_code"] != 0:
-            attempt.outcome = "failed"
-            return {
-                "result": "fail",
-                "data": {"error": result["error"], "exit_code": result["exit_code"]},
-            }
-        attempt.outcome = "succeeded" if response["result"] == "success" else "failed"
         return response
 
-    async def interrupt(self, state: RunnerState, reason: str) -> bool:
-        attempt = state.active_attempt
-        if attempt is None:
-            return True
-        if self._unstarted_attempt_id == attempt.attempt_id:
-            # This owner never reached Popen; a refused mandatory record cannot
-            # leave a running executor that needs an RPC timeout to stop.
-            return True
-        if self._process_attempt_id != attempt.attempt_id:
-            # A restored owner has no Popen handle, but may reconnect to the
-            # independently authenticated executor. Missing ownership is not success.
-            self._process_attempt_id = attempt.attempt_id
-            self._process = None
-        # Cancelling the DAG may close a pending query while retaining its client.
-        # Reconnect before sending the independent interruption command.
-        if self._connection is not None:
-            await self._connection.close()
-            self._connection = None
-        path = attempt.artifacts_directory / "execution_result.json"
-        deadline = time.monotonic() + state.template["unknown_state"]["timeout_seconds"]
-        lock = state.experiment_directory / "executor.lock.json"
-        while time.monotonic() < deadline:
-            if path.is_file():
-                result = read_json(path)
-                confirmed = (
-                    result.get("attempt_id") == attempt.attempt_id
-                    and result.get("exit_code") is not None
+    async def _collect_result(
+        self, state: RunnerState, attempt: StageAttempt
+    ) -> JsonObject:
+        deadline = self._deadline(attempt)
+        try:
+            while True:
+                record = read_result(
+                    self._journal.client,
+                    attempt.request_id,
+                    expected={
+                        **attempt.participant,
+                        "stage_id": attempt.stage_id,
+                        "attempt_id": attempt.attempt_id,
+                    },
                 )
-                if confirmed:
-                    attempt.result_path = path
-                    attempt.outcome = (
-                        "timed_out" if reason == "timeout" else "interrupted"
-                    )
+                if record is not None and record["author"] == "runner":
+                    attempt.result_request_id = attempt.request_id
+                    attempt.outcome = record["outcome"]
+                    execution = record["response"].get("execution", {})
                     attempt.executor_status = {
-                        **(attempt.executor_status or {}),
+                        **execution,
                         "finished": True,
                         "current": None,
                         "pending": [],
-                        "exit_code": result["exit_code"],
                     }
-                    if self._notify_resources is not None:
-                        self._notify_resources()
-                return confirmed
+                    if execution:
+                        attempt.process_identity = execution.get("process")
+                        attempt.started_at = execution.get("started_at")
+                    finished = any(
+                        item["author"] == "participant"
+                        for item in record["observations"]
+                    )
+                    if (
+                        attempt.service_id is None
+                        and not finished
+                        and not await self.interrupt(state, "recovery")
+                    ):
+                        attempt.outcome = "unknown"
+                    return record["response"]
+                if deadline is not None and time.monotonic() >= deadline:
+                    response = self._accept(
+                        state,
+                        attempt,
+                        {"result": "fail", "data": {"reason": "timeout"}},
+                        "timed_out",
+                    )
+                    if attempt.service_id is not None:
+                        await self._services.cancel_request(
+                            state, attempt.service_id, attempt.request_id
+                        )
+                    elif record is None and not await self.interrupt(state, "timeout"):
+                        attempt.outcome = "unknown"
+                    return response
+                if record is not None:
+                    return self._accept(
+                        state,
+                        attempt,
+                        record["response"],
+                        "succeeded"
+                        if record["response"]["result"] == "success"
+                        else "failed",
+                    )
+                if attempt.service_id is not None:
+                    instance = state.services.get(attempt.service_id)
+                    if (
+                        instance is None
+                        or instance.stopped
+                        or instance.service_instance_id
+                        != attempt.participant["participant_instance_id"]
+                    ):
+                        return self._accept(
+                            state,
+                            attempt,
+                            {
+                                "result": "fail",
+                                "data": {"reason": "service_instance_changed"},
+                            },
+                            "invalidated",
+                        )
+                    attempt.process_identity = instance.process_identity
+                    attempt.executor_status = {
+                        "participant": attempt.participant,
+                        "request_id": attempt.request_id,
+                        "process": instance.process_identity,
+                        "finished": False,
+                        "current": instance.active_request,
+                    }
+                    if (
+                        self._call_future is not None
+                        and self._call_future.done()
+                        and not self._call_future.cancelled()
+                    ):
+                        response = self._call_future.result()
+                        if response["result"] == "fail":
+                            return self._accept(
+                                state,
+                                attempt,
+                                {"result": "fail", "data": response["data"]},
+                                "failed",
+                            )
+                else:
+                    if self._call_future is not None and self._call_future.done():
+                        if not self._call_future.cancelled():
+                            self._call_future.exception()
+                        self._call_future = None
+                    timeout = state.template["unknown_state"]["timeout_seconds"]
+                    if deadline is not None:
+                        timeout = min(timeout, max(0.001, deadline - time.monotonic()))
+                    try:
+                        if self._connection is None:
+                            await self._connect(attempt, timeout)
+                        request_id = str(uuid4())
+                        state.used_request_ids.add(request_id)
+                        reply = await self._connection.query_command_state(
+                            request_id, timeout_seconds=timeout
+                        )
+                        first_observation = (
+                            attempt.process_identity is None
+                            and reply["data"].get("process") is not None
+                        )
+                        attempt.executor_status = reply["data"]
+                        attempt.process_identity = reply["data"].get("process")
+                        attempt.started_at = reply["data"].get("started_at")
+                        self._save_state(state)
+                        if first_observation and self._notify_resources is not None:
+                            self._notify_resources()
+                    except (OSError, EOFError):
+                        if (
+                            self._journal.client.read_command_result(attempt.request_id)
+                            is not None
+                        ):
+                            continue
+                        if deadline is not None and time.monotonic() >= deadline:
+                            continue
+                        await self._connect(attempt, timeout)
+                await asyncio.sleep(0.05)
+        finally:
+            if self._call_future is not None:
+                if not self._call_future.done():
+                    self._call_future.cancel()
+                await asyncio.gather(self._call_future, return_exceptions=True)
+                self._call_future = None
+            if self._connection is not None:
+                await self._connection.close()
+                self._connection = None
+
+    async def interrupt(self, state: RunnerState, reason: str) -> bool:
+        attempt = state.active_attempt
+        if attempt is None or self._unstarted_attempt_id == attempt.attempt_id:
+            return True
+        try:
+            existing = self._journal.client.read_command_result(attempt.request_id)
+            if existing is None or existing["author"] != "runner":
+                self._accept(
+                    state,
+                    attempt,
+                    {"result": "fail", "data": {"reason": reason}},
+                    "cancelled",
+                )
+        except LoggingError:
+            # Mandatory journal failure does not disable emergency interruption.
+            pass
+        if attempt.service_id is not None:
+            instance = state.services.get(attempt.service_id)
+            if instance is None:
+                return False
+            if (
+                instance is None
+                or instance.stopped
+                or instance.service_instance_id
+                != attempt.participant["participant_instance_id"]
+            ):
+                return True
+            return await self._services.cancel_request(
+                state, attempt.service_id, attempt.request_id, interrupt=True
+            )
+        process_path = attempt.artifacts_directory / "process.json"
+        if process_path.is_file():
+            saved = read_json(process_path)
+            if saved.get("attempt_id") != attempt.attempt_id:
+                raise ValueError("Process record belongs to another attempt.")
+            attempt.process_identity = saved.get("stage")
+            if saved.get("executor") is not None:
+                self._executor_identities[attempt.request_id] = saved["executor"]
+        deadline = time.monotonic() + state.template["unknown_state"]["timeout_seconds"]
+        while time.monotonic() < deadline:
             try:
-                if self._connection is None and lock.is_file():
-                    self._connection = ParticipantConnection(
-                        lock,
-                        {
-                            "experiment_id": state.experiment_id,
-                            "stage_id": attempt.stage_id,
-                            "attempt_id": attempt.attempt_id,
+                await self._connect(attempt, max(0.001, deadline - time.monotonic()))
+                request_id = str(uuid4())
+                state.used_request_ids.add(request_id)
+                intent = {
+                    "action": "interrupt_stage",
+                    "request_id": request_id,
+                    "target_request_id": attempt.request_id,
+                    "reason": reason,
+                }
+                try:
+                    self._journal.client.record_event(
+                        "control.intent",
+                        intent,
+                        context={
+                            **self._context(state, attempt),
+                            "request_id": request_id,
                         },
                     )
-                    await self._connection.connect(
-                        timeout_seconds=max(0.001, deadline - time.monotonic())
+                except LoggingError as error:
+                    write_json(
+                        attempt.artifacts_directory / "stop.emergency.json",
+                        {**intent, "error": str(error)},
                     )
+                reply = await self._connection.request(
+                    request_id,
+                    "interrupt",
+                    {"request_id": attempt.request_id, "reason": reason},
+                    timeout_seconds=state.template["start_timeout"]
+                    + state.template["runner_timeout_margin_seconds"],
+                )
+                if reply["result"] == "success" and reply["data"].get("stopped"):
+                    return True
+            except (OSError, EOFError):
+                pass
+            finally:
                 if self._connection is not None:
-                    request_id = str(uuid4())
-                    state.used_request_ids.add(request_id)
-                    intent = {
-                        "action": "interrupt_stage",
-                        "reason": reason,
-                        "request_id": request_id,
-                    }
-                    try:
-                        self._journal.client.record_event(
-                            "control.intent",
-                            intent,
-                            context={
-                                "experiment_id": state.experiment_id,
-                                "attempt_id": attempt.attempt_id,
-                            },
-                        )
-                    except LoggingError as error:
-                        # Emergency stopping must still reach the independently owned executor.
-                        try:
-                            write_json(
-                                attempt.artifacts_directory / "stop.emergency.json",
-                                {**intent, "error": str(error)},
-                            )
-                        except OSError as diagnostic_error:
-                            error.add_note(
-                                f"Emergency stop diagnostic failed: {diagnostic_error}"
-                            )
-                    await self._connection.request(
-                        request_id,
-                        "interrupt",
-                        {},
-                        timeout_seconds=state.template["start_timeout"],
-                    )
                     await self._connection.close()
                     self._connection = None
-            except (
-                OSError,
-                ConnectionError,
-                asyncio.IncompleteReadError,
-                TimeoutError,
-            ):
-                if self._connection is not None:
-                    await self._connection.close()
-                self._connection = None
-            await asyncio.sleep(0.05)
-        if attempt.process_identity is not None:
-            try:
-                current = process_identity(attempt.process_identity["pid"])
-                if current != attempt.process_identity:
-                    return True
+            if attempt.process_identity is not None:
                 try:
-                    psutil.Process(current["pid"]).wait(timeout=0)
+                    if (
+                        process_identity(attempt.process_identity["pid"])
+                        != attempt.process_identity
+                    ):
+                        return True
+                    psutil.Process(attempt.process_identity["pid"]).wait(timeout=0)
                     return True
                 except psutil.TimeoutExpired:
                     pass
-            except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
-                return True
-            except OSError as error:
-                if getattr(error, "winerror", None) in (87, 1168):
+                except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
                     return True
-                raise
+                except OSError as error:
+                    if getattr(error, "winerror", None) in (87, 1168):
+                        return True
+                    raise
+            await asyncio.sleep(0.05)
         return False
 
     async def recover(
@@ -528,53 +677,33 @@ class StageRunner:
             or attempt.cycle_number != state.cycle_number
         ):
             raise ValueError("Saved attempt does not match the DAG cursor.")
-        saved_context = read_json(attempt.artifacts_directory / "context.json")
+        saved = read_json(attempt.artifacts_directory / "context.json")
         if (
-            saved_context["context"]["attempt_id"] != attempt.attempt_id
-            or saved_context["input_data"] != attempt.input_data
-            or saved_context["settings"] != attempt.effective_settings
+            saved["context"]["attempt_id"] != attempt.attempt_id
+            or json.dumps(saved["input_data"], sort_keys=True)
+            != json.dumps(attempt.input_data, sort_keys=True)
+            or json.dumps(saved["settings"], sort_keys=True)
+            != json.dumps(attempt.effective_settings, sort_keys=True)
         ):
-            raise ValueError("Saved attempt differs from its original launch context.")
-        if self._process_attempt_id != attempt.attempt_id:
-            self._process = None
+            raise ValueError("Attempt differs from its original context.")
+        self._process = None
         self._process_attempt_id = attempt.attempt_id
-        result_path = attempt.artifacts_directory / "execution_result.json"
-        context = {
-            "experiment_id": state.experiment_id,
-            "run_id": state.run_id,
-            "stage_id": attempt.stage_id,
-            "attempt_id": attempt.attempt_id,
-        }
+        self._unstarted_attempt_id = None
         try:
-            if not result_path.is_file():
-                self._connection = ParticipantConnection(
-                    state.experiment_directory / "executor.lock.json",
-                    {
-                        "experiment_id": state.experiment_id,
-                        "stage_id": attempt.stage_id,
-                        "attempt_id": attempt.attempt_id,
-                    },
+            record = read_result(
+                self._journal.client, attempt.request_id, expected=attempt.participant
+            )
+            if record is None and attempt.service_id is None:
+                await self._connect(
+                    attempt, state.template["unknown_state"]["timeout_seconds"]
                 )
-                timeout = state.template["unknown_state"]["timeout_seconds"]
-                try:
-                    async with asyncio.timeout(timeout):
-                        await self._connection.connect(timeout_seconds=timeout)
-                except (OSError, EOFError):
-                    await self._connection.close()
-                    self._connection = None
-                    # Completion publishes the result before removing the endpoint.
-                    # Recovery can race that teardown just like a fresh launch;
-                    # collect and validate the saved attempt instead of losing it.
-                    if not result_path.is_file():
-                        raise
-            self._journal.client.record_event("stage.reconnected", {}, context=context)
+            self._journal.client.record_event(
+                "stage.reconnected", {}, context=self._context(state, attempt)
+            )
             return await self.execute(
                 state, wait_services=wait_services, recovered=attempt
             )
         except (OSError, EOFError, ValueError, RuntimeError) as error:
-            if self._connection is not None:
-                await self._connection.close()
-                self._connection = None
             state.unknown_state_recovery_count += 1
             policy = state.template["unknown_state"]
             action = (
@@ -586,17 +715,18 @@ class StageRunner:
                 "stage.recovery_failed",
                 {
                     "action": action,
-                    "error": f"{type(error).__name__}: {error}",
+                    "error": str(error),
                     "count": state.unknown_state_recovery_count,
                 },
-                context=context,
+                context=self._context(state, attempt),
             )
-            self._save_state(state)
             if action == "pause":
                 attempt.outcome = "unknown"
+                self._save_state(state)
                 return StageOutcome(attempt, None, "pause")
             if not await self.interrupt(state, "unknown_state"):
                 attempt.outcome = "unknown"
+                self._save_state(state)
                 return StageOutcome(attempt, None, "stop")
             attempt.outcome = "unknown_stopped"
             if action == "rerun":
@@ -613,18 +743,49 @@ class StageRunner:
         import shutil
 
         parent = attempt.artifacts_directory.parent
-        folders = sorted(
-            (item for item in parent.glob("attempt_*") if item.name[8:].isdigit()),
-            key=lambda item: int(item.name[8:]),
-        )
-        for folder in folders[: -state.template["keep_attempts"]]:
+        keep = state.template["keep_attempts"]
+        for path in parent.iterdir():
             if (
-                folder.is_symlink()
-                or folder.is_junction()
-                or not folder.resolve().is_relative_to(parent.resolve())
+                path == attempt.artifacts_directory
+                or not path.is_dir()
+                or not path.name.startswith("attempt_")
             ):
-                raise ValueError("Unsafe attempt directory.")
-            shutil.rmtree(folder)
+                continue
+            suffix = path.name.removeprefix("attempt_")
+            if suffix.isdigit() and int(suffix) <= attempt.attempt_number - keep:
+                if not path.resolve().is_relative_to(
+                    state.experiment_directory.resolve()
+                ):
+                    raise ValueError("Attempt directory escapes the experiment.")
+                shutil.rmtree(path)
+
+    def termination_confirmed(self, state: RunnerState) -> bool:
+        attempt = state.active_attempt
+        if attempt is None or self._unstarted_attempt_id == attempt.attempt_id:
+            return True
+        if attempt.service_id is not None:
+            instance = state.services.get(attempt.service_id)
+            return instance is not None and (
+                instance.stopped
+                or instance.service_instance_id
+                != attempt.participant["participant_instance_id"]
+            )
+        identity = attempt.process_identity
+        if identity is None:
+            return False
+        try:
+            if process_identity(identity["pid"]) != identity:
+                return True
+            psutil.Process(identity["pid"]).wait(timeout=0)
+            return True
+        except psutil.TimeoutExpired:
+            return False
+        except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+            return True
+        except OSError as error:
+            if getattr(error, "winerror", None) in (87, 1168):
+                return True
+            raise
 
     def _save_state(self, state: RunnerState) -> None:
         try:
@@ -638,61 +799,62 @@ class StageRunner:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
+        if self._call_future is not None:
+            self._call_future.cancel()
+            await asyncio.gather(self._call_future, return_exceptions=True)
+            self._call_future = None
         remaining = []
-        for process, result_path, timeout in self._executor_processes:
-            if process.poll() is None and not result_path.is_file():
-                # Detaching from an active attempt preserves its independent lifetime.
-                remaining.append((process, result_path, timeout))
+        for process, request_id in self._executor_processes:
+            active = (
+                state is None
+                or state.active_attempt is not None
+                and state.active_attempt.request_id == request_id
+            )
+            if active and process.poll() is None:
+                remaining.append((process, request_id))
             else:
-                await asyncio.to_thread(process.wait, timeout=timeout)
+                await asyncio.to_thread(
+                    process.wait,
+                    timeout=30 if state is None else state.template["start_timeout"],
+                )
         self._executor_processes = remaining
         if state is not None:
-            paths = list(state.stage_result_paths.values())
-            if state.active_attempt is not None:
-                paths.append(
-                    state.active_attempt.artifacts_directory / "execution_result.json"
+            for request_id in state.stage_result_ids.values():
+                record = self._journal.client.read_command_result(request_id)
+                if record is None:
+                    raise ValueError("An accepted result is missing from the journal.")
+                context = record["event"]["context"]
+                if context.get("participant_id") != context.get("stage_id"):
+                    continue
+                # The result context identifies its writer without a per-call result file.
+                module_name = context.get("module_name")
+                if module_name is None:
+                    continue
+                directory = (
+                    state.experiment_directory
+                    / "shared_artifacts"
+                    / f"epoch_{context['cycle_number']}"
+                    / module_name
+                    / context["stage_id"]
+                    / f"attempt_{context['attempt_number']}"
                 )
-            deadline = time.monotonic() + state.template["start_timeout"]
-            for result_path in paths:
-                record_path = result_path.parent / "process.json"
-                if not record_path.is_file():
-                    if (
-                        state.active_attempt is not None
-                        and result_path.parent
-                        == state.active_attempt.artifacts_directory
-                        and self._unstarted_attempt_id
-                        != state.active_attempt.attempt_id
-                        and not (
-                            self._process_attempt_id == state.active_attempt.attempt_id
-                            and self._process is not None
-                            and self._process.poll() is not None
-                        )
-                    ):
-                        raise RuntimeError(
-                            "Cannot confirm closure of the recovered executor writer."
-                        )
-                    continue
-                record = read_json(record_path)
-                if record.get("experiment_id") != state.experiment_id:
-                    continue
-                identity = record.get("executor")
-                if identity is None:
-                    raise RuntimeError(
-                        "Cannot identify a previous stage journal writer."
-                    )
+                process_path = directory / "process.json"
+                if process_path.is_file():
+                    process_record = read_json(process_path)
+                    if process_record.get("experiment_id") == state.experiment_id:
+                        self._executor_identities[request_id] = process_record[
+                            "executor"
+                        ]
+            for request_id, identity in list(self._executor_identities.items()):
                 try:
-                    if process_identity(identity["pid"]) != identity:
-                        continue
-                    await asyncio.to_thread(
-                        psutil.Process(identity["pid"]).wait,
-                        max(0.001, deadline - time.monotonic()),
-                    )
+                    if process_identity(identity["pid"]) == identity:
+                        await asyncio.to_thread(
+                            psutil.Process(identity["pid"]).wait,
+                            state.template["start_timeout"],
+                        )
                 except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
-                    continue
+                    pass
                 except OSError as error:
                     if getattr(error, "winerror", None) not in (87, 1168):
                         raise
-                except psutil.TimeoutExpired as error:
-                    raise RuntimeError(
-                        "A previous executor still owns runtime files."
-                    ) from error
+                self._executor_identities.pop(request_id, None)

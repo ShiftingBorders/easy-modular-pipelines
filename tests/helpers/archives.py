@@ -173,30 +173,22 @@ class ArchiveWorkspace:
         folder.mkdir(parents=True)
         helper = "archive_stage.py" if interface is None else "archive_service.py"
         shutil.copy2(Path(__file__).with_name(helper), folder / "main.py")
-        if interface == "socket":
+        if interface is not None:
             shutil.copy2(
                 Path(__file__).with_name("service_process.py"),
                 folder / "service_process.py",
             )
         definition = {
-            "schema_version": 1,
+            "schema_version": 2,
             "name": name,
             "version": version,
             "role": "stage" if interface is None else "service",
             "implementation": "action" if interface == "commands" else "full",
             "commands": {"start": ["python", "-B", "main.py"]},
-            "defaults": {} if interface is None else {"auto_increment": False},
+            "defaults": {}
+            if interface is None
+            else {"auto_increment": False, "command_proxy": interface == "commands"},
         }
-        if interface is not None:
-            definition["service_interface"] = interface
-        if interface == "commands":
-            definition["commands"]["stop"] = [
-                "python",
-                "-B",
-                "main.py",
-                "--action",
-                "stop",
-            ]
         (folder / "module.yaml").write_text(
             yaml.safe_dump(definition), encoding="utf-8"
         )
@@ -232,7 +224,7 @@ class ArchiveWorkspace:
                     "module": self.module(f"portable-{interface}", interface=interface),
                     "settings": {},
                 }
-                if interface == "socket":
+                if interface is not None:
                     service.update(
                         heartbeat={"interval_seconds": 1, "grace_seconds": 10},
                         command_timeout_seconds=30,
@@ -253,7 +245,7 @@ class ArchiveWorkspace:
         )
         (inputs / "tree/zero.bin").write_bytes(b"")
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "name": "portable-archive",
             "cycles": 2 if versions else 1,
             "keep_attempts": 1,
@@ -368,6 +360,7 @@ class ArchiveWorkspace:
         return process, ownership, record["process"]
 
     async def close(self):
+        failure = None
         self.filer.release.set()
         for gate in self.gates:
             gate.touch(exist_ok=True)
@@ -382,8 +375,15 @@ class ArchiveWorkspace:
             output.close()
         for runner in reversed(self.runners):
             if not runner._closed:
-                await runner.stop()
-                await runner.close()
+                try:
+                    await runner.stop()
+                except Exception as error:  # noqa: BLE001 - Preserve failure while releasing every owned resource.
+                    failure = failure or error
+                finally:
+                    try:
+                        await runner.close()
+                    except Exception as error:  # noqa: BLE001 - Do not leave the fixture HTTP server alive.
+                        failure = failure or error
         for record in self.root.glob(
             "*/experiments/*/shared_artifacts/**/process.json"
         ):
@@ -412,6 +412,8 @@ class ArchiveWorkspace:
                 if getattr(error, "winerror", None) not in (5, 32, 145) or attempt == 9:
                     raise
                 await asyncio.sleep(0.05)
+        if failure is not None:
+            raise failure
 
 
 class ArchiveTestCase(unittest.IsolatedAsyncioTestCase):

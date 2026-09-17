@@ -186,7 +186,7 @@ class RuntimeJournalTests(unittest.IsolatedAsyncioTestCase):
                         / "shared_artifacts/epoch_1"
                         / module["name"]
                         / stages[1]["stage_id"]
-                        / "attempt_1/execution_result.json"
+                        / "attempt_1/received.json"
                     )
                     self.assertTrue(other.is_file())
                     parameters = [

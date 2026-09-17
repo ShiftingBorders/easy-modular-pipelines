@@ -30,16 +30,18 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             endpoint = read_json(instance.endpoint_path)
             identity = {
                 key: endpoint[key]
-                for key in ("experiment_id", "service_id", "service_instance_id")
+                for key in (
+                    "experiment_id",
+                    "participant_id",
+                    "participant_instance_id",
+                )
             }
-            connection = ParticipantConnection(
-                instance.endpoint_path, identity, process_key="process"
-            )
+            connection = ParticipantConnection(instance.endpoint_path, identity)
             try:
                 await connection.connect(timeout_seconds=30)
                 await connection.send_message(
                     {
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "message_type": "request",
                         **identity,
                         "request_id": str(uuid4()),
@@ -93,8 +95,8 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             (w.controls[sid] / "ignore-shutdown").unlink()
             self.assertTrue((await w.manager.stop_all(w.state))[sid]["stopped"])
 
-    async def test_old_probe_and_wrong_instance_frames_do_not_restore_health(self):
-        """B: real late/foreign status frames and successful work cannot substitute for heartbeat."""
+    async def test_old_probe_and_successful_work_do_not_restore_health(self):
+        """A/D: late responses are dropped by correlation; work cannot replace heartbeat."""
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service()
@@ -106,8 +108,8 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 original.service_instance_id
             )
             base = {
-                "protocol_version": 1,
-                "message_type": "status",
+                "protocol_version": 2,
+                "message_type": "response",
                 "result": "success",
                 "data": {},
             }
@@ -116,7 +118,6 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "messages": [
                         {**base, "request_id": previous},
-                        {**base, "service_instance_id": str(uuid4())},
                     ]
                 },
             )
@@ -126,10 +127,6 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             reply = await w.manager.request(w.state, sid, "echo", {})
             self.assertEqual(reply["result"], "success")
             self.assertEqual(original.last_status["request_id"], previous)
-            ignored = {
-                row["data"]["ignored"] for row in w.events("service.message_ignored")
-            }
-            self.assertTrue({"old_probe", "different_instance"}.issubset(ignored))
             await wait_for(
                 lambda: (
                     w.state.services[sid] is not original

@@ -58,7 +58,7 @@ class LoggerProcessTests(unittest.TestCase):
     def test_independent_processes_share_one_journal_without_losing_source_sequences(
         self,
     ):
-        workers = [self.process("worker", name) for name in ("runner", "service")]
+        workers = [self.process("worker", name) for name in ("runner", "participant")]
         for worker in workers:
             self.assertTrue(worker.receive()["ready"])
         for worker in workers:
@@ -87,7 +87,7 @@ class LoggerProcessTests(unittest.TestCase):
 
     def test_concurrent_matching_and_conflicting_responses_are_atomic(self):
         workers = {
-            author: self.process("worker", author) for author in ("runner", "service")
+            author: self.process("worker", author) for author in ("runner", "participant")
         }
         for worker in workers.values():
             self.assertTrue(worker.receive()["ready"])
@@ -128,14 +128,14 @@ class LoggerProcessTests(unittest.TestCase):
                 len(read_database(self.path)) - before_count, 1 if same else 2
             )
             if same:
-                self.assertEqual(results["runner"], results["service"])
+                self.assertEqual(results["runner"], results["participant"])
                 self.assertTrue(
                     all(o["ignored"] is None for o in result["observations"])
                 )
             else:
-                self.assertNotEqual(results["runner"], results["service"])
+                self.assertNotEqual(results["runner"], results["participant"])
                 service = next(
-                    o for o in result["observations"] if o["author"] == "service"
+                    o for o in result["observations"] if o["author"] == "participant"
                 )
                 self.assertEqual(service["ignored"], "runner_result_precedence")
             with closing(sqlite3.connect(self.path)) as db:
@@ -152,13 +152,13 @@ class LoggerProcessTests(unittest.TestCase):
                     self.folder / (mode + "-service"),
                     db_path=str(self.path),
                     open_mode="existing",
-                    context={**BASE_CONTEXT, "source": "service"},
+                    context={**BASE_CONTEXT, "source": "participant"},
                 )
                 with OperationLogger(service_config) as service:
                     service.record_command_result(
                         request,
-                        {"origin": "service"},
-                        author="service",
+                        {"origin": "participant"},
+                        author="participant",
                         outcome="succeeded",
                     )
                 before = read_database(self.path)
@@ -178,7 +178,7 @@ class LoggerProcessTests(unittest.TestCase):
                     self.assertEqual(after[: len(before)], before)
                     if mode == "result_before_commit":
                         self.assertEqual(after, before)
-                        self.assertEqual(result["author"], "service")
+                        self.assertEqual(result["author"], "participant")
                         self.assertTrue(result["provisional"])
                     else:
                         self.assertEqual(len(after), len(before) + 1)

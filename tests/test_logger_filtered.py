@@ -89,10 +89,10 @@ class FilteredJournalTests(unittest.TestCase):
     def test_first_build_and_incremental_updates_preserve_effective_authority(self):
         """G2/G8: retraction and same-ID confirmation are both applied."""
         service = self.logger.record_command_result(
-            "conflict", {}, author="service", outcome="succeeded"
+            "conflict", {}, author="participant", outcome="succeeded"
         )
         matched = self.logger.record_command_result(
-            "matched", {}, author="service", outcome="succeeded"
+            "matched", {}, author="participant", outcome="succeeded"
         )
         self.view.refresh()
         initial = self.view.read_events()
@@ -127,7 +127,7 @@ class FilteredJournalTests(unittest.TestCase):
         self.assertTrue(
             all(entry["effective_author"] == "runner" for entry in updated["events"])
         )
-        self.assertEqual(updated["events"][0]["event"]["data"]["author"], "service")
+        self.assertEqual(updated["events"][0]["event"]["data"]["author"], "participant")
         self.assertEqual(len(read_database(self.path)), 3)
 
     def test_publication_pages_reject_mixing_snapshots_and_keep_freshness(self):

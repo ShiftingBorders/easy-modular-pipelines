@@ -20,6 +20,7 @@ from core.logger import OperationLogger
 from core.logger_utils.events import LoggingError, copy_json_object, require_text
 from core.logger_utils.storage import SQLiteEventStore
 from core.runner_utils.journal import RunnerJournal
+from core.runner_utils.results import read_result
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.services import ServiceManager
 from core.runner_utils.stages import StageRunner
@@ -43,6 +44,7 @@ class ExperimentSnapshots:
             "process.json",
             "ready.json",
             "executor.token",
+            "executor.lock.json",
             "stop.emergency.json",
         }
     )
@@ -250,7 +252,11 @@ class ExperimentSnapshots:
                         and relative.parts[0] == "shared_artifacts"
                         and relative.parts[1].startswith("epoch_")
                         and relative.parts[4].startswith("attempt_")
-                        and filename in self._STAGE_CONTROL_FILES
+                        and (
+                            filename in self._STAGE_CONTROL_FILES
+                            or filename.startswith("executor.lock.")
+                            and filename.endswith(".token")
+                        )
                     ):
                         continue
                     if (
@@ -292,7 +298,7 @@ class ExperimentSnapshots:
             except (OSError, ValueError):
                 continue
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "snapshot_id": snapshot_id,
             "experiment_id": document["experiment_id"],
             "experiment_folder": root.name,
@@ -320,9 +326,7 @@ class ExperimentSnapshots:
         root = state.experiment_directory.resolve()
         directory = self._project_root / "snapshots" / root.name / snapshot_id
         identities = {
-            key: value.service_instance_id
-            for key, value in state.services.items()
-            if value.interface == "socket"
+            key: value.service_instance_id for key, value in state.services.items()
         }
         document = state_to_document(state)
         document["phase"] = state.phase if kind == "final" else "waiting"
@@ -494,7 +498,7 @@ class ExperimentSnapshots:
         if (
             document.keys() != required
             or type(document["schema_version"]) is not int
-            or document["schema_version"] != 1
+            or document["schema_version"] != 2
         ):
             raise ValueError("Unsupported experiment snapshot manifest.")
         UUID(require_text(document["snapshot_id"], "snapshot_id"))
@@ -564,7 +568,11 @@ class ExperimentSnapshots:
                 and parts[:2] == ("files", "shared_artifacts")
                 and parts[2].startswith("epoch_")
                 and parts[5].startswith("attempt_")
-                and parts[6] in self._STAGE_CONTROL_FILES
+                and (
+                    parts[6] in self._STAGE_CONTROL_FILES
+                    or parts[6].startswith("executor.lock.")
+                    and parts[6].endswith(".token")
+                )
             ):
                 raise ValueError("Snapshot contains live stage control artifacts.")
             path = directory / name
@@ -621,7 +629,7 @@ class ExperimentSnapshots:
         checked_modules = {}
         for role in ("stage", "service"):
             for definition in template[f"{role}s"]:
-                reference = definition["module"]
+                reference = self._assembler.module_reference(template, definition)
                 key = (reference["name"], reference["version"])
                 if key not in checked_modules:
                     module_path = directory / "files/modules" / key[0] / key[1]
@@ -631,55 +639,32 @@ class ExperimentSnapshots:
                     )
                 metadata, digest = checked_modules[key]
                 if (
-                    metadata["role"] != role
+                    metadata["role"]
+                    != ("service" if "service_id" in definition else role)
                     or (metadata["name"], metadata["version"]) != key
                     or digest != reference["hash"]
                 ):
                     raise ValueError(
                         "Snapshot module identity or contents differ from its template."
                     )
-                if (
-                    role == "service"
-                    and state.services[definition["service_id"]].interface
-                    != metadata["service_interface"]
-                ):
-                    raise ValueError(
-                        "Snapshot service interface differs from its module."
-                    )
         if state.cycle_number > state.template["cycles"] or state.stage_position > len(
             state.template["stages"]
         ):
             raise ValueError("Snapshot cursor is outside its DAG.")
         stage_ids = {item["stage_id"] for item in state.template["stages"]}
-        for stage_id, result_path in state.stage_result_paths.items():
-            if stage_id not in stage_ids or not result_path.is_file():
-                raise ValueError(
-                    "Snapshot stage result is missing or belongs to an unknown stage."
-                )
-            result = read_json(result_path)
-            response = result.get("response")
-            if (
-                result.get("stage_id") != stage_id
-                or result.get("experiment_id")
-                != state.stage_result_origins.get(stage_id, state.experiment_id)
-                or result.get("exit_code") != 0
-                or result.get("interruption_reason") is not None
-                or not isinstance(response, dict)
-                or response.get("result") != "success"
-                or "data" not in response
-            ):
-                raise ValueError(
-                    "Snapshot stage result has an invalid identity or outcome."
-                )
-        if state.last_result_path is not None:
-            if (
-                state.last_result_path not in state.stage_result_paths.values()
-                or read_json(state.last_result_path)["response"]["data"]
-                != state.last_result
-            ):
-                raise ValueError("Snapshot retained result differs from its artifact.")
-        elif state.last_result is not None:
-            raise ValueError("Snapshot retained data has no result artifact.")
+        for stage_id, request_id in state.stage_result_ids.items():
+            if stage_id not in stage_ids:
+                raise ValueError("Snapshot result belongs to an unknown DAG node.")
+            UUID(require_text(request_id, "result request ID"))
+        if (
+            state.last_result_id is not None
+            and state.last_result_id not in state.stage_result_ids.values()
+        ):
+            raise ValueError(
+                "Snapshot retained result has no matching journal reference."
+            )
+        if state.last_result_id is None and state.last_result is not None:
+            raise ValueError("Snapshot retained data has no journal reference.")
         if set(state.services) != {
             item["service_id"] for item in state.template["services"]
         }:
@@ -706,16 +691,9 @@ class ExperimentSnapshots:
             ):
                 raise ValueError("Snapshot contains unresolved service work.")
             if path is None:
-                if (
-                    instance.interface == "socket"
-                    and instance.definition["state_required"]
-                ):
+                if instance.definition["state_required"]:
                     raise ValueError("Required service export is missing.")
                 continue
-            if instance.interface != "socket":
-                raise ValueError(
-                    "Commands-only service cannot contain an exported state."
-                )
             name = require_text(path, "service state path")
             member = directory / "files" / name
             allocated = (
@@ -758,6 +736,37 @@ class ExperimentSnapshots:
                 },
             )
             try:
+                store.open()
+                try:
+                    for stage_id, request_id in state.stage_result_ids.items():
+                        record = read_result(
+                            store,
+                            request_id,
+                            expected={
+                                "experiment_id": state.stage_result_origins.get(
+                                    stage_id, state.experiment_id
+                                ),
+                                "stage_id": stage_id,
+                            },
+                            accepted=True,
+                        )
+                        if (
+                            record is None
+                            or record["outcome"] != "succeeded"
+                            or record["response"]["result"] != "success"
+                        ):
+                            raise ValueError(
+                                "Snapshot result is missing or unsuccessful in its journal."
+                            )
+                        if (
+                            request_id == state.last_result_id
+                            and record["response"]["data"] != state.last_result
+                        ):
+                            raise ValueError(
+                                "Snapshot retained data differs from its journal result."
+                            )
+                finally:
+                    store.close()
                 store.complete_restore(
                     document["journal"],
                     restoration_id=str(uuid4()),
@@ -959,7 +968,7 @@ class ExperimentSnapshots:
             )
             self._journal.close()
             transaction = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "restoration_id": restoration_id,
                 "experiment_id": state.experiment_id,
                 "target_folder": target.name,
@@ -1004,7 +1013,7 @@ class ExperimentSnapshots:
                 "owner",
             }
             or type(transaction["schema_version"]) is not int
-            or transaction["schema_version"] != 1
+            or transaction["schema_version"] != 2
         ):
             raise ValueError("Invalid restore transaction marker.")
         restoration_id = str(UUID(transaction["restoration_id"]))
@@ -1107,11 +1116,11 @@ class ExperimentSnapshots:
                 current = state.services.get(service_id)
                 if (
                     current is not None
-                    and announced.get("service_instance_id")
+                    and announced.get("participant_instance_id")
                     == current.service_instance_id
                 ):
                     continue
-                instance_id = str(UUID(announced["service_instance_id"]))
+                instance_id = str(UUID(announced["participant_instance_id"]))
                 artifacts = (
                     target / "shared_artifacts/services" / service_id / instance_id
                 )
@@ -1125,17 +1134,15 @@ class ExperimentSnapshots:
                 recorded = read_json(artifacts / "process.json")
                 identity = {
                     "experiment_id": state.experiment_id,
-                    "service_id": service_id,
-                    "service_instance_id": instance_id,
+                    "participant_id": service_id,
+                    "participant_instance_id": instance_id,
                 }
                 if any(
                     announced.get(key) != value or recorded.get(key) != value
                     for key, value in identity.items()
                 ) or recorded.get("process") != announced.get("process"):
                     raise RuntimeError("Restored service ownership cannot be verified.")
-                instance = ServiceInstance(
-                    service_id, instance_id, definition, "socket"
-                )
+                instance = ServiceInstance(service_id, instance_id, definition)
                 instance.process_identity = recorded["process"]
                 instance.endpoint_path = endpoint
                 instance.artifacts_directory = artifacts
@@ -1231,7 +1238,7 @@ class ExperimentSnapshots:
                 set(document["used_request_ids"])
                 | set(transaction["stopped_state"]["used_request_ids"])
             )
-            for stage_id in document["stage_result_paths"]:
+            for stage_id in document["stage_result_ids"]:
                 document["stage_result_origins"].setdefault(
                     stage_id, manifest["experiment_id"]
                 )

@@ -116,6 +116,17 @@ async def run_owner(options):
                     await asyncio.sleep(0.05)
                 halt("stage_running")
                 halt("stage_without_state")
+                if options.phase == "service_work":
+                    request_id = runner._state.active_attempt.request_id
+                    while not any(
+                        row["event"]["event_type"] == "call.started"
+                        and row["event"]["context"].get("request_id") == request_id
+                        for row in runner._journal.client.read_events(limit=1000)[
+                            "events"
+                        ]
+                    ):
+                        await asyncio.sleep(0.05)
+                    halt("service_work")
                 await step
             else:
                 halt("ready")

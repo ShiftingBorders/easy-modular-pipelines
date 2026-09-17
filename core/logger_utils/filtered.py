@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 from core.logger import OperationLogger
 from core.logger_utils.events import (
+    SCHEMA_VERSION,
     JournalGenerationChanged,
     JsonObject,
     LoggingStateError,
@@ -206,7 +207,10 @@ class FilteredJournal:
         for key in ("cursor", "event_count", "change_cursor"):
             if type(data[key]) is not int or data[key] < 0:
                 raise ValueError("Invalid derived publication boundary.")
-        if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        if (
+            type(data["schema_version"]) is not int
+            or data["schema_version"] != SCHEMA_VERSION
+        ):
             raise ValueError("Invalid derived publication format.")
         if datetime.fromisoformat(data["published_at"]).utcoffset() != UTC.utcoffset(
             None
@@ -499,9 +503,9 @@ class FilteredJournal:
                     event = json.loads(encode_event(json.loads(encoded), None))
                     if event["event_id"] != event_id or provisional not in (0, 1):
                         raise ValueError("Invalid derived event identity.")
-                    if author not in (None, "runner", "service") or bool(
+                    if author not in (None, "runner", "participant") or bool(
                         provisional
-                    ) != (author == "service"):
+                    ) != (author == "participant"):
                         raise ValueError("Invalid derived result state.")
                     entries.append(
                         {

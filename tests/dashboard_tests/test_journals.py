@@ -44,9 +44,13 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(self.workspace.directory.rglob("*.emergency*")))
 
     async def test_late_runner_confirmation_reconciles_service_observation(self):
-        context = {"service_id": "service", "service_instance_id": "instance"}
+        context = {"participant_id": "service", "participant_instance_id": "instance"}
         first = self.workspace.logger.record_command_result(
-            "request", {"ok": 1}, author="service", outcome="succeeded", context=context
+            "request",
+            {"ok": 1},
+            author="participant",
+            outcome="succeeded",
+            context=context,
         )
         before = self.reader.load("exp-test")
         self.assertTrue(

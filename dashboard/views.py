@@ -374,8 +374,6 @@ class DashboardViews:
                     if service.get("stopped")
                     else "stopping"
                     if service.get("stopping")
-                    else "enabled"
-                    if service.get("interface") == "commands"
                     else "ready"
                     if service.get("ready")
                     else "starting"

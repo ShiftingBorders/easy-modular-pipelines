@@ -85,9 +85,9 @@ class ExperimentAssembler:
             )
         if (
             type(template["schema_version"]) is not int
-            or template["schema_version"] != 1
+            or template["schema_version"] != 2
         ):
-            raise ValueError("Only template schema_version 1 is supported.")
+            raise ValueError("Only template schema_version 2 is supported.")
         require_text(template["name"], "name")
         for key in ("cycles", "keep_attempts"):
             value = template[key]
@@ -176,7 +176,13 @@ class ExperimentAssembler:
             required = {"module", "settings"}
             if role == "stage":
                 required.update({"timeout_seconds", "errors"})
-            elif definition.keys() & socket_fields:
+                if "service_id" in definition:
+                    required.remove("module")
+                    required.add("service_id")
+                    definition["service_id"] = str(
+                        UUID(require_text(definition["service_id"], "service_id"))
+                    )
+            else:
                 required.update(socket_fields)
             if definition.keys() - {identity_key} != required:
                 raise ValueError(
@@ -190,18 +196,19 @@ class ExperimentAssembler:
                     raise ValueError("Duplicate stage/service definition ID.")
                 seen.add(identifier)
                 definition[identity_key] = identifier
-            module = copy_json_object(definition["module"], "module")
-            if module.keys() != {"name", "version", "hash"}:
-                raise ValueError("module requires name/version/hash.")
-            for key in ("name", "version"):
-                value = require_text(module[key], f"module.{key}")
-                if value in (".", "..") or any(c in value for c in '/\\:*?"<>|'):
-                    raise ValueError(f"Unsafe module {key}.")
-            digest = require_text(module["hash"], "module.hash")
-            if len(digest) != 64 or any(
-                c not in "0123456789abcdefABCDEF" for c in digest
-            ):
-                raise ValueError("module.hash must be SHA-256.")
+            if "module" in definition:
+                module = copy_json_object(definition["module"], "module")
+                if module.keys() != {"name", "version", "hash"}:
+                    raise ValueError("module requires name/version/hash.")
+                for key in ("name", "version"):
+                    value = require_text(module[key], f"module.{key}")
+                    if value in (".", "..") or any(c in value for c in '/\\:*?"<>|'):
+                        raise ValueError(f"Unsafe module {key}.")
+                digest = require_text(module["hash"], "module.hash")
+                if len(digest) != 64 or any(
+                    c not in "0123456789abcdefABCDEF" for c in digest
+                ):
+                    raise ValueError("module.hash must be SHA-256.")
             copy_json_object(definition["settings"], f"{role} settings")
             if (
                 role == "stage"
@@ -210,36 +217,18 @@ class ExperimentAssembler:
                 <= 0
             ):
                 raise ValueError("timeout_seconds must be positive or null.")
-            if role == "service" and "heartbeat" in definition:
-                heartbeat = copy_json_object(definition["heartbeat"], "heartbeat")
-                if heartbeat.keys() != {"interval_seconds", "grace_seconds"}:
-                    raise ValueError(
-                        "heartbeat requires interval_seconds and grace_seconds."
-                    )
-                for name, value in heartbeat.items():
-                    if require_number(value, name) <= 0:
-                        raise ValueError(f"{name} must be positive.")
-                if (
-                    require_number(
-                        definition["command_timeout_seconds"], "command_timeout_seconds"
-                    )
-                    <= 0
-                ):
-                    raise ValueError("command_timeout_seconds must be positive.")
-                if definition["on_command_timeout"] not in ("pause", "restart", "stop"):
-                    raise ValueError("Invalid on_command_timeout.")
-                if type(definition["state_required"]) is not bool:
-                    raise TypeError("state_required must be a boolean.")
-            if "errors" not in definition:
-                continue
-            errors = copy_json_object(definition["errors"], "errors")
-            if errors.keys() != {"retries", "retry_delay_seconds", "on_exhausted"}:
-                raise ValueError("All error policy fields must be explicit.")
-            if type(errors["retries"]) is not int or errors["retries"] < 0:
-                raise ValueError("errors.retries must be nonnegative.")
-            require_number(errors["retry_delay_seconds"], "retry_delay_seconds")
-            if errors["on_exhausted"] not in ("stop", "pause", "skip"):
-                raise ValueError("Invalid errors.on_exhausted.")
+            if role == "service":
+                self.validate_service_definition(definition)
+            self.validate_errors(definition["errors"])
+        service_ids = {item["service_id"] for item in services if "service_id" in item}
+        for definition in stages:
+            if (
+                "service_id" in definition
+                and definition["service_id"] not in service_ids
+            ):
+                raise ValueError(
+                    "A DAG service reference requires an explicit service_id in services."
+                )
         if type(template["resources"]) is not list:
             raise TypeError("resources must be an array.")
         resource_names = set()
@@ -274,6 +263,59 @@ class ExperimentAssembler:
                 raise ValueError("resource.hash must be SHA-256 or null.")
         return text, template
 
+    def module_reference(
+        self, template: JsonObject, definition: JsonObject
+    ) -> JsonObject:
+        if "module" in definition:
+            return copy_json_object(definition["module"], "module")
+        service_id = definition.get("service_id")
+        for service in template["services"]:
+            if service["service_id"] == service_id:
+                return copy_json_object(service["module"], "service module")
+        raise ValueError(f"Unknown service reference: {service_id}")
+
+    def validate_errors(self, errors: JsonObject) -> None:
+        errors = copy_json_object(errors, "errors")
+        if errors.keys() != {"retries", "retry_delay_seconds", "on_exhausted"}:
+            raise ValueError("All error policy fields must be explicit.")
+        if type(errors["retries"]) is not int or errors["retries"] < 0:
+            raise ValueError("errors.retries must be nonnegative.")
+        require_number(errors["retry_delay_seconds"], "retry_delay_seconds")
+        if errors["on_exhausted"] not in ("stop", "pause", "skip"):
+            raise ValueError("Invalid errors.on_exhausted.")
+
+    def validate_service_definition(self, definition: JsonObject) -> None:
+        required = {
+            "module",
+            "settings",
+            "heartbeat",
+            "command_timeout_seconds",
+            "on_command_timeout",
+            "state_required",
+            "errors",
+        }
+        if definition.keys() - {"service_id"} != required:
+            raise ValueError(
+                "A service requires explicit settings, heartbeat and policies."
+            )
+        copy_json_object(definition["settings"], "settings")
+        heartbeat = copy_json_object(definition["heartbeat"], "heartbeat")
+        if heartbeat.keys() != {"interval_seconds", "grace_seconds"}:
+            raise ValueError("heartbeat requires interval_seconds and grace_seconds.")
+        for name, value in heartbeat.items():
+            if require_number(value, name) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if (
+            require_number(definition["command_timeout_seconds"], "command timeout")
+            <= 0
+        ):
+            raise ValueError("command_timeout_seconds must be positive.")
+        if definition["on_command_timeout"] not in ("pause", "restart", "stop"):
+            raise ValueError("Invalid on_command_timeout.")
+        if type(definition["state_required"]) is not bool:
+            raise TypeError("state_required must be a boolean.")
+        self.validate_errors(definition["errors"])
+
     def read_module(self, module_directory: Path) -> JsonObject:
         directory = Path(module_directory)
         if not directory.is_absolute():
@@ -291,12 +333,10 @@ class ExperimentAssembler:
             "commands",
             "defaults",
         }
-        if module.get("role") == "service":
-            required.add("service_interface")
         if (
             module.keys() != required
             or type(module["schema_version"]) is not int
-            or module["schema_version"] != 1
+            or module["schema_version"] != 2
         ):
             raise ValueError("Invalid module schema.")
         if module["role"] not in ("stage", "service") or module[
@@ -308,20 +348,8 @@ class ExperimentAssembler:
             raise NotImplementedError(
                 "Modules require a stage/service role and full/action implementation."
             )
-        if module["role"] == "service":
-            if module["service_interface"] not in ("socket", "commands"):
-                raise ValueError("service_interface must be socket or commands.")
-            if (
-                module["service_interface"] == "commands"
-                and module["implementation"] != "action"
-            ):
-                raise ValueError(
-                    "Commands-only services require action start/stop commands."
-                )
         commands = copy_json_object(module["commands"], "commands")
-        expected = (
-            {"start", "stop"} if module["implementation"] == "action" else {"start"}
-        )
+        expected = {"start"}
         if commands.keys() != expected:
             raise ValueError("Module commands do not match its implementation.")
         for argv in commands.values():
@@ -384,6 +412,8 @@ class ExperimentAssembler:
                 (directory / name).mkdir(parents=True, exist_ok=True)
             copied = {}
             for role, item in definitions:
+                if role == "stage" and "service_id" in item:
+                    continue
                 module = copy_json_object(item["module"], "module")
                 key = (
                     require_text(module["name"], "module.name"),
@@ -405,13 +435,6 @@ class ExperimentAssembler:
                     raise ValueError("module.yaml identity differs from template.")
                 if definition["role"] != role:
                     raise ValueError(f"Module {key} does not have role={role}.")
-                if role == "service" and (
-                    (definition["service_interface"] == "socket")
-                    != ("heartbeat" in item)
-                ):
-                    raise ValueError(
-                        "Service policies do not match module.service_interface."
-                    )
                 if key not in copied:
                     copy_task = asyncio.create_task(
                         asyncio.to_thread(shutil.copytree, source, target)
@@ -481,7 +504,7 @@ class ExperimentAssembler:
                 self.check_module(state, definition)
 
     def check_module(self, state: RunnerState, definition: JsonObject) -> None:
-        module = copy_json_object(definition["module"], "module")
+        module = self.module_reference(state.template, definition)
         name = require_text(module["name"], "module.name")
         version = require_text(module["version"], "module.version")
         expected_hash = require_text(module["hash"], "module.hash")

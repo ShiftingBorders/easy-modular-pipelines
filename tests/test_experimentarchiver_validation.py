@@ -68,7 +68,7 @@ class ArchiveValidationTests(ArchiveTestCase):
     async def test_manifest_schema_types_and_identity_are_validated(self):
         """D: malformed metadata is rejected before any installation or execution."""
         for key, value in (
-            ("schema_version", 2),
+            ("schema_version", 1),
             ("schema_version", True),
             ("archive_id", "bad"),
             ("created_at", "2026-09-16T00:00:00"),

@@ -117,7 +117,7 @@ def write_settings(directory: Path, *, context: dict | None = None, **settings) 
 def event_fixture(number: int = 1) -> dict:
     """An independent literal envelope, without production serializers or constants."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "event_id": f"event-{number}",
         "producer_instance_id": "producer-1",
         "sequence_number": number,

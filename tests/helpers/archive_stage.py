@@ -27,6 +27,11 @@ def main():
             "label": context["settings"].get("label", "stage"),
         }
         write_json(artifacts / "output.json", data)
+        logger.record_artifact(
+            "output.json",
+            purpose="stage output",
+            size_bytes=(artifacts / "output.json").stat().st_size,
+        )
         data["artifact"] = (
             (artifacts / "output.json")
             .relative_to(context["experiment_directory"])

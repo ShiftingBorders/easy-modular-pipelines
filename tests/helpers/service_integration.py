@@ -41,7 +41,7 @@ class ServiceDagWorkspace:
         (code / "module.yaml").write_text(
             yaml.safe_dump(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "name": name,
                     "version": "1",
                     "role": "stage",

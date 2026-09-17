@@ -36,7 +36,8 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             )
             path = self.w.experiment / "modules" / definition["module"]["name"] / "1"
             valid = self.w.assembler.read_module(path)
-            self.assertEqual(valid["service_interface"], interface)
+            self.assertEqual(valid["implementation"], implementation)
+            self.assertNotIn("service_interface", valid)
             for update in (
                 {"service_interface": "unknown"},
                 {"schema_version": True},
@@ -210,16 +211,19 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             endpoint = json.loads(instance.endpoint_path.read_text())
             identity = {
                 key: endpoint[key]
-                for key in ("experiment_id", "service_id", "service_instance_id")
+                for key in (
+                    "experiment_id",
+                    "participant_id",
+                    "participant_instance_id",
+                )
             }
             for update in (
-                {"service_instance_id": str(uuid4())},
+                {"participant_instance_id": str(uuid4())},
                 {"experiment_id": str(uuid4())},
             ):
                 connection = ParticipantConnection(
                     instance.endpoint_path,
                     {**identity, **update},
-                    process_key="process",
                 )
                 with self.assertRaises(ValueError):
                     await connection.connect(timeout_seconds=30)
@@ -230,7 +234,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             altered["process"]["created_at_os"] += 1
             bad = w.root / "bad-endpoint.json"
             write_json(bad, altered)
-            connection = ParticipantConnection(bad, identity, process_key="process")
+            connection = ParticipantConnection(bad, identity)
             with self.assertRaises(ValueError):
                 await connection.connect(timeout_seconds=30)
             await connection.close()
@@ -239,7 +243,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             token.write_text("incorrect")
             altered["endpoint"]["token_file"] = str(token)
             write_json(bad, altered)
-            connection = ParticipantConnection(bad, identity, process_key="process")
+            connection = ParticipantConnection(bad, identity)
             with self.assertRaises((ValueError, EOFError, OSError)):
                 await connection.connect(timeout_seconds=30)
             await connection.close()

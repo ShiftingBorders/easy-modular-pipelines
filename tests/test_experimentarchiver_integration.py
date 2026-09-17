@@ -92,7 +92,7 @@ class ArchiveDagTests(ArchiveTestCase):
         self.assertEqual(runner.get_state()["phase"], "waiting", runner.get_state())
         self.assertTrue(all(row["ready"] for row in runner.get_state()["services"]))
         socket = next(
-            s for s in runner._state.services.values() if s.interface == "socket"
+            s for s in runner._state.services.values() if s.implementation == "full"
         )
         reply = await runner._services.request(
             runner._state, socket.service_id, "set_value", {"value": 17}
@@ -113,7 +113,7 @@ class ArchiveDagTests(ArchiveTestCase):
         self.assertEqual(runner.get_state()["phase"], "completed")
         self.assertTrue(all(s["stopped"] for s in runner.get_state()["services"]))
         commands = next(
-            s for s in runner._state.services.values() if s.interface == "commands"
+            s for s in runner._state.services.values() if s.implementation == "action"
         )
         trace = (
             runner._state.experiment_directory

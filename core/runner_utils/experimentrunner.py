@@ -88,6 +88,7 @@ class ExperimentRunner:
         self._task = None
         self._stage_task = None
         self._service_task = None
+        self._stages.bind_services(self._services)
         self._service_retrying = False
         self._step_future = None
         self._last_attempt = None
@@ -169,6 +170,7 @@ class ExperimentRunner:
             notify_resources=self._publish_resources,
         )
         self._service_task = None
+        self._stages.bind_services(self._services)
         self._snapshots = ExperimentSnapshots(
             self._project_root,
             self._stages,
@@ -380,25 +382,25 @@ class ExperimentRunner:
                         continue
                     if outcome.action == "stop":
                         state.last_result = None
-                        state.last_result_path = None
-                        state.stage_result_paths.pop(outcome.attempt.stage_id, None)
+                        state.last_result_id = None
+                        state.stage_result_ids.pop(outcome.attempt.stage_id, None)
                         state.stage_result_origins.pop(outcome.attempt.stage_id, None)
                         raise RuntimeError("Stage execution requires experiment stop.")
                     state.active_attempt = None
                     response = outcome.result
                     if response is not None and response["result"] == "success":
                         state.last_result = response["data"]
-                        state.last_result_path = outcome.attempt.result_path
-                        state.stage_result_paths[outcome.attempt.stage_id] = (
-                            outcome.attempt.result_path
+                        state.last_result_id = outcome.attempt.result_request_id
+                        state.stage_result_ids[outcome.attempt.stage_id] = (
+                            outcome.attempt.result_request_id
                         )
                         state.stage_result_origins[outcome.attempt.stage_id] = (
                             state.experiment_id
                         )
                     else:
                         state.last_result = None
-                        state.last_result_path = None
-                        state.stage_result_paths.pop(outcome.attempt.stage_id, None)
+                        state.last_result_id = None
+                        state.stage_result_ids.pop(outcome.attempt.stage_id, None)
                         state.stage_result_origins.pop(outcome.attempt.stage_id, None)
                     self._pending_advance = outcome.action == "advance"
                     if outcome.action == "pause":
@@ -538,11 +540,11 @@ class ExperimentRunner:
                     if state.stage_position > len(state.template["stages"]):
                         state.cycle_number += 1
                         state.stage_position = 1
-                        state.stage_result_paths.clear()
+                        state.stage_result_ids.clear()
                         state.stage_result_origins.clear()
                         state.stage_attempt_numbers.clear()
                         state.last_result = None
-                        state.last_result_path = None
+                        state.last_result_id = None
                         for instance in state.services.values():
                             instance.restart_count = 0
                     self._pending_advance = False
@@ -706,6 +708,19 @@ class ExperimentRunner:
                     item.stopped for item in self._state.services.values()
                 )
                 failure = failure or error
+            if (
+                not stopped
+                and self._state.active_attempt is not None
+                and self._state.active_attempt.service_id is not None
+                and all(item.stopped for item in self._state.services.values())
+                and self._stages.termination_confirmed(self._state)
+            ):
+                stopped = True
+                if (
+                    isinstance(failure, RuntimeError)
+                    and str(failure) == "Could not confirm stage termination."
+                ):
+                    failure = None
             self._termination_confirmed = stopped
             await self._services.close()
             if failure is not None:
@@ -781,8 +796,6 @@ class ExperimentRunner:
             raise RuntimeError(
                 "Retry the failed preceding service before starting later services."
             )
-        if instance.interface != "socket":
-            raise ValueError("Commands-only services have no restart policy.")
         self._service_retrying = True
         try:
             action = await self._services.restart(state, service_id, automatic=False)
@@ -843,7 +856,7 @@ class ExperimentRunner:
                 raise ValueError("Service position is outside the template.")
             service_id = state.template["services"][position - 1]["service_id"]
             instance = state.services.get(service_id)
-            if instance is None or instance.interface != "socket":
+            if instance is None:
                 raise ValueError("A started socket service is required.")
             old = instance.restart_count
             instance.restart_count = 0
@@ -1238,7 +1251,15 @@ class ExperimentRunner:
                             event["event_type"] == "control.intent"
                             and event["data"].get("action") == "start_stage"
                         ):
-                            launches.append(event["context"])
+                            launches.append(
+                                {
+                                    **event["context"],
+                                    "queued_monotonic": event["data"][
+                                        "queued_monotonic"
+                                    ],
+                                    "queued_at": event["data"]["queued_at"],
+                                }
+                            )
                     checkpoint = page["checkpoint"]
                     if checkpoint["cursor"] >= boundary or not page["has_more"]:
                         break
@@ -1267,7 +1288,9 @@ class ExperimentRunner:
                             root
                             / "shared_artifacts"
                             / f"epoch_{launched['cycle_number']}"
-                            / definition["module"]["name"]
+                            / self._assembler.module_reference(
+                                state.template, definition
+                            )["name"]
                             / launched["stage_id"]
                             / f"attempt_{launched['attempt_number']}"
                         )
@@ -1284,6 +1307,23 @@ class ExperimentRunner:
                         )
                         # Bind ownership before optional files are read so failure
                         # handling still has to confirm this attempt's termination.
+                        attempt.request_id = launched["request_id"]
+                        attempt.participant = {
+                            key: launched[key]
+                            for key in (
+                                "experiment_id",
+                                "participant_id",
+                                "participant_instance_id",
+                            )
+                        }
+                        attempt.service_id = definition.get("service_id")
+                        attempt.endpoint_path = (
+                            root / "runner/endpoints" / f"{attempt.service_id}.json"
+                            if attempt.service_id is not None
+                            else directory / "executor.lock.json"
+                        )
+                        attempt.queued_monotonic = launched["queued_monotonic"]
+                        attempt.queued_at = launched["queued_at"]
                         state.active_attempt = attempt
                         context = read_json(directory / "context.json")
                         if context["context"]["attempt_id"] != launched["attempt_id"]:
@@ -1292,6 +1332,19 @@ class ExperimentRunner:
                             )
                         attempt.input_data = context["input_data"]
                         attempt.effective_settings = context["settings"]
+                        attempt.request_id = context["context"]["request_id"]
+                        attempt.participant = {
+                            key: context["context"][key]
+                            for key in (
+                                "experiment_id",
+                                "participant_id",
+                                "participant_instance_id",
+                            )
+                        }
+                        attempt.endpoint_path = Path(context["endpoint_path"])
+                        attempt.service_id = context["service_id"]
+                        attempt.queued_at = context["queued_at"]
+                        attempt.queued_monotonic = context["queued_monotonic"]
                         record_path = directory / "process.json"
                         if record_path.exists():
                             record = read_json(record_path)
@@ -1379,8 +1432,15 @@ class ExperimentRunner:
                 self._error["interruption_error"] = str(interruption_error)
             try:
                 results = await self._services.stop_all(self._state)
-                self._termination_confirmed = self._termination_confirmed and all(
+                self._termination_confirmed = all(
                     result["stopped"] for result in results.values()
+                ) and (
+                    self._termination_confirmed
+                    or (
+                        self._state.active_attempt is not None
+                        and self._state.active_attempt.service_id is not None
+                        and self._stages.termination_confirmed(self._state)
+                    )
                 )
                 if any(
                     not result["stopped"] or result["error"]
@@ -1500,6 +1560,7 @@ class ExperimentRunner:
         attempt = state.active_attempt
         if (
             attempt is not None
+            and attempt.service_id is None
             and attempt.process_identity is not None
             and not (attempt.executor_status or {}).get("finished", False)
         ):
@@ -1526,11 +1587,7 @@ class ExperimentRunner:
                 }
             )
         for instance in state.services.values():
-            if (
-                instance.interface != "socket"
-                or instance.stopped
-                or instance.process_identity is None
-            ):
+            if instance.stopped or instance.process_identity is None:
                 continue
             module = instance.definition["module"]
             targets.append(
@@ -1591,7 +1648,9 @@ class ExperimentRunner:
                         "service_instance_id": None
                         if instance is None
                         else instance.service_instance_id,
-                        "interface": None if instance is None else instance.interface,
+                        "implementation": None
+                        if instance is None
+                        else instance.implementation,
                         "ready": instance is not None and instance.ready,
                         "stopping": instance is not None and instance.stopping,
                         "stopped": instance is None or instance.stopped,

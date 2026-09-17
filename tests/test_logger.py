@@ -174,13 +174,13 @@ class OperationLoggerTests(unittest.TestCase):
             second.record_event("test.second", context={"run_id": "run-2"})
             second.record_event(
                 "service.heartbeat",
-                context={"run_id": None, "service_instance_id": "redis-1"},
+                context={"run_id": None, "participant_instance_id": "redis-1"},
             )
         self.assertEqual(read_database(self.db_path)[0]["context"]["run_id"], "run-1")
         events = read_database(second_config.parent / "events.db")
         self.assertEqual(events[0]["context"]["run_id"], "run-2")
         self.assertIsNone(events[1]["context"]["run_id"])
-        self.assertEqual(events[1]["context"]["service_instance_id"], "redis-1")
+        self.assertEqual(events[1]["context"]["participant_instance_id"], "redis-1")
 
     def test_start_timing_and_monotonic_duration(self):
         """OP-01: start is explicit and a backward wall clock does not change duration."""
@@ -468,7 +468,7 @@ class OperationLoggerTests(unittest.TestCase):
                         "scope": scope,
                     }
                 },
-                context={"service_instance_id": "redis-1"},
+                context={"participant_instance_id": "redis-1"},
             )
         events = [
             e

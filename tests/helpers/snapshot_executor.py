@@ -16,7 +16,11 @@ def main():
     mode = os.environ.get("EMP_TEST_EXECUTOR_MODE", "cleanup")
 
     def unlink(path, *args, **kwargs):
-        if path.name == "executor.token" and mode == "cleanup":
+        if (
+            path.name.startswith("executor.lock.")
+            and path.suffix == ".token"
+            and mode == "cleanup"
+        ):
             entered.touch()
             deadline = time.monotonic() + 30
             while not release.exists():

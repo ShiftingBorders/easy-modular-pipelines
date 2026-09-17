@@ -528,7 +528,7 @@ class OperationLogger:
         with self._lock:
             self._require_open()
             event_context, operation_id = self._get_record_context(operation, context)
-            for name in ("experiment_id", "service_id"):
+            for name in ("experiment_id", "participant_id"):
                 require_text(event_context.get(name), f"context.{name}")
             if event_context.get("request_id") not in (None, request_id):
                 raise ValueError("request_id disagrees with the supplied context.")

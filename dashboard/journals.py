@@ -350,8 +350,6 @@ class LocalJournals:
                 for entry in dataset["entries"]
                 if entry["event_type"] == "artifact.recorded"
                 and entry["data"].get("artifact_id") == artifact_id
-                or entry["event_type"] == "stage.finished"
-                and entry["event_id"] == artifact_id
             ),
             None,
         )
@@ -390,8 +388,6 @@ class LocalJournals:
             relative_directory = f"shared_artifacts/epoch_{context['cycle_number']}/{context['module_name']}/{context['stage_id']}/attempt_{context['attempt_number']}"
             directory = self.safe_path(directory, relative_directory)
             relative_file = event["data"]["path"]
-        else:
-            relative_file = event["data"].get("result_path")
         if not isinstance(relative_file, str) or not relative_file:
             raise SystemAPIError(
                 "not_found", "The artifact has no recorded local path.", 404

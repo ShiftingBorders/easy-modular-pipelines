@@ -42,8 +42,8 @@ class RunnerStateTests(unittest.TestCase):
         self.state.stage_attempt_numbers = {stage_id: 4}
         self.state.used_request_ids = {request_id}
         self.state.last_result = {"value": [1, None, "данные"]}
-        self.state.last_result_path = self.root / "previous.json"
-        self.state.stage_result_paths = {stage_id: self.root / "previous.json"}
+        self.state.last_result_id = request_id
+        self.state.stage_result_ids = {stage_id: request_id}
         self.state.active_attempt = StageAttempt(
             str(uuid4()),
             stage_id,
@@ -55,10 +55,18 @@ class RunnerStateTests(unittest.TestCase):
             {"enabled": False},
             None,
         )
-        self.state.active_attempt.result_path = self.root / "attempt/result.json"
+        self.state.active_attempt.result_request_id = request_id
+        self.state.active_attempt.participant = {
+            "experiment_id": self.state.experiment_id,
+            "participant_id": stage_id,
+            "participant_instance_id": self.state.active_attempt.attempt_id,
+        }
+        self.state.active_attempt.endpoint_path = (
+            self.root / "attempt/executor.lock.json"
+        )
         self.store.save(self.state)
         document = read_json(self.root / "runner/state.json")
-        self.assertEqual(document["last_result_path"], "previous.json")
+        self.assertEqual(document["last_result_id"], request_id)
         self.assertEqual(document["active_attempt"]["artifacts_directory"], "attempt")
         self.assertTrue(
             {"control_queue", "current_command", "tasks", "connections"}.isdisjoint(
@@ -79,9 +87,7 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(restored.used_request_ids, {request_id})
         self.assertEqual(restored.last_result, {"value": [1, None, "данные"]})
         self.assertEqual(restored.active_attempt.input_data, {"value": 7})
-        self.assertEqual(
-            restored.active_attempt.result_path, self.root / "attempt/result.json"
-        )
+        self.assertEqual(restored.active_attempt.result_request_id, request_id)
 
     def test_invalid_schema_corruption_and_escaping_paths_are_rejected(self):
         """D1: damaged and incompatible state cannot be mistaken for a valid checkpoint."""
@@ -91,12 +97,12 @@ class RunnerStateTests(unittest.TestCase):
         for key, value in (
             ("schema_version", True),
             ("schema_version", 1),
-            ("schema_version", 3),
+            ("schema_version", 2),
             ("mode", "unknown"),
             ("cycle_number", True),
             ("stage_position", 0),
             ("pause_requested", 1),
-            ("last_result_path", "../outside.json"),
+            ("last_result_id", "../outside.json"),
             ("used_request_ids", ["bad"]),
         ):
             with self.subTest(key=key, value=value):
@@ -115,7 +121,7 @@ class RunnerStateTests(unittest.TestCase):
         self.state.pending_advance = True
         self.state.checkpoint_id = str(uuid4())
         self.state.owner_identity = process_identity(os.getpid())
-        self.state.stage_result_paths[stage_id] = self.root / "result.json"
+        self.state.stage_result_ids[stage_id] = stage_id
         self.state.stage_result_origins[stage_id] = "source-experiment"
         self.store.save(self.state)
         relocated = self.root / "relocated"
@@ -128,9 +134,7 @@ class RunnerStateTests(unittest.TestCase):
         self.assertTrue(restored.pending_advance)
         self.assertEqual(restored.checkpoint_id, self.state.checkpoint_id)
         self.assertEqual(restored.owner_identity, self.state.owner_identity)
-        self.assertEqual(
-            restored.stage_result_paths[stage_id], relocated / "result.json"
-        )
+        self.assertEqual(restored.stage_result_ids[stage_id], stage_id)
         self.assertEqual(restored.stage_result_origins[stage_id], "source-experiment")
         self.state.template_path = self.workspace.root / "external.yaml"
         self.store.save(self.state)

@@ -62,7 +62,7 @@ class FullSystemDagTests(ServerTestCase):
         running = await server.wait_state("stage_running")
         self.assertEqual(running["experiment_id"], initial["experiment_id"])
         socket = next(
-            row for row in running["services"] if row["interface"] == "socket"
+            row for row in running["services"] if row["implementation"] == "full"
         )
         socket_pid = socket["process"]["pid"]
         self.assertTrue(process_running(socket_pid))
@@ -92,7 +92,7 @@ class FullSystemDagTests(ServerTestCase):
             all(read_json(path)["text"] == "portable input\n" for path in artifacts)
         )
         commands = next(
-            row for row in final["services"] if row["interface"] == "commands"
+            row for row in final["services"] if row["implementation"] == "action"
         )
         actions = (
             root / "module_data" / commands["service_id"] / "controls/actions.jsonl"

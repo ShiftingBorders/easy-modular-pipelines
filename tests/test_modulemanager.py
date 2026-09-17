@@ -1304,7 +1304,14 @@ class PlatformTests(ModuleManagerTestCase):
         expected = self.manager.module_hash("demo", self.source)
         link = self.source / "file-link"
         broken = self.source / "broken-link"
-        link.symlink_to(self.sentinel)
+        try:
+            link.symlink_to(self.sentinel)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                self.skipTest(
+                    "Windows file symlinks require Developer Mode or the symlink privilege."
+                )
+            raise
         broken.symlink_to(self.root / "absent")
         self.assertTrue(link.is_symlink())
         self.assertTrue(broken.is_symlink())

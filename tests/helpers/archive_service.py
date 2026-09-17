@@ -2,10 +2,8 @@
 
 import argparse
 import asyncio
-import json
 from pathlib import Path
 
-from core.logger import OperationLogger
 from core.runner_utils.runtimeio import read_json
 
 
@@ -18,14 +16,6 @@ def main():
     controls = Path(context["module_data_directory"]) / "controls"
     controls.mkdir(parents=True, exist_ok=True)
     context["settings"]["controls"] = str(controls)
-    if context["service_interface"] == "commands":
-        with OperationLogger(Path(context["logging_config_path"])) as logger:
-            logger.record_event(
-                "archive_fixture.service_action", {"action": args.action}
-            )
-        with (controls / "actions.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"action": args.action}) + "\n")
-        return
     from service_process import PythonService
 
     asyncio.run(PythonService(context).run())

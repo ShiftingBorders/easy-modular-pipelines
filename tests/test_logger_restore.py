@@ -54,11 +54,11 @@ class JournalRestorationTests(unittest.TestCase):
         )
         # Service observation is outside the operation tree; result references must include it.
         self.service_id = self.logger.record_command_result(
-            "request", {"value": "service"}, author="service", outcome="succeeded"
+            "request", {"value": "participant"}, author="participant", outcome="succeeded"
         )
         self.runner_id = self.logger.record_command_result(
             "request",
-            {"value": "service" if shared_response else "runner"},
+            {"value": "participant" if shared_response else "runner"},
             author="runner",
             outcome="succeeded",
             operation=child,
@@ -132,7 +132,7 @@ class JournalRestorationTests(unittest.TestCase):
         self.assertIn(self.intent_id, ids)
         self.assertNotIn(self.unrelated_id, ids)
         self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0]["service"]["event_id"], self.service_id)
+        self.assertEqual(commands[0]["participant"]["event_id"], self.service_id)
         self.assertEqual(commands[0]["runner"]["event_id"], self.runner_id)
         self.assertEqual(
             self.bundle["records_sha256"],
@@ -160,7 +160,7 @@ class JournalRestorationTests(unittest.TestCase):
         self.assertEqual(command["event_id"], self.runner_id)
         self.assertEqual(command["author"], "runner")
         self.assertEqual(
-            {item["author"] for item in command["observations"]}, {"runner", "service"}
+            {item["author"] for item in command["observations"]}, {"runner", "participant"}
         )
         self.assertTrue(store.read_changes()["changes"])
         self.assertEqual(read_database(self.path), self.before)
@@ -174,7 +174,7 @@ class JournalRestorationTests(unittest.TestCase):
         result = store.read_command_result("request")
         self.assertEqual(result["author"], "runner")
         self.assertFalse(result["provisional"])
-        self.assertEqual(result["event"]["data"]["author"], "service")
+        self.assertEqual(result["event"]["data"]["author"], "participant")
         self.assertEqual(len(result["observations"]), 2)
         self.assertEqual(
             len(
@@ -190,7 +190,7 @@ class JournalRestorationTests(unittest.TestCase):
     def test_confirmation_on_a_selected_root_remains_attached_to_that_operation(self):
         """F4: root selection works even without a parent_operation_id in the confirmation."""
         event_id = self.logger.record_command_result(
-            "request", {}, author="service", outcome="succeeded"
+            "request", {}, author="participant", outcome="succeeded"
         )
         root = self.logger.start_operation("rebuild", "root")
         self.logger.record_command_result(
@@ -466,7 +466,7 @@ class JournalRestorationTests(unittest.TestCase):
     def test_existing_observer_cannot_be_replaced_by_an_imported_observation(self):
         """F7: matching event data does not permit rewriting an observer's original metadata."""
         self.logger.record_command_result(
-            "request", {}, author="service", outcome="succeeded"
+            "request", {}, author="participant", outcome="succeeded"
         )
         self.snapshot = self.folder / "snapshot"
         self.manifest = self.logger.export_snapshot(self.snapshot, min_free_bytes=0)
@@ -483,7 +483,7 @@ class JournalRestorationTests(unittest.TestCase):
             .splitlines()
         ]
         command = next(record for record in records if record["kind"] == "command")
-        command["service"]["observation"]["occurred_at"] = "2026-01-01T00:00:00+00:00"
+        command["participant"]["observation"]["occurred_at"] = "2026-01-01T00:00:00+00:00"
         (self.diagnostics / "records.jsonl").write_text(
             "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
         )
@@ -542,7 +542,7 @@ class JournalRestorationTests(unittest.TestCase):
         with self.assertRaises(LoggingStorageError):
             stale.append(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "event_id": "stale",
                     "producer_instance_id": "stale",
                     "sequence_number": 1,

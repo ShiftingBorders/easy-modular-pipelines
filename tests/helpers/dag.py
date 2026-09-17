@@ -157,18 +157,24 @@ class DagWorkspace:
         raise AssertionError(f"Unexpected storage request: {request.method}")
 
     def module(
-        self, name="worker", version="1", defaults=None, *, implementation="full"
+        self,
+        name="worker",
+        version="1",
+        defaults=None,
+        *,
+        implementation="full",
+        source=None,
     ) -> dict:
         directory = self.root / "modules" / name / version
         directory.mkdir(parents=True)
-        shutil.copy2(Path(__file__).with_name("dag_stage.py"), directory / "main.py")
+        shutil.copy2(
+            source or Path(__file__).with_name("dag_stage.py"), directory / "main.py"
+        )
         commands = {"start": ["python", "-B", "main.py"]}
-        if implementation == "action":
-            commands["stop"] = ["not-a-valid-stop-command"]
         (directory / "module.yaml").write_text(
             yaml.safe_dump(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "name": name,
                     "version": version,
                     "role": "stage",
@@ -205,7 +211,7 @@ class DagWorkspace:
         self, stages=None, *, cycles=1, keep_attempts=1, resources=None
     ) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "name": "test-dag",
             "cycles": cycles,
             "keep_attempts": keep_attempts,
@@ -261,7 +267,7 @@ class DagWorkspace:
             except OSError as error:
                 # Windows may briefly retain delete-pending files after their last
                 # handle closes. Do not hide persistent or unrelated cleanup errors.
-                if getattr(error, "winerror", None) not in (32, 145) or attempt == 9:
+                if getattr(error, "winerror", None) not in (5, 32, 145) or attempt == 9:
                     raise
                 time.sleep(0.1)
 

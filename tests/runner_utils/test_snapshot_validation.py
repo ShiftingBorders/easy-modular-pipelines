@@ -45,7 +45,7 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         original = read_json(self.archive / "manifest.json")
         changes = [
             (("schema_version",), True),
-            (("schema_version",), 2),
+            (("schema_version",), 1),
             (("snapshot_id",), "invalid"),
             (("sequence",), 0),
             (("sequence",), True),
@@ -100,8 +100,13 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
                     self.rewrite_inventory(directory, relative)
                 elif mutation == "control":
                     manifest = read_json(directory / "manifest.json")
-                    relative = "files/" + manifest["state"]["last_result_path"].replace(
-                        "execution_result.json", "executor.token"
+                    relative = (
+                        next(
+                            key
+                            for key in manifest["files"]
+                            if key.endswith("/received.json")
+                        ).rsplit("/", 1)[0]
+                        + "/executor.lock.fake.token"
                     )
                     (directory / relative).write_bytes(b"runtime-only token")
                     self.rewrite_inventory(directory, relative)
@@ -111,11 +116,8 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
                     self.rewrite_inventory(directory, relative)
                 else:
                     manifest = read_json(directory / "manifest.json")
-                    relative = "files/" + manifest["state"]["last_result_path"]
-                    result = read_json(directory / relative)
-                    result["experiment_id"] = "foreign"
-                    write_json(directory / relative, result)
-                    self.rewrite_inventory(directory, relative)
+                    manifest["state"]["last_result_id"] = str(uuid4())
+                    write_json(directory / "manifest.json", manifest)
                 with self.assertRaises(
                     (ValueError, TypeError, KeyError, OSError, LoggingError)
                 ):

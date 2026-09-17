@@ -20,7 +20,7 @@ class PythonService:
         self.context = context
         self.identity = {
             key: context["context"][key]
-            for key in ("experiment_id", "service_id", "service_instance_id")
+            for key in ("experiment_id", "participant_id", "participant_instance_id")
         }
         self.directory = Path(context["artifacts_directory"])
         self.controls = Path(context["settings"]["controls"])
@@ -66,6 +66,7 @@ class PythonService:
                         "event": event,
                         "pid": os.getpid(),
                         "at": time.monotonic(),
+                        **self.context["context"],
                         **self.identity,
                         **data,
                     }
@@ -121,7 +122,15 @@ class PythonService:
                 or hello.get("token") != self.token
             ):
                 return
-            await self.send(writer, {"result": "success", "data": self.identity})
+            await self.send(
+                writer,
+                {
+                    "protocol_version": 2,
+                    "message_type": "hello",
+                    "result": "success",
+                    "data": self.identity,
+                },
+            )
             while not self.finished.is_set():
                 request = await self.read(reader, hold=client_number == 1)
                 request_id = request["request_id"]
@@ -147,7 +156,7 @@ class PythonService:
                     silence = self.controls / "silent-heartbeat"
                     if silence.exists() and silence.read_text().strip() in (
                         "",
-                        self.identity["service_instance_id"],
+                        self.identity["participant_instance_id"],
                     ):
                         continue
                     while (self.controls / "hold-start").exists():
@@ -163,8 +172,8 @@ class PythonService:
                     await self.send(
                         writer,
                         {
-                            "protocol_version": 1,
-                            "message_type": "status",
+                            "protocol_version": 2,
+                            "message_type": "response",
                             "request_id": request_id,
                             "result": "fail"
                             if (self.controls / "fail-health").exists()
@@ -177,21 +186,36 @@ class PythonService:
                     await self.send(
                         writer,
                         {
-                            "protocol_version": 1,
-                            "message_type": "command_state",
+                            "protocol_version": 2,
+                            "message_type": "response",
                             "request_id": request_id,
                             "result": "success",
                             "data": {"current": self.current, "pending": self.pending},
                         },
                     )
                 elif command == "shutdown":
+                    self.action_marker("stop")
+                    while (self.controls / "hold-stop").exists():
+                        await asyncio.sleep(0.05)
                     if (self.controls / "ignore-shutdown").exists():
+                        continue
+                    if (self.controls / "fail-stop").exists():
+                        await self.send(
+                            writer,
+                            {
+                                "protocol_version": 2,
+                                "message_type": "response",
+                                "request_id": request_id,
+                                "result": "fail",
+                                "data": {"reason": "internal_stop_failed"},
+                            },
+                        )
                         continue
                     await self.send(
                         writer,
                         {
-                            "protocol_version": 1,
-                            "message_type": "command_result",
+                            "protocol_version": 2,
+                            "message_type": "response",
                             "request_id": request_id,
                             "result": "success",
                             "data": {"shutdown": True},
@@ -293,7 +317,7 @@ class PythonService:
             self.logger.record_command_result(
                 entry["request_id"],
                 response,
-                author="service",
+                author="participant",
                 outcome="succeeded" if result == "success" else "failed",
             )
             self.trace("work_finished", **entry, response=response)
@@ -303,8 +327,8 @@ class PythonService:
                     await self.send(
                         writer,
                         {
-                            "protocol_version": 1,
-                            "message_type": "command_result",
+                            "protocol_version": 2,
+                            "message_type": "response",
                             "request_id": entry["request_id"],
                             **response,
                         },
@@ -320,7 +344,24 @@ class PythonService:
                 await self.publish_counter()
             await asyncio.sleep(0.25)
 
+    def action_marker(self, name: str) -> None:
+        if not self.context["settings"].get("command_proxy"):
+            return
+        row = {
+            "action": name,
+            "pid": os.getpid(),
+            "at": time.monotonic(),
+            **self.context["context"],
+        }
+        with (self.controls / "actions.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+        write_json(
+            self.controls / f"action-{name}.json",
+            {"pid": os.getpid(), "context": self.context},
+        )
+
     async def run(self) -> None:
+        self.action_marker("start")
         self.logger.open()
         self.token = str(uuid4())
         token = self.directory / "service.token"
@@ -330,6 +371,7 @@ class PythonService:
         write_json(
             endpoint,
             {
+                "protocol_version": 2,
                 **self.identity,
                 "process": process_identity(os.getpid()),
                 "endpoint": {
@@ -362,49 +404,7 @@ def main() -> None:
     parser.add_argument("--action", choices=("start", "stop"), default="start")
     options = parser.parse_args()
     context = read_json(options.emp_context)
-    controls = Path(context["settings"]["controls"])
-    if context["service_interface"] == "commands":
-        with (controls / "actions.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(
-                json.dumps(
-                    {
-                        "action": options.action,
-                        "pid": os.getpid(),
-                        "at": time.monotonic(),
-                        **context["context"],
-                    }
-                )
-                + "\n"
-            )
-        write_json(
-            controls / f"action-{options.action}.json",
-            {"pid": os.getpid(), "context": context},
-        )
-        while (controls / f"hold-{options.action}").exists():
-            time.sleep(0.05)
-        return
-    if options.action == "stop":
-        from core.runner_utils.connection import ParticipantConnection
-
-        async def stop():
-            identity = {
-                key: context["context"][key]
-                for key in ("experiment_id", "service_id", "service_instance_id")
-            }
-            connection = ParticipantConnection(
-                Path(context["endpoint_path"]), identity, process_key="process"
-            )
-            try:
-                await connection.connect(timeout_seconds=30)
-                await connection.request(
-                    str(uuid4()), "shutdown", {}, timeout_seconds=30
-                )
-            finally:
-                await connection.close()
-
-        asyncio.run(stop())
-    else:
-        asyncio.run(PythonService(context).run())
+    asyncio.run(PythonService(context).run())
 
 
 if __name__ == "__main__":

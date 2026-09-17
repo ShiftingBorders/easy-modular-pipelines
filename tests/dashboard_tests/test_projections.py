@@ -10,6 +10,19 @@ from tests.dashboard_tests.integration_helpers import history, timestamp
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_service_node_resolves_module_from_services_definition(self):
+        """I22: a DAG reference does not need a duplicated module declaration."""
+        dataset = history()
+        template = dataset["state"]["template"]
+        node = template["stages"][1]
+        module = node.pop("module")
+        node["service_id"] = "weather"
+        template["services"] = [{"service_id": "weather", "module": module}]
+        result = experiment_views(dataset)
+        self.assertEqual(
+            result["forecast"]["component_durations"][1]["module_name"], "long"
+        )
+
     def test_forecast_does_not_bridge_separate_logical_runs_with_same_revision(self):
         old = history(((1, 2),), total=2)
         current = history(((4, 8),), total=2)

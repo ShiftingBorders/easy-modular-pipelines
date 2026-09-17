@@ -7,6 +7,7 @@ from typing import Literal
 from uuid import UUID
 
 from core.logger_utils.events import copy_json_object, require_number, require_text
+from core.runner_utils.protocol import participant_identity
 from core.runner_utils.runtimeio import read_json, write_json
 
 type JsonValue = (
@@ -43,7 +44,7 @@ class StageAttempt:
     process_identity: JsonObject | None
     started_at: str | None
     timeout_seconds: float | None
-    result_path: Path | None
+    result_request_id: str | None
     outcome: str | None
 
     def __init__(
@@ -94,9 +95,15 @@ class StageAttempt:
         self.timeout_seconds = timeout_seconds
         self.process_identity = None
         self.started_at = None
-        self.result_path = None
+        self.result_request_id = None
         self.outcome = None
         self.executor_status: JsonObject | None = None
+        self.request_id = attempt_id
+        self.participant: JsonObject | None = None
+        self.endpoint_path: Path | None = None
+        self.service_id: str | None = None
+        self.queued_monotonic: float | None = None
+        self.queued_at: str | None = None
 
 
 class ServiceInstance:
@@ -105,7 +112,6 @@ class ServiceInstance:
     service_id: str
     service_instance_id: str
     definition: JsonObject
-    interface: Literal["socket", "commands"]
     process_identity: JsonObject | None
     endpoint_path: Path | None
     ready: bool
@@ -120,18 +126,14 @@ class ServiceInstance:
         service_id: str,
         service_instance_id: str,
         definition: JsonObject,
-        interface: Literal["socket", "commands"],
     ) -> None:
         UUID(require_text(service_id, "service_id"))
         UUID(require_text(service_instance_id, "service_instance_id"))
-        if interface not in ("socket", "commands"):
-            raise ValueError("interface must be socket or commands.")
         self.definition = copy_json_object(definition, "service definition")
         if self.definition.get("service_id") != service_id:
             raise ValueError("Service definition has a different service_id.")
         self.service_id = service_id
         self.service_instance_id = service_instance_id
-        self.interface = interface
         self.process_identity = None
         self.endpoint_path = None
         self.ready = False
@@ -145,7 +147,7 @@ class ServiceInstance:
         self.stopping = False
         self.stopped = False
         self.blocked_action: Literal["pause", "stop"] | None = None
-        self.failure: str | None = None
+        self.failure: JsonObject | None = None
         self.freeze_id: str | None = None
         self.prepared_freeze_id: str | None = None
         self.artifacts_directory: Path | None = None
@@ -172,8 +174,8 @@ class RunnerState:
     stage_attempt_numbers: dict[str, int]
     services: dict[str, ServiceInstance]
     last_result: JsonValue
-    last_result_path: Path | None
-    stage_result_paths: dict[str, Path]
+    last_result_id: str | None
+    stage_result_ids: dict[str, str]
     unknown_state_recovery_count: int
     used_request_ids: set[str]
     stable_snapshot_id: str | None
@@ -217,8 +219,8 @@ class RunnerState:
         self.stage_attempt_numbers = {}
         self.services = {}
         self.last_result = None
-        self.last_result_path = None
-        self.stage_result_paths = {}
+        self.last_result_id = None
+        self.stage_result_ids = {}
         self.unknown_state_recovery_count = 0
         self.used_request_ids = set()
         self.stable_snapshot_id = None
@@ -284,22 +286,15 @@ def state_to_document(state: RunnerState) -> JsonObject:
     root = state.experiment_directory.resolve()
     document = dict(vars(state))
     document.pop("experiment_directory")
-    document["schema_version"] = 2
+    document["schema_version"] = 3
     template_path = state.template_path.resolve()
     document["template_path"] = (
         template_path.relative_to(root).as_posix()
         if template_path.is_relative_to(root)
         else str(template_path)
     )
-    document["last_result_path"] = (
-        None
-        if state.last_result_path is None
-        else state.last_result_path.resolve().relative_to(root).as_posix()
-    )
-    document["stage_result_paths"] = {
-        key: value.resolve().relative_to(root).as_posix()
-        for key, value in state.stage_result_paths.items()
-    }
+    document["last_result_id"] = state.last_result_id
+    document["stage_result_ids"] = dict(state.stage_result_ids)
     document["used_request_ids"] = sorted(state.used_request_ids)
     document["services"] = {}
     for service_id, instance in state.services.items():
@@ -317,10 +312,11 @@ def state_to_document(state: RunnerState) -> JsonObject:
             .relative_to(root)
             .as_posix()
         )
-        attempt["result_path"] = (
+        endpoint = state.active_attempt.endpoint_path
+        attempt["endpoint_path"] = (
             None
-            if state.active_attempt.result_path is None
-            else state.active_attempt.result_path.resolve().relative_to(root).as_posix()
+            if endpoint is None
+            else endpoint.resolve().relative_to(root).as_posix()
         )
         document["active_attempt"] = attempt
     return copy_json_object(document, "runner state")
@@ -346,8 +342,8 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         "stage_attempt_numbers",
         "services",
         "last_result",
-        "last_result_path",
-        "stage_result_paths",
+        "last_result_id",
+        "stage_result_ids",
         "unknown_state_recovery_count",
         "used_request_ids",
         "stable_snapshot_id",
@@ -360,7 +356,7 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
     if (
         document.keys() != fields
         or type(document["schema_version"]) is not int
-        or document["schema_version"] != 2
+        or document["schema_version"] != 3
     ):
         raise ValueError("Unsupported runner state schema.")
     template_path = Path(document["template_path"])
@@ -442,9 +438,9 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         require_text(owner["boot_id"], "owner boot_id")
         state.owner_identity = owner
     origins = copy_json_object(document["stage_result_origins"], "stage result origins")
-    if type(document["stage_result_paths"]) is not dict:
-        raise TypeError("stage_result_paths must be an object.")
-    if origins.keys() - document["stage_result_paths"].keys():
+    if type(document["stage_result_ids"]) is not dict:
+        raise TypeError("stage_result_ids must be an object.")
+    if origins.keys() - document["stage_result_ids"].keys():
         raise ValueError("A result origin requires a saved stage result.")
     for stage_id, origin in origins.items():
         UUID(stage_id)
@@ -457,7 +453,6 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
             saved["service_id"],
             saved["service_instance_id"],
             saved["definition"],
-            saved["interface"],
         )
         if service_id != instance.service_id or saved.keys() != vars(instance).keys():
             raise ValueError("Invalid saved service fields or identity.")
@@ -485,9 +480,15 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
                     raise ValueError("Invalid service OS identity value.")
             for name in ("host_id", "boot_id"):
                 require_text(identity[name], name)
-        for name in ("started_at", "failure"):
+        for name in ("started_at",):
             if saved[name] is not None:
                 require_text(saved[name], name)
+        if saved["failure"] is not None:
+            failure = copy_json_object(saved["failure"], "service failure")
+            if failure.keys() != {"code", "message"}:
+                raise ValueError("Service failure requires code and message.")
+            require_text(failure["code"], "failure code")
+            require_text(failure["message"], "failure message")
         if saved["last_status"] is not None:
             copy_json_object(saved["last_status"], "service status")
         for key in ("freeze_id", "prepared_freeze_id"):
@@ -500,6 +501,11 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
             requests.append(saved["active_request"])
         for index, request in enumerate(requests):
             request = copy_json_object(request, "service request")
+            if request.get("owner") not in ("caller", "service"):
+                raise ValueError("Saved request has an invalid policy owner.")
+            require_number(request["queued_monotonic"], "request queue time")
+            if request.get("deadline_monotonic") is not None:
+                require_number(request["deadline_monotonic"], "request deadline")
             request_id = require_text(request["request_id"], "request_id")
             UUID(request_id)
             if (
@@ -536,21 +542,13 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         for name, value in saved.items():
             setattr(instance, name, value)
         state.services[service_id] = instance
-    if type(document["stage_result_paths"]) is not dict:
-        raise TypeError("stage_result_paths must be an object.")
-    paths = dict(document["stage_result_paths"])
-    if document["last_result_path"] is not None:
-        paths["last_result_path"] = document["last_result_path"]
-    for key, value in paths.items():
-        relative = Path(require_text(value, key))
-        resolved = (root / relative).resolve()
-        if relative.anchor or not resolved.is_relative_to(root):
-            raise ValueError("Saved result path escapes the experiment.")
-        if key == "last_result_path":
-            state.last_result_path = resolved
-        else:
-            UUID(key)
-            state.stage_result_paths[key] = resolved
+    for stage_id, request_id in document["stage_result_ids"].items():
+        UUID(stage_id)
+        UUID(require_text(request_id, "result request ID"))
+        state.stage_result_ids[stage_id] = request_id
+    if document["last_result_id"] is not None:
+        UUID(require_text(document["last_result_id"], "last result ID"))
+        state.last_result_id = document["last_result_id"]
     if document["active_attempt"] is not None:
         attempt = copy_json_object(document["active_attempt"], "active_attempt")
         observed = {
@@ -558,9 +556,15 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
             for key in (
                 "process_identity",
                 "started_at",
-                "result_path",
+                "result_request_id",
                 "outcome",
                 "executor_status",
+                "request_id",
+                "participant",
+                "endpoint_path",
+                "service_id",
+                "queued_monotonic",
+                "queued_at",
             )
         }
         relative = Path(attempt["artifacts_directory"])
@@ -568,11 +572,25 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         if relative.anchor or not attempt["artifacts_directory"].is_relative_to(root):
             raise ValueError("Saved attempt directory escapes the experiment.")
         state.active_attempt = StageAttempt(**attempt)
-        if observed["result_path"] is not None:
-            relative = Path(observed["result_path"])
-            observed["result_path"] = (root / relative).resolve()
-            if relative.anchor or not observed["result_path"].is_relative_to(root):
-                raise ValueError("Saved attempt result escapes the experiment.")
+        UUID(require_text(observed["request_id"], "request_id"))
+        if observed["result_request_id"] is not None:
+            UUID(require_text(observed["result_request_id"], "result request ID"))
+        if observed["participant"] is not None:
+            participant_identity(observed["participant"])
+        else:
+            raise ValueError("An active attempt requires a participant identity.")
+        if observed["service_id"] is not None:
+            UUID(require_text(observed["service_id"], "service ID"))
+            if observed["participant"]["participant_id"] != observed["service_id"]:
+                raise ValueError("Service attempt identity differs from its service.")
+        if observed["queued_monotonic"] is not None:
+            require_number(observed["queued_monotonic"], "queue time")
+        if observed["endpoint_path"] is not None:
+            relative = Path(observed["endpoint_path"])
+            resolved = (root / relative).resolve()
+            if relative.anchor or not resolved.is_relative_to(root):
+                raise ValueError("Saved participant endpoint escapes the experiment.")
+            observed["endpoint_path"] = resolved
         for key, value in observed.items():
             setattr(state.active_attempt, key, value)
     return state

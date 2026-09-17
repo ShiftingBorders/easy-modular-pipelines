@@ -58,7 +58,7 @@ class ServiceWorkspace:
         self.experiment = self.root / "experiment"
         self.experiment.mkdir()
         self.template = {
-            "schema_version": 1,
+            "schema_version": 2,
             "name": "services",
             "cycles": 1,
             "keep_attempts": 1,
@@ -83,7 +83,7 @@ class ServiceWorkspace:
             str(uuid4()),
             self.experiment / "experiment.yaml",
             str(uuid4()),
-            "schema_version: 1\n",
+            "schema_version: 2\n",
             self.template,
             "paused",
         )
@@ -113,17 +113,18 @@ class ServiceWorkspace:
         code.mkdir(parents=True)
         shutil.copy2(Path(__file__).with_name("service_process.py"), code / "main.py")
         commands = {"start": ["python", "-B", "main.py"]}
-        if implementation == "action":
-            commands["stop"] = ["python", "-B", "main.py", "--action", "stop"]
         module = {
-            "schema_version": 1,
+            "schema_version": 2,
             "name": name,
             "version": "1",
             "role": "service",
             "implementation": implementation,
-            "service_interface": interface,
             "commands": commands,
-            "defaults": {"nested": {"keep": 1, "replace": [1]}, "nullable": 1},
+            "defaults": {
+                "nested": {"keep": 1, "replace": [1]},
+                "nullable": 1,
+                "command_proxy": implementation == "action",
+            },
         }
         (code / "module.yaml").write_text(yaml.safe_dump(module), encoding="utf-8")
         digest = self.modules.module_hash(name, target_folder=code)
@@ -141,18 +142,17 @@ class ServiceWorkspace:
                 "nullable": None,
             },
         }
-        if interface == "socket":
-            definition.update(
-                heartbeat={"interval_seconds": 1, "grace_seconds": 10},
-                command_timeout_seconds=30,
-                on_command_timeout=policy,
-                state_required=required,
-                errors={
-                    "retries": retries,
-                    "retry_delay_seconds": 1,
-                    "on_exhausted": "pause",
-                },
-            )
+        definition.update(
+            heartbeat={"interval_seconds": 1, "grace_seconds": 10},
+            command_timeout_seconds=30,
+            on_command_timeout=policy,
+            state_required=required,
+            errors={
+                "retries": retries,
+                "retry_delay_seconds": 1,
+                "on_exhausted": "pause",
+            },
+        )
         self.state.template["services"].append(definition)
         self.state.template_yaml = yaml.safe_dump(self.state.template, sort_keys=False)
         self.state.template_path.write_text(self.state.template_yaml, encoding="utf-8")
@@ -214,7 +214,7 @@ class ServiceWorkspace:
                 lambda pid=identity["pid"]: not process_running(pid), timeout=10
             )
         for manager in self.managers:
-            for process in [*manager._processes.values(), *manager._action_processes]:
+            for process in [*manager._processes.values(), *manager._launch_processes]:
                 if process.poll() is None:
                     process.terminate()
                 await asyncio.to_thread(process.wait, 10)
@@ -233,6 +233,6 @@ class ServiceWorkspace:
                 break
             except OSError as error:
                 # Windows can retain a delete-pending SQLite file briefly after exit.
-                if getattr(error, "winerror", None) not in (32, 145) or attempt == 9:
+                if getattr(error, "winerror", None) not in (5, 32, 145) or attempt == 9:
                     raise
                 await asyncio.sleep(0.1)

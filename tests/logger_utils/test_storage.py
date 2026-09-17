@@ -370,7 +370,7 @@ class SQLiteEventStoreTests(unittest.TestCase):
             ("bad-json", "UPDATE command_results SET identity_json='{'"),
             (
                 "wrong-authority",
-                "UPDATE command_results SET effective_author='service'",
+                "UPDATE command_results SET effective_author='participant'",
             ),
             ("wrong-request", None),
             ("wrong-author", None),
@@ -396,7 +396,7 @@ class SQLiteEventStoreTests(unittest.TestCase):
                             if label == "wrong-request":
                                 event["context"]["request_id"] = "other"
                             else:
-                                event["data"]["author"] = "service"
+                                event["data"]["author"] = "participant"
                             db.execute(
                                 "UPDATE events SET event_json=?", (json.dumps(event),)
                             )

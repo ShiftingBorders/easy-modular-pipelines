@@ -50,7 +50,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await wait_for(entered.exists, 15)
                 with self.assertRaises(PermissionError):
-                    read_json(runner._state.experiment_directory / "executor.lock.json")
+                    read_json(runner._state.active_attempt.endpoint_path)
                 await asyncio.sleep(0.2)
                 self.assertIsNone(runner.get_state()["error"])
                 self.assertFalse(step.done())
@@ -88,7 +88,11 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             with patch("core.runner_utils.stages.subprocess.Popen", side_effect=spawn):
                 await runner.step()
             await wait_for(entered.exists, 15)
-            token = runner._state.last_result_path.parent / "executor.token"
+            token = next(
+                runner._state.experiment_directory.glob(
+                    "shared_artifacts/**/executor.lock.*.token"
+                )
+            )
             self.assertTrue(token.is_file())
             pending = asyncio.create_task(runner.snapshot("after cleanup"))
             await asyncio.sleep(0.2)
@@ -99,7 +103,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(token.exists())
         self.assertFalse(
             any(
-                path.name == "executor.token"
+                path.name.startswith("executor.lock.") and path.suffix == ".token"
                 for path in w.archive(result["snapshot_id"]).rglob("*")
             )
         )
@@ -120,7 +124,10 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             manifest = read_json(archive / "manifest.json")
             self.assertTrue(manifest["state"]["pending_advance"])
             self.assertIsNone(manifest["state"]["active_attempt"])
-            self.assertEqual(set(manifest["services"]), {w.socket["service_id"]})
+            self.assertEqual(
+                set(manifest["services"]),
+                {w.socket["service_id"], w.commands["service_id"]},
+            )
             self.assertFalse(any("/runner/" in key for key in saved))
             self.assertFalse(any("shared_artifacts/services/" in key for key in saved))
             self.assertFalse(
@@ -145,7 +152,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             generation = old_client.get_journal_info()["generation"]
             old_client.close()
             await runner.step()
-            second_path = runner._state.last_result_path
+            second_result = runner._state.last_result_id
             await w.value(20)
             await runner.snapshot("S2")
             reply = await runner.rollback(snapshot["snapshot_id"])
@@ -155,8 +162,10 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner._state.cycle_number, 1)
             self.assertEqual(runner._state.stage_position, 1)
             self.assertTrue(runner._state.pending_advance)
-            self.assertFalse(second_path.exists())
-            self.assertTrue(runner._state.last_result_path.is_file())
+            self.assertIsNone(runner._journal.client.read_command_result(second_result))
+            self.assertIsNotNone(
+                runner._journal.client.read_command_result(runner._state.last_result_id)
+            )
             self.assertFalse(process_running(old.process_identity["pid"]))
             self.assertNotEqual(
                 runner._state.services[old.service_id].service_instance_id,
@@ -252,7 +261,9 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             runner._state.stage_result_origins[w.stages[0]["stage_id"]], source_id
         )
-        artifact = read_json(runner._state.last_result_path)
+        artifact = runner._journal.client.read_command_result(
+            runner._state.last_result_id
+        )["event"]["context"]
         self.assertEqual(artifact["experiment_id"], source_id)
         self.assertEqual((await runner.step())["result"]["data"]["trail"], ["A", "B"])
         self.assertEqual(file_inventory(source), before)

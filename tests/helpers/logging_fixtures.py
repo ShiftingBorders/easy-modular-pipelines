@@ -30,8 +30,8 @@ BASE_CONTEXT = {
     "cycle_number": 3,
     "attempt_id": "attempt-A-3-1",
     "attempt_number": 1,
-    "service_id": "service-A",
-    "service_instance_id": "service-instance-A",
+    "participant_id": "service-A",
+    "participant_instance_id": "service-instance-A",
     "command_id": "command-A",
     "command_chain_id": "chain-A",
     "source": "runner",
@@ -55,7 +55,7 @@ def write_context_settings(
 def context_event(number: int = 1) -> dict:
     """Literal envelope; expected results do not depend on production constants."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "event_id": f"context-event-{number}",
         "producer_instance_id": "context-producer",
         "sequence_number": number,

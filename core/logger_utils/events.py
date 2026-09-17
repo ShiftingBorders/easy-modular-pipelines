@@ -11,7 +11,7 @@ type JsonValue = (
 )
 type JsonObject = dict[str, JsonValue]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RESERVED_EVENT_TYPES = frozenset(
     {
         "operation.started",
@@ -45,6 +45,8 @@ CONTEXT_TEXT_FIELDS = frozenset(
         "node_execution_id",
         "runner_session_id",
         "service_instance_id",
+        "participant_id",
+        "participant_instance_id",
         "module_name",
         "module_version",
         "module_hash",
@@ -297,7 +299,7 @@ def encode_event(event: object, max_bytes: int | None) -> str:
 
 
 def validate_command_result(data: object) -> JsonObject:
-    """Validate a command observation without deciding runner/service precedence."""
+    """Validate a command observation without deciding runner/participant precedence."""
     result = copy_json_object(data, "command result")
     if result.keys() != {
         "request_id",
@@ -309,8 +311,8 @@ def validate_command_result(data: object) -> JsonObject:
     }:
         raise ValueError("Command result fields do not match the contract.")
     require_text(result["request_id"], "request_id")
-    if result["author"] not in ("runner", "service"):
-        raise ValueError("Command result author must be runner or service.")
+    if result["author"] not in ("runner", "participant"):
+        raise ValueError("Command result author must be runner or participant.")
     if result["outcome"] not in (
         "succeeded",
         "failed",

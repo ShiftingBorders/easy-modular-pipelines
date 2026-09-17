@@ -59,12 +59,12 @@ _CREATE_COMMAND_RESULTS = """CREATE TABLE command_results (
     request_id TEXT PRIMARY KEY NOT NULL,
     identity_json TEXT NOT NULL,
     runner_event_id TEXT REFERENCES events(event_id),
-    service_event_id TEXT REFERENCES events(event_id),
+    participant_event_id TEXT REFERENCES events(event_id),
     runner_observation_json TEXT,
-    service_observation_json TEXT,
+    participant_observation_json TEXT,
     effective_event_id TEXT NOT NULL REFERENCES events(event_id),
-    effective_author TEXT NOT NULL CHECK (effective_author IN ('runner', 'service')),
-    CHECK (runner_event_id IS NOT NULL OR service_event_id IS NOT NULL)
+    effective_author TEXT NOT NULL CHECK (effective_author IN ('runner', 'participant')),
+    CHECK (runner_event_id IS NOT NULL OR participant_event_id IS NOT NULL)
 )"""
 
 
@@ -496,6 +496,8 @@ class SQLiteEventStore:
 
     def append(self, event: JsonObject) -> None:
         self._check_process()
+        if self._read_only:
+            raise LoggingStateError("This journal client is read-only.")
         encoded = encode_event(event, self._max_event_bytes)
         snapshot = json.loads(encoded)
         if snapshot["event_type"] == "command.result":
@@ -645,7 +647,7 @@ class SQLiteEventStore:
             raise LoggingStorageError("Command observation has no result index.")
         if event["event_id"] not in {
             state[author]["event_id"]
-            for author in ("runner", "service")
+            for author in ("runner", "participant")
             if state[author] is not None
         }:
             raise LoggingStorageError(
@@ -689,7 +691,7 @@ class SQLiteEventStore:
                 related_event_ids=list(
                     dict.fromkeys(
                         state[author]["event_id"]
-                        for author in ("runner", "service")
+                        for author in ("runner", "participant")
                         if state[author] is not None
                     )
                 ),
@@ -744,9 +746,9 @@ class SQLiteEventStore:
                 raise LoggingStorageError("Invalid ordinary event change.")
         elif change["kind"] == "command.result":
             require_text(change["request_id"], "request_id")
-            if change["effective_author"] not in ("runner", "service"):
+            if change["effective_author"] not in ("runner", "participant"):
                 raise LoggingStorageError("Invalid effective change author.")
-            if change["provisional"] != (change["effective_author"] == "service"):
+            if change["provisional"] != (change["effective_author"] == "participant"):
                 raise LoggingStorageError(
                     "Change confirmation state disagrees with author."
                 )
@@ -763,8 +765,8 @@ class SQLiteEventStore:
                     event["context"].get(key) != entry["event"]["context"].get(key)
                     for key in (
                         "experiment_id",
-                        "service_id",
-                        "service_instance_id",
+                        "participant_id",
+                        "participant_instance_id",
                         "request_id",
                     )
                 ):
@@ -781,7 +783,7 @@ class SQLiteEventStore:
                         "context",
                         "operation_id",
                     }
-                    or observation["author"] not in ("runner", "service")
+                    or observation["author"] not in ("runner", "participant")
                 ):
                     raise LoggingStorageError("Invalid change observer.")
                 if observation["operation_id"] is not None:
@@ -798,8 +800,8 @@ class SQLiteEventStore:
                     context.get(key) != entry["event"]["context"].get(key)
                     for key in (
                         "experiment_id",
-                        "service_id",
-                        "service_instance_id",
+                        "participant_id",
+                        "participant_instance_id",
                         "request_id",
                     )
                 ):
@@ -880,8 +882,8 @@ class SQLiteEventStore:
     ) -> dict | None:
         reader = self._connection if connection is None else connection
         row = reader.execute(
-            "SELECT identity_json, runner_event_id, service_event_id, "
-            "runner_observation_json, service_observation_json, "
+            "SELECT identity_json, runner_event_id, participant_event_id, "
+            "runner_observation_json, participant_observation_json, "
             "effective_event_id, effective_author FROM command_results WHERE request_id=?",
             (request_id,),
         ).fetchone()
@@ -891,23 +893,23 @@ class SQLiteEventStore:
             identity = copy_json_object(json.loads(row[0]), "request identity")
             if identity.keys() != {
                 "experiment_id",
-                "service_id",
-                "service_instance_id",
+                "participant_id",
+                "participant_instance_id",
             }:
                 raise ValueError("Invalid request identity fields.")
             validate_context(identity)
             require_text(identity["experiment_id"], "experiment_id")
-            require_text(identity["service_id"], "service_id")
+            require_text(identity["participant_id"], "participant_id")
             result = {
                 "identity": identity,
                 "runner": None,
-                "service": None,
+                "participant": None,
                 "effective_event_id": row[5],
                 "effective_author": row[6],
             }
             for author, event_id, observation_json in (
                 ("runner", row[1], row[3]),
-                ("service", row[2], row[4]),
+                ("participant", row[2], row[4]),
             ):
                 if event_id is None:
                     if observation_json is not None:
@@ -965,20 +967,22 @@ class SQLiteEventStore:
                     "observation": observation,
                 }
             runner = result["runner"]
-            service = result["service"]
+            participant = result["participant"]
             shared_event = (
                 runner is not None
-                and service is not None
-                and runner["event_id"] == service["event_id"]
+                and participant is not None
+                and runner["event_id"] == participant["event_id"]
             )
             if not shared_event:
-                for author in ("runner", "service"):
+                for author in ("runner", "participant"):
                     entry = result[author]
                     if entry is not None and entry["event"]["data"]["author"] != author:
                         raise ValueError(
                             "Command event author does not match its index."
                         )
-            effective_author = "runner" if result["runner"] is not None else "service"
+            effective_author = (
+                "runner" if result["runner"] is not None else "participant"
+            )
             effective = result[effective_author]
             if (
                 effective is None
@@ -986,45 +990,48 @@ class SQLiteEventStore:
                 or row[5] != effective["event_id"]
             ):
                 raise ValueError("Invalid effective command result.")
-            if runner is None and service["event"]["data"]["ignored"] is not None:
+            if runner is None and participant["event"]["data"]["ignored"] is not None:
                 raise ValueError(
-                    "An ignored service response requires a runner result."
+                    "An ignored participant response requires a runner result."
                 )
             if shared_event:
                 shared_data = effective["event"]["data"]
                 if shared_data["ignored"] is not None or shared_data["supersedes"]:
                     raise ValueError("A shared result cannot be ignored or superseded.")
             else:
-                if service is not None and service["event"]["data"]["supersedes"]:
-                    raise ValueError("A service response cannot supersede runner.")
+                if (
+                    participant is not None
+                    and participant["event"]["data"]["supersedes"]
+                ):
+                    raise ValueError("A participant response cannot supersede runner.")
                 if runner is not None:
                     runner_data = runner["event"]["data"]
                     if runner_data["ignored"] is not None:
                         raise ValueError("A runner result cannot be ignored.")
                     supersedes = runner_data["supersedes"]
                     if supersedes and (
-                        service is None
+                        participant is None
                         or supersedes
                         != [
                             {
-                                "event_id": service["event_id"],
+                                "event_id": participant["event_id"],
                                 "ignored": self._ignored_reason(runner["event"]),
                             }
                         ]
                     ):
-                        raise ValueError("Invalid superseded service reference.")
-                    if service is not None:
-                        service_data = service["event"]["data"]
-                        reason = service_data["ignored"]
+                        raise ValueError("Invalid superseded participant reference.")
+                    if participant is not None:
+                        participant_data = participant["event"]["data"]
+                        reason = participant_data["ignored"]
                         if reason is not None and reason != self._ignored_reason(
                             runner["event"]
                         ):
-                            raise ValueError("Invalid ignored service reason.")
+                            raise ValueError("Invalid ignored participant reason.")
                         if json.dumps(
                             [runner_data["outcome"], runner_data["response"]],
                             sort_keys=True,
                         ) == json.dumps(
-                            [service_data["outcome"], service_data["response"]],
+                            [participant_data["outcome"], participant_data["response"]],
                             sort_keys=True,
                         ):
                             raise ValueError(
@@ -1056,10 +1063,10 @@ class SQLiteEventStore:
             raise ValueError("Ignored/superseded state is assigned by the journal.")
         identity = {
             name: snapshot["context"].get(name)
-            for name in ("experiment_id", "service_id", "service_instance_id")
+            for name in ("experiment_id", "participant_id", "participant_instance_id")
         }
         require_text(identity["experiment_id"], "experiment_id")
-        require_text(identity["service_id"], "service_id")
+        require_text(identity["participant_id"], "participant_id")
         if snapshot["context"].get("request_id") != data["request_id"]:
             raise ValueError("Command request_id must match the event context.")
         response_key = json.dumps(
@@ -1067,7 +1074,7 @@ class SQLiteEventStore:
         )
         request_id = data["request_id"]
         author = data["author"]
-        other_author = "service" if author == "runner" else "runner"
+        other_author = "participant" if author == "runner" else "runner"
         observation = {
             "producer_instance_id": snapshot["producer_instance_id"],
             "occurred_at": snapshot["occurred_at"],
@@ -1087,7 +1094,7 @@ class SQLiteEventStore:
                         "request_id already belongs to another request context."
                     )
                 if state is None:
-                    state = {"identity": identity, "runner": None, "service": None}
+                    state = {"identity": identity, "runner": None, "participant": None}
                 before_effective = (
                     state.get("effective_author"),
                     state.get("effective_event_id"),
@@ -1118,7 +1125,7 @@ class SQLiteEventStore:
                     if response_key == other_key:
                         event_id = other["event_id"]
                     else:
-                        if author == "service" and other is not None:
+                        if author == "participant" and other is not None:
                             snapshot["data"]["ignored"] = self._ignored_reason(
                                 other["event"]
                             )
@@ -1138,7 +1145,7 @@ class SQLiteEventStore:
                         "observation": observation,
                     }
                     effective_author = (
-                        "runner" if state["runner"] is not None else "service"
+                        "runner" if state["runner"] is not None else "participant"
                     )
                     writing_started = True
                     self._save_command_state(self._connection, request_id, state)
@@ -1177,13 +1184,13 @@ class SQLiteEventStore:
                     effective = state[state["effective_author"]]
                     data = effective["event"]["data"]
                     observations = []
-                    for author in ("runner", "service"):
+                    for author in ("runner", "participant"):
                         entry = state[author]
                         if entry is None:
                             continue
                         ignored = None
                         if (
-                            author == "service"
+                            author == "participant"
                             and state["runner"] is not None
                             and entry["event_id"] != state["runner"]["event_id"]
                         ):
@@ -1357,7 +1364,7 @@ class SQLiteEventStore:
                     os.fsync(database_file.fileno())
                 temporary_database.rename(target / "journal.sqlite")
                 manifest = {
-                    "schema_version": 1,
+                    "schema_version": SCHEMA_VERSION,
                     "snapshot_id": uuid4().hex,
                     "journal_id": info["journal_id"],
                     "generation": info["generation"],
@@ -1492,7 +1499,7 @@ class SQLiteEventStore:
                     "SELECT request_id FROM command_results"
                 ):
                     state = self._load_command_result(request_id, connection=reader)
-                    for author in ("runner", "service"):
+                    for author in ("runner", "participant"):
                         entry = state[author]
                         if entry is None:
                             continue
@@ -1529,7 +1536,7 @@ class SQLiteEventStore:
                         requests[request_id] = state
                         dependencies.extend(
                             state[author]["event_id"]
-                            for author in ("runner", "service")
+                            for author in ("runner", "participant")
                             if state[author] is not None
                         )
                     for reference in dependencies:
@@ -1562,9 +1569,9 @@ class SQLiteEventStore:
                             "request_id": request_id,
                             "identity": state["identity"],
                             "runner": None,
-                            "service": None,
+                            "participant": None,
                         }
-                        for author in ("runner", "service"):
+                        for author in ("runner", "participant"):
                             if state[author] is not None:
                                 record[author] = {
                                     field: state[author][field]
@@ -1715,7 +1722,7 @@ class SQLiteEventStore:
                     "request_id",
                     "identity",
                     "runner",
-                    "service",
+                    "participant",
                 }:
                     request_id = require_text(record["request_id"], "request_id")
                     if request_id in request_ids:
@@ -1724,15 +1731,15 @@ class SQLiteEventStore:
                     identity = validate_context(record["identity"])
                     if identity.keys() != {
                         "experiment_id",
-                        "service_id",
-                        "service_instance_id",
+                        "participant_id",
+                        "participant_instance_id",
                     }:
                         raise ValueError("Invalid diagnostic request identity.")
                     require_text(identity["experiment_id"], "experiment_id")
-                    require_text(identity["service_id"], "service_id")
-                    if record["runner"] is None and record["service"] is None:
+                    require_text(identity["participant_id"], "participant_id")
+                    if record["runner"] is None and record["participant"] is None:
                         raise ValueError("Diagnostic result requires an observation.")
-                    for author in ("runner", "service"):
+                    for author in ("runner", "participant"):
                         entry = record[author]
                         if entry is None:
                             continue
@@ -1772,7 +1779,7 @@ class SQLiteEventStore:
         ):
             raise ValueError("Diagnostic record counts do not match.")
         for record in commands:
-            for author in ("runner", "service"):
+            for author in ("runner", "participant"):
                 if (
                     record[author] is not None
                     and record[author]["event_id"] not in event_ids
@@ -1783,23 +1790,23 @@ class SQLiteEventStore:
     def _save_command_state(
         self, connection: sqlite3.Connection, request_id: str, state: dict
     ) -> None:
-        runner, service = state["runner"], state["service"]
-        author = "runner" if runner is not None else "service"
+        runner, participant = state["runner"], state["participant"]
+        author = "runner" if runner is not None else "participant"
         connection.execute(
             "INSERT INTO command_results VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(request_id) DO UPDATE SET "
             "identity_json=excluded.identity_json, runner_event_id=excluded.runner_event_id, "
-            "service_event_id=excluded.service_event_id, "
+            "participant_event_id=excluded.participant_event_id, "
             "runner_observation_json=excluded.runner_observation_json, "
-            "service_observation_json=excluded.service_observation_json, "
+            "participant_observation_json=excluded.participant_observation_json, "
             "effective_event_id=excluded.effective_event_id, effective_author=excluded.effective_author",
             (
                 request_id,
                 json.dumps(state["identity"], sort_keys=True),
                 runner["event_id"] if runner else None,
-                service["event_id"] if service else None,
+                participant["event_id"] if participant else None,
                 json.dumps(runner["observation"]) if runner else None,
-                json.dumps(service["observation"]) if service else None,
+                json.dumps(participant["observation"]) if participant else None,
                 state[author]["event_id"],
                 author,
             ),
@@ -2009,14 +2016,14 @@ class SQLiteEventStore:
                         state = {
                             "identity": record["identity"],
                             "runner": None,
-                            "service": None,
+                            "participant": None,
                         }
                     if state["identity"] != record["identity"]:
                         raise ValueError(
                             "Diagnostic request belongs to another context."
                         )
                     changed = False
-                    for author in ("runner", "service"):
+                    for author in ("runner", "participant"):
                         incoming, current = record[author], state[author]
                         if incoming is None:
                             continue

@@ -85,11 +85,14 @@ def experiment_views(
                     "finished_at": None,
                     "duration_seconds": None,
                 }
+        elif kind == "call.started" and context.get("attempt_id"):
+            attempt = attempts.setdefault(context["attempt_id"], dict(context))
+            attempt.update(started_at=event["occurred_at"], status="running")
         elif kind == "stage.process_started":
             attempt = attempts.setdefault(context.get("attempt_id"), dict(context))
             attempt.update(
                 started_at=data.get("started_at", event["occurred_at"]),
-                process=data.get("identity"),
+                process=data.get("process"),
                 status="running",
             )
         elif kind == "stage.finished":
@@ -99,23 +102,11 @@ def experiment_views(
                 finished_at=event["occurred_at"],
                 status=data.get("outcome", "unknown"),
                 result=data.get("result"),
-                result_path=data.get("result_path"),
+                result_request_id=data.get("result_request_id"),
             )
             attempt["duration_seconds"] = elapsed(
                 attempt.get("started_at"), attempt["finished_at"]
             )
-            if data.get("result_path"):
-                artifacts.append(
-                    {
-                        **context,
-                        "artifact_id": event["event_id"],
-                        "path": data["result_path"],
-                        "path_base": "experiment",
-                        "purpose": "stage_result",
-                        "size_bytes": None,
-                        "occurred_at": event["occurred_at"],
-                    }
-                )
         elif kind == "operation.started":
             operations[event["operation_id"]] = {
                 **context,
@@ -242,11 +233,20 @@ def experiment_views(
     if current_run in runs:
         runs[current_run]["status"] = status
     stages = template.get("stages", [])
+    service_modules = {
+        service["service_id"]: service["module"]
+        for service in template.get("services", [])
+    }
     nodes = []
     for position, definition in enumerate(stages, 1):
         node = {
             **definition,
-            "name": definition.get("name") or definition["module"]["name"],
+            "name": definition.get("name")
+            or (
+                definition["module"]
+                if "module" in definition
+                else service_modules[definition["service_id"]]
+            )["name"],
             "position": position,
         }
         stage_attempts = [
@@ -405,7 +405,11 @@ def experiment_views(
         components.append(
             {
                 "stage_id": definition["stage_id"],
-                "module_name": definition["module"]["name"],
+                "module_name": (
+                    definition["module"]
+                    if "module" in definition
+                    else service_modules[definition["service_id"]]
+                )["name"],
                 "mean_seconds": statistics.mean(times) if times else None,
             }
         )

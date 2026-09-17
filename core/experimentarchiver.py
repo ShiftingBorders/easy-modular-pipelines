@@ -428,6 +428,8 @@ class ExperimentArchiver:
         modules: dict[tuple[str, str], dict[str, str]] = {}
         for role in ("stage", "service"):
             for definition in self._objects(template[f"{role}s"], role):
+                if role == "stage" and "service_id" in definition:
+                    continue
                 module = copy_json_object(definition["module"], "module")
                 name = self._member(module["name"])
                 version = self._member(module["version"])
@@ -502,7 +504,7 @@ class ExperimentArchiver:
             directories, files = await asyncio.to_thread(self._inventory, payload)
             manifest = copy_json_object(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "archive_id": str(uuid4()),
                     "created_at": datetime.now(UTC).isoformat(),
                     "source_experiment_id": state.experiment_id,
@@ -704,7 +706,7 @@ class ExperimentArchiver:
                 "files",
             }
             or type(manifest["schema_version"]) is not int
-            or manifest["schema_version"] != 1
+            or manifest["schema_version"] != 2
         ):
             raise ValueError("Unsupported experiment archive manifest.")
         UUID(require_text(manifest["archive_id"], "archive_id"))
@@ -764,18 +766,6 @@ class ExperimentArchiver:
                 )
             if self._manager.module_hash(module["name"], folder) != module["hash"]:
                 raise ValueError("Module content differs from its expected hash.")
-            if module["role"] == "service":
-                for service in self._objects(template["services"], "services"):
-                    reference = copy_json_object(service["module"], "service module")
-                    if (reference["name"], reference["version"]) == (
-                        module["name"],
-                        module["version"],
-                    ) and (definition["service_interface"] == "socket") != (
-                        "heartbeat" in service
-                    ):
-                        raise ValueError(
-                            "Service interface differs from template policies."
-                        )
             roots.append(relative)
         for resource in self._objects(raw_template["resources"], "resources"):
             name = self._member(resource["name"])
