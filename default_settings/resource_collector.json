@@ -10,5 +10,9 @@
   "restart_delays_seconds": [1, 2, 4, 8, 16, 30],
   "stable_reset_seconds": 60,
   "logging_busy_timeout_seconds": 0.05,
-  "logging_retry_seconds": 5
+  "logging_retry_seconds": 5,
+  "disk_path": "..",
+  "network_interface": null,
+  "network_reference_address": "1.1.1.1",
+  "gpu_interval_seconds": 5
 }
