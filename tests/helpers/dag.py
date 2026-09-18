@@ -25,7 +25,7 @@ from core.experimentcontroller import ExperimentController
 from core.hashdb import HashDB
 from core.modulemanager import ModuleManager
 from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import process_identity
+from core.runner_utils.runtimeio import process_identity, read_json
 from core.seaweed import SeaweedDB
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -351,19 +351,19 @@ class DagSession:
         return result
 
     async def ready_attempt(self) -> tuple[Path, dict]:
-        def locate():
-            state = self.runner._state
-            attempt = None if state is None else state.active_attempt
-            if attempt is None:
-                return None
-            ready = attempt.artifacts_directory / "ready.json"
-            return (
-                (attempt.artifacts_directory, json.loads(ready.read_text()))
-                if ready.is_file()
-                else None
-            )
-
-        return await wait_until(locate)
+        async with asyncio.timeout(10):
+            while True:
+                state = self.runner._state
+                attempt = None if state is None else state.active_attempt
+                if attempt is not None:
+                    directory = attempt.artifacts_directory
+                    try:
+                        ready = await asyncio.to_thread(read_json, directory / "ready.json")
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        return directory, ready
+                await asyncio.sleep(0.01)
 
     async def close(self) -> None:
         if self.closed:
