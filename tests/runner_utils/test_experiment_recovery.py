@@ -1,6 +1,7 @@
 """Approved snapshots.md A5/I: actual owner loss, live work and journal recovery."""
 
 import asyncio
+import json
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -14,6 +15,74 @@ from tests.helpers.snapshots import SnapshotWorkspace
 
 
 class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_accepts_result_published_during_connection(self):
+        """Accept the original result when its executor exits during recovery connect."""
+        async with asyncio.timeout(30):
+            workspace = SnapshotWorkspace(services=False, cycles=1)
+            self.addAsyncCleanup(workspace.close)
+            gate = workspace.files.gate()
+            marker = str(uuid4())
+            workspace.stages[0]["settings"].update(gate=str(gate), echo=marker)
+            runner = await workspace.launch()
+            step = asyncio.create_task(runner.step())
+            await wait_for(
+                lambda: runner._state.active_attempt is not None
+                and runner._state.active_attempt.process_identity is not None
+            )
+            original_attempt = runner._state.active_attempt
+            request_id = original_attempt.request_id
+            experiment_id = runner._state.experiment_id
+            await runner.close()
+            await asyncio.gather(step, return_exceptions=True)
+            runner = workspace.replacement()
+            connect = runner._stages._connect
+            connection_errors = []
+            published_responses = []
+
+            async def finish_before_connect(attempt, timeout):
+                self.assertEqual(attempt.request_id, request_id)
+                self.assertIsNone(runner._journal.client.read_command_result(request_id))
+                gate.touch()
+                record = await wait_for(
+                    lambda: runner._journal.client.read_command_result(request_id),
+                    timeout,
+                )
+                self.assertEqual(record["author"], "participant")
+                self.assertEqual(record["outcome"], "succeeded")
+                published_responses.append(record["response"])
+                await wait_for(lambda: not attempt.endpoint_path.exists(), timeout)
+                try:
+                    await connect(attempt, timeout)
+                except FileNotFoundError as error:
+                    connection_errors.append(error)
+                    raise
+
+            with patch.object(runner._stages, "_connect", new=finish_before_connect):
+                await runner.recover(experiment_id)
+                await wait_for(
+                    lambda: runner._state.active_attempt is None
+                    or runner._state.unknown_state_recovery_count > 0
+                )
+
+            self.assertTrue(connection_errors, "The real endpoint connection must fail.")
+            state = runner._state
+            self.assertIsNone(state.active_attempt, runner.get_state())
+            self.assertEqual(state.unknown_state_recovery_count, 0)
+            self.assertEqual(state.last_result_id, request_id)
+            accepted = runner._journal.client.read_command_result(request_id)
+            self.assertEqual(accepted["author"], "runner")
+            self.assertEqual(accepted["outcome"], "succeeded")
+            self.assertEqual(accepted["response"], published_responses[0])
+            self.assertEqual(state.last_result["echo"], marker)
+            self.assertEqual(state.stage_attempt_numbers[original_attempt.stage_id], 1)
+            trace = state.experiment_directory / "shared_data/trace.jsonl"
+            entries = [
+                json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
+            ]
+            starts = [entry for entry in entries if entry["event"] == "start"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(starts[0]["pid"], original_attempt.process_identity["pid"])
+
     async def test_partially_stopped_services_stay_paused_with_remaining_peer_observed(
         self,
     ):

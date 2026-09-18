@@ -52,6 +52,70 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
         await self.session.start()
         self.addAsyncCleanup(self.session.close)
 
+    async def test_result_published_during_reconnect_is_accepted(self):
+        """Use the durable result when a disconnected executor finishes before retry."""
+        async with asyncio.timeout(30):
+            gate = self.workspace.gate()
+            marker = str(uuid4())
+            module = self.workspace.module()
+            stage = self.workspace.stage(
+                module, settings={"gate": str(gate), "echo": marker}, timeout=30
+            )
+            template = self.workspace.template([stage, self.workspace.stage(module)])
+            template["unknown_state"]["timeout_seconds"] = 10
+            await self.session.launch(template)
+            step = self.session.post("step")
+            _, ready = await self.session.ready_attempt()
+            runner = self.session.runner
+            original_attempt = runner._state.active_attempt
+            request_id = original_attempt.request_id
+            connect = runner._stages._connect
+            connection_errors = []
+            published_responses = []
+
+            async def finish_before_connect(attempt, timeout):
+                self.assertEqual(attempt.request_id, request_id)
+                self.assertIsNone(runner._journal.client.read_command_result(request_id))
+                gate.touch()
+                record = await wait_until(
+                    lambda: runner._journal.client.read_command_result(request_id),
+                    timeout=timeout,
+                )
+                self.assertEqual(record["author"], "participant")
+                self.assertEqual(record["outcome"], "succeeded")
+                published_responses.append(record["response"])
+                await wait_until(lambda: not attempt.endpoint_path.exists(), timeout=timeout)
+                try:
+                    await connect(attempt, timeout)
+                except FileNotFoundError as error:
+                    connection_errors.append(error)
+                    raise
+
+            with patch.object(runner._stages, "_connect", new=finish_before_connect):
+                # Close a real TCP client while its stage is still waiting at the gate.
+                await runner._stages._connection.close()
+                reply = await step
+
+            self.assertTrue(connection_errors, "The real endpoint connection must fail.")
+            self.assertEqual(reply["result"], "success", reply)
+            state = runner._state
+            self.assertIsNone(state.active_attempt, runner.get_state())
+            self.assertEqual(state.unknown_state_recovery_count, 0)
+            self.assertEqual(state.last_result_id, request_id)
+            accepted = runner._journal.client.read_command_result(request_id)
+            self.assertEqual(accepted["author"], "runner")
+            self.assertEqual(accepted["outcome"], "succeeded")
+            self.assertEqual(accepted["response"], published_responses[0])
+            self.assertEqual(state.last_result["echo"], marker)
+            self.assertEqual(state.stage_attempt_numbers[stage["stage_id"]], 1)
+            trace = state.experiment_directory / "shared_data/trace.jsonl"
+            entries = [
+                json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
+            ]
+            starts = [entry for entry in entries if entry["event"] == "start"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(starts[0]["pid"], ready["pid"])
+
     async def test_full_context_merging_and_streams_are_available_before_completion(
         self,
     ):
