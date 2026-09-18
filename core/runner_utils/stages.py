@@ -559,6 +559,8 @@ class StageRunner:
                                 is not None
                             ):
                                 continue
+                            if deadline is not None and time.monotonic() >= deadline:
+                                continue
                             raise
                 await asyncio.sleep(0.05)
         finally:

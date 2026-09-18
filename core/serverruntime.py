@@ -1173,7 +1173,7 @@ class ServerRuntime:
         )
         for finished_at, identifier, record in finished:
             if (
-                now - finished_at >= self.settings.result_ttl
+                now >= finished_at + self.settings.result_ttl
                 or len(self._records) + required > self.settings.max_records
                 or self._cache_bytes > self.settings.max_cache_bytes
             ):
