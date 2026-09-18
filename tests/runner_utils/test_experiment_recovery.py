@@ -2,14 +2,16 @@
 
 import asyncio
 import json
+import sqlite3
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
 import psutil
 
 from core.runner_utils.runtimeio import read_json, write_json
-from tests.helpers.dag import process_running, terminate_owned
+from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 from tests.helpers.services import wait_for
 from tests.helpers.snapshots import SnapshotWorkspace
 
@@ -136,8 +138,28 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await runner.close()
         await asyncio.gather(step, return_exceptions=True)
         executor = psutil.Process(record["executor"]["pid"])
-        executor.suspend()
+        suspended = False
+        phase = "suspension barrier"
         try:
+            # Own the writer slot until the executor is stopped, so this test
+            # freezes an unavailable executor rather than a journal writer.
+            database = runner._state.experiment_directory / "journals/events.sqlite"
+            barrier = sqlite3.connect(
+                database.as_uri() + "?mode=rw", uri=True, timeout=5,
+                isolation_level=None,
+            )
+            try:
+                barrier.execute("BEGIN IMMEDIATE")
+                executor.suspend()
+                suspended = True
+                await wait_for(lambda: executor.status() == psutil.STATUS_STOPPED, 5)
+            finally:
+                try:
+                    if barrier.in_transaction:
+                        barrier.rollback()
+                finally:
+                    barrier.close()
+            phase = "recovery"
             self.assertTrue(process_running(record["stage"]["pid"]))
             runner = w.replacement()
             await runner.recover(experiment_id)
@@ -147,9 +169,57 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner._state.stage_attempt_numbers[attempt.stage_id], 1)
             with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
                 await runner.run(w.template_path)
+        except Exception as failure:
+            destination = (
+                REPOSITORY / ".artifacts/ci-failures" / f"executor-recovery-{uuid4()}.json"
+            )
+            report = {
+                "test": self.id(), "phase": phase, "exception": repr(failure),
+                "cause": repr(failure.__cause__), "process_record": record,
+                "suspended": suspended, "processes": [], "diagnostic_errors": [],
+                "emergency_records": [],
+            }
+            try:
+                report["state"] = runner.get_state()
+                for role in ("executor", "stage"):
+                    pid = record[role]["pid"]
+                    observed = {"role": role, "pid": pid, "locks": []}
+                    report["processes"].append(observed)
+                    try:
+                        observed["status"] = psutil.Process(pid).status()
+                        for entry in sorted(Path(f"/proc/{pid}/fdinfo").glob("*"))[:64]:
+                            locks = [
+                                line for line in entry.read_text().splitlines()
+                                if line.startswith("lock:")
+                            ]
+                            if locks:
+                                observed["locks"].append({
+                                    "file": str(Path(f"/proc/{pid}/fd/{entry.name}").resolve()),
+                                    "locks": locks,
+                                })
+                    except (OSError, psutil.Error) as error:
+                        observed["error"] = repr(error)
+                for emergency in sorted(database.parent.glob("*.emergency-*.jsonl"))[:8]:
+                    with emergency.open("rb") as stream:
+                        report["emergency_records"].append({
+                            "name": emergency.name,
+                            "text": stream.read(65536).decode("utf-8", errors="replace"),
+                        })
+            except Exception as error:  # noqa: BLE001 - Preserve the original test failure.
+                report["diagnostic_errors"].append(repr(error))
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                failure.add_note(f"Executor recovery diagnostics: {destination}")
+            except (OSError, TypeError, ValueError) as error:
+                failure.add_note(f"Could not save executor recovery diagnostics: {error!r}")
+            raise
         finally:
-            executor.resume()
-            gate.touch()
+            try:
+                if suspended:
+                    executor.resume()
+            finally:
+                gate.touch()
 
     async def test_stage_survives_actual_owner_crash_and_is_not_repeated(self):
         """I1/I2: an independently owned executor survives os._exit of its runner."""

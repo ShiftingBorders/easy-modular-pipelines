@@ -9,6 +9,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 import uvicorn
@@ -17,6 +18,7 @@ from core.runner_utils.runtimeio import process_identity
 from dashboard.application import create_app
 from tests.dashboard_tests.helpers import (
     FIXTURES,
+    PROJECT_ROOT,
     cleanup_directory,
     temporary_directory,
     write_settings,
@@ -88,11 +90,19 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(server.serve(sockets=[listener]))
             browser = None
             identity = None
+            browser_output = None
+            phase = "server startup"
+            port_text = ""
+            last_port_error = None
+            port_attempts = 0
+            stdout = stderr = b""
             try:
                 async with asyncio.timeout(15):
                     while not server.started:
                         await asyncio.sleep(0.02)
                 profile = root / "browser"
+                phase = "browser startup"
+                browser_output = (root / "browser-stderr.log").open("wb")
                 browser = await asyncio.create_subprocess_exec(
                     str(EDGE),
                     "--headless=new",
@@ -102,14 +112,38 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                     f"--user-data-dir={profile}",
                     "about:blank",
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=browser_output,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 identity = process_identity(browser.pid)
+                phase = "port publication"
                 async with asyncio.timeout(15):
-                    while not (profile / "DevToolsActivePort").exists():
+                    while True:
+                        if browser.returncode is not None:
+                            raise RuntimeError(
+                                f"Edge exited before publishing its port: {browser.returncode}"
+                            )
+                        port_attempts += 1
+                        try:
+                            port_text = await asyncio.to_thread(
+                                (profile / "DevToolsActivePort").read_text,
+                                encoding="utf-8",
+                            )
+                            lines = port_text.splitlines()
+                            if (
+                                len(lines) != 2
+                                or not lines[1].startswith("/devtools/browser/")
+                                or not lines[0].isdigit()
+                                or not 0 < int(lines[0]) < 65536
+                            ):
+                                raise ValueError("Incomplete or invalid Edge port marker.")
+                        except (FileNotFoundError, PermissionError, ValueError) as error:
+                            last_port_error = repr(error)
+                        else:
+                            port = lines[0]
+                            break
                         await asyncio.sleep(0.025)
-                port = (profile / "DevToolsActivePort").read_text().splitlines()[0]
+                phase = "browser checks"
                 node = await asyncio.create_subprocess_exec(
                     shutil.which("node"),
                     str(FIXTURES / "browser_check.mjs"),
@@ -152,6 +186,37 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result["fontsLoaded"])
                 self.assertEqual(result["connection"], "System connected")
                 self.assertTrue(result["narrowLayout"])
+            except Exception as failure:
+                destination = (
+                    PROJECT_ROOT / ".artifacts/ci-failures" / f"browser-{uuid4()}.json"
+                )
+                report = {
+                    "test": self.id(),
+                    "phase": phase,
+                    "exception": repr(failure),
+                    "browser_identity": identity,
+                    "browser_exit_code": None if browser is None else browser.returncode,
+                    "port_attempts": port_attempts,
+                    "last_port_error": last_port_error,
+                    "port_text": port_text[:1024],
+                    "node_stdout": stdout[-65536:].decode("utf-8", errors="replace"),
+                    "node_stderr": stderr[-65536:].decode("utf-8", errors="replace"),
+                }
+                try:
+                    with (root / "browser-stderr.log").open("rb") as stream:
+                        stream.seek(max(0, stream.seek(0, os.SEEK_END) - 65536))
+                        report["browser_stderr"] = stream.read(65536).decode(
+                            "utf-8", errors="replace"
+                        )
+                except OSError as error:
+                    report["browser_stderr_error"] = repr(error)
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                    failure.add_note(f"Browser diagnostics: {destination}")
+                except OSError as error:
+                    failure.add_note(f"Could not save browser diagnostics: {error!r}")
+                raise
             finally:
                 if browser is not None:
                     try:
@@ -160,5 +225,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                         if identity:
                             terminate_owned(identity)
                         await browser.wait()
+                if browser_output is not None:
+                    browser_output.close()
                 server.should_exit = True
                 await asyncio.wait_for(task, 15)
