@@ -548,7 +548,18 @@ class StageRunner:
                             continue
                         if deadline is not None and time.monotonic() >= deadline:
                             continue
-                        await self._connect(attempt, timeout)
+                        try:
+                            await self._connect(attempt, timeout)
+                        except (OSError, EOFError):
+                            # Completion can commit and remove the endpoint while
+                            # reconnecting. Reenter normal result validation and
+                            # deadline handling before declaring the attempt unknown.
+                            if (
+                                self._journal.client.read_command_result(attempt.request_id)
+                                is not None
+                            ):
+                                continue
+                            raise
                 await asyncio.sleep(0.05)
         finally:
             if self._call_future is not None:
@@ -694,9 +705,19 @@ class StageRunner:
                 self._journal.client, attempt.request_id, expected=attempt.participant
             )
             if record is None and attempt.service_id is None:
-                await self._connect(
-                    attempt, state.template["unknown_state"]["timeout_seconds"]
-                )
+                try:
+                    await self._connect(
+                        attempt, state.template["unknown_state"]["timeout_seconds"]
+                    )
+                except (OSError, EOFError):
+                    # The executor may finish between the journal read and connect.
+                    # A matching committed result no longer needs a live endpoint.
+                    if read_result(
+                        self._journal.client,
+                        attempt.request_id,
+                        expected=attempt.participant,
+                    ) is None:
+                        raise
             self._journal.client.record_event(
                 "stage.reconnected", {}, context=self._context(state, attempt)
             )
