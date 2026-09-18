@@ -325,7 +325,7 @@ class SeaweedConfigurationTests(SeaweedTestCase):
         command = popen.call_args.args[0]
         self.assertTrue(command[0].endswith("weed.exe"))
         self.assertIn("server", command)
-        self.assertIn(f"-dir={self.temp_path}", command)
+        self.assertIn(f"-dir={self.temp_path.resolve()}", command)
         self.assertIn("-master.port=9433", command)
         self.assertIn("-volume.port=8180", command)
         self.assertIn("-filer.port=8988", command)

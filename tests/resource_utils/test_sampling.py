@@ -211,6 +211,10 @@ class RealSamplingTests(unittest.IsolatedAsyncioTestCase):
             baseline = sampler._process_sample(observed)
             self.assertIsNone(baseline["resources"]["process_cpu_percent"]["value"])
             memory_before = baseline["resources"]["process_memory_rss_bytes"]["value"]
+            while memory_before is None:
+                await asyncio.sleep(0.01)
+                baseline = sampler._process_sample(observed)
+                memory_before = baseline["resources"]["process_memory_rss_bytes"]["value"]
             pipe.send("allocate")
             self.assertEqual(await asyncio.to_thread(pipe.recv), "allocated")
             latest = {}
@@ -218,10 +222,13 @@ class RealSamplingTests(unittest.IsolatedAsyncioTestCase):
             def grew():
                 latest.update(sampler._process_sample(observed))
                 resources = latest["resources"]
+                cpu = resources["process_cpu_percent"]["value"]
+                memory = resources["process_memory_rss_bytes"]["value"]
                 return (
-                    resources["process_cpu_percent"]["value"] > 0
-                    and resources["process_memory_rss_bytes"]["value"]
-                    >= memory_before + 32 * 1024 * 1024
+                    cpu is not None
+                    and memory is not None
+                    and cpu > 0
+                    and memory >= memory_before + 32 * 1024 * 1024
                 )
 
             await wait_until(grew)

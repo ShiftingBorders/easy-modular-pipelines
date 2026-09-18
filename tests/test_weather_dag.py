@@ -5,15 +5,21 @@ The object storage fixture serves files over loopback HTTP; journals use SQLite.
 """
 
 import asyncio
+import json
 import shutil
 import subprocess
+import time
+import traceback
 import unittest
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 
+import psutil
 import yaml
 
 from core.runner_utils.experimentrunner import ExperimentRunner
+from core.runner_utils.runtimeio import process_identity, read_json
 from tests.helpers.archives import ArchiveWorkspace, inventory
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned, wait_until
 
@@ -251,15 +257,101 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(process_running(instance.process_identity["pid"]))
         self.runner = self.new_runner()
-        await self.runner.recover(experiment_id)
-        await wait_until(lambda: self.runner._state.active_attempt is None, timeout=70)
-        await self.finish()
-        self.assertEqual(
-            self.runner._state.stage_attempt_numbers[
-                self.template["stages"][0]["stage_id"]
-            ],
-            1,
-        )
+        try:
+            await self.runner.recover(experiment_id)
+            await wait_until(
+                lambda: self.runner._state.active_attempt is None, timeout=70
+            )
+            await self.finish()
+            self.assertEqual(
+                self.runner._state.stage_attempt_numbers[
+                    self.template["stages"][0]["stage_id"]
+                ],
+                1,
+            )
+        except Exception as failure:
+            # Capture before fixture cleanup stops participants and removes the journal.
+            destination = (
+                REPOSITORY / ".artifacts/ci-failures" / f"weather-recovery-{uuid4()}.json"
+            )
+            report = {
+                "test": self.id(),
+                "error": repr(failure),
+                "traceback": traceback.format_exc(),
+                "observed_monotonic": time.monotonic(),
+                "diagnostic_errors": [],
+            }
+            try:
+                report["state"] = self.runner.get_state()
+                state = self.runner._state
+                attempt = None if state is None else state.active_attempt
+                report["attempt"] = None if attempt is None else vars(attempt).copy()
+                report["recovery_count"] = (
+                    None if state is None else state.unknown_state_recovery_count
+                )
+                identities = [instance.process_identity]
+                if attempt is not None:
+                    identities.append(attempt.process_identity)
+                    process_path = attempt.artifacts_directory / "process.json"
+                    if process_path.is_file():
+                        record = read_json(process_path)
+                        report["process_record"] = record
+                        identities.extend([record.get("stage"), record.get("executor")])
+                report["processes"] = []
+                for expected in identities:
+                    if expected is None:
+                        continue
+                    observation = {"expected": expected}
+                    try:
+                        observation["actual"] = process_identity(expected["pid"])
+                        process = psutil.Process(expected["pid"])
+                        observation["status"] = process.status()
+                        observation["command"] = process.cmdline()
+                    except (OSError, psutil.Error) as error:
+                        observation["error"] = repr(error)
+                    report["processes"].append(observation)
+            except Exception as error:  # noqa: BLE001 - Keep the original test failure primary.
+                report["diagnostic_errors"].append(f"state/processes: {error!r}")
+            events = deque(maxlen=200)
+            try:
+                checkpoint = None
+                deadline = time.monotonic() + 5
+                for _page in range(20):
+                    page = self.runner._journal.client.read_events(checkpoint, limit=1000)
+                    events.extend(row["event"] for row in page["events"])
+                    checkpoint = page["checkpoint"]
+                    if not page["has_more"] or time.monotonic() >= deadline:
+                        report["journal_scan_complete"] = not page["has_more"]
+                        break
+                else:
+                    report["journal_scan_complete"] = False
+            except Exception as error:  # noqa: BLE001 - A broken journal is useful diagnostic evidence.
+                report["diagnostic_errors"].append(f"journal: {error!r}")
+            report["events"] = list(events)
+            try:
+                with (self.w.root / "weather-owner.log").open("rb") as stream:
+                    stream.seek(0, 2)
+                    stream.seek(max(0, stream.tell() - 128 * 1024))
+                    report["owner_output_tail"] = stream.read().decode("utf-8", "replace")
+            except OSError as error:
+                report["diagnostic_errors"].append(f"owner output: {error!r}")
+            try:
+                limit = 10 * 1024 * 1024
+                encoded = json.dumps(report, ensure_ascii=True, default=str).encode("utf-8")
+                while len(encoded) > limit and report["events"]:
+                    report["events"].pop(0)
+                    report["journal_events_trimmed"] = True
+                    encoded = json.dumps(report, ensure_ascii=True, default=str).encode("utf-8")
+                if len(encoded) > limit:
+                    encoded = json.dumps(
+                        {"test": self.id(), "diagnostic_error": "Report exceeded 10 MiB."}
+                    ).encode("utf-8")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(encoded)
+                failure.add_note(f"Weather recovery diagnostics: {destination}")
+            except Exception as error:  # noqa: BLE001 - Reporting must never hide the test failure.
+                failure.add_note(f"Could not save weather recovery diagnostics: {error!r}")
+            raise
 
     async def test_stop_while_waiting_terminates_module_and_service(self):
         """B/D11: stop interrupts the first step and leaves no output or live service."""

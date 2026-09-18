@@ -115,6 +115,14 @@ class ServerLifecycleTests(ServerTestCase):
         await wait_until(
             lambda: not process_running(ready["controller"]["pid"]), timeout=20
         )
+        # The resource tracker may finish just after the controller exits.
+        await wait_until(
+            lambda: all(
+                not process_running(identity["pid"])
+                for identity in server.owned.values()
+            ),
+            timeout=15,
+        )
         for identity in server.owned.values():
             self.assertFalse(process_running(identity["pid"]), identity)
         fresh = await self.start_server()
