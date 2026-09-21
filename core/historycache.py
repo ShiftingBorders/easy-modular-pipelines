@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterator
 from contextlib import closing
 from fractions import Fraction
 from pathlib import Path
+from typing import BinaryIO
 
 from core.logger import OperationLogger
 from core.logger_utils.events import LoggingStateError
@@ -43,6 +44,30 @@ class HistoryCacheLimit(ValueError):
 
 class HistoryCacheBusy(LoggingStateError):
     """Another process currently owns this experiment's cache writer."""
+
+
+def acquire_cache_writer(path: Path) -> BinaryIO:
+    """Acquire a derived-cache writer lock; closing the stream releases it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = path.with_suffix(".lock").open("a+b")
+    try:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return stream
+    except OSError as error:
+        stream.close()
+        raise HistoryCacheBusy("Another process is caching this experiment.") from error
 
 
 class JournalHistoryCache:
@@ -190,35 +215,11 @@ class JournalHistoryCache:
     ) -> dict:
         """Advance ingestion, projections and the active window explicitly."""
         with self._lock:
-            writer = self._acquire_writer()
+            writer = acquire_cache_writer(self.path)
             try:
                 return self._refresh_owned(state, compact, project, target, window)
             finally:
                 writer.close()
-
-    def _acquire_writer(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        stream = self.path.with_suffix(".lock").open("a+b")
-        try:
-            stream.seek(0, os.SEEK_END)
-            if stream.tell() == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return stream
-        except OSError as error:
-            stream.close()
-            raise HistoryCacheBusy(
-                "Another process is caching this experiment."
-            ) from error
 
     def _refresh_owned(
         self,

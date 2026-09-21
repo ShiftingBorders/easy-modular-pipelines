@@ -131,6 +131,20 @@ are retained. A pending refresh keeps the preceding observations visible;
 failures identify them as previous observations. Opening a record's details
 loads its original source events when they are outside the active RAM window.
 
+Modules reads a precomputed project-wide publication in
+`state_directory/readers/modules.json`. Cache workers build it from consistent
+read snapshots of the experiment caches and replace it atomically. Its source
+versions and journal boundaries are included in the API response. Unchanged
+versions reuse the existing publication, including across dashboard restarts;
+precache also finishes this publication before exiting.
+
+Opening Modules does not read original journals or calculate statistics.
+Counts and exact p50/p95 values cover all included attempts, not just the RAM
+window or recent-attempt list. Percentiles combine ordered duration samples
+across experiments; per-experiment percentiles are never averaged. Pending or
+unavailable histories are shown as incomplete statistics. Source checks remain
+in the background cache workers, so changes become visible on their next refresh.
+
 ## Commands and restoration
 
 Pause, Resume, Step, Stop, Snapshot, and Recover submit commands to the runtime,

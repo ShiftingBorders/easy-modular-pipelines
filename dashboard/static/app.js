@@ -283,7 +283,7 @@ async function loadPage(automatic = false) {
             if (!candidates.some(row => row.experiment_id === state.experiment)) state.experiment = candidates[0]?.experiment_id || null;
             content = views.experiments(candidates, state.experiment);
             if (state.page === "forecast") content = content.replace('id="run-history"', 'id="forecast-body"');
-        } else if (state.page === "modules") { const document = await systemRead("modules", signal); state.modules = rows(document); content = views.modules(state.modules, state.detail); }
+        } else if (state.page === "modules") { const document = await systemRead("modules", signal); state.modules = rows(document); content = (document.complete === false ? `<div class="error-banner">${e(document.error || "Module statistics are still loading.")}</div>` : "") + views.modules(state.modules, state.detail); }
         else if (state.page === "services") content = views.services(rows(await systemRead("services", signal)), state.detail);
         else if (state.page === "compute") {
             const params = {};

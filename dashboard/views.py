@@ -3,26 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-import heapq
 import json
-import math
 import multiprocessing
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from dashboard.api_client import SystemAPIClient, SystemAPIError
-from dashboard.journals import LocalJournals, cache_experiment, read_object
+from dashboard.journals import (
+    LocalJournals,
+    cache_experiment,
+    publish_module_statistics,
+    read_object,
+)
 from dashboard.projections import (
     cached_experiment_views,
     cached_metrics,
     experiment_views,
     instant,
-    percentile,
 )
 
 
@@ -90,6 +92,10 @@ class DashboardViews:
         self._cache_targets: dict[str, dict] = {}
         self._cache_errors: dict[str, dict] = {}
         self._cache_checked: dict[str, float] = {}
+        self._module_error: str | None = None
+        self._module_job = None
+        self._module_registry: tuple | None = None
+        self._module_retry_at = 0.0
 
     async def open(self) -> None:
         path = self.settings["state_directory"] / "commands.json"
@@ -108,10 +114,7 @@ class DashboardViews:
                 if record["status"] == "submitting":
                     record.update(status="unknown", polling=True)
             self._commands = document["items"][-1000:]
-        self._cache_pool = ProcessPoolExecutor(
-            max_workers=self.settings.get("cache_workers", 2),
-            mp_context=multiprocessing.get_context("spawn"),
-        )
+        self._replace_cache_pool()
         self._command_task = asyncio.create_task(self._poll_commands())
         self._source_tasks = [
             asyncio.create_task(self._poll_source("state")),
@@ -127,7 +130,26 @@ class DashboardViews:
             except (OSError, TypeError, ValueError):
                 registry = {}
             self._collect_cache_jobs()
+            self._collect_module_job()
             now = time.monotonic()
+            signature = tuple(
+                (identifier, str(path)) for identifier, path in registry.items()
+            )
+            if (
+                self._module_job is None
+                and self.settings["project_root"] is not None
+                and signature != self._module_registry
+                and now >= self._module_retry_at
+            ):
+                try:
+                    self._module_job = self._cache_pool.submit(
+                        publish_module_statistics, self.settings
+                    )
+                    self._module_registry = signature
+                except BrokenProcessPool:
+                    self._replace_cache_pool()
+                    await asyncio.sleep(0.25)
+                    continue
             for identifier in registry:
                 if len(self._cache_jobs) >= self.settings.get("cache_workers", 2):
                     break
@@ -145,13 +167,32 @@ class DashboardViews:
                         self._cache_targets.get(identifier),
                     )
                 except BrokenProcessPool:
-                    self._cache_pool.shutdown(wait=False, cancel_futures=True)
-                    self._cache_pool = ProcessPoolExecutor(
-                        max_workers=self.settings.get("cache_workers", 2),
-                        mp_context=multiprocessing.get_context("spawn"),
-                    )
+                    self._replace_cache_pool()
                     break
             await asyncio.sleep(0.25)
+
+    def _replace_cache_pool(self) -> None:
+        if self._cache_pool is not None:
+            self._cache_pool.shutdown(wait=False, cancel_futures=True)
+        self._cache_pool = ProcessPoolExecutor(
+            max_workers=self.settings.get("cache_workers", 2),
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+
+    def _collect_module_job(self) -> None:
+        if self._module_job is None or not self._module_job.done():
+            return
+        try:
+            if not self._module_job.result():
+                self._module_registry = None
+            else:
+                self._module_error = None
+        except Exception as error:  # noqa: BLE001 - Keep the last snapshot visibly incomplete until publication recovers.
+            self._module_error = str(error)
+            self._module_registry = None
+            self._module_retry_at = time.monotonic() + self.journals.interval
+        finally:
+            self._module_job = None
 
     def _collect_cache_jobs(self) -> None:
         for identifier, future in list(self._cache_jobs.items()):
@@ -165,6 +206,10 @@ class DashboardViews:
                     "error": {"code": "cache_worker_failed", "message": str(error)}
                 }
             error = result.get("error")
+            if result.get("modules_error"):
+                self._module_error = result["modules_error"]
+            elif result.get("modules_published"):
+                self._module_error = None
             if error:
                 self._cache_errors[identifier] = error
                 self._cache_checked[identifier] = time.monotonic()
@@ -358,6 +403,20 @@ class DashboardViews:
     async def read(self, resource: str, params: dict) -> dict:
         if resource == "compute":
             return await self.compute(params)
+        if resource == "modules":
+            result = await asyncio.to_thread(self.journals.modules)
+            unavailable = any(
+                identifier in result.get("sources", {})
+                for identifier in self._cache_errors
+            )
+            if unavailable or self._module_error:
+                result = {
+                    **result,
+                    "complete": False,
+                    "error": "Some experiment caches are unavailable; showing the last published statistics.",
+                    "items": [{**item, "complete": False} for item in result["items"]],
+                }
+            return result
         source_error = None
         try:
             models = await self.models() if resource != "services" else []
@@ -413,74 +472,6 @@ class DashboardViews:
                 "error": source_error or compute.get("error"),
                 "observed_at": datetime.now(UTC).isoformat(),
             }
-        if resource == "modules" and all(dataset.get("cache") for dataset, _ in models):
-            return {"items": await asyncio.to_thread(self._cached_modules, models)}
-        if resource == "modules":
-            modules = {}
-            for dataset, model in models:
-                for attempt in model["parameters"]:
-                    name, version = (
-                        attempt.get("module_name"),
-                        attempt.get("module_version"),
-                    )
-                    if not name:
-                        continue
-                    key = (name, version, attempt.get("module_hash"))
-                    item = modules.setdefault(
-                        key,
-                        {
-                            "module_id": "/".join(str(part or "") for part in key),
-                            "name": name,
-                            "version": version,
-                            "module_hash": key[2],
-                            "runs": 0,
-                            "error_count": 0,
-                            "restarts": 0,
-                            "recent_attempts": [],
-                            "durations": [],
-                            "experiments": set(),
-                            "complete": True,
-                        },
-                    )
-                    item["runs"] += int(attempt.get("started_at") is not None)
-                    item["recent_attempts"].append(attempt)
-                    item["experiments"].add(model["summary"]["name"])
-                    item["complete"] = item["complete"] and dataset["complete"]
-                    if attempt.get("duration_seconds") is not None:
-                        item["durations"].append(attempt["duration_seconds"])
-                    item["error_count"] += sum(
-                        error.get("attempt_id") == attempt.get("attempt_id")
-                        for error in model["errors"]
-                    )
-                execution_groups = defaultdict(list)
-                for attempt in model["parameters"]:
-                    execution_groups[
-                        (
-                            attempt.get("module_name"),
-                            attempt.get("module_version"),
-                            attempt.get("module_hash"),
-                            attempt.get("stage_id"),
-                            attempt.get("cycle_number"),
-                        )
-                    ].append(attempt)
-                for key, attempts in execution_groups.items():
-                    if key[:3] in modules:
-                        modules[key[:3]]["restarts"] += max(
-                            0,
-                            sum(item.get("started_at") is not None for item in attempts)
-                            - 1,
-                        )
-            for module in modules.values():
-                durations = module.pop("durations")
-                module["p50_seconds"] = percentile(durations, 0.5)
-                module["p95_seconds"] = percentile(durations, 0.95)
-                module["experiment_name"] = ", ".join(sorted(module.pop("experiments")))
-                module["recent_attempts"] = sorted(
-                    module["recent_attempts"],
-                    key=lambda item: item.get("recorded_at", ""),
-                    reverse=True,
-                )[:100]
-            return {"items": list(modules.values())}
         if resource == "services":
             live = await self.state()
             if not live.get("available"):
@@ -520,110 +511,6 @@ class DashboardViews:
                 )
             return {"items": services, "fresh": live.get("fresh", False)}
         raise SystemAPIError("not_found", "Unknown dashboard view.", 404)
-
-    def _cached_modules(self, models: list[tuple[dict, dict]]) -> list[dict]:
-        groups = {}
-        module_fields = "json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.module_hash')"
-        for dataset, model in models:
-            cache = dataset["cache"]
-            for name, version, digest in cache.query(
-                "SELECT DISTINCT "
-                + module_fields
-                + " FROM records WHERE kind='parameters'"
-            ):
-                if not name:
-                    continue
-                key = (name, version, digest)
-                group = groups.setdefault(
-                    key,
-                    {
-                        "module_id": "/".join(str(part or "") for part in key),
-                        "name": name,
-                        "version": version,
-                        "module_hash": digest,
-                        "runs": 0,
-                        "error_count": 0,
-                        "restarts": 0,
-                        "recent_attempts": [],
-                        "complete": True,
-                        "experiments": set(),
-                        "caches": [],
-                    },
-                )
-                selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ?"
-                counts = cache.query(
-                    "SELECT COUNT(*) FROM records WHERE "
-                    + selection
-                    + " AND json_extract(payload,'$.started_at') IS NOT NULL",
-                    key,
-                )[0][0]
-                restarts = cache.query(
-                    "SELECT COALESCE(SUM(MAX(0,n-1)),0) FROM (SELECT COUNT(*) AS n FROM records WHERE "
-                    + selection
-                    + " AND json_extract(payload,'$.started_at') IS NOT NULL GROUP BY run_id, cycle, json_extract(payload,'$.stage_id'))",
-                    key,
-                )[0][0]
-                errors = cache.query(
-                    "SELECT COUNT(*) FROM records AS error WHERE error.kind='errors' AND EXISTS (SELECT 1 FROM records WHERE "
-                    + selection
-                    + " AND json_extract(payload,'$.attempt_id')=json_extract(error.payload,'$.attempt_id'))",
-                    key,
-                )[0][0]
-                recent = cache.query(
-                    "SELECT payload FROM records WHERE "
-                    + selection
-                    + " ORDER BY json_extract(payload,'$.recorded_at') DESC LIMIT 100",
-                    key,
-                )
-                group["runs"] += counts
-                group["restarts"] += restarts
-                group["error_count"] += errors
-                group["complete"] = group["complete"] and dataset["complete"]
-                group["experiments"].add(model["summary"]["name"])
-                group["caches"].append(cache)
-                group["recent_attempts"] = sorted(
-                    [
-                        *group["recent_attempts"],
-                        *(json.loads(row[0]) for row in recent),
-                    ],
-                    key=lambda row: row.get("recorded_at", ""),
-                    reverse=True,
-                )[:100]
-        for key, group in groups.items():
-            selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ? AND json_extract(payload,'$.duration_seconds') IS NOT NULL"
-            caches = group.pop("caches")
-            count = sum(
-                cache.query("SELECT COUNT(*) FROM records WHERE " + selection, key)[0][
-                    0
-                ]
-                for cache in caches
-            )
-            ranks = {
-                "p50_seconds": max(0, math.ceil(count * 0.5) - 1),
-                "p95_seconds": max(0, math.ceil(count * 0.95) - 1),
-            }
-            group.update(p50_seconds=None, p95_seconds=None)
-            streams = [
-                cache.iter_query(
-                    "SELECT json_extract(payload,'$.duration_seconds') FROM records WHERE "
-                    + selection
-                    + " ORDER BY json_extract(payload,'$.duration_seconds')",
-                    key,
-                )
-                for cache in caches
-            ]
-            try:
-                for index, (duration,) in enumerate(heapq.merge(*streams)):
-                    for field, rank in ranks.items():
-                        if index == rank:
-                            group[field] = duration
-                    if index >= ranks["p95_seconds"]:
-                        break
-            finally:
-                for stream in streams:
-                    stream.close()
-            group["experiment_name"] = ", ".join(sorted(group.pop("experiments")))
-        return list(groups.values())
 
     def error_count(self, dataset: dict, seconds: float, now: float) -> int:
         cache = dataset.get("cache")
@@ -1370,6 +1257,7 @@ class DashboardViews:
             )
             self._cache_pool = None
             self._cache_jobs.clear()
+            self._module_job = None
         if self._command_task is not None:
             self._command_task.cancel()
             await asyncio.gather(self._command_task, return_exceptions=True)

@@ -8,14 +8,21 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import ExitStack, closing
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from core.historycache import HistoryCacheBusy, HistoryCacheLimit, JournalHistoryCache
+from core.historycache import (
+    HistoryCacheBusy,
+    HistoryCacheLimit,
+    JournalHistoryCache,
+    acquire_cache_writer,
+)
 from core.logger_utils.events import LoggingError
-from core.runner_utils.runtimeio import read_json
+from core.runner_utils.runtimeio import read_json, write_json
 from dashboard.api_client import SystemAPIError
-from dashboard.projections import compact_event, project_scope
+from dashboard.projections import compact_event, module_statistics, project_scope
 
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
@@ -39,10 +46,16 @@ def cache_experiment(
             cached["cursor"] >= boundary["cursor"]
             and cached["change_cursor"] >= boundary["change_cursor"]
         )
+        publication = {}
+        try:
+            publication["modules_published"] = journals.publish_modules()
+        except Exception as error:  # noqa: BLE001 - Module publication failure must not invalidate journal projections.
+            publication["modules_error"] = str(error)
         return {
             "experiment_id": identifier,
             "pid": os.getpid(),
             "complete": complete,
+            **publication,
             **{key: dataset[key] for key in ("cached_through", "target_boundary")},
         }
     except Exception as error:  # noqa: BLE001 - A failed experiment must not break the worker pool.
@@ -55,6 +68,15 @@ def cache_experiment(
                 "message": str(error),
             },
         }
+    finally:
+        journals.close()
+
+
+def publish_module_statistics(settings: dict) -> bool:
+    """Process-pool entry point for a final project-wide publication."""
+    journals = LocalJournals(settings)
+    try:
+        return journals.publish_modules()
     finally:
         journals.close()
 
@@ -72,6 +94,165 @@ class LocalJournals:
         self.window_events = settings.get("history_window_events", 1000)
         self._lock = threading.RLock()
         self._experiment_locks: dict[str, threading.RLock] = {}
+        self._module_signature: tuple | None = None
+        self._module_publication: dict | None = None
+
+    def modules(self) -> dict:
+        """Serve a ready publication without touching any original journal."""
+        if self.project is None:
+            raise SystemAPIError(
+                "not_configured", "Configure project_root to read module statistics."
+            )
+        path = self.state_directory / "modules.json"
+        with self._lock:
+            try:
+                status = path.stat()
+            except FileNotFoundError:
+                return {
+                    "items": [],
+                    "complete": False,
+                    "error": "Module statistics are being prepared.",
+                }
+            except OSError as error:
+                raise SystemAPIError(
+                    "cache_unavailable", f"Cannot inspect module statistics: {error}"
+                ) from error
+            signature = (
+                status.st_dev,
+                status.st_ino,
+                status.st_mtime_ns,
+                status.st_size,
+            )
+            if signature == self._module_signature:
+                return self._module_publication
+            try:
+                document = read_object(path, self.settings["max_response_bytes"])
+            except (OSError, TypeError, ValueError) as error:
+                raise SystemAPIError(
+                    "cache_unavailable", f"Cannot read module statistics: {error}"
+                ) from error
+            if document.get("schema_version") != 1 or document.get(
+                "project_root"
+            ) != str(self.project):
+                return {
+                    "items": [],
+                    "complete": False,
+                    "error": "Module statistics are being prepared for this project.",
+                }
+            if (
+                not isinstance(document.get("items"), list)
+                or not isinstance(document.get("sources"), dict)
+                or type(document.get("complete")) is not bool
+            ):
+                raise SystemAPIError(
+                    "cache_unavailable", "Invalid module statistics publication."
+                )
+            self._module_publication = document
+            self._module_signature = signature
+            return document
+
+    def publish_modules(self) -> bool:
+        """Materialize exact project statistics from consistent cache snapshots."""
+        if self.project is None:
+            return True
+        path = self.state_directory / "modules.json"
+        try:
+            writer = acquire_cache_writer(path)
+        except HistoryCacheBusy:
+            return False
+        with writer, ExitStack() as resources:
+            registry = self.registry()
+            models, sources = self._module_sources(registry, resources)
+            signature = {
+                "schema_version": 1,
+                "project_root": str(self.project),
+                "sources": sources,
+            }
+            previous = (
+                read_object(path, self.settings["max_response_bytes"])
+                if path.exists()
+                else {}
+            )
+            if all(previous.get(key) == value for key, value in signature.items()):
+                return True
+            complete = all(source["complete"] for source in sources.values())
+            items = module_statistics(models)
+            for item in items:
+                item["complete"] = item["complete"] and complete
+            document = {
+                **signature,
+                "items": items,
+                "complete": complete,
+                "error": None
+                if complete
+                else "Some experiment histories are incomplete; statistics cover the published records only.",
+                "published_at": datetime.now(UTC).isoformat(),
+            }
+            if (
+                len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+                > self.settings["max_response_bytes"]
+            ):
+                raise HistoryCacheLimit("Module statistics exceed max_response_bytes.")
+            write_json(path, document)
+            return True
+
+    def _module_sources(
+        self, registry: dict[str, Path], resources: ExitStack
+    ) -> tuple[list[tuple[dict, sqlite3.Connection]], dict[str, dict]]:
+        models, sources = [], {}
+        for identifier, directory in registry.items():
+            key = hashlib.sha256(identifier.encode()).hexdigest()
+            database = self.state_directory / f"{key}.cache.sqlite"
+            source = {"directory": str(directory), "complete": False}
+            sources[identifier] = source
+            if not database.exists():
+                source["error"] = "Cache is not initialized."
+                continue
+            try:
+                connection = resources.enter_context(
+                    closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True))
+                )
+                connection.execute("PRAGMA query_only=ON")
+                connection.execute("BEGIN")
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+                identity = json.loads(metadata["source"])
+                configuration = read_object(
+                    self.state_directory / f"{key}.json", 1048576
+                )
+                if (
+                    identity["experiment_id"] != identifier
+                    or configuration["logging"]["expected_journal"]
+                    != identity["identity"]
+                    or Path(configuration["logging"]["db_path"]).resolve()
+                    != (directory / "journals/events.sqlite").resolve()
+                ):
+                    source["error"] = "Cache belongs to a different journal."
+                    continue
+                source.update(
+                    journal=identity["identity"],
+                    file_key=identity["file_key"],
+                    cache_schema_version=identity["version"],
+                    version=int(metadata.get("version", 0)),
+                    cached_through=json.loads(metadata.get("cached_through", "null")),
+                    complete=metadata.get("ready") == "1",
+                )
+                template = connection.execute(
+                    "SELECT json_extract(compact,'$.data.template.name') FROM facts WHERE kind='template.applied' AND effective=1 ORDER BY cursor DESC LIMIT 1"
+                ).fetchone()
+                name = template[0] if template and template[0] else identifier
+                models.append(
+                    (
+                        {
+                            "experiment_id": identifier,
+                            "name": name,
+                            "complete": source["complete"],
+                        },
+                        connection,
+                    )
+                )
+            except (sqlite3.Error, ValueError, KeyError, OSError) as error:
+                source.update(complete=False, error=str(error))
+        return models, sources
 
     def registry(self) -> dict[str, Path]:
         if self.project is None:

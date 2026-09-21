@@ -79,6 +79,14 @@ instantiate runtime/controller classes. These views do not change the event sche
 System Alerts exclude dashboard-local ICMP incidents, which are counted separately.
 An unknown system count remains unknown in the header even if local ICMP is healthy.
 
+`modules` is a materialized worker publication. Its response includes `complete`,
+`published_at`, and `sources` with per-experiment cache versions, journal
+identities and completed boundaries. HTTP reads only this publication and
+performs no source-journal scans or aggregate SQL queries. Counts and exact
+nearest-rank p50/p95 values cover the full published history; `recent_attempts`
+is limited to the latest 100 entries per module. Uninitialized or partially
+available histories return an explicit incomplete result, not complete zero counts.
+
 `compute.metrics.cpu/ram/disk` are `{value, fresh, exceeded}` objects with
 host-normalized percentages. `internet` has `receive_mbps` and `transmit_mbps`.
 The selected internet path belongs to the system collector, not an arbitrary

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import math
+import sqlite3
 import statistics
 from collections import defaultdict
 from datetime import datetime
@@ -1015,3 +1017,106 @@ def cycle_measurements(
             }
         )
     return result
+
+
+def module_statistics(snapshots: list[tuple[dict, sqlite3.Connection]]) -> list[dict]:
+    """Exact project statistics from caller-owned SQLite read transactions."""
+    groups = {}
+    module_fields = "json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.module_hash')"
+    for dataset, connection in snapshots:
+        for name, version, digest in connection.execute(
+            "SELECT DISTINCT " + module_fields + " FROM records WHERE kind='parameters'"
+        ):
+            if not name:
+                continue
+            key = (name, version, digest)
+            group = groups.setdefault(
+                key,
+                {
+                    "module_id": "/".join(str(part or "") for part in key),
+                    "name": name,
+                    "version": version,
+                    "module_hash": digest,
+                    "runs": 0,
+                    "error_count": 0,
+                    "restarts": 0,
+                    "recent_attempts": [],
+                    "complete": True,
+                    "experiments": set(),
+                    "caches": [],
+                },
+            )
+            selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ?"
+            counts = connection.execute(
+                "SELECT COUNT(*) FROM records WHERE "
+                + selection
+                + " AND json_extract(payload,'$.started_at') IS NOT NULL",
+                key,
+            ).fetchone()[0]
+            restarts = connection.execute(
+                "SELECT COALESCE(SUM(MAX(0,n-1)),0) FROM (SELECT COUNT(*) AS n FROM records WHERE "
+                + selection
+                + " AND json_extract(payload,'$.started_at') IS NOT NULL GROUP BY run_id, cycle, json_extract(payload,'$.stage_id'))",
+                key,
+            ).fetchone()[0]
+            errors = connection.execute(
+                "SELECT COUNT(*) FROM records AS error WHERE error.kind='errors' AND EXISTS (SELECT 1 FROM records WHERE "
+                + selection
+                + " AND json_extract(payload,'$.attempt_id')=json_extract(error.payload,'$.attempt_id'))",
+                key,
+            ).fetchone()[0]
+            recent = connection.execute(
+                "SELECT payload FROM records WHERE "
+                + selection
+                + " ORDER BY json_extract(payload,'$.recorded_at') DESC LIMIT 100",
+                key,
+            )
+            group["runs"] += counts
+            group["restarts"] += restarts
+            group["error_count"] += errors
+            group["complete"] = group["complete"] and dataset["complete"]
+            group["experiments"].add(dataset["name"])
+            group["caches"].append(connection)
+            group["recent_attempts"] = sorted(
+                [
+                    *group["recent_attempts"],
+                    *(json.loads(row[0]) for row in recent),
+                ],
+                key=lambda row: row.get("recorded_at", ""),
+                reverse=True,
+            )[:100]
+    for key, group in groups.items():
+        selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ? AND json_extract(payload,'$.duration_seconds') IS NOT NULL"
+        caches = group.pop("caches")
+        count = sum(
+            connection.execute(
+                "SELECT COUNT(*) FROM records WHERE " + selection, key
+            ).fetchone()[0]
+            for connection in caches
+        )
+        ranks = {
+            "p50_seconds": max(0, math.ceil(count * 0.5) - 1),
+            "p95_seconds": max(0, math.ceil(count * 0.95) - 1),
+        }
+        group.update(p50_seconds=None, p95_seconds=None)
+        streams = [
+            connection.execute(
+                "SELECT json_extract(payload,'$.duration_seconds') FROM records WHERE "
+                + selection
+                + " ORDER BY json_extract(payload,'$.duration_seconds')",
+                key,
+            )
+            for connection in caches
+        ]
+        try:
+            for index, (duration,) in enumerate(heapq.merge(*streams)):
+                for field, rank in ranks.items():
+                    if index == rank:
+                        group[field] = duration
+                if index >= ranks["p95_seconds"]:
+                    break
+        finally:
+            for stream in streams:
+                stream.close()
+        group["experiment_name"] = ", ".join(sorted(group.pop("experiments")))
+    return list(groups.values())

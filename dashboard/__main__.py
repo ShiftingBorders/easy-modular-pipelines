@@ -9,7 +9,11 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 from dashboard.config import load_settings
-from dashboard.journals import LocalJournals, cache_experiment
+from dashboard.journals import (
+    LocalJournals,
+    cache_experiment,
+    publish_module_statistics,
+)
 
 
 def precache(settings: dict) -> int:
@@ -56,6 +60,10 @@ def precache(settings: dict) -> int:
                     completed += 1
                 else:
                     pending.append((identifier, result["target_boundary"]))
+        # Finish a project-wide publication even if concurrent per-experiment
+        # workers found its writer lock busy on their last batch.
+        while not pool.submit(publish_module_statistics, settings).result():
+            time.sleep(0.1)
     print(
         json.dumps({"mode": "precache", "completed": completed, "failed": failed}),
         flush=True,
