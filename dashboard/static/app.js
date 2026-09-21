@@ -1,6 +1,6 @@
 "use strict";
 
-import {escape as e, numeric, dateTime, address, badge, warning, panel, empty, unavailable, stat, inspectButton, table, lineChart} from "./ui.js";
+import {recordKey, updateContent, escape as e, numeric, dateTime, address, badge, warning, panel, empty, unavailable, stat, inspectButton, table, lineChart} from "./ui.js";
 import * as views from "./views.js";
 
 const navigation = [
@@ -172,7 +172,7 @@ async function refreshICMP() {
     try {
         state.icmp = await request("/api/icmp"); updateAlertCount();
         const container = document.getElementById("icmp-panel");
-        if (container && !container.contains(document.activeElement)) container.innerHTML = views.icmpPanel(state.icmp, state.page !== "icmp");
+        if (container && !container.contains(document.activeElement)) updateContent(container, views.icmpPanel(state.icmp, state.page !== "icmp"));
     } catch (error) {
         const container = document.getElementById("icmp-panel");
         if (container && !container.contains(document.activeElement)) container.innerHTML = panel("ICMP Echo Reply", empty("Monitor unavailable", error.message));
@@ -187,14 +187,24 @@ async function selectExperiment(identity) {
     const target = document.getElementById(state.page === "forecast" ? "forecast-body" : "run-history");
     if (!target) return;
     if (!identity) { target.innerHTML = empty("No experiment selected"); return; }
-    target.innerHTML = '<div class="loading">Loading execution history…</div>';
+    if (target.experiment !== identity) {
+        target.innerHTML = '<div class="loading">Loading execution history…</div>';
+        target.rendered = null;
+    }
+    target.experiment = identity;
+    const serial = target.request = (target.request || 0) + 1;
     try {
         const response = await systemRead(experimentPath(state.page === "forecast" ? "forecast" : "runs", identity));
         checkContext(response, identity);
-        if (state.experiment !== identity || !target.isConnected) return;
-        if (state.page === "forecast") { state.data = response; target.innerHTML = views.forecast(response, state.metrics); }
-        else target.innerHTML = views.runHistory(rows(response), identity);
-    } catch (error) { if (target.isConnected && state.experiment === identity) target.innerHTML = unavailable(error); }
+        if (state.experiment !== identity || !target.isConnected || serial !== target.request) return;
+        const content = state.page === "forecast" ? views.forecast(response, state.metrics) : views.runHistory(rows(response), identity);
+        if (state.page === "forecast") state.data = response;
+        if (target.rendered !== content) { updateContent(target, content); target.rendered = content; }
+    } catch (error) {
+        if (target.isConnected && state.experiment === identity && serial === target.request) {
+            target.innerHTML = unavailable(error); target.rendered = null;
+        }
+    }
 }
 
 function renderAlerts(document) {
@@ -232,11 +242,11 @@ function renderRun(response) {
         case "dag": content = `<div class="actions" style="margin-bottom:16px"><a class="button quiet" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.dag(response)}`; break;
         case "events": content = views.events(state.rows, state.mode); break;
         case "errors": content = views.errors(state.rows); break;
-        case "resources": content = `<div id="metric-cards">${views.metricCards(state.rows, state.metrics)}</div>`; break;
+        case "resources": content = `<div id="metric-cards">${views.metricCards(state.data?.measurements || state.rows, state.metrics, null, state.data?.metric_summaries, state.data?.measurement_cycles)}</div>`; break;
         case "commands": content = panel("Commands", table(state.rows, [["Command", row => inspectButton(row.command || row.name, row)], ["Target", row => e(row.target || "—")], ["Status", row => badge(row.status || row.outcome)], ["Run", row => e(row.run_id)], ["Sent", row => e(dateTime(row.sent_at))]], [["kind", "Kind"], ["status", "Status"]])); break;
         case "snapshots": content = panel("Snapshots & recovery", table(state.rows, [["Snapshot", row => inspectButton(row.snapshot_id, row)], ["State", row => badge(row.status)], ["Template", row => e(row.template_revision_id)], ["Cycle", row => numeric(row.cycle_number)], ["Created", row => e(dateTime(row.created_at))], ["", row => `<button class="button quiet" data-restore="${e(row.snapshot_id)}" ${row.available === false || !state.controlAvailable ? "disabled" : ""}>Restore</button>`]], [["status", "State"]])); break;
         case "artifacts": content = panel("Artifacts", table(state.rows, [["Artifact", row => inspectButton(row.path || row.name, row)], ["Purpose", row => e(row.purpose || "—")], ["Module", row => e(row.module_name || "—")], ["Attempt", row => e(row.attempt_id || "—")], ["Size", row => row.size_bytes == null ? "—" : numeric(row.size_bytes) + " B"], ["", row => row.artifact_id ? `<a class="button quiet" href="/api/experiments/${encodeURIComponent(state.experiment)}/artifacts/${encodeURIComponent(row.artifact_id)}/download" download>Download</a>` : "—"]], [["purpose", "Purpose"], ["module_name", "Module"]])); break;
-        case "settings": content = panel("Recorded settings", `<div class="panel-body"><label class="field" style="margin-bottom:16px">Template revision<select id="template-revision"><option value="">Latest in this selection</option>${(response.revisions || []).map(row=>`<option value="${e(row.template_revision_id)}" ${state.revision === row.template_revision_id ? "selected" : ""}>${e(dateTime(row.occurred_at))} · ${e(row.template_revision_id)}</option>`).join("")}</select></label><div class="segmented" style="margin-bottom:16px"><button data-settings="yaml" class="${state.settingsMode === "yaml" ? "active" : ""}">YAML</button><button data-settings="json" class="${state.settingsMode === "json" ? "active" : ""}">JSON</button><button data-settings="parameters" class="${state.settingsMode === "parameters" ? "active" : ""}">Attempt parameters</button></div><div id="settings-content"><pre>${e(state.settingsMode === "yaml" ? response.template_yaml || "Original YAML is unavailable." : JSON.stringify(response.template || {}, null, 2))}</pre></div></div>`); break;
+        case "settings": content = panel("Recorded settings", `<div class="panel-body"><label class="field" style="margin-bottom:16px">Template revision<select id="template-revision"><option value="">Latest in this selection</option>${(response.revisions || []).map(row=>`<option value="${e(row.template_revision_id)}" ${state.revision === row.template_revision_id ? "selected" : ""}>${e(dateTime(row.occurred_at))} · ${e(row.template_revision_id)}</option>`).join("")}</select></label><div class="segmented" style="margin-bottom:16px"><button data-settings="yaml" class="${state.settingsMode === "yaml" ? "active" : ""}">YAML</button><button data-settings="json" class="${state.settingsMode === "json" ? "active" : ""}">JSON</button><button data-settings="parameters" class="${state.settingsMode === "parameters" ? "active" : ""}">Attempt parameters</button></div><div id="settings-content">${state.settingsMode === "parameters" ? views.parameters(state.parameterRows || []) : `<pre>${e(state.settingsMode === "yaml" ? response.template_yaml || "Original YAML is unavailable." : JSON.stringify(response.template || {}, null, 2))}</pre>`}</div></div>`); break;
     }
     return (response.complete === false ? `<div class="error-banner">${warning(response.error || "History is still loading. Aggregate statistics may be incomplete.")} ${e(response.error || "History is still loading.")}</div>` : "") + content + (state.nextCursor ? '<button class="button" data-action="load-more">Load more records</button>' : "");
 }
@@ -247,8 +257,10 @@ async function loadPage(automatic = false) {
     if (automatic && (state.loading || main.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))) return;
     state.abort?.abort(); state.abort = new AbortController(); const signal = state.abort.signal;
     const serial = ++state.request; state.loading = true; if (automatic) rememberFilters();
-    if (!automatic) main.innerHTML = header("Loading…") + '<div class="loading" role="status">Loading observations…</div>';
-    navigationChrome();
+    if (!automatic) {
+        main.innerHTML = header("Loading…") + '<div class="loading" role="status">Loading observations…</div>';
+    }
+    if (!automatic) navigationChrome();
     void refreshConnection();
     let title = navigation.find(([page]) => page === state.page)?.[1] || runViews.find(([page]) => page === state.page)?.[1] || "ICMP ping";
     try {
@@ -290,18 +302,28 @@ async function loadPage(automatic = false) {
             if (!state.experiment) { content = empty("No experiment selected", "Open Experiments and select an execution history."); }
             else {
                 const selected = state.experiment;
-                const params = {limit: "200"}; if (state.run) params.run_id = state.run;
+                const params = {limit: "200", compact: "1"}; if (state.run) params.run_id = state.run;
                 if (state.page === "settings" && state.revision) params.revision = state.revision;
                 if (state.page === "events") params.view = state.mode;
                 if (state.cursor) params.cursor = typeof state.cursor === "string" ? state.cursor : JSON.stringify(state.cursor);
                 const endpoint = runViews.find(([page]) => page === state.page)[2];
                 const [document, summary] = await Promise.all([systemRead(experimentPath(endpoint), signal, params), systemRead(experimentPath("summary"), signal, state.run ? {run_id: state.run} : {}).catch(() => null)]);
                 checkContext(document, selected); if (summary) checkContext(summary, selected);
+                if (state.page === "settings" && state.settingsMode === "parameters") {
+                    const attempts = await systemRead(experimentPath("parameters"), signal, {compact: "1", ...(state.run ? {run_id: state.run} : {})});
+                    checkContext(attempts, selected); state.parameterRows = rows(attempts);
+                }
                 state.controlAvailable = Boolean(summary?.fresh); state.data = document; heading = runHeading(summary); content = renderRun(document);
             }
         }
         if (serial !== state.request) return;
-        main.innerHTML = heading + content; document.title = `${title} · EMP`;
+        updateContent(main, heading + content);
+        const dialog = document.getElementById("details-dialog");
+        if (dialog.open && dialog.dataset.recordKey && dialog.dataset.selection === location.search) {
+            const present = [...main.querySelectorAll("[data-inspect]")].some(button => recordKey(JSON.parse(button.dataset.inspect)) === dialog.dataset.recordKey);
+            if (!present) { dialog.close(); toast("The inspected record is no longer in the current view."); }
+        }
+        document.title = `${title} · EMP`;
         if (["experiments", "forecast"].includes(state.page)) void selectExperiment(state.experiment);
         if (state.page === "compute") {
             const field = document.getElementById("resource-window");
@@ -323,7 +345,11 @@ async function loadPage(automatic = false) {
             toast("History changed. Loading its first page.");
             return await loadPage();
         }
-        main.innerHTML = header(title) + unavailable(error);
+        if (automatic) {
+            let banner = document.getElementById("refresh-error");
+            if (!banner) { banner = document.createElement("div"); banner.id = "refresh-error"; banner.className = "error-banner"; main.prepend(banner); }
+            banner.textContent = "Refresh failed; showing previous observations. " + error.message;
+        } else { main.innerHTML = header(title) + unavailable(error); }
     } finally { if (serial === state.request) state.loading = false; }
 }
 
@@ -357,9 +383,21 @@ document.addEventListener("click", async event => {
     if (button.dataset.editRule) { document.getElementById("detail-title").textContent = "Alert rule"; document.getElementById("detail-content").innerHTML = views.alertRuleForm(JSON.parse(button.dataset.editRule), state.experiments); document.getElementById("details-dialog").showModal(); return; }
     if (button.dataset.deleteRule) { try { await request("/api/alerts/rules/" + encodeURIComponent(button.dataset.deleteRule), {method: "DELETE", headers: {"X-Dashboard-Request": "1"}}); await loadPage(); } catch (error) { toast(error.message); } return; }
     if (button.dataset.inspect) {
-        const record = JSON.parse(button.dataset.inspect); const pre = document.createElement("pre"); pre.textContent = JSON.stringify(record, null, 2);
+        let record = JSON.parse(button.dataset.inspect); const pre = document.createElement("pre"); pre.textContent = JSON.stringify(record, null, 2);
         document.getElementById("detail-title").textContent = record.name || record.event_type || record.operation_type || "Recorded details";
-        document.getElementById("detail-content").replaceChildren(pre); document.getElementById("details-dialog").showModal(); return;
+        document.getElementById("detail-content").replaceChildren(pre);
+        const dialog = document.getElementById("details-dialog"); dialog.showModal();
+        dialog.dataset.recordKey = recordKey(record); dialog.dataset.selection = location.search;
+        const selected = state.experiment, selection = location.search;
+        if (record.detail_ref) {
+            try {
+                const response = await systemRead(experimentPath("detail", selected), undefined, {ref: JSON.stringify(record.detail_ref)});
+                if (!dialog.open || !pre.isConnected || selection !== location.search || state.experiment !== selected) return;
+                checkContext(response, selected);
+                pre.textContent = JSON.stringify({...record, ...response.record}, null, 2);
+            } catch (error) { if (pre.isConnected && dialog.open) pre.textContent = "Details unavailable: " + error.message; }
+        }
+        return;
     }
     if (button.dataset.mode) { state.mode = button.dataset.mode; state.cursor = null; state.rows = []; state.filters = []; await loadPage(); return; }
     if (button.dataset.settings) {
@@ -368,8 +406,13 @@ document.addEventListener("click", async event => {
         const container = document.getElementById("settings-content");
         if (state.settingsMode === "parameters") {
             container.innerHTML = '<div class="loading">Loading attempt parameters…</div>';
-            try { const result = await systemRead(experimentPath("parameters"), undefined, state.run ? {run_id: state.run} : {}); checkContext(result, state.experiment); container.innerHTML = table(rows(result), [["Attempt", row => inspectButton(row.attempt_id, row)], ["Module", row => e(row.module_name)], ["Cycle", row => numeric(row.cycle_number)]], [], "attempts"); }
-            catch (error) { container.innerHTML = unavailable(error); }
+            const selected = state.experiment, selection = location.search;
+            try {
+                const result = await systemRead(experimentPath("parameters"), undefined, {compact: "1", ...(state.run ? {run_id: state.run} : {})});
+                checkContext(result, selected);
+                if (!container.isConnected || selection !== location.search || state.settingsMode !== "parameters") return;
+                state.parameterRows = rows(result); updateContent(container, views.parameters(state.parameterRows));
+            } catch (error) { if (container.isConnected && state.settingsMode === "parameters") updateContent(container, unavailable(error)); }
         } else container.innerHTML = `<pre>${e(state.settingsMode === "yaml" ? state.data.template_yaml || "Original YAML unavailable." : JSON.stringify(state.data.template || {}, null, 2))}</pre>`;
         return;
     }
@@ -476,7 +519,7 @@ main.addEventListener("change", event => {
         const index = Number(field.dataset.metricModule ?? field.dataset.metricName);
         if (field.dataset.metricModule !== undefined) state.metrics[index] = {module: field.value}; else state.metrics[index].metric = field.value;
         const target = document.getElementById("metric-cards");
-        if (target) target.innerHTML = views.metricCards(state.rows, state.metrics);
+        if (target) target.innerHTML = views.metricCards(state.data?.measurements || state.rows, state.metrics, null, state.data?.metric_summaries, state.data?.measurement_cycles);
         else document.getElementById("forecast-body").innerHTML = views.forecast(state.data, state.metrics);
     }
     if (field.id === "template-revision") {

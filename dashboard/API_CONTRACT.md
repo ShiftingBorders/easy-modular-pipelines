@@ -13,6 +13,10 @@ The actual upstream routes are `GET state`, `GET resources`,
 Historical screen routes below belong to dashboard. They require a configured,
 locally readable `project_root` for the same runtime.
 
+The original journal is authoritative. Dashboard opens it read-only and makes
+no changes to its contents, schema, indexes, or event format. All cache writes
+target a separate, rebuildable database in the dashboard state directory.
+
 `system_api_url` is a configured base URL. Requests are server-to-server HTTP calls
 from dashboard to that base URL. The browser communicates with dashboard's own
 origin. Credentials and redirects are not accepted in the base URL; redirects
@@ -41,6 +45,11 @@ the system's message and expose its diagnostic code as `error.upstream_code`.
 - History accepts `limit` (1–1000), opaque `cursor`, `view=effective|raw` and
   `run_id`. Template accepts `revision`; compute accepts `since`/`until`.
   Table search and module/metric selectors filter loaded records in the browser.
+- `compact=1` requests screen rows with `detail_ref` instead of embedded large
+  source payloads. `GET experiments/{experiment_id}/detail?ref=<JSON detail_ref>`
+  loads original records and validates journal identity and generation. Treat
+  the reference as opaque. Details return `{...metadata, record: {...}}`;
+  derived records include `source_events`, preserving complete original JSON.
 - 404/501 means unavailable resource/capability. Other errors do not become empty
   success responses. HTTP time and decoded response size are bounded locally.
 
@@ -92,6 +101,13 @@ Paths are relative to `/api/system/experiments/{experiment_id}/` on dashboard.
 | `snapshots` | items: snapshot_id, status, template_revision_id, cycle_number, created_at, validation and recovery details. |
 | `artifacts` | items: path/name, purpose, module_name, attempt_id, size_bytes and recorded metadata. |
 | `forecast` | completed_cycles, total_cycles, eta_seconds, paused, sample_mean_seconds, sample_cycles, eta_low_seconds, eta_high_seconds, measurements, component_durations. |
+
+Forecast and measurement responses also include `metric_summaries`,
+`measurement_cycles`, and the latest 20 `measurements` per module/version/metric.
+These summaries cover the entire comparable run/revision cohort, irrespective
+of pagination or RAM-window size. The paginated `items` endpoint remains
+available for every historical cycle value. Mixed units, duplicate cycles,
+unknown values, overlap, and estimation flags remain explicit.
 
 `measurements` contains **one aggregate per completed DAG cycle / module version /
 metric / revision**, prepared using logger resource semantics. It is not an array
@@ -163,10 +179,15 @@ duration_seconds and optional experiment_id. An unavailable source cannot
 resolve an active incident. GPU/VRAM are unfinished and unused in sampling,
 views and rules; their prototype code is retained.
 
-Journal caches default to 100000 events / 64 MiB per experiment. Publication
-cursors expire after five minutes or journal generation replacement and return
-409 `history_changed`. At most 16 publications share the history byte budget.
-Oversized histories/records return 413. The live resource cache retains at most
+The active source-payload window defaults to 1000 events in RAM per experiment,
+ordered by source cursor. Pausing or stopping does not age it out. Exact older
+projections and source locators persist on disk; checkpoints and dirty projection
+scopes are committed together. A projection working set defaults to at most
+100000 compact records / 64 MiB; these are not total-history limits.
+Publication cursors expire after five minutes, a cache publication change, or
+journal replacement and return 409 `history_changed`. At most 16 small history
+publication descriptors are retained. Oversized working sets/records return 413.
+The live resource cache retains at most
 50000 samples and reports gaps; upstream retention defaults to 15 minutes.
 
 Writes require same-origin validation and `X-Dashboard-Request: 1`; JSON bodies

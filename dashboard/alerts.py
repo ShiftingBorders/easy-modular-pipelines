@@ -363,11 +363,18 @@ class AlertMonitor:
                                 or dataset["experiment_id"] == rule["experiment_id"]
                             ]
                             value = sum(
-                                0
-                                <= time.time() - (instant(error["occurred_at"]) or 0)
-                                <= rule["window_seconds"]
-                                for _, model in selected
-                                for error in model["errors"]
+                                self.views.error_count(
+                                    dataset, rule["window_seconds"], time.time()
+                                )
+                                if dataset.get("cache")
+                                else sum(
+                                    0
+                                    <= time.time()
+                                    - (instant(error["occurred_at"]) or 0)
+                                    <= rule["window_seconds"]
+                                    for error in model["errors"]
+                                )
+                                for dataset, model in selected
                             )
                             known = (
                                 model_error is None

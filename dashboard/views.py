@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -12,7 +14,13 @@ from uuid import UUID, uuid4
 
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import LocalJournals, read_object
-from dashboard.projections import experiment_views, instant, percentile
+from dashboard.projections import (
+    cached_experiment_views,
+    cached_metrics,
+    experiment_views,
+    instant,
+    percentile,
+)
 
 
 def validate_samples(samples: object) -> list[dict]:
@@ -96,7 +104,23 @@ class DashboardViews:
         self._source_tasks = [
             asyncio.create_task(self._poll_source("state")),
             asyncio.create_task(self._poll_source("resources")),
+            asyncio.create_task(self._poll_journals()),
         ]
+
+    async def _poll_journals(self) -> None:
+        """Advance disk projections even when no browser page is open."""
+        while True:
+            try:
+                registry = await asyncio.to_thread(self.journals.registry)
+            except (OSError, TypeError, ValueError):
+                registry = {}
+            for identifier in registry:
+                try:
+                    await asyncio.to_thread(self.journals.load, identifier)
+                except SystemAPIError:
+                    # Screen reads report source failures; other journals still advance.
+                    continue
+            await asyncio.sleep(1)
 
     def _write_commands(self) -> None:
         path = self.settings["state_directory"] / "commands.json"
@@ -185,7 +209,20 @@ class DashboardViews:
             previous = self._models.get(key)
             if dataset.get("refreshed") and previous and previous[0] == version:
                 return previous[1], previous[2]
-            model = await asyncio.to_thread(experiment_views, dataset, live, run_id)
+            project = (
+                cached_experiment_views if dataset.get("cache") else experiment_views
+            )
+            if dataset.get("cache"):
+                model = await asyncio.to_thread(
+                    self.journals.read_view, dataset, project, live, run_id
+                )
+            else:
+                model = await asyncio.to_thread(project, dataset, live, run_id)
+            self._models = {
+                cached_key: value
+                for cached_key, value in self._models.items()
+                if cached_key[0] != identifier or value[1] is dataset
+            }
             self._models.pop(key, None)
             while len(self._models) >= 8:
                 self._models.pop(next(iter(self._models)))
@@ -288,6 +325,8 @@ class DashboardViews:
                 "error": source_error or compute.get("error"),
                 "observed_at": datetime.now(UTC).isoformat(),
             }
+        if resource == "modules" and all(dataset.get("cache") for dataset, _ in models):
+            return {"items": await asyncio.to_thread(self._cached_modules, models)}
         if resource == "modules":
             modules = {}
             for dataset, model in models:
@@ -394,6 +433,121 @@ class DashboardViews:
             return {"items": services, "fresh": live.get("fresh", False)}
         raise SystemAPIError("not_found", "Unknown dashboard view.", 404)
 
+    def _cached_modules(self, models: list[tuple[dict, dict]]) -> list[dict]:
+        groups = {}
+        module_fields = "json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.module_hash')"
+        for dataset, model in models:
+            cache = dataset["cache"]
+            for name, version, digest in cache.query(
+                "SELECT DISTINCT "
+                + module_fields
+                + " FROM records WHERE kind='parameters'"
+            ):
+                if not name:
+                    continue
+                key = (name, version, digest)
+                group = groups.setdefault(
+                    key,
+                    {
+                        "module_id": "/".join(str(part or "") for part in key),
+                        "name": name,
+                        "version": version,
+                        "module_hash": digest,
+                        "runs": 0,
+                        "error_count": 0,
+                        "restarts": 0,
+                        "recent_attempts": [],
+                        "complete": True,
+                        "experiments": set(),
+                        "caches": [],
+                    },
+                )
+                selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ?"
+                counts = cache.query(
+                    "SELECT COUNT(*) FROM records WHERE "
+                    + selection
+                    + " AND json_extract(payload,'$.started_at') IS NOT NULL",
+                    key,
+                )[0][0]
+                restarts = cache.query(
+                    "SELECT COALESCE(SUM(MAX(0,n-1)),0) FROM (SELECT COUNT(*) AS n FROM records WHERE "
+                    + selection
+                    + " AND json_extract(payload,'$.started_at') IS NOT NULL GROUP BY run_id, cycle, json_extract(payload,'$.stage_id'))",
+                    key,
+                )[0][0]
+                errors = cache.query(
+                    "SELECT COUNT(*) FROM records AS error WHERE error.kind='errors' AND EXISTS (SELECT 1 FROM records WHERE "
+                    + selection
+                    + " AND json_extract(payload,'$.attempt_id')=json_extract(error.payload,'$.attempt_id'))",
+                    key,
+                )[0][0]
+                recent = cache.query(
+                    "SELECT payload FROM records WHERE "
+                    + selection
+                    + " ORDER BY json_extract(payload,'$.recorded_at') DESC LIMIT 100",
+                    key,
+                )
+                group["runs"] += counts
+                group["restarts"] += restarts
+                group["error_count"] += errors
+                group["complete"] = group["complete"] and dataset["complete"]
+                group["experiments"].add(model["summary"]["name"])
+                group["caches"].append(cache)
+                group["recent_attempts"] = sorted(
+                    [
+                        *group["recent_attempts"],
+                        *(json.loads(row[0]) for row in recent),
+                    ],
+                    key=lambda row: row.get("recorded_at", ""),
+                    reverse=True,
+                )[:100]
+        for key, group in groups.items():
+            selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ? AND json_extract(payload,'$.duration_seconds') IS NOT NULL"
+            caches = group.pop("caches")
+            count = sum(
+                cache.query("SELECT COUNT(*) FROM records WHERE " + selection, key)[0][
+                    0
+                ]
+                for cache in caches
+            )
+            ranks = {
+                "p50_seconds": max(0, math.ceil(count * 0.5) - 1),
+                "p95_seconds": max(0, math.ceil(count * 0.95) - 1),
+            }
+            group.update(p50_seconds=None, p95_seconds=None)
+            streams = [
+                cache.iter_query(
+                    "SELECT json_extract(payload,'$.duration_seconds') FROM records WHERE "
+                    + selection
+                    + " ORDER BY json_extract(payload,'$.duration_seconds')",
+                    key,
+                )
+                for cache in caches
+            ]
+            try:
+                for index, (duration,) in enumerate(heapq.merge(*streams)):
+                    for field, rank in ranks.items():
+                        if index == rank:
+                            group[field] = duration
+                    if index >= ranks["p95_seconds"]:
+                        break
+            finally:
+                for stream in streams:
+                    stream.close()
+            group["experiment_name"] = ", ".join(sorted(group.pop("experiments")))
+        return list(groups.values())
+
+    def error_count(self, dataset: dict, seconds: float, now: float) -> int:
+        cache = dataset.get("cache")
+        if cache is None:
+            return 0
+        since = datetime.fromtimestamp(now - seconds, UTC).isoformat()
+        until = datetime.fromtimestamp(now, UTC).isoformat()
+        return cache.query(
+            "SELECT COUNT(*) FROM facts WHERE kind='error.recorded' AND effective=1 AND occurred_at>=? AND occurred_at<=?",
+            (since, until),
+        )[0][0]
+
     async def experiment(self, identifier: str, view: str, params: dict) -> dict:
         dataset, model = await self._model(identifier, params.get("run_id"))
         live = await self.state()
@@ -411,6 +565,16 @@ class DashboardViews:
         }
         if view == "summary":
             return {**metadata, **model["summary"]}
+        if dataset.get("cache"):
+            return await asyncio.to_thread(
+                self.journals.read_view,
+                dataset,
+                self._cached_view,
+                model,
+                metadata,
+                view,
+                params,
+            )
         if view == "template":
             template = model["template"]
             revision = params.get("revision")
@@ -458,6 +622,223 @@ class DashboardViews:
                 ),
             ]
         return self.page(items, metadata, view, params)
+
+    def _cached_view(
+        self, dataset: dict, model: dict, metadata: dict, view: str, params: dict
+    ) -> dict:
+        if view == "detail":
+            return {
+                **metadata,
+                "record": self.journals.detail(
+                    dataset, json.loads(params.get("ref", "{}"))
+                ),
+            }
+        if view == "template":
+            return {**metadata, **self._cached_template(dataset, model, params)}
+        if view == "forecast":
+            forecast = dict(model["forecast"])
+            forecast.update(cached_metrics(dataset, model))
+            return {**metadata, **forecast}
+        if view == "snapshots":
+            return self.page(
+                self.journals.snapshots(dataset["experiment_id"]),
+                metadata,
+                view,
+                params,
+            )
+        if view == "runs":
+            page = self._cached_page(dataset, metadata, view, params)
+            for row in page["items"]:
+                if row["run_id"] == model["summary"]["run_id"]:
+                    row["status"] = model["summary"]["status"]
+            return {**metadata, **page}
+        if view not in {
+            "events",
+            "operations",
+            "errors",
+            "parameters",
+            "measurements",
+            "commands",
+            "artifacts",
+        }:
+            raise SystemAPIError("not_found", "Unknown experiment view.", 404)
+        if view == "measurements":
+            params = {
+                **params,
+                "run_id": model["summary"]["run_id"],
+                "revision": model["summary"]["template_revision_id"],
+            }
+        page = self._cached_page(dataset, metadata, view, params)
+        if view == "measurements":
+            page.update(cached_metrics(dataset, model))
+        if view == "operations":
+            run_ids = list(
+                dict.fromkeys(
+                    row.get("run_id") for row in page["items"] if row.get("run_id")
+                )
+            )
+            runs = self._cached_runs(dataset, model, run_ids)
+            parents = [
+                {
+                    **run,
+                    "operation_id": "run:" + run["run_id"],
+                    "parent_operation_id": None,
+                    "name": "Logical run " + run["run_id"],
+                }
+                for run in runs
+            ]
+            page["items"] = parents + page["items"]
+            page["total"] += len(parents)
+        if view == "commands":
+            page["items"] += [
+                row
+                for row in self._commands
+                if row.get("experiment_id") == dataset["experiment_id"]
+            ]
+        return {**metadata, **page}
+
+    def _cached_page(
+        self, dataset: dict, metadata: dict, view: str, params: dict
+    ) -> dict:
+        now = time.monotonic()
+        self._publications = {
+            key: value
+            for key, value in self._publications.items()
+            if now - value["at"] < 300
+        }
+        scope = (
+            dataset["experiment_id"],
+            params.get("run_id"),
+            view,
+            params.get("view", "effective"),
+            params.get("revision"),
+        )
+        cursor = params.get("cursor")
+        if cursor:
+            try:
+                cursor = json.loads(cursor)
+                token = cursor["publication"]
+                publication = self._publications[token]
+                if (
+                    publication["scope"] != scope
+                    or publication["version"] != dataset["version"]
+                    or publication["metadata"]["journal"] != dataset["identity"]
+                ):
+                    raise ValueError("History publication changed.")
+                internal = {**publication["cursor"], "position": cursor["position"]}
+                params = {**params, "cursor": json.dumps(internal)}
+            except (ValueError, TypeError, KeyError) as error:
+                raise SystemAPIError(
+                    "history_changed", "Refresh this history publication.", 409
+                ) from error
+        else:
+            token = uuid4().hex
+            while len(self._publications) >= 16:
+                self._publications.pop(next(iter(self._publications)))
+            publication = {
+                "at": now,
+                "scope": scope,
+                "metadata": metadata,
+                "version": dataset["version"],
+                "bytes": 0,
+            }
+        page = self.journals.page(dataset, view, params)
+        if page["next_cursor"]:
+            publication["cursor"] = page["next_cursor"]
+            self._publications[token] = publication
+            page["next_cursor"] = {
+                "publication": token,
+                "position": page["next_cursor"]["position"],
+            }
+        return page
+
+    def _cached_runs(
+        self, dataset: dict, model: dict, run_ids: list[str]
+    ) -> list[dict]:
+        if not run_ids:
+            return []
+        placeholders = ",".join("?" for _ in run_ids)
+        rows = dataset["cache"].query(
+            f"SELECT run_id, started_at, revision FROM runs WHERE run_id IN ({placeholders}) ORDER BY first_cursor",
+            tuple(run_ids),
+        )
+        summary = model["summary"]
+        runs = []
+        for run, started, revision in rows:
+            finishes = dataset["cache"].query(
+                "SELECT MAX(json_extract(payload,'$.finished_at')), MIN(json_extract(payload,'$.finished_at') IS NOT NULL) FROM records WHERE kind='operations' AND run_id=?",
+                (run,),
+            )[0]
+            finished = (
+                finishes[0]
+                if finishes[1]
+                and summary["status"] in {"completed", "stopped", "failed"}
+                else None
+            )
+            runs.append(
+                {
+                    "run_id": run,
+                    "started_at": started,
+                    "finished_at": finished,
+                    "template_revision_id": revision,
+                    "status": summary["status"]
+                    if run == summary["run_id"]
+                    else "recorded",
+                }
+            )
+        return runs
+
+    def _cached_template(self, dataset: dict, model: dict, params: dict) -> dict:
+        selection = " AND run_id=?" if params.get("run_id") else ""
+        args = (params["run_id"],) if params.get("run_id") else ()
+        rows = dataset["cache"].query(
+            "SELECT event_id, compact FROM facts WHERE kind='template.applied' AND effective=1"
+            + selection
+            + " ORDER BY cursor",
+            args,
+        )
+        revisions = [
+            json.loads(encoded)["data"]
+            | {"event_id": event_id, "occurred_at": json.loads(encoded)["occurred_at"]}
+            for event_id, encoded in rows
+        ]
+        selected = next(
+            (
+                row
+                for row in reversed(revisions)
+                if not params.get("revision")
+                or row["template_revision_id"] == params["revision"]
+            ),
+            None,
+        )
+        if params.get("revision") and selected is None:
+            raise SystemAPIError(
+                "not_found", "The requested template revision is unavailable.", 404
+            )
+        template = dict(model["template"])
+        if selected:
+            source = dataset["cache"].events([selected["event_id"]])[0]
+            template.update(
+                template=source["data"]["template"],
+                template_yaml=source["data"]["template_yaml"],
+            )
+        else:
+            template.update(
+                template=dataset["state"].get("template", {}),
+                template_yaml=dataset["state"].get("template_yaml", ""),
+            )
+        definitions = {
+            stage["stage_id"]: stage for stage in template["template"].get("stages", [])
+        }
+        template["nodes"] = [
+            {**node, **definitions.get(node["stage_id"], {})}
+            for node in template["nodes"]
+        ]
+        template["revisions"] = [
+            {key: row[key] for key in ("template_revision_id", "occurred_at")}
+            for row in revisions
+        ]
+        return template
 
     def page(self, items: list[dict], metadata: dict, view: str, params: dict) -> dict:
         limit = int(params.get("limit", 200))
@@ -896,3 +1277,4 @@ class DashboardViews:
             await asyncio.gather(self._command_task, return_exceptions=True)
         async with self._command_lock:
             pass
+        await asyncio.to_thread(self.journals.close)

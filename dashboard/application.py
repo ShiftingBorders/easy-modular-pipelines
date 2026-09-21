@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from dashboard.alerts import AlertMonitor
@@ -29,6 +29,8 @@ def query_parameters(request: Request) -> dict:
         "since",
         "until",
         "revision",
+        "ref",
+        "compact",
     }
     if request.query_params.keys() - allowed:
         raise HTTPException(400, "Unknown query parameter.")
@@ -165,7 +167,9 @@ def create_app(
                     )
         return result
 
-    async def read_experiment(experiment_id: str, view: str, request: Request) -> dict:
+    async def read_experiment(
+        experiment_id: str, view: str, request: Request
+    ) -> Response:
         allowed_views = {
             "summary",
             "runs",
@@ -179,6 +183,7 @@ def create_app(
             "snapshots",
             "artifacts",
             "forecast",
+            "detail",
         }
         if view not in allowed_views:
             raise HTTPException(404, "Unknown experiment view.")
@@ -188,7 +193,17 @@ def create_app(
             or any(char in experiment_id for char in "/\\\x00")
         ):
             raise HTTPException(400, "Invalid experiment identifier.")
-        return await views.experiment(experiment_id, view, query_parameters(request))
+        result = await views.experiment(experiment_id, view, query_parameters(request))
+        encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
+        if len(encoded) > settings["max_response_bytes"]:
+            raise SystemAPIError(
+                "response_too_large",
+                "This response exceeds max_response_bytes; request a smaller page.",
+                413,
+            )
+        return Response(content=encoded, media_type="application/json")
 
     async def download_artifact(experiment_id: str, artifact_id: str) -> FileResponse:
         import asyncio

@@ -4,6 +4,12 @@ The dashboard is a separate FastAPI application. It reads local experiment
 history through the logger's read-only API and uses the system HTTP API for
 live state, resources, and commands. Starting it does not start the runtime.
 
+**The journal is the source of truth.** Dashboard history reads never change
+journal contents, event formats, tables, indexes, or schema versions. The
+dashboard writes its derived cache only in its own state directory. Removing
+that cache loses no journal information. Explicit runtime control commands
+remain separate: the runtime may record their effects in its journal.
+
 ## Start the dashboard
 
 From the framework checkout:
@@ -47,8 +53,9 @@ Base settings are in [dashboard/settings.json](../dashboard/settings.json).
 | `refresh_seconds` | Initial UI refresh: 5 seconds. |
 | `project_root` | Optional local project directory, initially `null`. |
 | `system_api_token_env` | Optional environment-variable name containing the system bearer token. |
-| `history_max_events` | Optional event limit per experiment: 100000. |
-| `history_max_bytes` | Optional loaded-history/page budget: 64 MiB. |
+| `history_window_events` | Complete source events retained in RAM per experiment: 1000. |
+| `history_max_events` | Maximum compact input records for one affected execution scope: 100000; not a limit on total history. |
+| `history_max_bytes` | Active payload window and per-scope projection working budget: 64 MiB. |
 
 Relative JSON paths resolve from the configuration file; absolute paths remain
 absolute. CLI paths are resolved at the CLI boundary.
@@ -80,6 +87,12 @@ remote access requires a suitably protected external proxy.
 
 Search and filters operate on loaded records. History has pagination and JSON
 inspection. The interface is English and uses local fonts.
+
+Background refresh updates existing rows and blocks by stable identifiers.
+Unchanged DOM nodes, focus, input values, expanded details, and scroll containers
+are retained. A pending refresh keeps the preceding observations visible;
+failures identify them as previous observations. Opening a record's details
+loads its original source events when they are outside the active RAM window.
 
 ## Commands and restoration
 
@@ -134,10 +147,38 @@ to 50000 received resource samples; selecting a longer time range cannot
 reconstruct missing observations. Experiment journals remain the persistent
 source for cycle statistics.
 
-Published history pages expire after five minutes or a journal generation
-change. Up to 16 publications share the history byte budget. Expired pages
-require restarting pagination. Increase the configured history limits when
-needed; oversized history is reported explicitly.
+The active RAM window consists of the latest `history_window_events` source
+events in cursor order, including ignored or superseded observations. It is
+independent of wall-clock time. Paused and completed experiments retain their
+window; historical detail reads do not displace recent events.
+
+Older history is represented by indexed, exact projection inputs and screen
+records in `state_directory/readers/*.cache.sqlite`. Source event IDs and
+cursors remain attached to derived records. Large original parameters,
+templates, tracebacks and command observations are fetched through the logger
+using the journal's existing indexes. Full old payloads are not retained in RAM.
+
+Initial cache construction reads history in bounded batches and reports
+`complete: false` until ingestion and projections catch up. Background refresh
+continues without an open browser. Later refreshes consume only new journal
+changes and recalculate affected execution scopes; unchanged completed scopes
+are reused. Restarting resumes persisted checkpoints and reconstructs only the
+active payload window. Live runtime observations do not rebuild history.
+
+The cache is disposable. Stop dashboard before removing its `*.cache.sqlite`
+files; the next start reconstructs them from the original journals. Cache
+version or journal generation/file identity changes invalidate derived data.
+An unavailable or corrupt source is reported, never repaired by dashboard.
+SQLite read-only access may use WAL coordination files; it does not write
+journal events or alter the journal schema.
+
+Indexed history pages retain only small publication descriptors in RAM. They
+expire after five minutes, a cache publication change, or journal replacement;
+at most 16 descriptors are retained. Expired pages require restarting pagination.
+Limits apply to the active window, one projection working set, and responses,
+not to the total historical event count. Oversized working sets are reported
+explicitly without truncating events. The disk cache grows with the amount of
+exact historical information retained.
 
 See the [dashboard API contract](../dashboard/API_CONTRACT.md),
 [system API](http_api.md), and [test requirements](testing.md#dashboard).

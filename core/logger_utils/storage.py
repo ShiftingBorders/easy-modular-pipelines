@@ -602,6 +602,67 @@ class SQLiteEventStore:
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read events")
 
+    def read_event_batch(
+        self,
+        event_ids: list[str] | None = None,
+        *,
+        limit: int = 1000,
+        before: int | None = None,
+    ) -> JsonObject:
+        """Indexed raw lookup or descending cursor page; never modify the journal."""
+        self._check_process()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer from 1 to 1000.")
+        if before is not None and (type(before) is not int or before < 1):
+            raise ValueError("before must be a positive event cursor.")
+        if event_ids is not None:
+            if type(event_ids) is not list or len(event_ids) > limit:
+                raise ValueError("event_ids must be a list no larger than limit.")
+            for identifier in event_ids:
+                require_text(identifier, "event_id")
+            if len(set(event_ids)) != len(event_ids) or before is not None:
+                raise ValueError("Use distinct event IDs or cursor pagination.")
+        with self._lock:
+            self._require_open()
+            try:
+                self._check_health()
+                self._connection.execute("BEGIN")
+                boundary = self._read_boundary(self._connection)
+                columns = "cursor, event_id, producer_instance_id, sequence_number, event_json"
+                if event_ids is not None:
+                    placeholders = ",".join("?" for _ in event_ids)
+                    rows = self._connection.execute(
+                        f"SELECT {columns} FROM events WHERE event_id IN ({placeholders}) ORDER BY cursor",
+                        event_ids,
+                    )
+                else:
+                    rows = self._connection.execute(
+                        f"SELECT {columns} FROM events WHERE cursor < ? ORDER BY cursor DESC LIMIT ?",
+                        (
+                            before if before is not None else boundary["cursor"] + 1,
+                            limit,
+                        ),
+                    )
+                entries, size = [], 0
+                try:
+                    for row in rows:
+                        length = len(row[4].encode("utf-8"))
+                        if size + length > _PAGE_BYTES and entries:
+                            break
+                        entries.append(self._decode_row(row))
+                        size += length
+                finally:
+                    rows.close()
+                self._connection.execute("COMMIT")
+                self._check_health()
+                return {"events": entries, "boundary": boundary}
+            except LoggingStateError as error:
+                self._rollback(self._connection, error)
+                raise
+            except BaseException as error:  # noqa: BLE001 - Roll back interrupted read transactions.
+                self._rollback(self._connection, error)
+                raise self._storage_failure(error, "read event batch")
+
     def _read_boundary(self, connection: sqlite3.Connection) -> JsonObject:
         info = self._read_journal_info(connection)
         cursor = connection.execute(

@@ -775,6 +775,25 @@ class OperationLogger:
                     self._failed = True
                 raise
 
+    def read_event_batch(
+        self,
+        event_ids: list[str] | None = None,
+        *,
+        limit: int = 1000,
+        before: int | None = None,
+    ) -> JsonObject:
+        """Read selected original events or a tail page using existing indexes."""
+        self._check_process()
+        with self._lock:
+            if self._store is None:
+                raise LoggingStateError("Logger is closed.")
+            try:
+                return self._store.read_event_batch(event_ids, limit=limit, before=before)
+            except BaseException as error:
+                if getattr(error, "journal_failed", False):
+                    self._failed = True
+                raise
+
     def read_changes(
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
     ) -> JsonObject:

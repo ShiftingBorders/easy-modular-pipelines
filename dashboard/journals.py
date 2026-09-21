@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
+from core.historycache import HistoryCacheLimit, JournalHistoryCache
 from core.logger_utils.events import LoggingError
 from core.runner_utils.runtimeio import read_json
 from dashboard.api_client import SystemAPIError
+from dashboard.projections import compact_event, project_scope
 
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
@@ -21,6 +22,7 @@ def read_object(path: Path, maximum: int = 33554432) -> dict:
 
 class LocalJournals:
     def __init__(self, settings: dict) -> None:
+        self.settings = settings
         self.project = settings["project_root"]
         self.state_directory = settings["state_directory"] / "readers"
         self.max_events = settings["history_max_events"]
@@ -28,7 +30,9 @@ class LocalJournals:
         self.interval = min(settings["refresh_seconds"], 5)
         self._cache: dict[str, dict] = {}
         self._snapshots: dict[str, dict] = {}
+        self.window_events = settings.get("history_window_events", 1000)
         self._lock = threading.RLock()
+        self._experiment_locks: dict[str, threading.RLock] = {}
 
     def registry(self) -> dict[str, Path]:
         if self.project is None:
@@ -56,234 +60,373 @@ class LocalJournals:
 
     def load(self, identifier: str, *, force: bool = False) -> dict:
         with self._lock:
+            lock = self._experiment_locks.setdefault(identifier, threading.RLock())
+        with lock:
             directory = self.registry().get(identifier)
             if directory is None:
                 raise SystemAPIError("not_found", "Unknown experiment.", 404)
-            previous = self._cache.get(identifier)
             try:
-                if (
-                    previous
-                    and not force
-                    and time.monotonic() - previous["refreshed"] < self.interval
-                ):
-                    identity = read_object(
-                        self.safe_path(directory, "runner/journal.json")
-                    )
-                    status = self.safe_path(directory, "journals/events.sqlite").stat()
-                    if (
-                        identity == previous["identity"]
-                        and (status.st_dev, status.st_ino) == previous["file_key"]
-                    ):
-                        return self._snapshots[identifier]
-                state_path = self.safe_path(directory, "runner/state.json")
-                state = read_object(state_path) if state_path.exists() else {}
-                if state and state.get("experiment_id") != identifier:
-                    raise ValueError(
-                        "Experiment metadata belongs to a different experiment."
-                    )
-                identity_path = self.safe_path(directory, "runner/journal.json")
-                if not identity_path.exists():
-                    return {
-                        "experiment_id": identifier,
-                        "directory": directory,
-                        "state": state,
-                        "entries": [],
-                        "identity": None,
-                        "complete": False,
-                        "error": "No journal has been published for this experiment.",
-                        "refreshed": time.monotonic(),
-                    }
-                identity = read_object(identity_path)
-                database = self.safe_path(directory, "journals/events.sqlite")
-                file_status = database.stat()
-                file_key = (file_status.st_dev, file_status.st_ino)
-                if (
-                    not previous
-                    or previous["identity"] != identity
-                    or previous["file_key"] != file_key
-                ):
-                    previous = {
-                        "experiment_id": identifier,
-                        "directory": directory,
-                        "identity": identity,
-                        "file_key": file_key,
-                        "raw": {},
-                        "metadata": {},
-                        "event_checkpoint": None,
-                        "change_checkpoint": None,
-                        "bytes": 0,
-                        "entries": [],
-                        "complete": False,
-                    }
-                logging = state.get("template", {}).get("logging")
-                if not isinstance(logging, dict):
-                    raise TypeError("Recorded logging settings are missing.")
-                configuration = {
-                    "logging": {
-                        **logging,
-                        "db_path": str(database),
-                        "open_mode": "existing",
-                        "expected_journal": identity,
-                    },
-                    "operation_context": {
-                        "source": "dashboard",
-                        "experiment_id": identifier,
-                    },
-                }
-                self.state_directory.mkdir(parents=True, exist_ok=True)
-                config_path = self.state_directory / (
-                    hashlib.sha256(identifier.encode()).hexdigest() + ".json"
-                )
-                encoded = json.dumps(configuration, ensure_ascii=False)
-                if (
-                    not config_path.exists()
-                    or config_path.read_text(encoding="utf-8") != encoded
-                ):
-                    temporary = config_path.with_suffix(".tmp")
-                    temporary.write_text(encoded, encoding="utf-8")
-                    temporary.replace(config_path)
-                deadline = time.monotonic() + 5
-                complete = True
-                with OperationLogger(config_path, read_only=True) as reader:
-                    while True:
-                        page = reader.read_events(
-                            previous["event_checkpoint"], limit=500
-                        )
-                        for entry in page["events"]:
-                            event = entry["event"]
-                            if event["context"].get("experiment_id") not in (
-                                None,
-                                identifier,
-                            ):
-                                raise ValueError(
-                                    "The journal contains another experiment's events."
-                                )
-                            size = len(
-                                json.dumps(event, ensure_ascii=False).encode("utf-8")
-                            )
-                            if event["event_id"] not in previous["raw"]:
-                                if (
-                                    len(previous["raw"]) >= self.max_events
-                                    or previous["bytes"] + size > self.max_bytes
-                                ):
-                                    raise SystemAPIError(
-                                        "history_limit",
-                                        "Journal exceeds dashboard history limits; increase history_max_events/history_max_bytes.",
-                                        413,
-                                    )
-                                previous["bytes"] += size
-                            previous["raw"][event["event_id"]] = entry
-                        previous["event_checkpoint"] = page["checkpoint"]
-                        previous["boundary"] = page["boundary"]
-                        if not page["has_more"]:
-                            break
-                        if time.monotonic() > deadline:
-                            complete = False
-                            break
-                    while time.monotonic() <= deadline:
-                        page = reader.read_changes(
-                            previous["change_checkpoint"], limit=500
-                        )
-                        for change in page["changes"]:
-                            entry = change["entry"]
-                            event = entry["event"]
-                            for record in (change["observed_event"], event):
-                                existing = previous["raw"].get(record["event_id"])
-                                if existing:
-                                    existing["event"] = record
-                            for related in change["related_event_ids"]:
-                                previous["metadata"][related] = {
-                                    "effective": related
-                                    == change["effective_event_id"],
-                                    "effective_author": change["effective_author"],
-                                    "provisional": change["provisional"],
-                                }
-                            for superseded in event.get("data", {}).get(
-                                "supersedes", []
-                            ):
-                                old = previous["raw"].get(superseded["event_id"])
-                                if old:
-                                    old["event"]["data"]["ignored"] = superseded[
-                                        "ignored"
-                                    ]
-                        previous["change_checkpoint"] = page["checkpoint"]
-                        if not page["has_more"]:
-                            break
-                    else:
-                        complete = False
-                    current_identity = reader.get_journal_info()
-                    if any(
-                        current_identity[key] != identity[key]
-                        for key in ("journal_id", "generation")
-                    ):
-                        raise ValueError(
-                            "Journal identity changed while it was being read."
-                        )
-                # The runner may replace its journal metadata immediately after the last read.
-                if read_object(identity_path) != identity:
-                    raise ValueError(
-                        "Journal generation changed; retry with the new history."
-                    )
-                entries = []
-                for event_id, entry in sorted(
-                    previous["raw"].items(), key=lambda pair: pair[1]["cursor"]
-                ):
-                    event = entry["event"]
-                    metadata = previous["metadata"].get(event_id, {})
-                    entries.append(
-                        {
-                            **event,
-                            "cursor": entry["cursor"],
-                            **metadata,
-                            "ignored": event["data"].get("ignored"),
-                            "confirmation": "provisional"
-                            if metadata.get("provisional")
-                            else "confirmed"
-                            if metadata.get("effective_author")
-                            else "recorded",
-                        }
-                    )
-                if previous.get("change_checkpoint") is None or (
-                    previous["event_checkpoint"]["cursor"] < page["boundary"]["cursor"]
-                ):
-                    complete = False
-                previous.update(
-                    state=state,
-                    entries=entries,
-                    complete=complete,
-                    error=None,
-                    refreshed=time.monotonic(),
-                )
-                self._cache[identifier] = previous
-                # Publish one detached snapshot per refresh. Dashboard consumers
-                # treat it as read-only; mutable ingestion buffers never escape.
-                self._snapshots[identifier] = copy.deepcopy(
-                    {
-                        key: previous[key]
-                        for key in (
-                            "experiment_id",
-                            "directory",
-                            "identity",
-                            "state",
-                            "entries",
-                            "complete",
-                            "error",
-                            "refreshed",
-                        )
-                    }
-                )
-                return self._snapshots[identifier]
+                return self._load_directory(identifier, directory, force)
             except SystemAPIError:
-                self._cache.pop(identifier, None)
-                self._snapshots.pop(identifier, None)
                 raise
-            except (OSError, TypeError, ValueError, LoggingError) as error:
-                self._cache.pop(identifier, None)
-                self._snapshots.pop(identifier, None)
+            except HistoryCacheLimit as error:
+                raise SystemAPIError("history_limit", str(error), 413) from error
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                LoggingError,
+                sqlite3.Error,
+            ) as error:
                 raise SystemAPIError(
                     "journal_unavailable",
                     f"Cannot read experiment {identifier}: {error}",
                 ) from error
+
+    def _load_directory(self, identifier: str, directory: Path, force: bool) -> dict:
+        identity_path = self.safe_path(directory, "runner/journal.json")
+        state_path = self.safe_path(directory, "runner/state.json")
+        state = read_object(state_path) if state_path.exists() else {}
+        if state and state.get("experiment_id") != identifier:
+            raise ValueError("Experiment metadata belongs to a different experiment.")
+        if not identity_path.exists():
+            return {
+                "experiment_id": identifier,
+                "directory": directory,
+                "state": state,
+                "entries": [],
+                "identity": None,
+                "complete": False,
+                "error": "No journal has been published for this experiment.",
+                "refreshed": time.monotonic(),
+            }
+        identity = read_object(identity_path)
+        database = self.safe_path(directory, "journals/events.sqlite")
+        status = database.stat()
+        file_key = (status.st_dev, status.st_ino)
+        previous = self._cache.get(identifier)
+        if previous and (
+            previous["identity"] != identity or previous["file_key"] != file_key
+        ):
+            previous["reader"].close()
+            previous = None
+        if (
+            previous
+            and not force
+            and time.monotonic() - previous["checked"] < self.interval
+        ):
+            return self._snapshots[identifier]
+        config_path = self._reader_configuration(identifier, state, database, identity)
+        if previous is None:
+            reader = JournalHistoryCache(
+                config_path.with_suffix(".cache.sqlite"),
+                config_path,
+                identity,
+                file_key,
+                identifier,
+                self.window_events,
+                self.max_bytes,
+                self.max_events,
+            )
+            previous = {"reader": reader, "identity": identity, "file_key": file_key}
+        reader = previous["reader"]
+        publication = reader.refresh(state, compact_event, project_scope)
+        if read_object(identity_path) != identity:
+            raise ValueError("Journal generation changed while reading history.")
+        old = self._snapshots.get(identifier)
+        previous["checked"] = time.monotonic()
+        self._cache[identifier] = previous
+        if (
+            old
+            and old.get("version") == publication["version"]
+            and old["state"] == state
+            and old["identity"] == identity
+            and old["complete"] == publication["complete"]
+        ):
+            return old
+        # Only the configured RAM window is detached for legacy reader consumers.
+        entries = reader.events(list(reader.window))
+        snapshot = {
+            "experiment_id": identifier,
+            "directory": directory,
+            "identity": identity,
+            "state": state,
+            "entries": entries,
+            "cache": reader,
+            **publication,
+            "error": None,
+            "refreshed": time.monotonic(),
+        }
+        self._snapshots[identifier] = snapshot
+        return snapshot
+
+    def _reader_configuration(
+        self, identifier: str, state: dict, database: Path, identity: dict
+    ) -> Path:
+        logging = state.get("template", {}).get("logging")
+        if not isinstance(logging, dict):
+            raise TypeError("Recorded logging settings are missing.")
+        configuration = {
+            "logging": {
+                **logging,
+                "db_path": str(database),
+                "open_mode": "existing",
+                "expected_journal": identity,
+            },
+            "operation_context": {"source": "dashboard", "experiment_id": identifier},
+        }
+        self.state_directory.mkdir(parents=True, exist_ok=True)
+        path = self.state_directory / (
+            hashlib.sha256(identifier.encode()).hexdigest() + ".json"
+        )
+        encoded = json.dumps(configuration, ensure_ascii=False)
+        if not path.exists() or path.read_text(encoding="utf-8") != encoded:
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(encoded, encoding="utf-8")
+            temporary.replace(path)
+        return path
+
+    def close(self) -> None:
+        with self._lock:
+            for identifier, entry in self._cache.items():
+                with self._experiment_locks[identifier]:
+                    entry["reader"].close()
+            self._cache.clear()
+            self._snapshots.clear()
+
+    def read_view(self, dataset: dict, reader, *args) -> dict:
+        """Keep a multi-query response within its advertised cache publication."""
+        identifier = dataset["experiment_id"]
+        with self._experiment_locks[identifier]:
+            current = self._snapshots.get(identifier)
+            version = dataset["cache"].query(
+                "SELECT value FROM metadata WHERE key='version'"
+            )
+            if (
+                current is not dataset
+                or not version
+                or int(version[0][0]) != dataset["version"]
+            ):
+                raise SystemAPIError(
+                    "history_changed",
+                    "The history publication changed; refresh the selection.",
+                    409,
+                )
+            try:
+                return reader(dataset, *args)
+            except HistoryCacheLimit as error:
+                raise SystemAPIError("history_limit", str(error), 413) from error
+            except (LoggingError, OSError, sqlite3.Error) as error:
+                raise SystemAPIError("journal_unavailable", str(error)) from error
+
+    def page(self, dataset: dict, view: str, params: dict) -> dict:
+        cache = dataset["cache"]
+        run_id = params.get("run_id")
+        scope = [
+            dataset["identity"],
+            run_id,
+            view,
+            params.get("view", "effective"),
+            params.get("revision"),
+        ]
+        position = [0, "", ""]
+        if params.get("cursor"):
+            try:
+                cursor = json.loads(params["cursor"])
+                if (
+                    cursor["scope"] != scope
+                    or cursor["version"] != dataset["version"]
+                    or time.time() - cursor["at"] > 300
+                ):
+                    raise ValueError("History changed.")
+                position = cursor["position"]
+                if len(position) != 3 or type(position[0]) is not int:
+                    raise ValueError("Invalid cursor position.")
+            except (KeyError, TypeError, ValueError) as error:
+                raise SystemAPIError(
+                    "history_changed", "Refresh this history publication.", 409
+                ) from error
+        limit = int(params.get("limit", 200))
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000.")
+        if view == "events":
+            return self._event_page(dataset, params, scope, position, limit)
+        if view == "runs":
+            return self._run_page(dataset, params, scope, position, limit)
+        selection, args = "kind=?", [view]
+        if run_id:
+            selection += " AND run_id=?"
+            args.append(run_id)
+        if view == "measurements" and params.get("revision"):
+            selection += " AND revision=?"
+            args.append(params["revision"])
+        total = cache.query(
+            "SELECT COUNT(*) FROM records WHERE " + selection, tuple(args)
+        )[0][0]
+        rows = cache.query(
+            "SELECT position, record_key, scope, payload FROM records WHERE "
+            + selection
+            + " AND (position, record_key, scope)>(?, ?, ?) ORDER BY position, record_key, scope LIMIT ?",
+            (*args, *position, limit + 1),
+        )
+        selected, size, last = [], 1024, position
+        for number, key, partition, encoded in rows[:limit]:
+            item = json.loads(encoded)
+            item["detail_ref"] = (
+                {**item["detail_ref"], **dataset["identity"]}
+                if item.get("detail_ref")
+                else None
+            )
+            if params.get("compact") != "1" and item["detail_ref"]:
+                item = self.detail(dataset, item["detail_ref"], item)
+            size += len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+            if size > self.settings["max_response_bytes"]:
+                if not selected:
+                    raise SystemAPIError(
+                        "response_too_large",
+                        "This record exceeds the history byte budget.",
+                        413,
+                    )
+                break
+            selected.append(item)
+            last = [number, key, partition]
+        more = len(rows) > len(selected)
+        return {
+            "items": selected,
+            "total": total,
+            "next_cursor": {
+                "scope": scope,
+                "version": dataset["version"],
+                "position": last,
+                "at": time.time(),
+            }
+            if more
+            else None,
+        }
+
+    def _run_page(
+        self, dataset: dict, params: dict, scope: list, position: list, limit: int
+    ) -> dict:
+        where, args = (
+            ("run_id=?", [params["run_id"]]) if params.get("run_id") else ("1=1", [])
+        )
+        cache = dataset["cache"]
+        rows = cache.query(
+            "SELECT first_cursor, run_id, started_at, revision FROM runs WHERE "
+            + where
+            + " AND (first_cursor,run_id)>(?,?) ORDER BY first_cursor,run_id LIMIT ?",
+            (*args, position[0], position[1], limit + 1),
+        )
+        items = [
+            {
+                "run_id": run,
+                "started_at": started,
+                "template_revision_id": revision,
+                "status": "recorded",
+            }
+            for _, run, started, revision in rows[:limit]
+        ]
+        total = cache.query("SELECT COUNT(*) FROM runs WHERE " + where, tuple(args))[0][
+            0
+        ]
+        return {
+            "items": items,
+            "total": total,
+            "next_cursor": {
+                "scope": scope,
+                "version": dataset["version"],
+                "at": time.time(),
+                "position": [rows[len(items) - 1][0], rows[len(items) - 1][1], ""],
+            }
+            if len(rows) > len(items)
+            else None,
+        }
+
+    def _event_page(
+        self, dataset: dict, params: dict, scope: list, position: list, limit: int
+    ) -> dict:
+        cache = dataset["cache"]
+        selection, args = "1=1", []
+        if params.get("run_id"):
+            selection += " AND run_id=?"
+            args.append(params["run_id"])
+        if params.get("view", "effective") == "effective":
+            selection += " AND effective=1"
+        total = cache.query(
+            "SELECT COUNT(*) FROM facts WHERE " + selection, tuple(args)
+        )[0][0]
+        records = cache.query(
+            "SELECT cursor, event_id, compact FROM facts WHERE "
+            + selection
+            + " AND cursor>? ORDER BY cursor LIMIT ?",
+            (*args, position[0], limit + 1),
+        )
+        items, size = [], 1024
+        if params.get("compact") == "1":
+            events = iter(json.loads(row[2]) for row in records[:limit])
+        else:
+            events = cache.iter_events([row[1] for row in records[:limit]])
+        try:
+            for event in events:
+                event["detail_ref"] = {
+                    "event_ids": [event["event_id"]],
+                    "kind": "events",
+                    **dataset["identity"],
+                }
+                size += len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
+                if size > self.settings["max_response_bytes"]:
+                    if not items:
+                        raise SystemAPIError(
+                            "response_too_large",
+                            "This event exceeds the response byte budget.",
+                            413,
+                        )
+                    break
+                items.append(event)
+        finally:
+            events.close()
+        return {
+            "items": items,
+            "total": total,
+            "next_cursor": {
+                "scope": scope,
+                "version": dataset["version"],
+                "position": [records[len(items) - 1][0], "", ""],
+                "at": time.time(),
+            }
+            if len(records) > len(items)
+            else None,
+        }
+
+    def detail(self, dataset: dict, reference: dict, row: dict | None = None) -> dict:
+        if any(
+            reference.get(key) != dataset["identity"][key]
+            for key in ("journal_id", "generation")
+        ):
+            raise SystemAPIError(
+                "history_changed", "This detail belongs to replaced history.", 409
+            )
+        identifiers = reference.get("event_ids")
+        if (
+            not isinstance(identifiers, list)
+            or not 1 <= len(identifiers) <= 1000
+            or any(not isinstance(key, str) for key in identifiers)
+        ):
+            raise ValueError("Detail requires a bounded list of event IDs.")
+        events = dataset["cache"].events(identifiers)
+        kind = reference.get("kind")
+        if kind == "events":
+            return events[0]
+        result = dict(row or {})
+        result["source_events"] = events
+        if kind == "commands":
+            result["observations"] = events
+        for event in events:
+            if event["event_type"] == "attempt.parameters":
+                result.update(event["data"])
+            if event["event_type"] == "error.recorded":
+                result.update(event["data"])
+        return result
 
     def safe_path(self, directory: Path, relative: str) -> Path:
         path = (directory / relative).resolve()
@@ -338,14 +481,16 @@ class LocalJournals:
 
     def artifact(self, identifier: str, artifact_id: str) -> Path:
         dataset = self.load(identifier, force=True)
-        event = next(
-            (
-                entry
-                for entry in dataset["entries"]
-                if entry["event_type"] == "artifact.recorded"
-                and entry["data"].get("artifact_id") == artifact_id
-            ),
-            None,
+        records = dataset["cache"].query(
+            "SELECT payload FROM records WHERE kind='artifacts' AND record_key=? LIMIT 1",
+            (artifact_id,),
+        )
+        event = (
+            dataset["cache"].events(
+                json.loads(records[0][0])["detail_ref"]["event_ids"]
+            )[0]
+            if records
+            else None
         )
         if event is None:
             raise SystemAPIError(
@@ -354,15 +499,11 @@ class LocalJournals:
         directory = dataset["directory"]
         if event["event_type"] == "artifact.recorded":
             context = event["context"]
-            parameters = next(
-                (
-                    entry["context"]
-                    for entry in dataset["entries"]
-                    if entry["event_type"] == "attempt.parameters"
-                    and entry["context"].get("attempt_id") == context.get("attempt_id")
-                ),
-                {},
+            rows = dataset["cache"].query(
+                "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
+                (context.get("attempt_id"),),
             )
+            parameters = json.loads(rows[0][0])["context"] if rows else {}
             context = {**parameters, **context}
             if any(
                 context.get(key) is None
