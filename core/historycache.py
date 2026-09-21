@@ -110,7 +110,7 @@ class JournalHistoryCache:
                 raise LoggingStateError("Journal changed before cache initialization.")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             expected = {
-                "version": 2,
+                "version": 3,
                 "identity": self.identity,
                 "file_key": list(self.file_key),
                 "experiment_id": self.experiment_id,
@@ -376,6 +376,11 @@ class JournalHistoryCache:
             "SELECT scope FROM facts WHERE event_id=?", (event["event_id"],)
         ).fetchone()
         scope_context = self._scope_context(db, context)
+        if event["event_type"] == "template.applied":
+            scope_context = {
+                **scope_context,
+                "template_revision_id": event["data"]["template_revision_id"],
+            }
         scope = json.dumps(
             [
                 scope_context.get("run_id"),
@@ -383,6 +388,20 @@ class JournalHistoryCache:
                 scope_context.get("cycle_number"),
             ]
         )
+        if event["event_type"] in {
+            "control.intent",
+            "control.result",
+            "control.reconciled",
+            "command.result",
+        }:
+            request_id = (
+                context.get("request_id")
+                or event["data"].get("request_id")
+                or event["data"].get("intent_event_id")
+                or event["event_id"]
+            )
+            # Runner and service observations can have different cycle contexts.
+            scope = json.dumps({"request_id": request_id})
         reduced = compact(event)
         reduced.update(cursor=item["cursor"], **metadata)
         db.execute(
@@ -659,7 +678,9 @@ class JournalHistoryCache:
     def _project_scope(
         self, db: sqlite3.Connection, scope: str, state: dict, project: Callable
     ) -> None:
-        run_id, revision, cycle = json.loads(scope)
+        scope_key = json.loads(scope)
+        command_scope = isinstance(scope_key, dict)
+        run_id, revision, cycle = (None, None, None) if command_scope else scope_key
         size, count = db.execute(
             "SELECT COALESCE(SUM(length(CAST(compact AS BLOB))),0), COUNT(*) FROM facts WHERE scope=? AND effective=1",
             (scope,),
@@ -675,10 +696,12 @@ class JournalHistoryCache:
                 (scope,),
             )
         ]
-        template = db.execute(
-            "SELECT compact FROM facts WHERE kind='template.applied' AND run_id IS ? AND revision IS ? AND effective=1 ORDER BY cursor DESC LIMIT 1",
-            (run_id, revision),
-        ).fetchone()
+        template = None
+        if not command_scope:
+            template = db.execute(
+                "SELECT compact FROM facts WHERE kind='template.applied' AND run_id IS ? AND revision IS ? AND effective=1 ORDER BY cursor DESC LIMIT 1",
+                (run_id, revision),
+            ).fetchone()
         if template:
             event = json.loads(template[0])
             if all(item["event_id"] != event["event_id"] for item in entries):
@@ -716,13 +739,15 @@ class JournalHistoryCache:
                         kind,
                         key,
                         scope,
-                        run_id,
+                        item.get("run_id") if command_scope else run_id,
                         revision,
                         cycle,
                         position,
                         json.dumps(item, ensure_ascii=False),
                     ),
                 )
+        if command_scope:
+            return
         db.execute(
             "INSERT OR REPLACE INTO scopes VALUES (?, ?, ?, ?, ?)",
             (
