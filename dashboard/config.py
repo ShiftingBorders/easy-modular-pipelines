@@ -44,6 +44,7 @@ def load_settings(path: Path, overrides: dict | None = None) -> dict:
             "history_max_events",
             "history_max_bytes",
             "history_window_events",
+            "cache_workers",
         }
     ):
         raise ValueError(
@@ -110,6 +111,7 @@ def load_settings(path: Path, overrides: dict | None = None) -> dict:
     else:
         settings["project_root"] = None
     for name, default, maximum in (
+        ("cache_workers", 2, 32),
         ("history_window_events", 1000, 100000),
         ("history_max_events", 100000, 10000000),
         ("history_max_bytes", 67108864, 2147483648),

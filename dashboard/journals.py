@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
-from core.historycache import HistoryCacheLimit, JournalHistoryCache
+from core.historycache import HistoryCacheBusy, HistoryCacheLimit, JournalHistoryCache
 from core.logger_utils.events import LoggingError
 from core.runner_utils.runtimeio import read_json
 from dashboard.api_client import SystemAPIError
@@ -18,6 +20,43 @@ from dashboard.projections import compact_event, project_scope
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
     return read_json(path, max_bytes=maximum)
+
+
+def cache_experiment(
+    settings: dict, identifier: str, target: dict | None = None
+) -> dict:
+    """One bounded process job; only plain progress data crosses the process boundary."""
+    journals = LocalJournals(settings)
+    try:
+        dataset = journals.load(identifier, force=True, window=False, target=target)
+        if "cache" not in dataset:
+            raise SystemAPIError(
+                "journal_unavailable",
+                dataset.get("error") or "The journal is unavailable.",
+            )
+        cached, boundary = dataset["cached_through"], dataset["target_boundary"]
+        complete = (
+            cached["cursor"] >= boundary["cursor"]
+            and cached["change_cursor"] >= boundary["change_cursor"]
+        )
+        return {
+            "experiment_id": identifier,
+            "pid": os.getpid(),
+            "complete": complete,
+            **{key: dataset[key] for key in ("cached_through", "target_boundary")},
+        }
+    except Exception as error:  # noqa: BLE001 - A failed experiment must not break the worker pool.
+        return {
+            "experiment_id": identifier,
+            "pid": os.getpid(),
+            "complete": False,
+            "error": {
+                "code": getattr(error, "code", "cache_failed"),
+                "message": str(error),
+            },
+        }
+    finally:
+        journals.close()
 
 
 class LocalJournals:
@@ -58,7 +97,15 @@ class LocalJournals:
             result[identifier] = directory
         return result
 
-    def load(self, identifier: str, *, force: bool = False) -> dict:
+    def load(
+        self,
+        identifier: str,
+        *,
+        force: bool = False,
+        build: bool = True,
+        window: bool = True,
+        target: dict | None = None,
+    ) -> dict:
         with self._lock:
             lock = self._experiment_locks.setdefault(identifier, threading.RLock())
         with lock:
@@ -66,9 +113,13 @@ class LocalJournals:
             if directory is None:
                 raise SystemAPIError("not_found", "Unknown experiment.", 404)
             try:
-                return self._load_directory(identifier, directory, force)
+                return self._load_directory(
+                    identifier, directory, force, build, window, target
+                )
             except SystemAPIError:
                 raise
+            except HistoryCacheBusy as error:
+                raise SystemAPIError("cache_busy", str(error)) from error
             except HistoryCacheLimit as error:
                 raise SystemAPIError("history_limit", str(error), 413) from error
             except (
@@ -83,7 +134,15 @@ class LocalJournals:
                     f"Cannot read experiment {identifier}: {error}",
                 ) from error
 
-    def _load_directory(self, identifier: str, directory: Path, force: bool) -> dict:
+    def _load_directory(
+        self,
+        identifier: str,
+        directory: Path,
+        force: bool,
+        build: bool,
+        window: bool,
+        target: dict | None,
+    ) -> dict:
         identity_path = self.safe_path(directory, "runner/journal.json")
         state_path = self.safe_path(directory, "runner/state.json")
         state = read_object(state_path) if state_path.exists() else {}
@@ -112,6 +171,7 @@ class LocalJournals:
             previous = None
         if (
             previous
+            and build
             and not force
             and time.monotonic() - previous["checked"] < self.interval
         ):
@@ -130,7 +190,12 @@ class LocalJournals:
             )
             previous = {"reader": reader, "identity": identity, "file_key": file_key}
         reader = previous["reader"]
-        publication = reader.refresh(state, compact_event, project_scope)
+        if build:
+            publication = reader.refresh(
+                state, compact_event, project_scope, target=target, window=window
+            )
+        else:
+            publication = reader.observe(target)
         if read_object(identity_path) != identity:
             raise ValueError("Journal generation changed while reading history.")
         old = self._snapshots.get(identifier)
@@ -142,21 +207,25 @@ class LocalJournals:
             and old["state"] == state
             and old["identity"] == identity
             and old["complete"] == publication["complete"]
+            and old.get("boundary") == publication.get("boundary")
+            and old.get("target_boundary") == publication.get("target_boundary")
         ):
             return old
         # Only the configured RAM window is detached for legacy reader consumers.
-        entries = reader.events(list(reader.window))
+        available = publication.get("cache_available", True)
+        entries = reader.events(list(reader.window)) if window and available else []
         snapshot = {
             "experiment_id": identifier,
             "directory": directory,
             "identity": identity,
             "state": state,
             "entries": entries,
-            "cache": reader,
             **publication,
-            "error": None,
+            "error": None if available else "The history cache is being initialized.",
             "refreshed": time.monotonic(),
         }
+        if available:
+            snapshot["cache"] = reader
         self._snapshots[identifier] = snapshot
         return snapshot
 
@@ -181,7 +250,7 @@ class LocalJournals:
         )
         encoded = json.dumps(configuration, ensure_ascii=False)
         if not path.exists() or path.read_text(encoding="utf-8") != encoded:
-            temporary = path.with_suffix(".tmp")
+            temporary = path.with_name(f".{path.stem}-{uuid4().hex}.tmp")
             temporary.write_text(encoded, encoding="utf-8")
             temporary.replace(path)
         return path
@@ -213,7 +282,9 @@ class LocalJournals:
                     409,
                 )
             try:
-                return reader(dataset, *args)
+                return dataset["cache"].read_view(
+                    dataset["version"], reader, dataset, *args
+                )
             except HistoryCacheLimit as error:
                 raise SystemAPIError("history_limit", str(error), 413) from error
             except (LoggingError, OSError, sqlite3.Error) as error:

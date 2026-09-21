@@ -22,10 +22,46 @@ uv run --locked python -B -m dashboard --project-root examples/weather_dag --sys
 Open <http://127.0.0.1:8765/>. The first command opens an unconfigured dashboard;
 the second connects it to the weather example. Run one command at a time.
 
-Use one worker. CLI options are `--config`, `--host`, `--port`,
-`--project-root`, and `--system-api-url`.
+Use one HTTP worker. Cache construction runs in separate processes;
+`--cache-workers` controls their number (default: 2, range: 1–32).
+CLI options are `--config`, `--host`, `--port`, `--project-root`,
+`--system-api-url`, `--mode`, and `--cache-workers`.
 Library callers use `dashboard.application.create_app(config_path)` with an
 absolute configuration path.
+
+## Precache and exit
+
+Use the same configuration and project root as the dashboard that will consume
+the cache:
+
+```text
+uv run --locked python -B -m dashboard --config path/to/dashboard.json --mode precache --cache-workers 4
+```
+
+`--project-root path/to/runtime` can override the configured project. This mode
+starts only cache processes: no HTTP server, ICMP monitor, runtime polling or
+command submission. Experiments from the initial registry snapshot are
+distributed among independent spawned processes, with one writer per
+experiment. Each bounded task releases its resources and commits its progress.
+The ordinary `serve` mode uses the same process-based cache workers while the
+HTTP process maintains the active RAM windows and reads projections.
+On-demand reads can await up to two already bounded worker batches to reach
+their captured read boundary. Larger rebuilds return explicitly incomplete
+history and continue in the background.
+
+For each experiment, precache captures a target journal boundary at its first
+successful task. It exits once every target's projections are complete, even
+if the runtime keeps appending events. Later appends are handled on the next
+precache or dashboard refresh. JSON-line progress reports contain experiment
+IDs, worker PIDs, target boundaries and completed cache boundaries. Exit code
+0 means all targets completed, 1 means an experiment failed, and 2 indicates a
+configuration or pool-level failure. Interruption exits with 130; committed
+progress remains available for resumption.
+
+Use the same `state_directory` to reuse precached data. Multiple writers for one
+cache are prevented by an OS file lock in that directory, independent of the
+source journal. SQLite read snapshots allow the dashboard to read a consistent
+publication while a worker advances it.
 
 ## Connect data sources
 
@@ -54,6 +90,7 @@ Base settings are in [dashboard/settings.json](../dashboard/settings.json).
 | `project_root` | Optional local project directory, initially `null`. |
 | `system_api_token_env` | Optional environment-variable name containing the system bearer token. |
 | `history_window_events` | Complete source events retained in RAM per experiment: 1000. |
+| `cache_workers` | Independent cache processes: 2 (1–32). |
 | `history_max_events` | Maximum compact input records for one affected execution scope: 100000; not a limit on total history. |
 | `history_max_bytes` | Active payload window and per-scope projection working budget: 64 MiB. |
 
@@ -164,6 +201,17 @@ continues without an open browser. Later refreshes consume only new journal
 changes and recalculate affected execution scopes; unchanged completed scopes
 are reused. Restarting resumes persisted checkpoints and reconstructs only the
 active payload window. Live runtime observations do not rebuild history.
+
+The cache always persists `cached_through`: journal ID, generation, event
+`cursor` and `change_cursor` through the last completed projection boundary.
+`ingested_through` and the change checkpoint separately track committed input
+whose projections may still be pending. Workers resume from these positions;
+they never jump their checkpoint forward to the RAM window.
+
+If uncached events precede the start of the latest N-event window, dashboard
+reports the gap and prioritizes caching the missing prefix. History stays
+explicitly incomplete until caught up. Late confirmations are also consumed
+through the change cursor even when the event cursor has not advanced.
 
 The cache is disposable. Stop dashboard before removing its `*.cache.sqlite`
 files; the next start reconstructs them from the original journals. Cache

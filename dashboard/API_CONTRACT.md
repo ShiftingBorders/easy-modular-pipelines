@@ -39,6 +39,14 @@ the system's message and expose its diagnostic code as `error.upstream_code`.
 - Journal responses carry `journal: {journal_id, generation}`, `observed_at`,
   `items` and optional `next_cursor`. Cursor is opaque to the dashboard and must
   identify the publication/generation where required by the logger.
+- Journal responses additionally expose `cached_through` (journal identity,
+  completed event/change cursors), `window_start_cursor`, and `cache_gap`.
+  A gap is `{after: cached_event_cursor, before: window_start_cursor}` with
+  exclusive bounds, or `null`. `target_boundary` identifies the finite source
+  boundary requested by this read. Pending work through that boundary, or a
+  gap before the RAM window, keeps `complete: false`; a source boundary is never
+  substituted for a completed cache boundary. Appends after the requested
+  boundary are handled by subsequent refreshes.
 - A cursor from replaced history is rejected. Dashboard resets its selection
   on a changed generation. Effective publications must reconcile confirmations,
   ignored evidence and changed outcomes without duplicating records.
@@ -178,6 +186,12 @@ An error rule uses kind=errors, threshold (positive event count), window_seconds
 duration_seconds and optional experiment_id. An unavailable source cannot
 resolve an active incident. GPU/VRAM are unfinished and unused in sampling,
 views and rules; their prototype code is retained.
+
+Cache construction runs in independent spawned processes (`cache_workers`,
+default 2), with one writer per experiment and consistent SQLite read snapshots
+for HTTP queries. `--mode precache` builds captured per-experiment boundaries
+and exits without starting HTTP or other monitoring services. Both modes reuse
+the same persistent checkpoints and fill any gap before the RAM window.
 
 The active source-payload window defaults to 1000 events in RAM per experiment,
 ordered by source cursor. Pausing or stopping does not age it out. Exact older

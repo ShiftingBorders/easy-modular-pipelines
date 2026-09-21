@@ -6,14 +6,17 @@ import asyncio
 import heapq
 import json
 import math
+import multiprocessing
 import os
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from dashboard.api_client import SystemAPIClient, SystemAPIError
-from dashboard.journals import LocalJournals, read_object
+from dashboard.journals import LocalJournals, cache_experiment, read_object
 from dashboard.projections import (
     cached_experiment_views,
     cached_metrics,
@@ -82,6 +85,11 @@ class DashboardViews:
         self._model_lock = asyncio.Lock()
         self._models: dict[tuple[str, str | None], tuple[tuple, dict, dict]] = {}
         self._resource_observed_at = 0.0
+        self._cache_pool: ProcessPoolExecutor | None = None
+        self._cache_jobs: dict = {}
+        self._cache_targets: dict[str, dict] = {}
+        self._cache_errors: dict[str, dict] = {}
+        self._cache_checked: dict[str, float] = {}
 
     async def open(self) -> None:
         path = self.settings["state_directory"] / "commands.json"
@@ -100,6 +108,10 @@ class DashboardViews:
                 if record["status"] == "submitting":
                     record.update(status="unknown", polling=True)
             self._commands = document["items"][-1000:]
+        self._cache_pool = ProcessPoolExecutor(
+            max_workers=self.settings.get("cache_workers", 2),
+            mp_context=multiprocessing.get_context("spawn"),
+        )
         self._command_task = asyncio.create_task(self._poll_commands())
         self._source_tasks = [
             asyncio.create_task(self._poll_source("state")),
@@ -108,19 +120,61 @@ class DashboardViews:
         ]
 
     async def _poll_journals(self) -> None:
-        """Advance disk projections even when no browser page is open."""
+        """Schedule independent process writers; HTTP reads never build projections."""
         while True:
             try:
                 registry = await asyncio.to_thread(self.journals.registry)
             except (OSError, TypeError, ValueError):
                 registry = {}
+            self._collect_cache_jobs()
+            now = time.monotonic()
             for identifier in registry:
-                try:
-                    await asyncio.to_thread(self.journals.load, identifier)
-                except SystemAPIError:
-                    # Screen reads report source failures; other journals still advance.
+                if len(self._cache_jobs) >= self.settings.get("cache_workers", 2):
+                    break
+                if (
+                    identifier in self._cache_jobs
+                    or now - self._cache_checked.get(identifier, 0)
+                    < self.journals.interval
+                ):
                     continue
-            await asyncio.sleep(1)
+                try:
+                    self._cache_jobs[identifier] = self._cache_pool.submit(
+                        cache_experiment,
+                        self.settings,
+                        identifier,
+                        self._cache_targets.get(identifier),
+                    )
+                except BrokenProcessPool:
+                    self._cache_pool.shutdown(wait=False, cancel_futures=True)
+                    self._cache_pool = ProcessPoolExecutor(
+                        max_workers=self.settings.get("cache_workers", 2),
+                        mp_context=multiprocessing.get_context("spawn"),
+                    )
+                    break
+            await asyncio.sleep(0.25)
+
+    def _collect_cache_jobs(self) -> None:
+        for identifier, future in list(self._cache_jobs.items()):
+            if not future.done():
+                continue
+            del self._cache_jobs[identifier]
+            try:
+                result = future.result()
+            except Exception as error:  # noqa: BLE001 - Surface failed worker processes through history reads.
+                result = {
+                    "error": {"code": "cache_worker_failed", "message": str(error)}
+                }
+            error = result.get("error")
+            if error:
+                self._cache_errors[identifier] = error
+                self._cache_checked[identifier] = time.monotonic()
+                self._cache_targets.pop(identifier, None)
+                continue
+            self._cache_errors.pop(identifier, None)
+            self._cache_targets[identifier] = result["target_boundary"]
+            if result["complete"]:
+                self._cache_targets.pop(identifier, None)
+                self._cache_checked[identifier] = time.monotonic()
 
     def _write_commands(self) -> None:
         path = self.settings["state_directory"] / "commands.json"
@@ -193,11 +247,45 @@ class DashboardViews:
                     }
             await asyncio.sleep(1)
 
+    async def _cache_read_boundary(self, identifier: str, dataset: dict) -> dict:
+        target = dataset.get("boundary")
+        if target is None:
+            return dataset
+        # Two bounded batches allow an older background job to finish first.
+        # Large rebuilds remain visibly incomplete instead of blocking on all history.
+        for _ in range(2):
+            future = self._cache_jobs.get(identifier)
+            if future is None:
+                future = self._cache_pool.submit(
+                    cache_experiment, self.settings, identifier, target
+                )
+                self._cache_jobs[identifier] = future
+            result = await asyncio.shield(asyncio.wrap_future(future))
+            self._collect_cache_jobs()
+            error = result.get("error")
+            if error and error["code"] != "cache_busy":
+                raise SystemAPIError(error["code"], error["message"])
+            dataset = await asyncio.to_thread(
+                self.journals.load, identifier, force=True, build=False, target=target
+            )
+            if dataset["complete"] or error:
+                return dataset
+        return dataset
+
     async def _model(
         self, identifier: str, run_id: str | None = None
     ) -> tuple[dict, dict]:
         async with self._model_lock:
-            dataset = await asyncio.to_thread(self.journals.load, identifier)
+            error = self._cache_errors.get(identifier)
+            if error and error["code"] != "cache_busy":
+                raise SystemAPIError(error["code"], error["message"])
+            dataset = await asyncio.to_thread(
+                self.journals.load, identifier, build=self._cache_pool is None
+            )
+            if dataset.get("gap"):
+                self._cache_checked.pop(identifier, None)
+            if self._cache_pool is not None and not dataset["complete"]:
+                dataset = await self._cache_read_boundary(identifier, dataset)
             live = await self.state()
             key = (identifier, run_id)
             live_version = (
@@ -562,6 +650,10 @@ class DashboardViews:
             ),
             "source": "local_journal",
             "error": dataset.get("error"),
+            "cached_through": dataset.get("cached_through"),
+            "window_start_cursor": dataset.get("window_start_cursor"),
+            "cache_gap": dataset.get("gap"),
+            "target_boundary": dataset.get("target_boundary"),
         }
         if view == "summary":
             return {**metadata, **model["summary"]}
@@ -1272,6 +1364,12 @@ class DashboardViews:
             task.cancel()
         await asyncio.gather(*self._source_tasks, return_exceptions=True)
         self._source_tasks.clear()
+        if self._cache_pool is not None:
+            await asyncio.to_thread(
+                self._cache_pool.shutdown, wait=True, cancel_futures=True
+            )
+            self._cache_pool = None
+            self._cache_jobs.clear()
         if self._command_task is not None:
             self._command_task.cancel()
             await asyncio.gather(self._command_task, return_exceptions=True)

@@ -7,6 +7,7 @@ indexes are used for hydration; no source schema or payload is changed.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -40,6 +41,10 @@ class HistoryCacheLimit(ValueError):
     """A bounded working set cannot be loaded without dropping information."""
 
 
+class HistoryCacheBusy(LoggingStateError):
+    """Another process currently owns this experiment's cache writer."""
+
+
 class JournalHistoryCache:
     def __init__(
         self,
@@ -64,6 +69,7 @@ class JournalHistoryCache:
         self._window_bytes = 0
         self._lock = threading.RLock()
         self._opened = False
+        self._reading: sqlite3.Connection | None = None
 
     def open(self) -> None:
         """Create only the disposable cache, never the source journal."""
@@ -85,6 +91,7 @@ class JournalHistoryCache:
                 "experiment_id": self.experiment_id,
             }
             with closing(sqlite3.connect(self.path)) as db, db:
+                db.execute("PRAGMA journal_mode=WAL")
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                 )
@@ -143,6 +150,11 @@ class JournalHistoryCache:
                     "INSERT OR REPLACE INTO metadata VALUES ('source', ?)",
                     (json.dumps(expected),),
                 )
+                empty = json.dumps({**self.identity, "cursor": 0, "change_cursor": 0})
+                for key in ("cached_through", "ingested_through"):
+                    db.execute(
+                        "INSERT OR IGNORE INTO metadata VALUES (?, ?)", (key, empty)
+                    )
             self._opened = True
 
     def _remember(self, entry: dict) -> None:
@@ -167,20 +179,73 @@ class JournalHistoryCache:
                 "The configured active event window exceeds history_max_bytes; increase the byte budget or reduce history_window_events."
             )
 
-    def refresh(self, state: dict, compact: Callable, project: Callable) -> dict:
+    def refresh(
+        self,
+        state: dict,
+        compact: Callable,
+        project: Callable,
+        *,
+        target: dict | None = None,
+        window: bool = True,
+    ) -> dict:
         """Advance ingestion, projections and the active window explicitly."""
         with self._lock:
-            if not self._opened:
-                self.open()
-            with (
-                OperationLogger(self.config_path, read_only=True) as source,
-                closing(sqlite3.connect(self.path)) as db,
-            ):
-                deadline = time.monotonic() + 1
-                page, changed = self._read_changes(db, source, compact, deadline)
-                projected = self._project_pending(db, state, project, deadline)
+            writer = self._acquire_writer()
+            try:
+                return self._refresh_owned(state, compact, project, target, window)
+            finally:
+                writer.close()
+
+    def _acquire_writer(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.path.with_suffix(".lock").open("a+b")
+        try:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return stream
+        except OSError as error:
+            stream.close()
+            raise HistoryCacheBusy(
+                "Another process is caching this experiment."
+            ) from error
+
+    def _refresh_owned(
+        self,
+        state: dict,
+        compact: Callable,
+        project: Callable,
+        target: dict | None,
+        window: bool,
+    ) -> dict:
+        if not self._opened:
+            self.open()
+        with (
+            OperationLogger(self.config_path, read_only=True) as source,
+            closing(sqlite3.connect(self.path)) as db,
+        ):
+            target = target or source.read_event_batch([])["boundary"]
+            if any(target[key] != self.identity[key] for key in self.identity):
+                raise LoggingStateError(
+                    "The precache target belongs to replaced history."
+                )
+            deadline = time.monotonic() + 1
+            page, changed = self._read_changes(db, source, compact, deadline, target)
+            projected = self._project_pending(db, state, project, deadline)
+            if window:
                 self._refresh_window(source, changed)
-                return self._publication(db, page, bool(changed) or projected)
+            result = self._publication(db, page, bool(changed) or projected)
+            return {**result, "target_boundary": target}
 
     def _read_changes(
         self,
@@ -188,11 +253,25 @@ class JournalHistoryCache:
         source: OperationLogger,
         compact: Callable,
         deadline: float,
+        target: dict,
     ) -> tuple[dict, list[dict]]:
         row = db.execute("SELECT value FROM metadata WHERE key='checkpoint'").fetchone()
         checkpoint = json.loads(row[0]) if row else None
         changed = []
         while True:
+            if checkpoint and checkpoint["change_cursor"] >= target["change_cursor"]:
+                cursor, count = db.execute(
+                    "SELECT COALESCE(MAX(cursor),0), COUNT(*) FROM facts"
+                ).fetchone()
+                if cursor < target["cursor"] or count < target["event_count"]:
+                    raise LoggingStateError(
+                        "Cached checkpoint skips source events; rebuild the disposable cache."
+                    )
+                return {
+                    "checkpoint": checkpoint,
+                    "boundary": target,
+                    "has_more": False,
+                }, changed
             page = source.read_changes(checkpoint, limit=100)
             with db:
                 for change in page["changes"]:
@@ -211,6 +290,20 @@ class JournalHistoryCache:
                     "INSERT OR REPLACE INTO metadata VALUES ('boundary', ?)",
                     (json.dumps(page["boundary"]),),
                 )
+                event_cursor = db.execute(
+                    "SELECT COALESCE(MAX(cursor),0) FROM facts"
+                ).fetchone()[0]
+                ingested = {
+                    **self.identity,
+                    "cursor": event_cursor,
+                    "change_cursor": checkpoint["change_cursor"],
+                }
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('ingested_through', ?)",
+                    (json.dumps(ingested),),
+                )
+            if checkpoint["change_cursor"] >= target["change_cursor"]:
+                page = {**page, "boundary": target, "has_more": False}
             changed = sorted(
                 {item["event"]["event_id"]: item for item in changed}.values(),
                 key=lambda item: item["cursor"],
@@ -399,13 +492,168 @@ class JournalHistoryCache:
                 "INSERT OR REPLACE INTO metadata VALUES ('ready', ?)",
                 (str(int(complete)),),
             )
+            if db.execute("SELECT 1 FROM dirty LIMIT 1").fetchone() is None:
+                checkpoint = db.execute(
+                    "SELECT value FROM metadata WHERE key='checkpoint'"
+                ).fetchone()
+                cursor = db.execute(
+                    "SELECT COALESCE(MAX(cursor),0) FROM facts"
+                ).fetchone()[0]
+                cached = {
+                    **self.identity,
+                    "cursor": cursor,
+                    "change_cursor": json.loads(checkpoint[0])["change_cursor"]
+                    if checkpoint
+                    else 0,
+                }
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('cached_through', ?)",
+                    (json.dumps(cached),),
+                )
+        cached_row = db.execute(
+            "SELECT value FROM metadata WHERE key='cached_through'"
+        ).fetchone()
         return {
             "complete": complete,
             "version": version,
             "observed_at": latest[0] if latest else None,
             "boundary": page["boundary"],
             "window_count": len(self.window),
+            "cached_through": json.loads(cached_row[0]),
         }
+
+    def observe(self, target: dict | None = None) -> dict:
+        """Read worker-owned projections and reconstruct the latest source window."""
+        with self._lock, OperationLogger(self.config_path, read_only=True) as source:
+            boundary = source.read_event_batch([])["boundary"]
+            if target and any(
+                target[key] != self.identity[key] for key in self.identity
+            ):
+                raise LoggingStateError(
+                    "The requested read boundary belongs to replaced history."
+                )
+            latest = next(reversed(self.window.values()), None)
+            if latest is None or latest["entry"]["cursor"] != boundary["cursor"]:
+                self.window.clear()
+                self._window_bytes = 0
+                before, remaining = boundary["cursor"] + 1, self.window_events
+                while remaining:
+                    page = source.read_event_batch(
+                        before=before, limit=min(remaining, 1000)
+                    )
+                    if not page["events"]:
+                        break
+                    for entry in page["events"]:
+                        self._remember(entry)
+                    before = min(entry["cursor"] for entry in page["events"])
+                    remaining -= len(page["events"])
+            publication = self._observed_publication(boundary, target)
+            cached = publication["cached_through"]
+            if (
+                cached["cursor"] > boundary["cursor"]
+                or cached["change_cursor"] > boundary["change_cursor"]
+            ):
+                # A worker may have ingested appends made while the RAM tail was read.
+                current = source.read_event_batch([])["boundary"]
+                if (
+                    cached["cursor"] > current["cursor"]
+                    or cached["change_cursor"] > current["change_cursor"]
+                ):
+                    raise LoggingStateError(
+                        "The cached boundary exceeds the source journal."
+                    )
+            first = next(iter(self.window.values()), None)
+            start = first["entry"]["cursor"] if first else None
+            end = publication["cached_through"]["cursor"]
+            gap = None
+            if start is not None and end < start:
+                checkpoint = {**self.identity, "cursor": end}
+                missing = source.read_events(checkpoint, limit=1)["events"]
+                if missing and missing[0]["cursor"] < start:
+                    gap = {"after": end, "before": start}
+            return {
+                **publication,
+                "boundary": boundary,
+                "window_count": len(self.window),
+                "window_start_cursor": start,
+                "gap": gap,
+                "complete": publication["complete"] and gap is None,
+                "target_boundary": target or boundary,
+            }
+
+    def _observed_publication(self, boundary: dict, target: dict | None = None) -> dict:
+        empty = {
+            "complete": False,
+            "version": 0,
+            "observed_at": None,
+            "cache_available": False,
+            "cached_through": {**self.identity, "cursor": 0, "change_cursor": 0},
+        }
+        if not self.path.exists():
+            return empty
+        try:
+            with closing(
+                sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True)
+            ) as db:
+                db.execute("BEGIN")
+                metadata = dict(db.execute("SELECT key, value FROM metadata"))
+                recorded = json.loads(metadata.get("source", "{}"))
+                if recorded.get("identity") != self.identity or recorded.get(
+                    "file_key"
+                ) != list(self.file_key):
+                    return empty
+                if "checkpoint" not in metadata:
+                    return empty
+                cached = json.loads(
+                    metadata.get("cached_through", json.dumps(empty["cached_through"]))
+                )
+                latest = db.execute(
+                    "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
+                ).fetchone()
+                requested = target or boundary
+                complete = (
+                    metadata.get("ready") == "1"
+                    and cached["cursor"] >= requested["cursor"]
+                    and cached["change_cursor"] >= requested["change_cursor"]
+                )
+                return {
+                    "complete": complete,
+                    "version": int(metadata.get("version", 0)),
+                    "observed_at": latest[0] if latest else None,
+                    "cached_through": cached,
+                    "cache_available": True,
+                }
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error):
+                raise
+            return empty
+
+    def read_view(self, version: int, reader: Callable, *args):
+        """One SQLite read snapshot while an independent worker may publish."""
+        with (
+            self._lock,
+            closing(sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True)) as db,
+        ):
+            db.execute("PRAGMA query_only=ON")
+            db.create_aggregate("exact_mean", 1, _ExactMean)
+            db.execute("BEGIN")
+            metadata = dict(
+                db.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('version','source')"
+                )
+            )
+            if (
+                int(metadata.get("version", -1)) != version
+                or json.loads(metadata["source"])["identity"] != self.identity
+            ):
+                raise LoggingStateError(
+                    "The cache publication changed; refresh the selection."
+                )
+            self._reading = db
+            try:
+                return reader(*args)
+            finally:
+                self._reading = None
 
     def _project_scope(
         self, db: sqlite3.Connection, scope: str, state: dict, project: Callable
@@ -487,6 +735,9 @@ class JournalHistoryCache:
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
         """Query the separate projection database, never the source tables."""
+        with self._lock:
+            if self._reading is not None:
+                return self._reading.execute(sql, parameters).fetchall()
         with (
             self._lock,
             closing(sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True)) as db,
