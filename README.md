@@ -5,10 +5,12 @@
   </picture>
 </h1>
 
-Easy Modular Pipelines is a Python framework for building reproducible AI
-experiments from versioned modules. Describe an experiment in YAML, run its
-stages, and inspect results, logs, resources, and artifacts through the CLI or
-dashboard.
+Easy Modular Pipelines is a Python framework for improving the repeatability
+of AI experiments and making them easier to share. Build experiments from
+versioned modules, describe their settings and execution in YAML, and inspect
+results, logs, resources, and artifacts through the CLI or dashboard.
+Reproducibility depends on both the framework's controls and the modules'
+implementation and environment; it is not an unconditional guarantee.
 
 > [!IMPORTANT]
 > This is a new project under active development. Bugs are possible, and APIs,
@@ -17,16 +19,45 @@ dashboard.
 
 ## What it does
 
-- Runs sequential stages and long-lived services with explicit inputs,
-  settings, timeouts, and retry policies.
-- Checks module versions and hashes before execution.
-- Supports pause, step, resume, stop, snapshots, recovery, and exchange archives.
-- Records operations and results in a shared journal.
-- Provides a separate dashboard for history, live state, artifacts, resource
-  monitoring, and alerts.
+- **Strict module identity and runtime integrity checks.** Templates pin each
+  module by name, version, and SHA-256 hash. The hash covers packaged file paths
+  and contents, including the module README. Different content cannot silently
+  replace a registered version. Checks compare the experiment's module files
+  with both the registered hash and the template at startup and during runtime
+  preparation of stage attempts, service launches, and service calls. A mismatch
+  fails validation. These are execution-boundary checks, not continuous file
+  monitoring. See [module storage](docs/storage.md#versions-hashes-and-failures).
+- **Execution controlled through commands.** Run sequential stages and
+  long-lived services with explicit inputs, settings, timeouts, and retry
+  policies. Pause, step, resume, stop, move the paused stage pointer, or rerun
+  a stage when the runtime state permits it.
+  See [execution commands](docs/cli.md#execute-and-control-experiments).
+- **Snapshots, rollbacks, and recovery.** Create a snapshot at an idle pause
+  and use `rollback` to restore saved experiment state and journal history.
+  Recover an interrupted experiment, or create a continuation from a valid
+  saved snapshot. Restoration of service state relies on the service's snapshot
+  implementation. See [snapshots and recovery](docs/basic_dag.md#snapshots-recovery-and-exchange).
+- **Experiment packaging, exchange, and installation.** Create a `tar.xz`
+  exchange archive from a stopped or completed experiment, share it, inspect
+  it, and install it into a new directory. Installation registers the required
+  module packages and installs the applied template and static resources for
+  another run. Exchange archives carry those inputs; snapshots serve runtime
+  restoration. See [archive commands](docs/cli.md#snapshots-and-archives).
+- **Execution history and observation.** Record operations and results in a
+  shared journal, with a separate dashboard for history, live state, artifacts,
+  resource monitoring, and alerts.
 
 Stages currently run sequentially; branching and parallel stage execution are
 not supported. See [current capabilities](docs/basic_dag.md#current-limits).
+
+## Reproducibility and responsibility
+
+The library checks module identity and manages execution, snapshots, and exchange.
+Module authors remain responsible for dependencies, deterministic behavior,
+complete restorable state, and external side effects. These controls improve
+repeatability without guaranteeing identical results in every environment.
+See [reproducibility and responsibility](docs/reproducibility.md) for the full
+boundary and examples.
 
 ## Installation
 
