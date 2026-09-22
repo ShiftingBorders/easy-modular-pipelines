@@ -6,6 +6,7 @@ indexes are used for hydration; no source schema or payload is changed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -44,6 +45,10 @@ class HistoryCacheLimit(ValueError):
 
 class HistoryCacheBusy(LoggingStateError):
     """Another process currently owns this experiment's cache writer."""
+
+
+class HistoryCacheChanged(LoggingStateError):
+    """A reader must restart against the newly published cache version."""
 
 
 def acquire_cache_writer(path: Path) -> BinaryIO:
@@ -149,6 +154,8 @@ class JournalHistoryCache:
                     CREATE INDEX IF NOT EXISTS facts_kind ON facts(kind, run_id, cursor);
                     CREATE INDEX IF NOT EXISTS facts_attempt ON facts(attempt_id, cursor);
                     CREATE INDEX IF NOT EXISTS facts_time ON facts(kind, occurred_at);
+                    CREATE INDEX IF NOT EXISTS facts_effective ON facts(effective, cursor);
+                    CREATE INDEX IF NOT EXISTS facts_run_effective ON facts(run_id, effective, cursor);
                     CREATE TABLE IF NOT EXISTS dirty (scope TEXT PRIMARY KEY);
                     CREATE TABLE IF NOT EXISTS runs (
                         run_id TEXT PRIMARY KEY, first_cursor INTEGER NOT NULL,
@@ -212,12 +219,15 @@ class JournalHistoryCache:
         *,
         target: dict | None = None,
         window: bool = True,
+        reader_context: dict | None = None,
     ) -> dict:
         """Advance ingestion, projections and the active window explicitly."""
         with self._lock:
             writer = acquire_cache_writer(self.path)
             try:
-                return self._refresh_owned(state, compact, project, target, window)
+                return self._refresh_owned(
+                    state, compact, project, target, window, reader_context
+                )
             finally:
                 writer.close()
 
@@ -228,6 +238,7 @@ class JournalHistoryCache:
         project: Callable,
         target: dict | None,
         window: bool,
+        reader_context: dict | None = None,
     ) -> dict:
         if not self._opened:
             self.open()
@@ -243,10 +254,61 @@ class JournalHistoryCache:
             deadline = time.monotonic() + 1
             page, changed = self._read_changes(db, source, compact, deadline, target)
             projected = self._project_pending(db, state, project, deadline)
+            self._publish_template(db, source)
+            if reader_context is not None:
+                encoded = json.dumps(
+                    {**reader_context, "state": state},
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                revision = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                with db:
+                    previous = db.execute(
+                        "SELECT value FROM metadata WHERE key='reader_revision'"
+                    ).fetchone()
+                    if previous is None or previous[0] != revision:
+                        db.execute(
+                            "INSERT OR REPLACE INTO metadata VALUES ('reader_context', ?)",
+                            (encoded,),
+                        )
+                        db.execute(
+                            "INSERT OR REPLACE INTO metadata VALUES ('reader_revision', ?)",
+                            (revision,),
+                        )
             if window:
                 self._refresh_window(source, changed)
             result = self._publication(db, page, bool(changed) or projected)
             return {**result, "target_boundary": target}
+
+    def _publish_template(
+        self, db: sqlite3.Connection, source: OperationLogger
+    ) -> None:
+        """Keep the current settings document ready; older revisions stay lazy."""
+        latest = db.execute(
+            "SELECT event_id FROM facts WHERE kind='template.applied' AND effective=1 ORDER BY cursor DESC LIMIT 1"
+        ).fetchone()
+        if latest is None:
+            return
+        previous = db.execute(
+            "SELECT value FROM metadata WHERE key='template_event_id'"
+        ).fetchone()
+        if previous and previous[0] == latest[0]:
+            return
+        entries = source.read_event_batch([latest[0]])["events"]
+        if not entries:
+            raise LoggingStateError(
+                "The recorded template is missing from its source journal."
+            )
+        document = {"event_id": latest[0], "data": entries[0]["event"]["data"]}
+        with db:
+            db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES ('template_document', ?)",
+                (json.dumps(document, ensure_ascii=False),),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES ('template_event_id', ?)",
+                (latest[0],),
+            )
 
     def _read_changes(
         self,
@@ -506,6 +568,10 @@ class JournalHistoryCache:
         version = (int(version[0]) if version else 0) + int(changed)
         with db:
             db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES ('publication_boundary', ?)",
+                (json.dumps(page["boundary"]),),
+            )
+            db.execute(
                 "INSERT OR REPLACE INTO metadata VALUES ('version', ?)", (str(version),)
             )
             db.execute(
@@ -553,7 +619,26 @@ class JournalHistoryCache:
                     "The requested read boundary belongs to replaced history."
                 )
             latest = next(reversed(self.window.values()), None)
-            if latest is None or latest["entry"]["cursor"] != boundary["cursor"]:
+            last_cursor = latest["entry"]["cursor"] if latest else None
+            if (
+                last_cursor is not None
+                and 0 < boundary["cursor"] - last_cursor <= self.window_events
+            ):
+                checkpoint = {**self.identity, "cursor": last_cursor}
+                while checkpoint["cursor"] < boundary["cursor"]:
+                    page = source.read_events(
+                        checkpoint, limit=min(self.window_events, 1000)
+                    )
+                    if not page["events"]:
+                        raise LoggingStateError(
+                            "The source window could not reach its captured boundary."
+                        )
+                    for entry in page["events"]:
+                        if entry["cursor"] > boundary["cursor"]:
+                            break
+                        self._remember(entry)
+                    checkpoint = page["checkpoint"]
+            elif last_cursor != boundary["cursor"]:
                 self.window.clear()
                 self._window_bytes = 0
                 before, remaining = boundary["cursor"] + 1, self.window_events
@@ -586,16 +671,20 @@ class JournalHistoryCache:
             start = first["entry"]["cursor"] if first else None
             end = publication["cached_through"]["cursor"]
             gap = None
+            predecessor = None
             if start is not None and end < start:
                 checkpoint = {**self.identity, "cursor": end}
                 missing = source.read_events(checkpoint, limit=1)["events"]
                 if missing and missing[0]["cursor"] < start:
                     gap = {"after": end, "before": start}
+                    preceding = source.read_event_batch(before=start, limit=1)["events"]
+                    predecessor = preceding[0]["cursor"] if preceding else 0
             return {
                 **publication,
                 "boundary": boundary,
                 "window_count": len(self.window),
                 "window_start_cursor": start,
+                "window_predecessor_cursor": predecessor,
                 "gap": gap,
                 "complete": publication["complete"] and gap is None,
                 "target_boundary": target or boundary,
@@ -666,7 +755,7 @@ class JournalHistoryCache:
                 int(metadata.get("version", -1)) != version
                 or json.loads(metadata["source"])["identity"] != self.identity
             ):
-                raise LoggingStateError(
+                raise HistoryCacheChanged(
                     "The cache publication changed; refresh the selection."
                 )
             self._reading = db

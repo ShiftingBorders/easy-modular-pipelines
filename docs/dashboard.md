@@ -45,9 +45,11 @@ distributed among independent spawned processes, with one writer per
 experiment. Each bounded task releases its resources and commits its progress.
 The ordinary `serve` mode uses the same process-based cache workers while the
 HTTP process maintains the active RAM windows and reads projections.
-On-demand reads can await up to two already bounded worker batches to reach
-their captured read boundary. Larger rebuilds return explicitly incomplete
-history and continue in the background.
+Ordinary page reads do not wait for cache workers. They read the latest
+published snapshot, with incomplete history shown explicitly while a rebuild
+continues. Startup can prime one bounded batch per worker when no published
+reader context exists. Successful control commands refresh their history in
+workers so subsequent navigation can observe their effects, including rollback.
 
 For each experiment, precache captures a target journal boundary at its first
 successful task. It exits once every target's projections are complete, even
@@ -130,6 +132,10 @@ Unchanged DOM nodes, focus, input values, expanded details, and scroll container
 are retained. A pending refresh keeps the preceding observations visible;
 failures identify them as previous observations. Opening a record's details
 loads its original source events when they are outside the active RAM window.
+
+Experiment tabs receive their heading and page data in one response. Switching
+tabs within the same experiment keeps its heading and navigation visible while
+the new content loads. Number/date formatters and unchanged DOM nodes are reused.
 
 Modules reads a precomputed project-wide publication in
 `state_directory/readers/modules.json`. Cache workers build it from consistent
@@ -215,6 +221,14 @@ continues without an open browser. Later refreshes consume only new journal
 changes and recalculate affected execution scopes; unchanged completed scopes
 are reused. Restarting resumes persisted checkpoints and reconstructs only the
 active payload window. Live runtime observations do not rebuild history.
+
+Ordinary history pages read only the derived database and published reader
+metadata. Original journal checks, runner-state reads and raw-window updates
+run in the background. An unchanged raw tail is reused; small appends extend
+the window incrementally. HTTP readers use separate locks, so source I/O cannot
+block switching tabs. The cache also holds the exact current template document;
+explicit inspection of older revisions still loads their original source events.
+All new metadata and indexes belong to the disposable cache, not the journal.
 
 The cache always persists `cached_through`: journal ID, generation, event
 `cursor` and `change_cursor` through the last completed projection boundary.

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from uuid import uuid4
 
 from core.historycache import (
     HistoryCacheBusy,
+    HistoryCacheChanged,
     HistoryCacheLimit,
     JournalHistoryCache,
     acquire_cache_writer,
@@ -96,6 +98,133 @@ class LocalJournals:
         self._experiment_locks: dict[str, threading.RLock] = {}
         self._module_signature: tuple | None = None
         self._module_publication: dict | None = None
+        self._read_snapshots: dict[str, tuple[tuple, dict]] = {}
+        self._windows: dict[str, tuple[dict, tuple, OrderedDict, dict]] = {}
+
+    def cached(self, identifier: str) -> dict:
+        """Load a published dataset using only the derived database's metadata."""
+        key = hashlib.sha256(identifier.encode()).hexdigest()
+        path = self.state_directory / f"{key}.cache.sqlite"
+        if not path.exists():
+            return self._pending_dataset(identifier)
+        try:
+            return self._read_cached(identifier, path, key)
+        except sqlite3.OperationalError as error:
+            if "no such table" in str(error):
+                return self._pending_dataset(identifier)
+            raise SystemAPIError("cache_unavailable", str(error)) from error
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+            raise SystemAPIError(
+                "cache_unavailable", f"Cannot read cached history: {error}"
+            ) from error
+
+    def _read_cached(self, identifier: str, path: Path, key: str) -> dict:
+        with (
+            self._lock,
+            closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db,
+        ):
+            db.execute("BEGIN")
+            metadata = dict(
+                db.execute(
+                    "SELECT key,value FROM metadata WHERE key IN ('source','version','reader_revision')"
+                )
+            )
+            if not metadata.get("reader_revision") or "version" not in metadata:
+                return self._pending_dataset(identifier)
+            source = json.loads(metadata["source"])
+            status = path.stat()
+            signature = (
+                status.st_dev,
+                status.st_ino,
+                metadata["source"],
+                metadata["version"],
+                metadata["reader_revision"],
+            )
+            previous = self._read_snapshots.get(identifier)
+            if previous and previous[0] == signature:
+                dataset = previous[1]
+            else:
+                values = dict(
+                    db.execute(
+                        "SELECT key,value FROM metadata WHERE key IN ('reader_context','ready','cached_through','boundary','publication_boundary')"
+                    )
+                )
+                context = json.loads(values["reader_context"])
+                if (
+                    context["project_root"] != str(self.project)
+                    or source["experiment_id"] != identifier
+                ):
+                    return self._pending_dataset(identifier)
+                identity, file_key = source["identity"], tuple(source["file_key"])
+                reader = JournalHistoryCache(
+                    path,
+                    self.state_directory / f"{key}.json",
+                    identity,
+                    file_key,
+                    identifier,
+                    self.window_events,
+                    self.max_bytes,
+                    self.max_events,
+                )
+                latest = db.execute(
+                    "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
+                ).fetchone()
+                boundary = json.loads(values.get("boundary", "null"))
+                dataset = {
+                    "experiment_id": identifier,
+                    "directory": Path(context["directory"]),
+                    "identity": identity,
+                    "file_key": file_key,
+                    "state": context["state"],
+                    "entries": [],
+                    "cache": reader,
+                    "version": int(metadata["version"]),
+                    "complete": values.get("ready") == "1",
+                    "cached_through": json.loads(values["cached_through"]),
+                    "boundary": boundary,
+                    "target_boundary": json.loads(
+                        values.get(
+                            "publication_boundary", values.get("boundary", "null")
+                        )
+                    ),
+                    "observed_at": latest[0] if latest else None,
+                    "gap": None,
+                    "error": None,
+                    "refreshed": time.monotonic(),
+                }
+                self._read_snapshots[identifier] = (signature, dataset)
+            window = self._windows.get(identifier)
+            if (
+                window
+                and window[0] == dataset["identity"]
+                and window[1] == dataset["file_key"]
+            ):
+                dataset["cache"].window = window[2]
+                first = next(iter(window[2].values()), None)
+                dataset["window_start_cursor"] = (
+                    first["entry"]["cursor"] if first else None
+                )
+                dataset["window_count"] = len(window[2])
+                predecessor = window[3].get("window_predecessor_cursor")
+                cached_end = dataset["cached_through"]["cursor"]
+                if predecessor is not None and cached_end < predecessor:
+                    dataset["gap"] = {
+                        "after": cached_end,
+                        "before": dataset["window_start_cursor"],
+                    }
+                    dataset["complete"] = False
+            return dataset
+
+    def _pending_dataset(self, identifier: str) -> dict:
+        return {
+            "experiment_id": identifier,
+            "identity": None,
+            "state": {},
+            "entries": [],
+            "complete": False,
+            "error": "History is being prepared in the background.",
+            "refreshed": None,
+        }
 
     def modules(self) -> dict:
         """Serve a ready publication without touching any original journal."""
@@ -373,7 +502,15 @@ class LocalJournals:
         reader = previous["reader"]
         if build:
             publication = reader.refresh(
-                state, compact_event, project_scope, target=target, window=window
+                state,
+                compact_event,
+                project_scope,
+                target=target,
+                window=window,
+                reader_context={
+                    "directory": str(directory),
+                    "project_root": str(self.project),
+                },
             )
         else:
             publication = reader.observe(target)
@@ -382,6 +519,13 @@ class LocalJournals:
         old = self._snapshots.get(identifier)
         previous["checked"] = time.monotonic()
         self._cache[identifier] = previous
+        if window:
+            self._windows[identifier] = (
+                identity,
+                file_key,
+                OrderedDict(reader.window),
+                publication,
+            )
         if (
             old
             and old.get("version") == publication["version"]
@@ -399,6 +543,7 @@ class LocalJournals:
             "experiment_id": identifier,
             "directory": directory,
             "identity": identity,
+            "file_key": file_key,
             "state": state,
             "entries": entries,
             **publication,
@@ -443,33 +588,21 @@ class LocalJournals:
                     entry["reader"].close()
             self._cache.clear()
             self._snapshots.clear()
+            self._read_snapshots.clear()
+            self._windows.clear()
 
     def read_view(self, dataset: dict, reader, *args) -> dict:
         """Keep a multi-query response within its advertised cache publication."""
-        identifier = dataset["experiment_id"]
-        with self._experiment_locks[identifier]:
-            current = self._snapshots.get(identifier)
-            version = dataset["cache"].query(
-                "SELECT value FROM metadata WHERE key='version'"
+        try:
+            return dataset["cache"].read_view(
+                dataset["version"], reader, dataset, *args
             )
-            if (
-                current is not dataset
-                or not version
-                or int(version[0][0]) != dataset["version"]
-            ):
-                raise SystemAPIError(
-                    "history_changed",
-                    "The history publication changed; refresh the selection.",
-                    409,
-                )
-            try:
-                return dataset["cache"].read_view(
-                    dataset["version"], reader, dataset, *args
-                )
-            except HistoryCacheLimit as error:
-                raise SystemAPIError("history_limit", str(error), 413) from error
-            except (LoggingError, OSError, sqlite3.Error) as error:
-                raise SystemAPIError("journal_unavailable", str(error)) from error
+        except HistoryCacheChanged as error:
+            raise SystemAPIError("history_changed", str(error), 409) from error
+        except HistoryCacheLimit as error:
+            raise SystemAPIError("history_limit", str(error), 413) from error
+        except (LoggingError, OSError, sqlite3.Error) as error:
+            raise SystemAPIError("journal_unavailable", str(error)) from error
 
     def page(self, dataset: dict, view: str, params: dict) -> dict:
         cache = dataset["cache"]

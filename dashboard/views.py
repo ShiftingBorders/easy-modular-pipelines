@@ -84,7 +84,7 @@ class DashboardViews:
         self._command_lock = asyncio.Lock()
         self._command_task: asyncio.Task | None = None
         self._source_tasks: list[asyncio.Task] = []
-        self._model_lock = asyncio.Lock()
+        self._model_locks: dict[str, asyncio.Lock] = {}
         self._models: dict[tuple[str, str | None], tuple[tuple, dict, dict]] = {}
         self._resource_observed_at = 0.0
         self._cache_pool: ProcessPoolExecutor | None = None
@@ -96,6 +96,15 @@ class DashboardViews:
         self._module_job = None
         self._module_registry: tuple | None = None
         self._module_retry_at = 0.0
+        self._registry: dict = {}
+        self._registry_error: str | None = None
+        self._window_jobs: dict[str, asyncio.Task] = {}
+        self._window_checked: dict[str, float] = {}
+        self._window_errors: dict[str, str] = {}
+        self._window_positions: dict[str, tuple] = {}
+        self._command_refreshing: set[str] = set()
+        self._command_history_tasks: dict[str, asyncio.Task] = {}
+        self._command_cache_locks: dict[str, asyncio.Lock] = {}
 
     async def open(self) -> None:
         path = self.settings["state_directory"] / "commands.json"
@@ -115,20 +124,107 @@ class DashboardViews:
                     record.update(status="unknown", polling=True)
             self._commands = document["items"][-1000:]
         self._replace_cache_pool()
+        try:
+            self._registry = await asyncio.to_thread(self.journals.registry)
+        except (OSError, TypeError, ValueError) as error:
+            self._registry_error = str(error)
+        await self._prime_caches()
         self._command_task = asyncio.create_task(self._poll_commands())
         self._source_tasks = [
             asyncio.create_task(self._poll_source("state")),
             asyncio.create_task(self._poll_source("resources")),
             asyncio.create_task(self._poll_journals()),
+            asyncio.create_task(self._poll_windows()),
         ]
+
+    async def _prime_caches(self) -> None:
+        """Bootstrap at most one batch per worker before accepting HTTP reads."""
+        initial = []
+        for identifier in self._registry:
+            try:
+                dataset = await asyncio.to_thread(self.journals.cached, identifier)
+            except SystemAPIError:
+                dataset = {}
+            if "cache" in dataset:
+                continue
+            future = self._cache_pool.submit(
+                cache_experiment, self.settings, identifier
+            )
+            self._cache_jobs[identifier] = future
+            initial.append(asyncio.wrap_future(future))
+            if len(initial) >= self.settings.get("cache_workers", 2):
+                break
+        await asyncio.gather(*initial, return_exceptions=True)
+
+    async def _poll_windows(self) -> None:
+        """Keep raw RAM windows current without holding HTTP readers' locks."""
+        try:
+            while True:
+                for identifier, task in list(self._window_jobs.items()):
+                    if not task.done():
+                        continue
+                    del self._window_jobs[identifier]
+                    try:
+                        snapshot = task.result()
+                        self._window_errors.pop(identifier, None)
+                        self._window_positions[identifier] = (
+                            snapshot.get("identity"),
+                            snapshot.get("file_key"),
+                            (snapshot.get("boundary") or {}).get("cursor", 0),
+                        )
+                        if snapshot.get("gap"):
+                            self._cache_checked.pop(identifier, None)
+                    except Exception as error:  # noqa: BLE001 - Report a failed window independently from cached projections.
+                        self._window_errors[identifier] = str(error)
+                    self._window_checked[identifier] = time.monotonic()
+                for identifier in self._registry:
+                    if len(self._window_jobs) >= self.settings.get("cache_workers", 2):
+                        break
+                    if (
+                        identifier in self._window_jobs
+                        or time.monotonic() - self._window_checked.get(identifier, 0)
+                        < self.journals.interval
+                    ):
+                        continue
+                    self._window_checked[identifier] = time.monotonic()
+                    try:
+                        dataset = await asyncio.to_thread(
+                            self.journals.cached, identifier
+                        )
+                    except SystemAPIError as error:
+                        self._window_errors[identifier] = str(error)
+                        continue
+                    if "cache" not in dataset:
+                        continue
+                    position = self._window_positions.get(identifier)
+                    if (
+                        position
+                        and position[:2] == (dataset["identity"], dataset["file_key"])
+                        and position[2]
+                        >= (dataset.get("boundary") or {}).get("cursor", 0)
+                    ):
+                        continue
+                    self._window_jobs[identifier] = asyncio.create_task(
+                        asyncio.to_thread(
+                            self.journals.load, identifier, force=True, build=False
+                        )
+                    )
+                await asyncio.sleep(0.25)
+        finally:
+            await asyncio.gather(*self._window_jobs.values(), return_exceptions=True)
+            self._window_jobs.clear()
 
     async def _poll_journals(self) -> None:
         """Schedule independent process writers; HTTP reads never build projections."""
         while True:
             try:
                 registry = await asyncio.to_thread(self.journals.registry)
-            except (OSError, TypeError, ValueError):
+            except (OSError, TypeError, ValueError) as error:
                 registry = {}
+                self._registry_error = str(error)
+            else:
+                self._registry_error = None
+            self._registry = registry
             self._collect_cache_jobs()
             self._collect_module_job()
             now = time.monotonic()
@@ -155,6 +251,7 @@ class DashboardViews:
                     break
                 if (
                     identifier in self._cache_jobs
+                    or identifier in self._command_refreshing
                     or now - self._cache_checked.get(identifier, 0)
                     < self.journals.interval
                 ):
@@ -292,45 +389,21 @@ class DashboardViews:
                     }
             await asyncio.sleep(1)
 
-    async def _cache_read_boundary(self, identifier: str, dataset: dict) -> dict:
-        target = dataset.get("boundary")
-        if target is None:
-            return dataset
-        # Two bounded batches allow an older background job to finish first.
-        # Large rebuilds remain visibly incomplete instead of blocking on all history.
-        for _ in range(2):
-            future = self._cache_jobs.get(identifier)
-            if future is None:
-                future = self._cache_pool.submit(
-                    cache_experiment, self.settings, identifier, target
-                )
-                self._cache_jobs[identifier] = future
-            result = await asyncio.shield(asyncio.wrap_future(future))
-            self._collect_cache_jobs()
-            error = result.get("error")
-            if error and error["code"] != "cache_busy":
-                raise SystemAPIError(error["code"], error["message"])
-            dataset = await asyncio.to_thread(
-                self.journals.load, identifier, force=True, build=False, target=target
-            )
-            if dataset["complete"] or error:
-                return dataset
-        return dataset
-
     async def _model(
         self, identifier: str, run_id: str | None = None
     ) -> tuple[dict, dict]:
-        async with self._model_lock:
+        async with self._model_locks.setdefault(identifier, asyncio.Lock()):
             error = self._cache_errors.get(identifier)
             if error and error["code"] != "cache_busy":
                 raise SystemAPIError(error["code"], error["message"])
-            dataset = await asyncio.to_thread(
-                self.journals.load, identifier, build=self._cache_pool is None
-            )
-            if dataset.get("gap"):
-                self._cache_checked.pop(identifier, None)
-            if self._cache_pool is not None and not dataset["complete"]:
-                dataset = await self._cache_read_boundary(identifier, dataset)
+            if self._cache_pool is None:
+                dataset = await asyncio.to_thread(self.journals.load, identifier)
+            else:
+                if self._registry_error:
+                    raise SystemAPIError("registry_unavailable", self._registry_error)
+                if identifier not in self._registry:
+                    raise SystemAPIError("not_found", "Unknown experiment.", 404)
+                dataset = await asyncio.to_thread(self.journals.cached, identifier)
             live = await self.state()
             key = (identifier, run_id)
             live_version = (
@@ -338,7 +411,12 @@ class DashboardViews:
                 if live.get("experiment_id") == identifier
                 else None
             )
-            version = (dataset.get("identity"), dataset.get("refreshed"), live_version)
+            version = (
+                dataset.get("identity"),
+                dataset.get("refreshed"),
+                live_version,
+                dataset.get("gap"),
+            )
             previous = self._models.get(key)
             if dataset.get("refreshed") and previous and previous[0] == version:
                 return previous[1], previous[2]
@@ -364,7 +442,13 @@ class DashboardViews:
 
     async def models(self) -> list[tuple[dict, dict]]:
         try:
-            registry = await asyncio.to_thread(self.journals.registry)
+            if self._registry_error:
+                raise ValueError(self._registry_error)
+            registry = (
+                self._registry
+                if self._cache_pool is not None
+                else await asyncio.to_thread(self.journals.registry)
+            )
         except (ValueError, OSError) as error:
             raise SystemAPIError("registry_unavailable", str(error)) from error
         result = []
@@ -533,7 +617,12 @@ class DashboardViews:
             "observed_at": live.get("observed_at")
             if live.get("experiment_id") == identifier and live.get("fresh")
             else (
-                dataset["entries"][-1]["occurred_at"] if dataset["entries"] else None
+                dataset.get("observed_at")
+                or (
+                    dataset["entries"][-1]["occurred_at"]
+                    if dataset["entries"]
+                    else None
+                )
             ),
             "source": "local_journal",
             "error": dataset.get("error"),
@@ -541,6 +630,8 @@ class DashboardViews:
             "window_start_cursor": dataset.get("window_start_cursor"),
             "cache_gap": dataset.get("gap"),
             "target_boundary": dataset.get("target_boundary"),
+            "summary": model["summary"],
+            "window_error": self._window_errors.get(identifier),
         }
         if view == "summary":
             return {**metadata, **model["summary"]}
@@ -796,7 +887,15 @@ class DashboardViews:
             )
         template = dict(model["template"])
         if selected:
-            source = dataset["cache"].events([selected["event_id"]])[0]
+            stored = dataset["cache"].query(
+                "SELECT value FROM metadata WHERE key='template_document' AND json_extract(value,'$.event_id')=?",
+                (selected["event_id"],),
+            )
+            source = (
+                json.loads(stored[0][0])
+                if stored
+                else dataset["cache"].events([selected["event_id"]])[0]
+            )
             template.update(
                 template=source["data"]["template"],
                 template_yaml=source["data"]["template_yaml"],
@@ -1201,6 +1300,7 @@ class DashboardViews:
 
     async def command_result(self, identifier: str) -> dict:
         result = await self.system.read(f"commands/{identifier}")
+        refresh_history = None
         async with self._command_lock:
             record = next(
                 (item for item in self._commands if item["command_id"] == identifier),
@@ -1218,13 +1318,61 @@ class DashboardViews:
                     )
                     await self._save_commands()
                     return {**result, "state": "unknown", "result": None}
+                if (
+                    record.get("polling")
+                    and result.get("result") == "success"
+                    and result.get("state") != "pending"
+                ):
+                    refresh_history = result.get("experiment_id") or record.get(
+                        "experiment_id"
+                    )
                 record.update(status=result.get("state", "unknown"), result=result)
                 record["polling"] = result.get("state") == "pending"
                 if result.get("experiment_id"):
                     record["experiment_id"] = result["experiment_id"]
                 await self._save_commands()
+            if (
+                refresh_history
+                and self._cache_pool is not None
+                and self.settings["project_root"] is not None
+            ):
+                self._command_history_tasks = {
+                    key: task
+                    for key, task in self._command_history_tasks.items()
+                    if not task.done()
+                }
+                self._command_history_tasks[identifier] = asyncio.create_task(
+                    self._refresh_command_history(refresh_history)
+                )
+            history_task = self._command_history_tasks.get(identifier)
         self._live_at = 0
+        if history_task is not None:
+            await asyncio.shield(history_task)
         return result
+
+    async def _refresh_command_history(self, identifier: str) -> None:
+        """Make command effects visible without putting worker waits in page reads."""
+        async with self._command_cache_locks.setdefault(identifier, asyncio.Lock()):
+            self._command_refreshing.add(identifier)
+            try:
+                previous = self._cache_jobs.get(identifier)
+                if previous is not None:
+                    await asyncio.shield(asyncio.wrap_future(previous))
+                    self._collect_cache_jobs()
+                current = self._cache_pool.submit(
+                    cache_experiment, self.settings, identifier
+                )
+                self._cache_jobs[identifier] = current
+                await asyncio.shield(asyncio.wrap_future(current))
+                self._collect_cache_jobs()
+                self._registry = await asyncio.to_thread(self.journals.registry)
+            except Exception as error:  # noqa: BLE001 - Keep successful command outcomes independent of cache failures.
+                self._cache_errors[identifier] = {
+                    "code": "history_refresh_failed",
+                    "message": str(error),
+                }
+            finally:
+                self._command_refreshing.discard(identifier)
 
     async def _poll_commands(self) -> None:
         while True:
@@ -1251,6 +1399,13 @@ class DashboardViews:
             task.cancel()
         await asyncio.gather(*self._source_tasks, return_exceptions=True)
         self._source_tasks.clear()
+        if self._command_task is not None:
+            self._command_task.cancel()
+            await asyncio.gather(self._command_task, return_exceptions=True)
+        await asyncio.gather(
+            *self._command_history_tasks.values(), return_exceptions=True
+        )
+        self._command_history_tasks.clear()
         if self._cache_pool is not None:
             await asyncio.to_thread(
                 self._cache_pool.shutdown, wait=True, cancel_futures=True
@@ -1258,9 +1413,6 @@ class DashboardViews:
             self._cache_pool = None
             self._cache_jobs.clear()
             self._module_job = None
-        if self._command_task is not None:
-            self._command_task.cancel()
-            await asyncio.gather(self._command_task, return_exceptions=True)
         async with self._command_lock:
             pass
         await asyncio.to_thread(self.journals.close)

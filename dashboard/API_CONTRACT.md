@@ -47,6 +47,12 @@ the system's message and expose its diagnostic code as `error.upstream_code`.
   gap before the RAM window, keeps `complete: false`; a source boundary is never
   substituted for a completed cache boundary. Appends after the requested
   boundary are handled by subsequent refreshes.
+- Experiment responses include `summary` for the heading and controls, avoiding
+  a second summary request. Normal compact page reads use only published cache
+  metadata and indexed projections; they neither reopen the original journal
+  nor wait for cache construction. RAM-window maintenance and source validation
+  run independently in the background. An unavailable raw window is reported
+  as `window_error` without inventing history records.
 - A cursor from replaced history is rejected. Dashboard resets its selection
   on a changed generation. Effective publications must reconcile confirmations,
   ignored evidence and changed outcomes without duplicating records.

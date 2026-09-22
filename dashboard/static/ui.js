@@ -1,5 +1,8 @@
 "use strict";
 
+const numberFormats = new Map();
+const dateFormat = new Intl.DateTimeFormat("en-GB", {year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric", hour12: false});
+
 export function updateContent(target, html) {
     const template = document.createElement("template");
     template.innerHTML = html;
@@ -15,7 +18,7 @@ function updateChildren(target, incoming) {
         let current = identity ? keyed.get(identity) : position;
         if (current && (key(current) !== identity || current.nodeType !== next.nodeType || current.nodeName !== next.nodeName)) current = null;
         if (!current) {
-            current = next.cloneNode(true);
+            current = next;
             target.insertBefore(current, position);
         } else {
             if (current !== position) target.insertBefore(current, position);
@@ -58,8 +61,9 @@ export function escape(value) {
 }
 
 export function numeric(value, digits = 2) {
-    return typeof value === "number" && Number.isFinite(value)
-        ? value.toLocaleString("en", {maximumFractionDigits: digits}) : "—";
+    if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+    if (!numberFormats.has(digits)) numberFormats.set(digits, new Intl.NumberFormat("en", {maximumFractionDigits: digits}));
+    return numberFormats.get(digits).format(value);
 }
 
 export function duration(seconds) {
@@ -73,7 +77,7 @@ export function duration(seconds) {
 export function dateTime(value) {
     if (!value) return "—";
     const date = new Date(value);
-    return Number.isFinite(date.valueOf()) ? date.toLocaleString("en-GB", {hour12: false}) : "—";
+    return Number.isFinite(date.valueOf()) ? dateFormat.format(date) : "—";
 }
 
 export function address(page, experiment = null, run = null, extra = {}) {

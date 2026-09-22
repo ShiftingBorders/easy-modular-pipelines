@@ -251,7 +251,7 @@ function renderRun(response) {
     return (response.complete === false ? `<div class="error-banner">${warning(response.error || "History is still loading. Aggregate statistics may be incomplete.")} ${e(response.error || "History is still loading.")}</div>` : "") + content + (state.nextCursor ? '<button class="button" data-action="load-more">Load more records</button>' : "");
 }
 
-async function loadPage(automatic = false) {
+async function loadPage(automatic = false, retryHistory = true) {
     // Paged history is a browsing session. Refresh explicitly to return to its first page.
     if (automatic && state.cursor) return;
     if (automatic && (state.loading || main.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))) return;
@@ -307,7 +307,9 @@ async function loadPage(automatic = false) {
                 if (state.page === "events") params.view = state.mode;
                 if (state.cursor) params.cursor = typeof state.cursor === "string" ? state.cursor : JSON.stringify(state.cursor);
                 const endpoint = runViews.find(([page]) => page === state.page)[2];
-                const [document, summary] = await Promise.all([systemRead(experimentPath(endpoint), signal, params), systemRead(experimentPath("summary"), signal, state.run ? {run_id: state.run} : {}).catch(() => null)]);
+                const document = await systemRead(experimentPath(endpoint), signal, params);
+                if (serial !== state.request) return;
+                const summary = document.summary || null;
                 checkContext(document, selected); if (summary) checkContext(summary, selected);
                 if (state.page === "settings" && state.settingsMode === "parameters") {
                     const attempts = await systemRead(experimentPath("parameters"), signal, {compact: "1", ...(state.run ? {run_id: state.run} : {})});
@@ -340,17 +342,20 @@ async function loadPage(automatic = false) {
         restoreFilters(); updateAlertCount();
     } catch (error) {
         if (error.name === "AbortError" || serial !== state.request) return;
-        if (error.code === "history_changed" && state.cursor) {
-            state.cursor = null; state.rows = []; document.getElementById("details-dialog").close();
-            toast("History changed. Loading its first page.");
-            return await loadPage();
+        if (error.code === "history_changed" && retryHistory) {
+            if (state.cursor) {
+                state.cursor = null; state.rows = []; document.getElementById("details-dialog").close();
+                toast("History changed. Loading its first page.");
+            }
+            state.loading = false;
+            return await loadPage(automatic, false);
         }
         if (automatic) {
             let banner = document.getElementById("refresh-error");
             if (!banner) { banner = document.createElement("div"); banner.id = "refresh-error"; banner.className = "error-banner"; main.prepend(banner); }
             banner.textContent = "Refresh failed; showing previous observations. " + error.message;
         } else { main.innerHTML = header(title) + unavailable(error); }
-    } finally { if (serial === state.request) state.loading = false; }
+    } finally { if (serial === state.request) { state.loading = false; main.removeAttribute("aria-busy"); } }
 }
 
 function markOffline(error) {
