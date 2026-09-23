@@ -1135,10 +1135,19 @@ def module_statistics(snapshots: list[tuple[dict, sqlite3.Connection]]) -> list[
             group["complete"] = group["complete"] and dataset["complete"]
             group["experiments"].add(dataset["name"])
             group["caches"].append(connection)
+            recent_attempts = []
+            for row in recent:
+                attempt = json.loads(row[0])
+                if attempt.get("detail_ref"):
+                    attempt["detail_ref"] = {
+                        **attempt["detail_ref"],
+                        **dataset["identity"],
+                    }
+                recent_attempts.append(attempt)
             group["recent_attempts"] = sorted(
                 [
                     *group["recent_attempts"],
-                    *(json.loads(row[0]) for row in recent),
+                    *recent_attempts,
                 ],
                 key=lambda row: row.get("recorded_at", ""),
                 reverse=True,

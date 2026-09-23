@@ -282,7 +282,7 @@ class LocalJournals:
                 raise SystemAPIError(
                     "cache_unavailable", f"Cannot read module statistics: {error}"
                 ) from error
-            if document.get("schema_version") != 1 or document.get(
+            if document.get("schema_version") != 2 or document.get(
                 "project_root"
             ) != str(self.project):
                 return {
@@ -315,7 +315,7 @@ class LocalJournals:
             registry = self.registry()
             models, sources = self._module_sources(registry, resources)
             signature = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "project_root": str(self.project),
                 "sources": sources,
             }
@@ -397,6 +397,7 @@ class LocalJournals:
                             "experiment_id": identifier,
                             "name": name,
                             "complete": source["complete"],
+                            "identity": source["journal"],
                         },
                         connection,
                     )
