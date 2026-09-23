@@ -128,10 +128,22 @@ def project_scope(dataset: dict, run_id: str | None, cycle: int | None) -> dict:
     model = experiment_views({**dataset, "state": state}, run_id=run_id)
     events = dataset["entries"]
     by_attempt, by_operation = defaultdict(list), defaultdict(list)
+    by_artifact = defaultdict(list)
     positions = {event["event_id"]: event["cursor"] for event in events}
     for event in events:
-        by_attempt[event["context"].get("attempt_id")].append(event["event_id"])
-        by_operation[event.get("operation_id")].append(event["event_id"])
+        kind = event["event_type"]
+        if kind in {
+            "attempt.parameters",
+            "stage.process_started",
+            "stage.finished",
+            "call.started",
+        }:
+            by_attempt[event["context"].get("attempt_id")].append(event["event_id"])
+        if kind in {"operation.started", "operation.finished"}:
+            by_operation[event.get("operation_id")].append(event["event_id"])
+        artifact_id = event["data"].get("artifact_id")
+        if isinstance(artifact_id, str):
+            by_artifact[artifact_id].append(event["event_id"])
     records = {}
     identity_fields = {
         "parameters": "attempt_id",
@@ -146,7 +158,7 @@ def project_scope(dataset: dict, run_id: str | None, cycle: int | None) -> dict:
             key = row.get(identity_field)
             if key is None or kind == "operations" and str(key).startswith("run:"):
                 continue
-            sources = projection_sources(kind, row, events, by_attempt, by_operation)
+            sources = projection_sources(kind, row, by_artifact, by_attempt, by_operation)
             if not sources:
                 continue
             row = {
@@ -267,37 +279,17 @@ def observed_attempt_status(attempt: dict, fresh: bool) -> str:
 
 
 def projection_sources(
-    kind: str, row: dict, events: list[dict], by_attempt: dict, by_operation: dict
+    kind: str, row: dict, by_artifact: dict, by_attempt: dict, by_operation: dict
 ) -> list[str]:
     if kind == "errors":
         return [row["event_id"]]
     if kind == "artifacts":
-        return [
-            event["event_id"]
-            for event in events
-            if event["data"].get("artifact_id") == row["artifact_id"]
-        ]
+        return by_artifact.get(row["artifact_id"], [])
     if kind == "commands":
         return [event["event_id"] for event in row["observations"]]
     if kind == "parameters" or str(row.get("operation_id", "")).startswith("attempt:"):
-        return [
-            event["event_id"]
-            for event in events
-            if event["event_id"] in by_attempt[row.get("attempt_id")]
-            and event["event_type"]
-            in {
-                "attempt.parameters",
-                "stage.process_started",
-                "stage.finished",
-                "call.started",
-            }
-        ]
-    return [
-        event["event_id"]
-        for event in events
-        if event["event_id"] in by_operation[row.get("operation_id")]
-        and event["event_type"] in {"operation.started", "operation.finished"}
-    ]
+        return by_attempt.get(row.get("attempt_id"), [])
+    return by_operation.get(row.get("operation_id"), [])
 
 
 def cached_experiment_views(
