@@ -157,7 +157,7 @@ async function refreshConnection() {
         const connected = connection?.connected === true;
         status.textContent = connected ? "System connected" : "System unavailable";
         status.className = connected ? "connection online" : "connection offline";
-        status.title = connected ? `Runtime observed: ${dateTime(connection.observed_at)}` : connection?.error || (info.system_api_configured ? "Waiting for a current runtime observation." : "System API is not configured.");
+        status.title = connected ? `Runtime observed: ${dateTime(connection.observed_at)}` : connection?.error || (info.system_api_configured ? "Waiting for a current runtime observation." : "Cannot connect to the system. It may be offline.");
     }).catch(markOffline).finally(() => { state.connectionRequest = null; });
     return state.connectionRequest;
 }
