@@ -392,8 +392,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await pending
-        self.assertIn(
-            "deadline", (await self.http.get("/api/system/compute")).json()["error"]
+        self.assertEqual(
+            "The system did not respond in time.",
+            (await self.http.get("/api/system/compute")).json()["error"],
         )
 
     async def test_icmp_configuration_and_probe_persist_on_dashboard_host(self) -> None:
