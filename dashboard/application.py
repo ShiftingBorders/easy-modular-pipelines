@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from dashboard.alerts import AlertMonitor
 from dashboard.api_client import SystemAPIClient, SystemAPIError
@@ -195,7 +196,9 @@ def create_app(
             or any(char in experiment_id for char in "/\\\x00")
         ):
             raise HTTPException(400, "Invalid experiment identifier.")
-        result = await views.experiment(experiment_id, view, query_parameters(request))
+        result = await views.experiment(
+            experiment_id, view, query_parameters(request), defer_cache=True
+        )
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
@@ -205,7 +208,12 @@ def create_app(
                 "This response exceeds max_response_bytes; request a smaller page.",
                 413,
             )
-        return Response(content=encoded, media_type="application/json")
+        background = None
+        if views._cache_pool is not None and experiment_id in views._cache_requests:
+            background = BackgroundTask(views._submit_cache, experiment_id)
+        return Response(
+            content=encoded, media_type="application/json", background=background
+        )
 
     async def download_artifact(experiment_id: str, artifact_id: str) -> FileResponse:
         import asyncio

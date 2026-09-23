@@ -204,6 +204,15 @@ class DashboardViews:
             return
         try:
             dataset = await asyncio.to_thread(self.journals.cached, identifier)
+            if (
+                dataset.get("complete")
+                and identifier not in self._cache_requests
+                and identifier not in self._cache_final_requests
+                and identifier not in self._cache_targets
+            ):
+                # Source polling requests a writer when either cursor changes.
+                self._cache_checked[identifier] = time.monotonic()
+                return
             if identifier in self._cache_jobs or len(
                 self._cache_jobs
             ) >= self.settings.get("cache_workers", 2):
@@ -714,7 +723,9 @@ class DashboardViews:
             (since, until),
         )[0][0]
 
-    async def experiment(self, identifier: str, view: str, params: dict) -> dict:
+    async def experiment(
+        self, identifier: str, view: str, params: dict, *, defer_cache: bool = False
+    ) -> dict:
         first_open = identifier not in self._opened_caches
         if self._cache_pool is not None:
             self._collect_cache_jobs()
@@ -725,11 +736,10 @@ class DashboardViews:
         ):
             self._opened_caches.add(identifier)
             self._cache_requests.add(identifier)
-            self._cache_checked.pop(identifier, None)
+            self._cache_checked[identifier] = time.monotonic()
             # The first request may hydrate a complete RAM preview itself.
             # Avoid starting a second source read during that short operation.
             self._window_checked[identifier] = time.monotonic()
-            await self._submit_cache(identifier)
         dataset, model = await self._model(identifier, params.get("run_id"))
         preview = self._ram_previews.get(identifier)
         if first_open and self._cache_pool is not None and not dataset["complete"]:
@@ -760,6 +770,9 @@ class DashboardViews:
                     await self.state(),
                     params.get("run_id"),
                 )
+        # Hydrate the first RAM response before a worker competes for this journal.
+        if first_open and self._cache_pool is not None and not defer_cache:
+            await self._submit_cache(identifier)
         live = await self.state()
         metadata = {
             "experiment_id": identifier,
