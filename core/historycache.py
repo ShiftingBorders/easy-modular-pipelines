@@ -115,7 +115,7 @@ class JournalHistoryCache:
                 raise LoggingStateError("Journal changed before cache initialization.")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             expected = {
-                "version": 3,
+                "version": 5,
                 "identity": self.identity,
                 "file_key": list(self.file_key),
                 "experiment_id": self.experiment_id,
@@ -128,6 +128,9 @@ class JournalHistoryCache:
                 row = db.execute(
                     "SELECT value FROM metadata WHERE key='source'"
                 ).fetchone()
+                if row and json.loads(row[0]) == expected:
+                    self._opened = True
+                    return
                 if row and json.loads(row[0]) != expected:
                     for table in (
                         "facts",
@@ -142,6 +145,7 @@ class JournalHistoryCache:
                         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                     )
                 db.executescript("""
+                    BEGIN IMMEDIATE;
                     CREATE TABLE IF NOT EXISTS facts (
                         cursor INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
                         run_id TEXT, revision TEXT, cycle INTEGER, attempt_id TEXT,
@@ -153,6 +157,8 @@ class JournalHistoryCache:
                     CREATE INDEX IF NOT EXISTS facts_run ON facts(run_id, cursor);
                     CREATE INDEX IF NOT EXISTS facts_kind ON facts(kind, run_id, cursor);
                     CREATE INDEX IF NOT EXISTS facts_attempt ON facts(attempt_id, cursor);
+                    CREATE INDEX IF NOT EXISTS facts_operation ON facts(operation_id, kind, cursor);
+                    CREATE INDEX IF NOT EXISTS facts_parent ON facts(json_extract(compact,'$.data.parent_operation_id'), operation_id) WHERE kind='operation.started';
                     CREATE INDEX IF NOT EXISTS facts_time ON facts(kind, occurred_at);
                     CREATE INDEX IF NOT EXISTS facts_effective ON facts(effective, cursor);
                     CREATE INDEX IF NOT EXISTS facts_run_effective ON facts(run_id, effective, cursor);
@@ -177,6 +183,7 @@ class JournalHistoryCache:
                     CREATE INDEX IF NOT EXISTS records_scope ON records(scope);
                     CREATE INDEX IF NOT EXISTS records_module ON records(kind, json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.module_hash'));
                     CREATE INDEX IF NOT EXISTS records_duration ON records(kind, json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.module_hash'), json_extract(payload,'$.duration_seconds'));
+                    COMMIT;
                 """)
                 db.execute(
                     "INSERT OR REPLACE INTO metadata VALUES ('source', ?)",
@@ -335,7 +342,7 @@ class JournalHistoryCache:
                     "boundary": target,
                     "has_more": False,
                 }, changed
-            page = source.read_changes(checkpoint, limit=100)
+            page = source.read_changes(checkpoint, limit=1000)
             with db:
                 for change in page["changes"]:
                     changed.extend(self._apply_change(db, source, change, compact))
@@ -417,7 +424,8 @@ class JournalHistoryCache:
         return entries
 
     def _scope_context(self, db: sqlite3.Connection, context: dict) -> dict:
-        if not context.get("attempt_id") or context.get("cycle_number") is not None:
+        coordinates = ("run_id", "template_revision_id", "cycle_number")
+        if not context.get("attempt_id") or all(key in context for key in coordinates):
             return context
         parent = db.execute(
             "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
@@ -471,7 +479,7 @@ class JournalHistoryCache:
             (
                 item["cursor"],
                 event["event_id"],
-                context.get("run_id"),
+                scope_context.get("run_id"),
                 scope_context.get("template_revision_id"),
                 scope_context.get("cycle_number"),
                 context.get("attempt_id"),
@@ -490,6 +498,26 @@ class JournalHistoryCache:
         db.execute("INSERT OR IGNORE INTO dirty VALUES (?)", (scope,))
         if previous:
             db.execute("INSERT OR IGNORE INTO dirty VALUES (?)", previous)
+        if event["event_type"] == "operation.started":
+            # A newly recorded ancestor can change overlap in other cycles.
+            # Keep recursive IDs outside the indexed lookup; SQLite may otherwise
+            # scan all operation starts at every level of the hierarchy.
+            db.execute(
+                """
+                WITH RECURSIVE descendants(operation_id) AS (
+                    VALUES (?)
+                    UNION
+                    SELECT child.operation_id FROM descendants AS parent
+                    CROSS JOIN facts AS child INDEXED BY facts_parent
+                      ON json_extract(child.compact,'$.data.parent_operation_id')=parent.operation_id
+                    WHERE child.kind='operation.started'
+                )
+                INSERT OR IGNORE INTO dirty
+                SELECT facts.scope FROM descendants
+                CROSS JOIN facts INDEXED BY facts_operation USING (operation_id)
+                """,
+                (event["operation_id"],),
+            )
         if event["event_type"] == "template.applied":
             db.execute(
                 "INSERT OR IGNORE INTO dirty SELECT DISTINCT scope FROM facts WHERE run_id IS ? AND revision IS ?",
@@ -764,6 +792,50 @@ class JournalHistoryCache:
             finally:
                 self._reading = None
 
+    def _operation_ancestors(
+        self,
+        db: sqlite3.Connection,
+        scope: str,
+        run_id: str | None,
+        size: int,
+        count: int,
+    ) -> dict:
+        """Load only indexed ancestry needed for this scope's measurements."""
+        parents = {}
+        rows = db.execute(
+            """
+            WITH RECURSIVE ancestors(operation_id) AS (
+                SELECT operation_id FROM facts
+                WHERE scope=? AND effective=1 AND operation_id IS NOT NULL
+                UNION
+                SELECT json_extract(parent.compact,'$.data.parent_operation_id')
+                FROM ancestors
+                CROSS JOIN facts AS parent INDEXED BY facts_operation USING (operation_id)
+                WHERE parent.kind='operation.started' AND parent.effective=1
+                  AND (? IS NULL OR parent.run_id=?)
+                  AND json_extract(parent.compact,'$.data.parent_operation_id') IS NOT NULL
+            )
+            SELECT facts.operation_id,
+                   json_extract(facts.compact,'$.data.parent_operation_id')
+            FROM ancestors
+            CROSS JOIN facts INDEXED BY facts_operation USING (operation_id)
+            WHERE facts.kind='operation.started' AND facts.effective=1
+              AND (? IS NULL OR facts.run_id=?)
+              AND facts.scope!=?
+            ORDER BY facts.cursor
+            """,
+            (scope, run_id, run_id, run_id, run_id, scope),
+        )
+        for operation_id, parent_id in rows:
+            count += 1
+            size += len(json.dumps([operation_id, parent_id]).encode("utf-8"))
+            if count > self.max_events or size > self.max_bytes:
+                raise HistoryCacheLimit(
+                    "Operation ancestry exceeds the projection working budget."
+                )
+            parents[operation_id] = {"parent_operation_id": parent_id}
+        return parents
+
     def _project_scope(
         self, db: sqlite3.Connection, scope: str, state: dict, project: Callable
     ) -> None:
@@ -778,13 +850,28 @@ class JournalHistoryCache:
             raise HistoryCacheLimit(
                 "An execution scope exceeds history_max_bytes/history_max_events; increase the projection working budget."
             )
-        entries = [
-            json.loads(row[0])
-            for row in db.execute(
-                "SELECT compact FROM facts WHERE scope=? AND effective=1 AND (json_extract(compact,'$.data')!='{}' OR kind='call.started') ORDER BY cursor",
-                (scope,),
-            )
-        ]
+        entries = []
+        for encoded, event_run, event_revision, event_cycle in db.execute(
+            "SELECT compact, run_id, revision, cycle FROM facts WHERE scope=? AND effective=1 AND (json_extract(compact,'$.data')!='{}' OR kind='call.started') ORDER BY cursor",
+            (scope,),
+        ):
+            event = json.loads(encoded)
+            coordinates = {
+                "run_id": event_run,
+                "template_revision_id": event_revision,
+                "cycle_number": event_cycle,
+            }
+            # Scope selection and projection filtering must use the same context.
+            # Enrich only this working copy; raw event pages retain source context.
+            event["context"] = {
+                **{
+                    key: value
+                    for key, value in coordinates.items()
+                    if value is not None
+                },
+                **event["context"],
+            }
+            entries.append(event)
         template = None
         if not command_scope:
             template = db.execute(
@@ -811,6 +898,11 @@ class JournalHistoryCache:
             {
                 "experiment_id": self.experiment_id,
                 "entries": entries,
+                "operation_ancestors": self._operation_ancestors(
+                    db, scope, run_id, size, count
+                )
+                if cycle is not None
+                else {},
                 "state": state,
                 "complete": True,
             },
@@ -886,6 +978,11 @@ class JournalHistoryCache:
     def iter_events(self, identifiers: list[str]) -> Iterator[dict]:
         """One read-only source connection, indexed lookups and bounded payloads."""
         with self._lock, OperationLogger(self.config_path, read_only=True) as source:
+            info = source.get_journal_info()
+            if any(info[key] != self.identity[key] for key in self.identity):
+                raise HistoryCacheChanged(
+                    "The journal changed before loading source details."
+                )
             for start in range(0, len(identifiers), 20):
                 batch = identifiers[start : start + 20]
                 placeholders = ",".join("?" for _ in batch)
@@ -912,7 +1009,11 @@ class JournalHistoryCache:
                         "cursor": entry["cursor"],
                         **json.loads(metadata.get(identifier, "{}")),
                     }
-            source.get_journal_info()
+            info = source.get_journal_info()
+            if any(info[key] != self.identity[key] for key in self.identity):
+                raise HistoryCacheChanged(
+                    "The journal changed while loading source details."
+                )
 
     def close(self) -> None:
         with self._lock:

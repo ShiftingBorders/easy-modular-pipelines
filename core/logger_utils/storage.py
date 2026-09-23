@@ -794,7 +794,11 @@ class SQLiteEventStore:
         if timestamp.utcoffset() != UTC.utcoffset(None):
             raise LoggingStorageError("Change timestamp must be UTC.")
         entry = self._event_entry(change["effective_event_id"], connection)
-        observed = self._event_entry(event_id, connection)
+        observed = (
+            entry
+            if event_id == change["effective_event_id"]
+            else self._event_entry(event_id, connection)
+        )
         related = change["related_event_ids"]
         if (
             type(related) is not list

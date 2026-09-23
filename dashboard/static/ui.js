@@ -24,7 +24,7 @@ function updateChildren(target, incoming) {
             if (current !== position) target.insertBefore(current, position);
             if (current.nodeType === Node.TEXT_NODE) {
                 if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
-            } else if (current.nodeType === Node.ELEMENT_NODE) {
+            } else if (current.nodeType === Node.ELEMENT_NODE && !current.isEqualNode(next)) {
                 updateElement(current, next);
             }
         }

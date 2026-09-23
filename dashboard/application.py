@@ -105,6 +105,7 @@ def create_app(
             "dashboard_host": monitor.host_name,
             "journals_configured": settings["project_root"] is not None,
             "data_mode": "local_journals_and_system_api",
+            "cache_activity": views.cache_activity(),
             "system_connection": {
                 "connected": bool(live.get("available") and live.get("fresh")),
                 "observed_at": live.get("observed_at"),

@@ -15,3 +15,4 @@
 .metric-projection{margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}
 
 textarea{font:13px/1.6 JetBrains Mono,monospace;background:#172332;color:var(--text);border:1px solid #4d6180;border-radius:4px;padding:10px;resize:vertical}
+.cache-activity{position:fixed;right:16px;bottom:16px;z-index:80;max-width:min(560px,calc(100vw - 32px));padding:14px 18px;background:#26364d;color:var(--text);border:1px solid #83b4fc;border-radius:6px;box-shadow:0 4px 24px #0008;font-size:13px}.cache-activity[hidden]{display:none}

@@ -51,6 +51,35 @@ continues. Startup can prime one bounded batch per worker when no published
 reader context exists. Successful control commands refresh their history in
 workers so subsequent navigation can observe their effects, including rollback.
 
+Serve automatically caches only running or paused experiments, including their
+active startup, snapshot and restoration phases. Stopped, completed, failed and
+idle experiments are cached when explicitly opened. Overview, the experiment
+list, Modules and alert monitoring do not initiate their cache construction.
+Precache explicitly processes every registered experiment regardless of phase.
+When an automatically cached experiment leaves its active phase, serve queues
+one final update with a fresh journal boundary, even if an older cache task is
+still running. That update finishes in bounded worker batches and publishes the
+final projections and module statistics before background caching stops.
+Once a history has been opened, background checks continue to verify its source
+identity and both event/change cursors, including while it is stopped. Changes
+made by another client or CLI schedule an incremental update or a rebuild after
+replacement. Unchanged sources reuse their RAM windows and cached projections;
+Histories already stopped when discovered are not probed or cached automatically
+unless opened or selected by precache.
+An initial build displays a status banner naming the experiments and explaining
+that pages may respond more slowly until caching finishes.
+
+On first opening a stopped experiment with at most 500 events, dashboard can
+render its complete active RAM window immediately while the disk cache is built.
+This applies only when the whole observed history fits both the configured
+event window and payload budget. The source is read-only, command confirmations
+are reconciled, and a changing source boundary prevents this shortcut. Subsequent
+reads reuse that window until the corresponding disk publication is ready.
+The response reports `source: ram_window`, accurate `complete` data coverage,
+and a separate `cache_complete` flag; `cached_through` still describes only the
+completed disk prefix. Larger or partially available histories stay explicitly
+incomplete and refresh promptly while caching is pending.
+
 For each experiment, precache captures a target journal boundary at its first
 successful task. It exits once every target's projections are complete, even
 if the runtime keeps appending events. Later appends are handled on the next
@@ -221,6 +250,14 @@ continues without an open browser. Later refreshes consume only new journal
 changes and recalculate affected execution scopes; unchanged completed scopes
 are reused. Restarting resumes persisted checkpoints and reconstructs only the
 active payload window. Live runtime observations do not rebuild history.
+
+Measurement scopes inherit missing coordinates from recorded attempt parameters.
+Projection inputs use those same coordinates for run filtering; raw event pages
+and source details retain the original event context.
+Indexed ancestor lookups include parent operations outside the measurement's
+scope, so nested totals are not counted twice. Later ancestor observations also
+invalidate dependent scopes. Attempt statuses are overlaid with runtime freshness
+when pages are read; recorded completion outcomes remain unchanged.
 
 Ordinary history pages read only the derived database and published reader
 metadata. Original journal checks, runner-state reads and raw-window updates

@@ -97,9 +97,19 @@ def read_json(path: Path, *, max_bytes: int | None = None) -> JsonObject:
             else:
                 stream = path.open("rb")
             with stream:
-                encoded = (
-                    stream.read() if max_bytes is None else stream.read(max_bytes + 1)
-                )
+                if max_bytes is None:
+                    encoded = stream.read()
+                else:
+                    # Large read buffers are expensive even for tiny Windows
+                    # metadata files. Keep the limit without allocating it up front.
+                    encoded = bytearray()
+                    remaining = max_bytes + 1
+                    while remaining:
+                        chunk = stream.read(min(remaining, 65536))
+                        if not chunk:
+                            break
+                        encoded.extend(chunk)
+                        remaining -= len(chunk)
             break
         except PermissionError:
             # A concurrent Windows replacement can briefly deny the open too.

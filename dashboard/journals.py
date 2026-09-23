@@ -21,6 +21,7 @@ from core.historycache import (
     JournalHistoryCache,
     acquire_cache_writer,
 )
+from core.logger import OperationLogger
 from core.logger_utils.events import LoggingError
 from core.runner_utils.runtimeio import read_json, write_json
 from dashboard.api_client import SystemAPIError
@@ -126,7 +127,7 @@ class LocalJournals:
             db.execute("BEGIN")
             metadata = dict(
                 db.execute(
-                    "SELECT key,value FROM metadata WHERE key IN ('source','version','reader_revision')"
+                    "SELECT key,value FROM metadata WHERE key IN ('source','version','reader_revision','ready','cached_through','publication_boundary')"
                 )
             )
             if not metadata.get("reader_revision") or "version" not in metadata:
@@ -139,6 +140,9 @@ class LocalJournals:
                 metadata["source"],
                 metadata["version"],
                 metadata["reader_revision"],
+                metadata.get("ready"),
+                metadata.get("cached_through"),
+                metadata.get("publication_boundary"),
             )
             previous = self._read_snapshots.get(identifier)
             if previous and previous[0] == signature:
@@ -170,6 +174,9 @@ class LocalJournals:
                     "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
                 ).fetchone()
                 boundary = json.loads(values.get("boundary", "null"))
+                target_key = (
+                    "publication_boundary" if values.get("ready") == "1" else "boundary"
+                )
                 dataset = {
                     "experiment_id": identifier,
                     "directory": Path(context["directory"]),
@@ -183,9 +190,7 @@ class LocalJournals:
                     "cached_through": json.loads(values["cached_through"]),
                     "boundary": boundary,
                     "target_boundary": json.loads(
-                        values.get(
-                            "publication_boundary", values.get("boundary", "null")
-                        )
+                        values.get(target_key, values.get("boundary", "null"))
                     ),
                     "observed_at": latest[0] if latest else None,
                     "gap": None,
@@ -205,6 +210,15 @@ class LocalJournals:
                     first["entry"]["cursor"] if first else None
                 )
                 dataset["window_count"] = len(window[2])
+                observed = window[3].get("boundary") or {}
+                requested = dataset.get("target_boundary") or {}
+                if observed.get("change_cursor", 0) > requested.get("change_cursor", 0):
+                    dataset["target_boundary"] = observed
+                cached = dataset["cached_through"]
+                if cached["cursor"] < observed.get("cursor", 0) or cached[
+                    "change_cursor"
+                ] < observed.get("change_cursor", 0):
+                    dataset["complete"] = False
                 predecessor = window[3].get("window_predecessor_cursor")
                 cached_end = dataset["cached_through"]["cursor"]
                 if predecessor is not None and cached_end < predecessor:
@@ -240,7 +254,7 @@ class LocalJournals:
                 return {
                     "items": [],
                     "complete": False,
-                    "error": "Module statistics are being prepared.",
+                    "error": "Open an experiment or run precache to prepare module statistics.",
                 }
             except OSError as error:
                 raise SystemAPIError(
@@ -266,7 +280,7 @@ class LocalJournals:
                 return {
                     "items": [],
                     "complete": False,
-                    "error": "Module statistics are being prepared for this project.",
+                    "error": "Module statistics have not been prepared for this project.",
                 }
             if (
                 not isinstance(document.get("items"), list)
@@ -406,6 +420,109 @@ class LocalJournals:
                 raise ValueError("Registered experiment escapes the project.")
             result[identifier] = directory
         return result
+
+    def scheduling_states(self, registry: dict[str, Path]) -> dict[str, dict]:
+        """Read runner metadata for scheduling without opening stopped journals."""
+        states = {}
+        for identifier, directory in registry.items():
+            try:
+                path = self.safe_path(directory, "runner/state.json")
+                state = read_object(path) if path.exists() else {}
+                if state.get("experiment_id") not in (None, identifier):
+                    raise ValueError("Experiment state belongs to another experiment.")
+                template = state.get("template", {})
+                if not isinstance(template, dict):
+                    raise TypeError("Experiment state template must be a JSON object.")
+                states[identifier] = {
+                    "phase": state.get("phase", "unknown"),
+                    "mode": state.get("mode"),
+                    "name": template.get("name") or identifier,
+                }
+            except (OSError, ValueError, TypeError) as error:
+                states[identifier] = {"phase": "unknown", "error": str(error)}
+        return states
+
+    def preview(self, identifier: str) -> dict | None:
+        """Render a small complete RAM window while its disk cache is constructed."""
+        directory = self.registry().get(identifier)
+        if directory is None:
+            return None
+        state = read_object(self.safe_path(directory, "runner/state.json"))
+        if state.get("experiment_id") != identifier:
+            return None
+        identity = read_object(self.safe_path(directory, "runner/journal.json"))
+        database = self.safe_path(directory, "journals/events.sqlite")
+        status = database.stat()
+        file_key = (status.st_dev, status.st_ino)
+        config = self._reader_configuration(identifier, state, database, identity)
+        limit = min(500, self.window_events)
+        with OperationLogger(config, read_only=True) as source:
+            boundary = source.read_event_batch([])["boundary"]
+            if boundary["event_count"] > limit:
+                return None
+            page = source.read_events(limit=limit, view="raw")
+            if page["has_more"] or page["boundary"] != boundary:
+                return None
+            entries, window, results, size = [], OrderedDict(), {}, 0
+            for item in page["events"]:
+                event = item["event"]
+                if event["context"].get("experiment_id") not in (None, identifier):
+                    return None
+                encoded_size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+                size += encoded_size
+                if size > min(self.max_bytes, self.settings["max_response_bytes"]):
+                    return None
+                metadata = {
+                    "effective": True,
+                    "effective_author": None,
+                    "provisional": False,
+                    "ignored": event["data"].get("ignored"),
+                    "confirmation": "recorded",
+                }
+                if event["event_type"] == "command.result":
+                    request_id = event["data"]["request_id"]
+                    if request_id not in results:
+                        results[request_id] = source.read_command_result(request_id)
+                    result = results[request_id]
+                    observation = next(
+                        row
+                        for row in result["observations"]
+                        if row["event_id"] == event["event_id"]
+                    )
+                    metadata.update(
+                        effective=event["event_id"] == result["event_id"],
+                        effective_author=result["author"],
+                        provisional=result["provisional"],
+                        ignored=observation["ignored"],
+                        confirmation="provisional"
+                        if result["provisional"]
+                        else "confirmed",
+                    )
+                entries.append({**event, "cursor": item["cursor"], **metadata})
+                window[event["event_id"]] = {"entry": item, "size": encoded_size}
+            if source.read_event_batch([])["boundary"] != boundary:
+                return None
+        self._windows[identifier] = (identity, file_key, window, {"boundary": boundary})
+        return {
+            "experiment_id": identifier,
+            "directory": directory,
+            "identity": identity,
+            "file_key": file_key,
+            "state": state,
+            "entries": entries,
+            "complete": True,
+            "error": None,
+            "boundary": boundary,
+            "target_boundary": boundary,
+            "cached_through": {**identity, "cursor": 0, "change_cursor": 0},
+            "window_start_cursor": page["events"][0]["cursor"]
+            if page["events"]
+            else None,
+            "window_count": len(window),
+            "gap": None,
+            "refreshed": time.monotonic(),
+            "source": "ram_window",
+        }
 
     def load(
         self,
@@ -784,6 +901,10 @@ class LocalJournals:
         }
 
     def detail(self, dataset: dict, reference: dict, row: dict | None = None) -> dict:
+        if not isinstance(reference, dict):
+            raise SystemAPIError(
+                "invalid_reference", "Detail reference must be an object.", 400
+            )
         if any(
             reference.get(key) != dataset["identity"][key]
             for key in ("journal_id", "generation")
@@ -795,9 +916,11 @@ class LocalJournals:
         if (
             not isinstance(identifiers, list)
             or not 1 <= len(identifiers) <= 1000
-            or any(not isinstance(key, str) for key in identifiers)
+            or any(not isinstance(key, str) or not key for key in identifiers)
         ):
-            raise ValueError("Detail requires a bounded list of event IDs.")
+            raise SystemAPIError(
+                "invalid_reference", "Detail requires a bounded list of event IDs.", 400
+            )
         events = dataset["cache"].events(identifiers)
         kind = reference.get("kind")
         if kind == "events":

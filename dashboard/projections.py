@@ -216,6 +216,56 @@ def project_scope(dataset: dict, run_id: str | None, cycle: int | None) -> dict:
     }
 
 
+def window_experiment_views(
+    dataset: dict, live: dict, run_id: str | None = None
+) -> dict:
+    """Project a complete RAM window while preserving original event contexts."""
+    attempts = {
+        event["context"].get("attempt_id"): {
+            key: value
+            for key, value in event["context"].items()
+            if key in ("run_id", "template_revision_id", "cycle_number")
+            and value is not None
+        }
+        for event in dataset["entries"]
+        if event["event_type"] == "attempt.parameters"
+        and event["context"].get("attempt_id")
+    }
+    entries = [
+        {
+            **event,
+            "context": {
+                **attempts.get(event["context"].get("attempt_id"), {}),
+                **event["context"],
+            },
+        }
+        for event in dataset["entries"]
+    ]
+    model = experiment_views({**dataset, "entries": entries}, live, run_id)
+    selected = {event["event_id"] for event in model["events"]}
+    model["events"] = [
+        event for event in dataset["entries"] if event["event_id"] in selected
+    ]
+    model["effective"] = [
+        event
+        for event in model["events"]
+        if event["effective"] and not event["ignored"]
+    ]
+    return model
+
+
+def observed_attempt_status(attempt: dict, fresh: bool) -> str:
+    """Apply runtime freshness without changing recorded completion outcomes."""
+    status = attempt.get("status", "unknown")
+    if (
+        status in {"running", "unconfirmed"}
+        and attempt.get("started_at")
+        and not attempt.get("finished_at")
+    ):
+        return "running" if fresh else "unconfirmed"
+    return status
+
+
 def projection_sources(
     kind: str, row: dict, events: list[dict], by_attempt: dict, by_operation: dict
 ) -> list[str]:
@@ -647,6 +697,9 @@ def experiment_views(
         )
     if current_run in runs:
         runs[current_run]["status"] = status
+    # DAG nodes and timeline scopes must use the same observed attempt status.
+    for attempt in attempts.values():
+        attempt["status"] = observed_attempt_status(attempt, fresh)
     stages = template.get("stages", [])
     service_modules = {
         service["service_id"]: service["module"]
@@ -691,8 +744,6 @@ def experiment_views(
     for attempt_id, attempt in attempts.items():
         if not attempt_id or not attempt.get("started_at"):
             continue
-        if attempt.get("status") == "running" and not fresh:
-            attempt["status"] = "unconfirmed"
         scope = f"attempt:{attempt_id}"
         operations[scope] = {
             **attempt,
@@ -766,7 +817,12 @@ def experiment_views(
                     "finished_at": max(ends),
                 }
     measurements = cycle_measurements(
-        effective, attempts, operations, valid_cycles, revision_id, current_run
+        effective,
+        attempts,
+        {**operations, **dataset.get("operation_ancestors", {})},
+        valid_cycles,
+        revision_id,
+        current_run,
     )
     total_cycles = template.get("cycles")
     completed = max(0, (observed.get("cycle_number") or 1) - 1)

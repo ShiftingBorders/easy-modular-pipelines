@@ -115,7 +115,7 @@ function applyFilters(scope) {
     const radios = [...scope.querySelectorAll('input[name="experiment"]')];
     if (radios.length) {
         const visible = radios.filter(radio => !radio.closest("tr").hidden);
-        if (!visible.some(radio => radio.checked)) {
+        if (state.experiment && !visible.some(radio => radio.checked)) {
             radios.forEach(radio => { radio.checked = radio === visible[0]; });
             void selectExperiment(visible[0]?.value || null);
         }
@@ -148,6 +148,10 @@ async function refreshConnection() {
     if (state.connectionRequest) return state.connectionRequest;
     state.connectionRequest = request("/api/application").then(info => {
         state.info = info;
+        const initial = info.cache_activity?.building || [];
+        const cacheStatus = document.getElementById("cache-activity");
+        cacheStatus.hidden = initial.length === 0;
+        cacheStatus.textContent = initial.length ? `Building history cache for ${initial.join(", ")}. Pages may respond more slowly until caching finishes.` : "";
         const connection = info.system_connection;
         const status = document.getElementById("connection-status");
         const connected = connection?.connected === true;
@@ -252,17 +256,26 @@ function renderRun(response) {
 }
 
 async function loadPage(automatic = false, retryHistory = true) {
+    clearTimeout(state.historyTimer);
     // Paged history is a browsing session. Refresh explicitly to return to its first page.
     if (automatic && state.cursor) return;
     if (automatic && (state.loading || main.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))) return;
     state.abort?.abort(); state.abort = new AbortController(); const signal = state.abort.signal;
     const serial = ++state.request; state.loading = true; if (automatic) rememberFilters();
-    if (!automatic) {
+    const context = `${state.experiment || ""}:${state.run || ""}`;
+    const sameExperiment = runViews.some(([page]) => page === state.page) && main.dataset.context === context && main.querySelector(".tabs");
+    main.setAttribute("aria-busy", "true");
+    if (!automatic && !sameExperiment) {
         main.innerHTML = header("Loading…") + '<div class="loading" role="status">Loading observations…</div>';
+    } else if (!automatic) {
+        main.querySelectorAll(".tabs a").forEach(link => link.classList.toggle("active", new URL(link.href).searchParams.get("page") === state.page));
+        const loading = document.createElement("span"); loading.id = "page-loading"; loading.className = "loading"; loading.setAttribute("role", "status"); loading.textContent = "Loading…";
+        document.getElementById("page-loading")?.remove(); main.querySelector(".heading .actions")?.prepend(loading);
     }
     if (!automatic) navigationChrome();
     void refreshConnection();
     let title = navigation.find(([page]) => page === state.page)?.[1] || runViews.find(([page]) => page === state.page)?.[1] || "ICMP ping";
+    let pendingHistory = false;
     try {
         let content = "", heading = header(title);
         if (state.page === "icmp") { heading = header(title, "Checks run on the dashboard host", `<a class="button quiet" href="${address("alerts")}">← Alerts</a>`); content = `<div id="icmp-panel">${views.icmpPanel(state.icmp, false)}</div>`; }
@@ -280,10 +293,10 @@ async function loadPage(automatic = false, retryHistory = true) {
             if (state.page === "experiments") heading = header(title, "", '<button class="button primary" data-action="run-experiment">Run experiment</button>');
             const document = await systemRead("experiments", signal); state.experiments = rows(document);
             const candidates = state.page === "forecast" ? state.experiments.filter(row => ["running", "paused", "waiting"].includes(row.status)) : state.experiments;
-            if (!candidates.some(row => row.experiment_id === state.experiment)) state.experiment = candidates[0]?.experiment_id || null;
+            if (!candidates.some(row => row.experiment_id === state.experiment)) state.experiment = state.page === "forecast" ? candidates[0]?.experiment_id || null : null;
             content = views.experiments(candidates, state.experiment);
             if (state.page === "forecast") content = content.replace('id="run-history"', 'id="forecast-body"');
-        } else if (state.page === "modules") { const document = await systemRead("modules", signal); state.modules = rows(document); content = (document.complete === false ? `<div class="error-banner">${e(document.error || "Module statistics are still loading.")}</div>` : "") + views.modules(state.modules, state.detail); }
+        } else if (state.page === "modules") { const document = await systemRead("modules", signal); state.modules = rows(document); content = (document.complete === false ? `<div class="error-banner">${e(document.error || "Some experiment histories have not been cached. Open an experiment to include its statistics.")}</div>` : "") + views.modules(state.modules, state.detail); }
         else if (state.page === "services") content = views.services(rows(await systemRead("services", signal)), state.detail);
         else if (state.page === "compute") {
             const params = {};
@@ -316,10 +329,12 @@ async function loadPage(automatic = false, retryHistory = true) {
                     checkContext(attempts, selected); state.parameterRows = rows(attempts);
                 }
                 state.controlAvailable = Boolean(summary?.fresh); state.data = document; heading = runHeading(summary); content = renderRun(document);
+                pendingHistory = document.complete === false && document.cache_pending;
             }
         }
         if (serial !== state.request) return;
         updateContent(main, heading + content);
+        main.dataset.context = `${state.experiment || ""}:${state.run || ""}`;
         const dialog = document.getElementById("details-dialog");
         if (dialog.open && dialog.dataset.recordKey && dialog.dataset.selection === location.search) {
             const present = [...main.querySelectorAll("[data-inspect]")].some(button => recordKey(JSON.parse(button.dataset.inspect)) === dialog.dataset.recordKey);
@@ -355,7 +370,14 @@ async function loadPage(automatic = false, retryHistory = true) {
             if (!banner) { banner = document.createElement("div"); banner.id = "refresh-error"; banner.className = "error-banner"; main.prepend(banner); }
             banner.textContent = "Refresh failed; showing previous observations. " + error.message;
         } else { main.innerHTML = header(title) + unavailable(error); }
-    } finally { if (serial === state.request) { state.loading = false; main.removeAttribute("aria-busy"); } }
+    } finally {
+        if (serial === state.request) {
+            state.loading = false; main.removeAttribute("aria-busy"); document.getElementById("page-loading")?.remove();
+            if (pendingHistory) {
+                state.historyTimer = setTimeout(() => { if (serial === state.request) void loadPage(true); }, 50);
+            }
+        }
+    }
 }
 
 function markOffline(error) {

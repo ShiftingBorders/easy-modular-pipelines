@@ -17,6 +17,21 @@ The original journal is authoritative. Dashboard opens it read-only and makes
 no changes to its contents, schema, indexes, or event format. All cache writes
 target a separate, rebuildable database in the dashboard state directory.
 
+`GET /api/application` includes `cache_activity`: `active` worker entries
+(experiment ID, initial-build flag, known event count and cached boundary),
+`queued` requested histories (including final updates), and `building` experiment
+IDs whose initial build is unfinished. The UI displays these builds and their possible
+latency impact. This metadata is read from the scheduler, without journal I/O.
+Serve schedules running/paused experiments automatically. Terminal or idle
+histories start only when explicitly opened; project-wide views and alerts
+do not request their construction. Precache explicitly includes all experiments.
+An experiment leaving automatic caching receives a final update against a fresh
+journal boundary. An older in-flight task cannot consume this request; bounded
+worker batches complete it and publish the final module statistics.
+Opened histories continue background checks of the source identity and both
+cursors. External changes trigger cache updates without requiring a new browser
+session; unchanged histories reuse their projections and active window.
+
 `system_api_url` is a configured base URL. Requests are server-to-server HTTP calls
 from dashboard to that base URL. The browser communicates with dashboard's own
 origin. Credentials and redirects are not accepted in the base URL; redirects
@@ -43,8 +58,8 @@ the system's message and expose its diagnostic code as `error.upstream_code`.
   completed event/change cursors), `window_start_cursor`, and `cache_gap`.
   A gap is `{after: cached_event_cursor, before: window_start_cursor}` with
   exclusive bounds, or `null`. `target_boundary` identifies the finite source
-  boundary requested by this read. Pending work through that boundary, or a
-  gap before the RAM window, keeps `complete: false`; a source boundary is never
+  boundary requested by this read. Pending disk projections without a complete
+  RAM-window representation, or a gap before the RAM window, keep `complete: false`; a source boundary is never
   substituted for a completed cache boundary. Appends after the requested
   boundary are handled by subsequent refreshes.
 - Experiment responses include `summary` for the heading and controls, avoiding
@@ -53,6 +68,15 @@ the system's message and expose its diagnostic code as `error.upstream_code`.
   nor wait for cache construction. RAM-window maintenance and source validation
   run independently in the background. An unavailable raw window is reported
   as `window_error` without inventing history records.
+- A complete small history (at most 500 events and within the configured RAM
+  window/byte budget) can be returned from its read-only source window during
+  the first disk build: `source: ram_window`, `complete: true`,
+  `cache_complete: false`, `cache_pending: true`. No historical data is omitted;
+  `cached_through` is not advanced to claim unfinished disk work. A subsequent
+  ready disk publication replaces the window projection. Incomplete pending
+  histories can be retried promptly without waiting for the regular UI interval.
+  Initial RAM-window responses contain complete in-window records; measurement
+  cards receive the complete bounded collection independently of page size.
 - A cursor from replaced history is rejected. Dashboard resets its selection
   on a changed generation. Effective publications must reconcile confirmations,
   ignored evidence and changed outcomes without duplicating records.
@@ -126,6 +150,8 @@ Paths are relative to `/api/system/experiments/{experiment_id}/` on dashboard.
 
 Forecast and measurement responses also include `metric_summaries`,
 `measurement_cycles`, and the latest 20 `measurements` per module/version/metric.
+`measurement_cycles` is an integer count of distinct cycles, including in a
+RAM-window response; it is never a list of cycle numbers.
 These summaries cover the entire comparable run/revision cohort, irrespective
 of pagination or RAM-window size. The paginated `items` endpoint remains
 available for every historical cycle value. Mixed units, duplicate cycles,
