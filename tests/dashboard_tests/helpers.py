@@ -31,14 +31,25 @@ def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
             directory.cleanup()
             return
         except OSError as error:
+            failed = Path(error.filename).resolve()
+            if not failed.is_relative_to(root):
+                raise
+            # SQLite can briefly rename a released Windows SHM file during
+            # deletion. Retry only this auxiliary file, not locked DBs/locks.
+            transient_shm = (
+                os.name == "nt"
+                and getattr(error, "winerror", None) in (5, 32)
+                and failed.name.lower().endswith(".sqlite-shm.tmp")
+            )
+            if transient_shm and attempt < 4:
+                time.sleep(0.05)
+                if not failed.exists():
+                    continue
             if (
                 os.name != "nt"
                 or getattr(error, "winerror", None) != 145
                 or attempt == 4
             ):
-                raise
-            failed = Path(error.filename).resolve()
-            if not failed.is_relative_to(root):
                 raise
             time.sleep(0.05)
             try:
@@ -93,6 +104,7 @@ class ProbeProcess:
             else json.dumps(result if result is not None else probe_result()).encode()
         )
         self.exit_code = exit_code
+        self.pid = 1_000_000_000  # Synthetic process group; POSIX signalling is mocked.
         self.returncode = None
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -115,6 +127,9 @@ class ProbeProcess:
 
     async def wait(self) -> int:
         self.waited = True
+        if self.returncode is None:
+            # Complete termination after the caller's mocked POSIX killpg.
+            self.kill()
         await self.release.wait()
         return self.returncode
 

@@ -45,6 +45,11 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read_object(path, len(encoded)), {"text": "погода"})
         with self.assertRaisesRegex(ValueError, "size limit"):
             read_object(path, len(encoded) - 1)
+        large = json.dumps({"text": "Ж" * 70000}, ensure_ascii=False).encode("utf-8")
+        path.write_bytes(large)
+        self.assertEqual(read_object(path, len(large))["text"], "Ж" * 70000)
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            read_object(path, len(large) - 1)
         for payload, error in ((b'{"unfinished":', ValueError), (b"[]", TypeError)):
             path.write_bytes(payload)
             with self.assertRaises(error):
@@ -204,6 +209,7 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(large.exception.status_code, 413)
 
     async def test_artifact_uses_attempt_directory_and_missing_file_returns_404(self):
+        """T073: historical artifact references enforce path and existence checks."""
         context = {
             "attempt_id": "1-0",
             "cycle_number": 1,
@@ -237,13 +243,42 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_cache_reuses_projection_then_refreshes_when_snapshot_changes(
         self,
     ):
-        import dashboard.views as module
+        """T093: unchanged reads reuse history; appends update visible results."""
+        self.addCleanup(self.views.journals.close)
+        before = self.views.journals.load("exp-test", force=True)
+        self.assertTrue(before["complete"])
+        with patch(
+            "dashboard.views.experiment_views",
+            side_effect=AssertionError("Cached pages must not project full history"),
+        ):
+            summary = await self.views.experiment("exp-test", "summary", {})
+            operations = await self.views.experiment(
+                "exp-test", "operations", {"compact": "1"}
+            )
+            with patch.object(
+                before["cache"],
+                "_project_scope",
+                side_effect=AssertionError("Unchanged history must not be rebuilt"),
+            ):
+                unchanged = self.views.journals.load("exp-test", force=True)
+                repeated = await self.views.experiment("exp-test", "summary", {})
+                repeated_operations = await self.views.experiment(
+                    "exp-test", "operations", {"compact": "1"}
+                )
+            self.assertEqual(unchanged["version"], before["version"])
+            self.assertEqual(unchanged["cached_through"], before["cached_through"])
+            self.assertEqual(repeated["summary"], summary["summary"])
+            self.assertEqual(repeated_operations["items"], operations["items"])
 
-        original = module.experiment_views
-        with patch.object(module, "experiment_views", wraps=original) as project:
-            await self.views.experiment("exp-test", "summary", {})
-            await self.views.experiment("exp-test", "operations", {})
-            self.assertEqual(project.call_count, 1)
-            self.views.journals.load("exp-test", force=True)
-            await self.views.experiment("exp-test", "summary", {})
-            self.assertEqual(project.call_count, 2)
+            error_id = self.workspace.logger.record_error(ValueError("New failure"))
+            after = self.views.journals.load("exp-test", force=True)
+            refreshed = await self.views.experiment("exp-test", "summary", {})
+            errors = await self.views.experiment("exp-test", "errors", {"compact": "1"})
+            self.assertTrue(after["complete"])
+            self.assertGreater(after["version"], before["version"])
+            self.assertGreater(
+                after["cached_through"]["cursor"], before["cached_through"]["cursor"]
+            )
+            self.assertEqual(refreshed["error_count"], summary["error_count"] + 1)
+            self.assertEqual(errors["total"], refreshed["error_count"])
+            self.assertIn(error_id, [row["error_id"] for row in errors["items"]])

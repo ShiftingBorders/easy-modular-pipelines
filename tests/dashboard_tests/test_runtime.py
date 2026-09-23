@@ -14,6 +14,7 @@ from tests.helpers.http_runtime import ServerTestCase
 
 class RuntimeIntegrationTests(ServerTestCase):
     async def test_real_run_step_snapshot_resume_rollback_and_offline_history(self):
+        """T074/T076: real command effects, rollback generation and offline history."""
         template = self.w.template()
         template["cycles"] = 2
         path = self.w.source / "dashboard.yaml"

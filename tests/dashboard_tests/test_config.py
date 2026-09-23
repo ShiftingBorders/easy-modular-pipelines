@@ -18,6 +18,28 @@ from tests.dashboard_tests.helpers import (
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_cache_defaults_and_all_numeric_boundaries(self):
+        """T012/T013: old configs retain defaults and cache budgets reject bad types."""
+        path = write_settings(self.directory)
+        defaults = load_settings(path)
+        self.assertEqual(defaults["cache_workers"], 2)
+        self.assertEqual(defaults["history_window_events"], 1000)
+        for key, maximum in (
+            ("cache_workers", 32),
+            ("history_window_events", 100000),
+            ("history_max_events", 10000000),
+            ("history_max_bytes", 2147483648),
+        ):
+            for value in (1, maximum):
+                with self.subTest(key=key, value=value):
+                    self.assertEqual(load_settings(path, {key: value})[key], value)
+            for value in (0, -1, True, "2", 1.5, maximum + 1):
+                with (
+                    self.subTest(key=key, value=value),
+                    self.assertRaises((ValueError, TypeError)),
+                ):
+                    load_settings(path, {key: value})
+
     def test_project_paths_overrides_and_history_limits(self):
         path = write_settings(
             self.directory,
@@ -72,6 +94,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse((self.directory / "state").exists())
 
     def test_relative_state_path_uses_config_directory_from_other_cwd(self) -> None:
+        """T014: library paths are anchored to the containing configuration."""
         config_path = write_settings(self.directory, state_directory="nested/state")
         elsewhere = self.directory / "elsewhere"
         elsewhere.mkdir()

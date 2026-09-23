@@ -1,0 +1,25 @@
+{
+  "source_experiment": "heilbronn-full-access-5gen",
+  "source_event_count": 9788,
+  "fixture_event_count": 4111,
+  "source_completed_cycles": 3,
+  "forecast_sample_cycles": 2,
+  "measurement_count": 42,
+  "module_count": 8,
+  "event_types": {
+    "template.applied": 1,
+    "runner.checkpoint": 77,
+    "experiment.state": 77,
+    "attempt.parameters": 24,
+    "control.intent": 24,
+    "call.started": 24,
+    "stage.process_started": 24,
+    "command.result": 24,
+    "stage.finished": 24,
+    "resources.recorded": 3791,
+    "artifact.recorded": 21
+  },
+  "history_sha256": "a01afdf7cd8563c20ddec6db9afd3d1ac38e1110999fd39eb03b77f2c2bd0978",
+  "uncompressed_bytes": 4396282,
+  "compressed_bytes": 202752
+}

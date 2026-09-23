@@ -1,4 +1,4 @@
-"""Windows-only probe semantics and real child-process cleanup; no Linux calls."""
+"""Native Windows probe semantics and portable real child-process cleanup."""
 
 import asyncio
 import contextlib
@@ -25,9 +25,7 @@ from tests.dashboard_tests.helpers import (
 )
 
 
-@unittest.skipUnless(
-    sys.platform == "win32", "Windows ICMP only; Linux is outside this test phase."
-)
+@unittest.skipUnless(sys.platform == "win32", "Requires native Windows ICMP APIs.")
 class WindowsProbeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.library = Mock()
@@ -167,11 +165,7 @@ class WindowsProbeTests(unittest.TestCase):
         self.assertGreaterEqual(observation["rtt_ms"], 0)
 
 
-@unittest.skipUnless(
-    sys.platform == "win32",
-    "Real child-process checks run only on Windows in this phase.",
-)
-class WindowsProcessCleanupTests(unittest.IsolatedAsyncioTestCase):
+class ProbeProcessCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)

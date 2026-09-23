@@ -58,6 +58,7 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(model["summary"]["error_count"], 0)
 
     def test_seconds_and_hours_use_whole_cycles_including_transition_time(self):
+        """T044: independent literal duration and forecast arithmetic."""
         model = experiment_views(history())
         forecast = model["forecast"]
         # Cycles: 2 + 3 + 3600 = 3605; 4 + 3 + 7200 = 7207.

@@ -10,8 +10,16 @@ from unittest.mock import AsyncMock, Mock, patch
 from dashboard.notifications import deliver
 
 
-@unittest.skipUnless(os.name == "nt", "Windows notification protocol; Linux deferred")
 class NotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        if os.name != "nt":
+            lookup = patch(
+                "dashboard.notifications.shutil.which",
+                side_effect=lambda name: "/test/bin/" + name,
+            )
+            lookup.start()
+            self.addCleanup(lookup.stop)
+
     async def test_disabled_channels_do_not_spawn(self):
         with patch(
             "dashboard.notifications.asyncio.create_subprocess_exec", new=AsyncMock()
@@ -36,10 +44,16 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
             result = await deliver("title", text, {"desktop": True, "sound": True})
         self.assertEqual(result["status"], "submitted")
         self.assertEqual(result["source"], "dashboard_host")
-        self.assertNotIn(text, spawn.call_args.args[-1])
-        payload = json.loads(process.communicate.call_args.args[0])
-        self.assertEqual(payload["message"], text)
-        self.assertNotEqual(spawn.call_args.kwargs["creationflags"], 0)
+        if os.name == "nt":
+            self.assertNotIn(text, spawn.call_args.args[-1])
+            payload = json.loads(process.communicate.call_args.args[0])
+            self.assertEqual(payload["message"], text)
+            self.assertNotEqual(spawn.call_args.kwargs["creationflags"], 0)
+        else:
+            desktop = spawn.await_args_list[0]
+            self.assertEqual(desktop.args[-3:], ("--", "title", text))
+            self.assertNotIn("shell", desktop.kwargs)
+            self.assertNotIn("creationflags", desktop.kwargs)
 
     async def test_launch_error_is_reported_and_cancelled_child_is_reaped(self):
         with patch(

@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import signal
 import socket
 import sys
 import unittest
@@ -83,9 +85,6 @@ class ICMPSettingsTests(unittest.TestCase):
                     validate_icmp_settings(icmp_settings(**{field: value}))
 
 
-@unittest.skipUnless(
-    sys.platform == "win32", "This phase runs monitor/process checks on Windows only."
-)
 class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
@@ -94,6 +93,10 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.monitor = ICMPMonitor(self.directory)
         # Exercise explicit probe calls independently of the periodic scheduler.
         self.monitor.settings = icmp_settings()
+        if os.name != "nt":
+            self.signal_patch = patch("dashboard.icmp.os.killpg")
+            self.killpg = self.signal_patch.start()
+            self.addCleanup(self.signal_patch.stop)
         self.addAsyncCleanup(self.monitor.close)
 
     async def measure(self, status: str = "reply") -> dict:
@@ -276,6 +279,8 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.monitor.close()
         self.assertTrue(process.killed)
         self.assertTrue(process.waited)
+        if os.name != "nt":
+            self.killpg.assert_called_once_with(process.pid, signal.SIGKILL)
         replacement = ICMPMonitor(self.directory)
         await replacement.open()
         await replacement.close()
