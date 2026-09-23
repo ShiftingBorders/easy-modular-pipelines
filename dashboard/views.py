@@ -394,8 +394,13 @@ class DashboardViews:
             error = result.get("error")
             if result.get("modules_error"):
                 self._module_error = result["modules_error"]
+                self._module_registry = None
             elif result.get("modules_published"):
                 self._module_error = None
+            elif result.get("modules_published") is False:
+                # Retry publication even after a stopped experiment leaves the queue.
+                # An older module job completing must not clear this invalidation.
+                self._module_registry = None
             if error:
                 self._ram_previews.pop(identifier, None)
                 self._cache_errors[identifier] = error
