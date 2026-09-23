@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from contextlib import ExitStack, closing
 from datetime import UTC, datetime
@@ -25,7 +26,12 @@ from core.logger import OperationLogger
 from core.logger_utils.events import LoggingError
 from core.runner_utils.runtimeio import read_json, write_json
 from dashboard.api_client import SystemAPIError
-from dashboard.projections import compact_event, module_statistics, project_scope
+from dashboard.projections import (
+    compact_event,
+    instant,
+    module_statistics,
+    project_scope,
+)
 
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
@@ -101,6 +107,8 @@ class LocalJournals:
         self._module_publication: dict | None = None
         self._read_snapshots: dict[str, tuple[tuple, dict]] = {}
         self._windows: dict[str, tuple[dict, tuple, OrderedDict, dict]] = {}
+        self._timeline_overviews: OrderedDict[tuple, dict] = OrderedDict()
+        self._timeline_lock = threading.Lock()
 
     def cached(self, identifier: str) -> dict:
         """Load a published dataset using only the derived database's metadata."""
@@ -707,6 +715,8 @@ class LocalJournals:
             self._snapshots.clear()
             self._read_snapshots.clear()
             self._windows.clear()
+        with self._timeline_lock:
+            self._timeline_overviews.clear()
 
     def read_view(self, dataset: dict, reader, *args) -> dict:
         """Keep a multi-query response within its advertised cache publication."""
@@ -720,6 +730,157 @@ class LocalJournals:
             raise SystemAPIError("history_limit", str(error), 413) from error
         except (LoggingError, OSError, sqlite3.Error) as error:
             raise SystemAPIError("journal_unavailable", str(error)) from error
+
+    def timeline(self, dataset: dict, params: dict, observed_at: str | None) -> dict:
+        """Read a bounded time slice and its ancestors from the existing cache."""
+        cache = dataset["cache"]
+        scope = [
+            dataset["identity"],
+            params.get("run_id"),
+            params.get("since"),
+            params.get("until"),
+        ]
+        position = [0, "", ""]
+        if params.get("cursor"):
+            try:
+                cursor = json.loads(params["cursor"])
+                if (
+                    cursor["scope"] != scope
+                    or cursor["version"] != dataset["version"]
+                    or time.time() - cursor["at"] > 300
+                ):
+                    raise ValueError("Timeline changed.")
+                position = cursor["position"]
+                if (
+                    not isinstance(position, list)
+                    or len(position) != 3
+                    or type(position[0]) is not int
+                    or not all(isinstance(value, str) for value in position[1:])
+                ):
+                    raise ValueError("Invalid timeline cursor.")
+            except (KeyError, TypeError, ValueError) as error:
+                raise SystemAPIError(
+                    "history_changed", "Refresh this timeline range.", 409
+                ) from error
+        limit = int(params.get("limit", 200))
+        if not 1 <= limit <= 1000:
+            raise SystemAPIError(
+                "invalid_limit", "limit must be between 1 and 1000.", 400
+            )
+        start_sql = "julianday(json_extract(payload,'$.started_at'))"
+        # Open operations extend only to the last available observation.
+        end_sql = f"MAX({start_sql},COALESCE(julianday(json_extract(payload,'$.finished_at')),julianday(?),{start_sql}))"
+        where, args = "kind='operations'", []
+        if params.get("run_id"):
+            where += " AND run_id=?"
+            args.append(params["run_id"])
+        where += f" AND {start_sql} IS NOT NULL"
+        # Reader identity changes on replacement/rebuild, even if version resets.
+        # Weak references avoid retaining readers and their raw payload windows.
+        overview_key = (weakref.ref(cache), dataset["version"], params.get("run_id"))
+        with self._timeline_lock:
+            overview = self._timeline_overviews.get(overview_key)
+            if overview is not None:
+                self._timeline_overviews.move_to_end(overview_key)
+        if overview is None:
+            finish_sql = "julianday(json_extract(payload,'$.finished_at'))"
+            recorded_end = f"MAX({start_sql},COALESCE({finish_sql},{start_sql}))"
+            first, last, count, has_open = cache.query(
+                f"SELECT MIN({start_sql}),MAX({recorded_end}),COUNT(*),MAX({finish_sql} IS NULL) FROM records WHERE {where}",
+                tuple(args),
+            )[0]
+            first_ms = (
+                round((first - 2440587.5) * 86400000) if first is not None else None
+            )
+            last_ms = round((last - 2440587.5) * 86400000) if last is not None else None
+            histogram = [0] * 64
+            if count:
+                bins = cache.query(
+                    f"SELECT MIN(63,CAST((ROUND(({start_sql}-2440587.5)*86400000)-?)*64.0/? AS INTEGER)),COUNT(*) FROM records WHERE {where} GROUP BY 1",
+                    (first_ms, max(last_ms - first_ms, 1), *args),
+                )
+                for bucket, number in bins:
+                    histogram[max(0, bucket)] = number
+            overview = {
+                "has_open": bool(has_open),
+                "timeline": {
+                    "start": first_ms,
+                    "end": last_ms,
+                    "histogram_end": last_ms,
+                    "histogram": histogram,
+                    "operation_count": count,
+                },
+            }
+            with self._timeline_lock:
+                self._timeline_overviews[overview_key] = overview
+                self._timeline_overviews.move_to_end(overview_key)
+                while len(self._timeline_overviews) > 32:
+                    self._timeline_overviews.popitem(last=False)
+        timeline = {
+            **overview["timeline"],
+            "histogram": list(overview["timeline"]["histogram"]),
+        }
+        # Elapsed live time changes the axis, not the recorded histogram buckets.
+        # Keeping their own domain avoids rescanning or approximate rebinning.
+        observed = instant(observed_at)
+        if overview["has_open"] and observed is not None:
+            timeline["end"] = max(timeline["end"], round(observed * 1000))
+        if params.get("since") is not None:
+            where += f" AND {start_sql}<=julianday(?) AND {end_sql}>=julianday(?)"
+            args.extend((params["until"], observed_at, params["since"]))
+        total = timeline["operation_count"]
+        if params.get("since") is not None:
+            total = cache.query(
+                f"SELECT COUNT(*) FROM records WHERE {where}", tuple(args)
+            )[0][0]
+        rows = cache.query(
+            f"SELECT position,record_key,scope,payload FROM records WHERE {where} "
+            "AND (position,record_key,scope)>(?,?,?) ORDER BY position,record_key,scope LIMIT ?",
+            (*args, *position, limit + 1),
+        )
+        selected = rows[:limit]
+        seeds = json.dumps(
+            [{"key": key, "scope": partition} for _, key, partition, _ in selected]
+        )
+        ancestors = cache.query(
+            """WITH RECURSIVE tree(record_key,scope,run_id,payload) AS (
+                SELECT r.record_key,r.scope,r.run_id,r.payload
+                FROM json_each(?) seed CROSS JOIN records r
+                WHERE r.kind='operations' AND r.record_key=json_extract(seed.value,'$.key')
+                  AND r.scope=json_extract(seed.value,'$.scope')
+                UNION
+                SELECT p.record_key,p.scope,p.run_id,p.payload
+                FROM tree child CROSS JOIN records p
+                WHERE p.kind='operations' AND p.run_id IS child.run_id
+                  AND p.record_key=json_extract(child.payload,'$.parent_operation_id')
+            ) SELECT payload FROM tree LIMIT 1001""",
+            (seeds,),
+        )
+        if len(ancestors) > 1000:
+            raise SystemAPIError(
+                "history_limit",
+                "Too many timeline ancestors; request a smaller page.",
+                413,
+            )
+        items = []
+        for (encoded,) in ancestors:
+            row = json.loads(encoded)
+            if row.get("detail_ref"):
+                row["detail_ref"] = {**row["detail_ref"], **dataset["identity"]}
+            items.append(row)
+        return {
+            "items": items,
+            "total": total,
+            "timeline": timeline,
+            "next_cursor": {
+                "scope": scope,
+                "version": dataset["version"],
+                "at": time.time(),
+                "position": list(selected[-1][:3]),
+            }
+            if len(rows) > limit
+            else None,
+        }
 
     def page(self, dataset: dict, view: str, params: dict) -> dict:
         cache = dataset["cache"]

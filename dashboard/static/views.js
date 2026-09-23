@@ -65,13 +65,38 @@ export function errors(rows) {
         ["Message", row => e(row.message || "—")]], [["type", "Type"], ["phase", "Phase"], ["module_name", "Module"]], "errors"));
 }
 
-export function timeline(rows, observedAt) {
+export function timelineNavigator(timeline, range) {
+    if (!Number.isFinite(timeline?.start) || !Number.isFinite(timeline?.end)) return "";
+    const start = Math.floor(timeline.start), end = Math.max(start + 1, Math.ceil(timeline.end));
+    const since = Math.max(start, Math.min(range?.since ?? start, end - 1));
+    const until = Math.min(end, Math.max(since + 1, range?.until ?? end));
+    const span = end - start, left = (since - start) / span * 100, right = (until - start) / span * 100;
+    const bins = timeline.histogram || [], peak = Math.max(1, ...bins);
+    const histogramEnd = timeline.histogram_end ?? timeline.end;
+    const histogramWidth = Math.min(100, Math.max(1, histogramEnd - start) / span * 100);
+    return `<div class="timeline-navigation" id="timeline-navigation">
+        <div class="timeline-range-caption"><span id="timeline-range-label">${e(dateTime(new Date(since).toISOString()))} — ${e(dateTime(new Date(until).toISOString()))} · ${duration((until - since) / 1000)}</span><button class="button quiet" data-action="timeline-reset">All history</button></div>
+        <div id="timeline-overview" class="timeline-overview" data-start="${start}" data-end="${end}" aria-label="Timeline range selector">
+            <div class="timeline-histogram" style="width:${histogramWidth}%" aria-hidden="true">${bins.map(count => `<i style="height:${count ? Math.max(5, Math.sqrt(count / peak) * 100) : 0}%"></i>`).join("")}</div>
+            <button type="button" class="timeline-window" data-timeline-part="move" style="left:${left}%;width:${right - left}%" aria-label="Move selected time range" title="Drag to move the selected range"></button>
+            <button type="button" class="timeline-handle" data-timeline-part="start" role="slider" aria-label="Range start" aria-orientation="horizontal" aria-valuemin="${start}" aria-valuemax="${until - 1}" aria-valuenow="${since}" aria-valuetext="${e(new Date(since).toISOString())}" style="left:${left}%" title="Drag to change the range start"></button>
+            <button type="button" class="timeline-handle" data-timeline-part="end" role="slider" aria-label="Range end" aria-orientation="horizontal" aria-valuemin="${since + 1}" aria-valuemax="${end}" aria-valuenow="${until}" aria-valuetext="${e(new Date(until).toISOString())}" style="left:${right}%" title="Drag to change the range end"></button>
+        </div>
+        <div class="timeline-overview-labels"><span>${e(dateTime(new Date(start).toISOString()))}</span><span>${e(dateTime(new Date(end).toISOString()))}</span></div>
+        <p class="source-note">Operation starts across the full history. Drag the edges to zoom, or the selection to move. Arrow keys make fine adjustments. A selected range stays fixed during refresh.</p>
+    </div>`;
+}
+
+export function timeline(rows, observedAt, overview = null, range = null) {
     const recorded = rows.filter(row => Number.isFinite(new Date(row.started_at).valueOf()));
-    if (!recorded.length) return panel("Timeline", empty("No operations recorded"));
+    const navigator = timelineNavigator(overview, range);
+    if (!recorded.length) return panel("Timeline", empty(navigator ? "No operations in this range" : "No operations recorded") + navigator);
     const observed = new Date(observedAt).valueOf();
     const starts = recorded.map(row => new Date(row.started_at).valueOf());
     const finish = row => row.finished_at ? new Date(row.finished_at).valueOf() : Number.isFinite(observed) ? Math.max(observed, new Date(row.started_at).valueOf()) : new Date(row.started_at).valueOf();
-    const start = Math.min(...starts), end = Math.max(start, ...recorded.map(finish).filter(Number.isFinite)), span = Math.max(1, end - start);
+    const fullStart = Number.isFinite(overview?.start) ? Math.floor(overview.start) : Math.min(...starts);
+    const fullEnd = Number.isFinite(overview?.end) ? Math.ceil(overview.end) : Math.max(fullStart, ...recorded.map(finish).filter(Number.isFinite));
+    const start = range?.since ?? fullStart, end = range?.until ?? fullEnd, span = Math.max(1, end - start);
     const byId = new Map(recorded.map(row => [row.operation_id, row]));
     const children = new Map();
     for (const row of recorded) {
@@ -88,12 +113,16 @@ export function timeline(rows, observedAt) {
     }
     for (const row of children.get(null) || []) visit(row, 0);
     for (const row of recorded) if (!visited.has(row.operation_id)) visit(row, 0);
-    return panel("Timeline", `<div class="table-scroll"><div class="trace"><div class="trace-row trace-ruler"><div class="trace-name">Operation</div><div class="trace-track">${[0, .25, .5, .75, 1].map(fraction => `<span>${duration(span * fraction / 1000)}</span>`).join("")}</div></div>${ordered.map(([row, depth]) => {
-        const left = (new Date(row.started_at).valueOf() - start) / span * 100;
-        const width = Math.max(0, (finish(row) - new Date(row.started_at)) / span * 100);
+    return panel("Timeline", `<div id="timeline-viewport" class="table-scroll timeline-viewport"><div class="trace"><div class="trace-row trace-ruler"><div class="trace-name">Operation</div><div class="trace-track">${[0, .25, .5, .75, 1].map(fraction => `<span>${duration((start - fullStart + span * fraction) / 1000)}</span>`).join("")}</div></div>${ordered.map(([row, depth]) => {
+        const began = new Date(row.started_at).valueOf(), ended = finish(row);
+        const clippedStart = Math.max(start, began), clippedEnd = Math.min(end, ended);
+        const left = Math.max(0, (clippedStart - start) / span * 100);
+        const width = Math.max(0, (clippedEnd - clippedStart) / span * 100);
         const status = ["failed", "error"].includes(row.status) ? "failed" : row.finished_at ? "" : "running";
-        return `<div class="trace-row" data-key="operation:${e(row.operation_id)}"><button class="trace-name" style="padding-left:${12 + depth * 16}px" data-inspect="${e(JSON.stringify(row))}">${e(row.name || row.operation_type || row.operation_id)}</button><div class="trace-track"><span class="trace-bar ${status}" style="left:${left}%;width:${width}%" title="${e(row.name)} · ${duration((finish(row) - new Date(row.started_at)) / 1000)}"></span></div></div>`;
-    }).join("")}</div></div>`, `<span class="muted">${e(dateTime(new Date(start).toISOString()))} · ${duration(span / 1000)}</span>`);
+        const clipped = `${began < start ? " clipped-start" : ""}${ended > end ? " clipped-end" : ""}`;
+        const bar = clippedEnd >= clippedStart ? `<span class="trace-bar ${status}${clipped}" style="left:${left}%;width:${width}%" title="${e(row.name)} · ${duration((ended - began) / 1000)}${began < start || ended > end ? " · Continues outside selected range" : ""}"></span>` : "";
+        return `<div class="trace-row" data-key="operation:${e(row.operation_id)}"><button class="trace-name" style="padding-left:${12 + depth * 16}px" data-inspect="${e(JSON.stringify(row))}">${e(row.name || row.operation_type || row.operation_id)}</button><div class="trace-track trace-range-track">${bar}</div></div>`;
+    }).join("")}</div></div>${navigator}`, `<span class="muted">${e(dateTime(new Date(start).toISOString()))} · ${duration(span / 1000)}</span>`);
 }
 
 export function dag(document) {

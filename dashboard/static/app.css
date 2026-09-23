@@ -16,3 +16,16 @@
 
 textarea{font:13px/1.6 JetBrains Mono,monospace;background:#172332;color:var(--text);border:1px solid #4d6180;border-radius:4px;padding:10px;resize:vertical}
 .cache-activity{position:fixed;right:16px;bottom:16px;z-index:80;max-width:min(560px,calc(100vw - 32px));padding:14px 18px;background:#26364d;color:var(--text);border:1px solid #83b4fc;border-radius:6px;box-shadow:0 4px 24px #0008;font-size:13px}.cache-activity[hidden]{display:none}
+.timeline-navigation{padding:18px 24px;border-top:1px solid var(--line)}
+.timeline-viewport{max-height:min(55vh,600px);overflow:auto}.timeline-viewport .trace-ruler{position:sticky;top:0;z-index:2;background:var(--panel)}
+.timeline-range-caption{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.timeline-overview{position:relative;height:64px;background:#141e2d;border:1px solid var(--line);border-radius:5px;touch-action:none;user-select:none}
+.timeline-histogram{position:absolute;inset:8px 0;display:flex;align-items:flex-end;gap:2px;pointer-events:none}
+.timeline-histogram i{flex:1;background:#678bb7;opacity:.65;min-width:0}
+.timeline-window{position:absolute;top:0;bottom:0;background:#83b4fc26;border:2px solid #83b4fc;border-radius:3px;cursor:grab;touch-action:none;min-width:1px;padding:0}
+.timeline-window:active{cursor:grabbing}.timeline-window:focus-visible,.timeline-handle:focus-visible{outline:2px solid var(--text);outline-offset:4px}
+.timeline-handle{position:absolute;top:-5px;bottom:-5px;width:14px;transform:translateX(-50%);background:#accbf5;border:1px solid #d5e7ff;border-radius:4px;cursor:ew-resize;touch-action:none;padding:0;z-index:1}
+.timeline-handle::after{content:"";position:absolute;top:24px;bottom:24px;left:5px;border-left:2px solid #314d70}
+.timeline-overview-labels{display:flex;justify-content:space-between;gap:16px;margin-top:12px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.trace-range-track{overflow:hidden}.trace-bar.clipped-start{border-left:3px dashed #fff;border-top-left-radius:0;border-bottom-left-radius:0}.trace-bar.clipped-end{border-right:3px dashed #fff;border-top-right-radius:0;border-bottom-right-radius:0}
+@media(max-width:700px){.timeline-navigation{padding:16px}.timeline-range-caption{align-items:flex-start}.timeline-overview-labels{font-size:10px}.timeline-handle{width:20px}.timeline-handle::after{left:8px}}

@@ -138,6 +138,7 @@ Paths are relative to `/api/system/experiments/{experiment_id}/` on dashboard.
 | `summary` | name, status, run_id, template_revision_id, observed_at. |
 | `runs` | items: run_id, template_revision_id, status in lineage order. |
 | `operations` | items: operation_id, parent_operation_id, name/operation_type, started_at, finished_at, status and contextual details. |
+| `timeline` | Compact, paginated operation rows with ancestors and a full-history `timeline` overview. Optional `since` / `until` select intersecting operations. |
 | `events` | items: event_id, event_type, occurred_at, context, data, confirmation, ignored. Original payload/author are preserved. |
 | `errors` | items: error_id, type, message, module_name, stage_id, phase, occurred_at, traceback and context. One item represents one error event. |
 | `measurements` | items: module_name, module_version, metric, unit, cycle_number, value, template_revision_id, complete, estimated. See aggregation rules below. |
@@ -146,6 +147,47 @@ Paths are relative to `/api/system/experiments/{experiment_id}/` on dashboard.
 | `commands` | items: command/name, target (display name), kind, status/outcome, run_id, sent_at, request_id and original observations. |
 | `snapshots` | items: snapshot_id, status, template_revision_id, cycle_number, created_at, validation and recovery details. |
 | `artifacts` | items: path/name, purpose, module_name, attempt_id, size_bytes and recorded metadata. |
+
+### Timeline range navigation
+
+`timeline` is independent of `operations`; existing operation pagination and
+statistics are unchanged. Use `run_id` to select a run and `limit` (1–1000,
+default 200) to bound the number of matching operations per page. Parent
+operations and logical-run rows are included for hierarchy and may be repeated
+between pages. `total` counts matching operations, excluding these extra rows.
+Use operation IDs to merge subsequent pages. Details retain full original times.
+
+`since` and `until` must be supplied together as valid timestamps with
+`since < until`. Operations intersecting either boundary are included; an open
+operation extends to the latest available observation, not an invented finish.
+The range applies to the complete published cache, including operations outside
+the raw RAM window. Small complete RAM previews use the same overlap semantics.
+An incomplete cache remains explicitly incomplete.
+
+`timeline.start` and `timeline.end` are UTC Unix milliseconds for all recorded
+operations in the selected run (or experiment), independent of the requested
+range and page. Empty history returns null bounds. `histogram` contains 64 counts
+of operation starts between `start` and `histogram_end`; it is an overview, not
+a resource metric. Its recorded domain is fixed for one publication. Open
+operations can extend `end` with each live observation without moving or
+recomputing the histogram buckets. The UI scales the histogram to its own
+domain within the full axis.
+The reader retains up to 32 small overviews, keyed by cache reader, publication
+version and run. Range changes and pagination reuse these summaries; replacement
+or a new publication invalidates reuse. Historical payloads are not retained in
+this overview cache.
+`operation_count` counts all timed operations in that scope. Cursors are bound
+to the journal generation, cache publication, run and requested range; changing
+the range starts at its first page. Extremely large ancestor sets return an
+explicit limit error instead of silently dropping rows.
+
+In the UI, drag either edge of the overview selection to zoom, or drag its body
+to pan. Arrow keys adjust the focused edge or selection (Shift increases the
+step); Home/End move it to a boundary. `All history` restores automatic scaling.
+Manual selections keep absolute times during refresh and appends. Changing the
+experiment/run or replacing its journal resets the selection. Striped bar ends
+indicate continuation beyond the visible range. Pending requests are cancelled
+when a newer range is selected; dragging itself performs no history requests.
 | `forecast` | completed_cycles, total_cycles, eta_seconds, paused, sample_mean_seconds, sample_cycles, eta_low_seconds, eta_high_seconds, measurements, component_durations. |
 
 Forecast and measurement responses also include `metric_summaries`,

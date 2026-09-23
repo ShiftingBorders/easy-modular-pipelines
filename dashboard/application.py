@@ -175,6 +175,7 @@ def create_app(
             "summary",
             "runs",
             "operations",
+            "timeline",
             "events",
             "errors",
             "measurements",

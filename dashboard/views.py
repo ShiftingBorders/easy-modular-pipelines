@@ -788,6 +788,19 @@ class DashboardViews:
         }
         if view == "summary":
             return {**metadata, **model["summary"]}
+        if view == "timeline":
+            if dataset.get("cache"):
+                return await asyncio.to_thread(
+                    self.journals.read_view,
+                    dataset,
+                    self._timeline_view,
+                    model,
+                    metadata,
+                    params,
+                )
+            return await asyncio.to_thread(
+                self._timeline_view, dataset, model, metadata, params
+            )
         if dataset.get("cache"):
             return await asyncio.to_thread(
                 self.journals.read_view,
@@ -853,6 +866,126 @@ class DashboardViews:
                 ),
             ]
         return self.page(items, metadata, view, params)
+
+    def _timeline_view(
+        self, dataset: dict, model: dict, metadata: dict, params: dict
+    ) -> dict:
+        """Keep timeline selection independent of ordinary operation pagination."""
+        since, until = instant(params.get("since")), instant(params.get("until"))
+        if ("since" in params or "until" in params) and (
+            since is None or until is None or since >= until
+        ):
+            raise SystemAPIError(
+                "invalid_range",
+                "Provide valid since and until times with since < until.",
+                400,
+            )
+        if dataset.get("cache"):
+            page = self.journals.timeline(dataset, params, metadata["observed_at"])
+            for row in page["items"]:
+                if str(row.get("operation_id", "")).startswith("attempt:"):
+                    row["status"] = observed_attempt_status(
+                        row, model["summary"]["fresh"]
+                    )
+            run_ids = list(
+                dict.fromkeys(
+                    row["run_id"] for row in page["items"] if row.get("run_id")
+                )
+            )
+            parents = [
+                {
+                    **run,
+                    "operation_id": "run:" + run["run_id"],
+                    "parent_operation_id": None,
+                    "name": "Logical run " + run["run_id"],
+                }
+                for run in self._cached_runs(dataset, model, run_ids)
+            ]
+            return {**metadata, **page, "items": parents + page["items"]}
+
+        operations = [
+            row
+            for row in model["operations"]
+            if not str(row["operation_id"]).startswith("run:")
+            and instant(row.get("started_at")) is not None
+        ]
+        positions = {}
+        for event in model["effective"]:
+            if event["event_type"] in {"operation.started", "operation.finished"}:
+                key = event.get("operation_id")
+            elif event["event_type"] in {
+                "attempt.parameters",
+                "stage.process_started",
+                "stage.finished",
+                "call.started",
+            }:
+                key = "attempt:" + str(event["context"].get("attempt_id"))
+            else:
+                continue
+            positions.setdefault(key, event.get("cursor", len(positions)))
+        operations.sort(
+            key=lambda row: (positions.get(row["operation_id"], 0), row["operation_id"])
+        )
+        observed = instant(metadata["observed_at"])
+        intervals = []
+        histogram_end = None
+        for row in operations:
+            left = instant(row["started_at"])
+            right = instant(row.get("finished_at"))
+            recorded_end = max(left, right if right is not None else left)
+            histogram_end = (
+                max(histogram_end, recorded_end)
+                if histogram_end is not None
+                else recorded_end
+            )
+            if right is None:
+                right = observed if observed is not None else left
+            intervals.append((row, left, max(left, right)))
+        start = min((left for _, left, _ in intervals), default=None)
+        end = max((right for _, _, right in intervals), default=None)
+        start_ms = round(start * 1000) if start is not None else None
+        end_ms = round(end * 1000) if end is not None else None
+        histogram_end_ms = (
+            round(histogram_end * 1000) if histogram_end is not None else None
+        )
+        histogram = [0] * 64
+        for _, left, _ in intervals:
+            bucket = int(
+                (round(left * 1000) - start_ms)
+                * 64
+                / max(histogram_end_ms - start_ms, 1)
+            )
+            histogram[min(63, bucket)] += 1
+        selected = [
+            row
+            for row, left, right in intervals
+            if since is None or left <= until and right >= since
+        ]
+        page = self.page(selected, metadata, f"timeline:{since}:{until}", params)
+        by_id = {row["operation_id"]: row for row in model["operations"]}
+        included = {row["operation_id"]: row for row in page["items"]}
+        pending = list(included.values())
+        while pending:
+            parent = by_id.get(pending.pop().get("parent_operation_id"))
+            if parent and parent["operation_id"] not in included:
+                included[parent["operation_id"]] = parent
+                pending.append(parent)
+        run_ids = {row.get("run_id") for row in included.values() if row.get("run_id")}
+        for run_id in run_ids:
+            parent = by_id.get("run:" + run_id)
+            if parent:
+                included[parent["operation_id"]] = parent
+        return {
+            **page,
+            "items": list(included.values()),
+            "timeline": {
+                "start": start_ms,
+                "end": end_ms,
+                "histogram_end": histogram_end_ms,
+                "histogram": histogram,
+                "operation_count": len(operations),
+            },
+        }
 
     def _cached_view(
         self, dataset: dict, model: dict, metadata: dict, view: str, params: dict

@@ -1,6 +1,6 @@
 "use strict";
 
-import {recordKey, updateContent, escape as e, numeric, dateTime, address, badge, warning, panel, empty, unavailable, stat, inspectButton, table, lineChart} from "./ui.js";
+import {recordKey, updateContent, escape as e, numeric, duration, dateTime, address, badge, warning, panel, empty, unavailable, stat, inspectButton, table, lineChart} from "./ui.js";
 import * as views from "./views.js";
 
 const navigation = [
@@ -13,7 +13,7 @@ const navigation = [
     ["alerts", "Alerts", "M6 8a6 6 0 0112 0v7l2 3H4l2-3zM10 21h4"],
 ];
 const runViews = [
-    ["timeline", "Execution", "operations"], ["dag", "DAG", "template"], ["errors", "Errors", "errors"],
+    ["timeline", "Execution", "timeline"], ["dag", "DAG", "template"], ["errors", "Errors", "errors"],
     ["events", "Events", "events"], ["resources", "Resources", "measurements"],
     ["artifacts", "Artifacts", "artifacts"], ["settings", "Run settings", "template"],
     ["commands", "Commands", "commands"], ["snapshots", "Snapshots", "snapshots"],
@@ -22,6 +22,7 @@ const main = document.getElementById("main");
 const state = {page: "overview", experiment: null, run: null, detail: null, info: null, icmp: null,
     experiments: [], modules: [], data: null, rows: [], cursor: null, nextCursor: null, journal: null,
     mode: "effective", metrics: [{}, {}, {}], filters: [], loading: false, request: 0,
+    timelineRange: null, timelineContext: null, timelineJournal: null, timelineDrag: null,
     abort: null, timer: null, systemAlerts: null, refresh: 5, bookmarks: [], window: "15", settingsMode: "yaml"};
 
 function readLocation() {
@@ -242,7 +243,7 @@ function renderRun(response) {
     state.nextCursor = response.next_cursor || null;
     let content = "";
     switch (state.page) {
-        case "timeline": content = `<div class="actions" style="margin-bottom:16px"><a class="button" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button quiet" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.timeline(state.rows, response.observed_at)}`; break;
+        case "timeline": content = `<div class="actions" style="margin-bottom:16px"><a class="button" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button quiet" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.timeline(state.rows, response.observed_at, response.timeline, state.timelineRange)}`; break;
         case "dag": content = `<div class="actions" style="margin-bottom:16px"><a class="button quiet" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.dag(response)}`; break;
         case "events": content = views.events(state.rows, state.mode); break;
         case "errors": content = views.errors(state.rows); break;
@@ -257,12 +258,17 @@ function renderRun(response) {
 
 async function loadPage(automatic = false, retryHistory = true) {
     clearTimeout(state.historyTimer);
+    if (state.timelineDrag) return;
     // Paged history is a browsing session. Refresh explicitly to return to its first page.
     if (automatic && state.cursor) return;
     if (automatic && (state.loading || main.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))) return;
     state.abort?.abort(); state.abort = new AbortController(); const signal = state.abort.signal;
     const serial = ++state.request; state.loading = true; if (automatic) rememberFilters();
     const context = `${state.experiment || ""}:${state.run || ""}`;
+    if (state.timelineContext !== context) {
+        state.timelineRange = null; state.timelineJournal = null; state.timelineContext = context;
+    }
+    const timelineJournal = state.timelineJournal;
     const sameExperiment = runViews.some(([page]) => page === state.page) && main.dataset.context === context && main.querySelector(".tabs");
     main.setAttribute("aria-busy", "true");
     if (!automatic && !sameExperiment) {
@@ -321,13 +327,25 @@ async function loadPage(automatic = false, retryHistory = true) {
             if (!state.experiment) { content = empty("No experiment selected", "Open Experiments and select an execution history."); }
             else {
                 const selected = state.experiment;
+                if (state.page === "timeline") state.timelineContext = `${state.experiment || ""}:${state.run || ""}`;
                 const params = {limit: "200", compact: "1"}; if (state.run) params.run_id = state.run;
+                if (state.page === "timeline" && state.timelineRange) {
+                    params.since = new Date(state.timelineRange.since).toISOString();
+                    params.until = new Date(state.timelineRange.until).toISOString();
+                }
                 if (state.page === "settings" && state.revision) params.revision = state.revision;
                 if (state.page === "events") params.view = state.mode;
                 if (state.cursor) params.cursor = typeof state.cursor === "string" ? state.cursor : JSON.stringify(state.cursor);
                 const endpoint = runViews.find(([page]) => page === state.page)[2];
                 const document = await systemRead(experimentPath(endpoint), signal, params);
                 if (serial !== state.request) return;
+                const journal = document.journal ? `${document.journal.journal_id}/${document.journal.generation}` : null;
+                if (state.page === "timeline" && state.timelineRange && state.timelineJournal && journal && journal !== state.timelineJournal) {
+                    state.timelineRange = null; state.cursor = null; state.rows = []; state.timelineJournal = journal;
+                    state.loading = false;
+                    return await loadPage(automatic, false);
+                }
+                if (state.page === "timeline") state.timelineJournal = journal;
                 const summary = document.summary || null;
                 checkContext(document, selected); if (summary) checkContext(summary, selected);
                 if (state.page === "settings" && state.settingsMode === "parameters") {
@@ -339,7 +357,23 @@ async function loadPage(automatic = false, retryHistory = true) {
             }
         }
         if (serial !== state.request) return;
+        // Read positions immediately before patching: the user may have scrolled
+        // while the request was in flight. Keep this local to timeline refreshes.
+        const timelineViewport = main.querySelector(".timeline-viewport");
+        const timelineScroll = automatic && state.page === "timeline" && sameExperiment && timelineJournal === state.timelineJournal ? {
+            pageX: window.scrollX, pageY: window.scrollY,
+            top: timelineViewport?.scrollTop ?? 0,
+            left: timelineViewport?.scrollLeft ?? 0,
+        } : null;
         updateContent(main, heading + content);
+        if (timelineScroll) {
+            const viewport = main.querySelector(".timeline-viewport");
+            if (viewport) {
+                viewport.scrollTop = timelineScroll.top;
+                viewport.scrollLeft = timelineScroll.left;
+            }
+            window.scrollTo({left: timelineScroll.pageX, top: timelineScroll.pageY, behavior: "instant"});
+        }
         main.dataset.context = `${state.experiment || ""}:${state.run || ""}`;
         const dialog = document.getElementById("details-dialog");
         if (dialog.open && dialog.dataset.recordKey && dialog.dataset.selection === location.search) {
@@ -391,6 +425,7 @@ function markOffline(error) {
 }
 
 function navigate(url) {
+    if (state.timelineDrag) state.timelineDrag = null;
     history.pushState(null, "", url); readLocation(); state.filters = []; state.cursor = null; state.rows = []; state.journal = null; state.metrics = [{}, {}, {}];
     void loadPage(); window.scrollTo(0, 0);
 }
@@ -450,6 +485,7 @@ document.addEventListener("click", async event => {
         return;
     }
     switch (button.dataset.action) {
+        case "timeline-reset": state.timelineRange = null; state.cursor = null; state.rows = []; await loadPage(); break;
         case "reload": state.cursor = null; await loadPage(); void refreshICMP(); break;
         case "close-dialog": document.getElementById("details-dialog").close(); break;
         case "run-experiment":
@@ -541,6 +577,85 @@ document.addEventListener("change", event => {
     form.querySelectorAll('[data-rule-resource]').forEach(element=>{element.hidden=kind!=="resource";});
     form.querySelectorAll('[data-rule-errors]').forEach(element=>{element.hidden=kind!=="errors";});
     if(kind === "errors") form.elements.threshold.value=10;
+});
+
+function paintTimelineRange(range) {
+    const overview = document.getElementById("timeline-overview");
+    if (!overview) return;
+    const start = Number(overview.dataset.start), end = Number(overview.dataset.end);
+    const left = (range.since - start) / (end - start) * 100;
+    const right = (range.until - start) / (end - start) * 100;
+    const frame = overview.querySelector('[data-timeline-part="move"]');
+    frame.style.left = `${left}%`; frame.style.width = `${right - left}%`;
+    for (const [part, value, percent] of [["start", range.since, left], ["end", range.until, right]]) {
+        const handle = overview.querySelector(`[data-timeline-part="${part}"]`);
+        handle.style.left = `${percent}%`;
+        handle.setAttribute("aria-valuenow", String(value));
+        handle.setAttribute("aria-valuetext", new Date(value).toISOString());
+        handle.setAttribute("aria-valuemin", String(part === "start" ? start : range.since + 1));
+        handle.setAttribute("aria-valuemax", String(part === "start" ? range.until - 1 : end));
+    }
+    document.getElementById("timeline-range-label").textContent = `${dateTime(new Date(range.since).toISOString())} — ${dateTime(new Date(range.until).toISOString())} · ${duration((range.until - range.since) / 1000)}`;
+}
+
+function moveTimelineRange(range, part, delta, start, end) {
+    const next = {...range};
+    if (part === "start") next.since = Math.max(start, Math.min(range.until - 1, range.since + delta));
+    else if (part === "end") next.until = Math.min(end, Math.max(range.since + 1, range.until + delta));
+    else {
+        delta = Math.max(start - range.since, Math.min(end - range.until, delta));
+        next.since += delta; next.until += delta;
+    }
+    return {since: Math.round(next.since), until: Math.round(next.until)};
+}
+
+function commitTimelineRange(range) {
+    state.timelineRange = range; state.cursor = null; state.rows = []; state.nextCursor = null;
+    void loadPage();
+}
+
+function timelinePointer(event) {
+    if (event.type === "pointerdown") {
+        const handle = event.target.closest("[data-timeline-part]");
+        if (!handle || event.button !== 0 || state.loading) return;
+        const overview = handle.closest("#timeline-overview");
+        const start = Number(overview.dataset.start), end = Number(overview.dataset.end);
+        const range = state.timelineRange || {since: start, until: end};
+        event.preventDefault(); handle.focus(); overview.setPointerCapture(event.pointerId);
+        state.timelineDrag = {pointer: event.pointerId, part: handle.dataset.timelinePart,
+            x: event.clientX, width: overview.getBoundingClientRect().width, start, end,
+            initial: {...range}, range: {...range}};
+        return;
+    }
+    const drag = state.timelineDrag;
+    if (!drag || drag.pointer !== event.pointerId) return;
+    if (event.type === "pointermove") {
+        drag.range = moveTimelineRange(drag.initial, drag.part,
+            (event.clientX - drag.x) / Math.max(1, drag.width) * (drag.end - drag.start), drag.start, drag.end);
+        paintTimelineRange(drag.range); return;
+    }
+    state.timelineDrag = null;
+    const overview = document.getElementById("timeline-overview");
+    if (overview?.hasPointerCapture(event.pointerId)) overview.releasePointerCapture(event.pointerId);
+    if (event.type === "pointercancel") { paintTimelineRange(drag.initial); return; }
+    if (drag.range.since !== drag.initial.since || drag.range.until !== drag.initial.until) commitTimelineRange(drag.range);
+}
+
+for (const event of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) main.addEventListener(event, timelinePointer);
+main.addEventListener("keydown", event => {
+    const handle = event.target.closest("[data-timeline-part]");
+    if (!handle || !["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const overview = handle.closest("#timeline-overview");
+    const start = Number(overview.dataset.start), end = Number(overview.dataset.end);
+    const range = state.timelineRange || {since: start, until: end};
+    const step = Math.max(1, Math.round((end - start) / 1000)) * (event.shiftKey ? 10 : 1);
+    let delta = ["ArrowLeft", "ArrowDown"].includes(event.key) ? -step : step;
+    if (event.key === "Home") delta = -(end - start);
+    if (event.key === "End") delta = end - start;
+    const next = moveTimelineRange(range, handle.dataset.timelinePart, delta, start, end);
+    if (next.since === range.since && next.until === range.until) return;
+    paintTimelineRange(next); commitTimelineRange(next);
 });
 
 main.addEventListener("input", event => { const scope = event.target.closest("[data-table]"); if (scope && event.target.matches("[data-filter-query]")) applyFilters(scope); });
