@@ -1,12 +1,69 @@
 "use strict";
 
+const numberFormats = new Map();
+const dateFormat = new Intl.DateTimeFormat("en-GB", {year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric", hour12: false});
+
+export function updateContent(target, html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    updateChildren(target, template.content);
+}
+
+function updateChildren(target, incoming) {
+    const key = node => node.nodeType === Node.ELEMENT_NODE ? node.dataset.key || node.id || null : null;
+    const keyed = new Map([...target.childNodes].filter(node => key(node)).map(node => [key(node), node]));
+    let position = target.firstChild;
+    for (const next of [...incoming.childNodes]) {
+        const identity = key(next);
+        let current = identity ? keyed.get(identity) : position;
+        if (current && (key(current) !== identity || current.nodeType !== next.nodeType || current.nodeName !== next.nodeName)) current = null;
+        if (!current) {
+            current = next;
+            target.insertBefore(current, position);
+        } else {
+            if (current !== position) target.insertBefore(current, position);
+            if (current.nodeType === Node.TEXT_NODE) {
+                if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+            } else if (current.nodeType === Node.ELEMENT_NODE && !current.isEqualNode(next)) {
+                updateElement(current, next);
+            }
+        }
+        keyed.delete(identity);
+        position = current.nextSibling;
+    }
+    while (position) {
+        const next = position.nextSibling;
+        position.remove(); position = next;
+    }
+}
+
+function updateElement(current, next) {
+    // Form state belongs to the user; polling must not overwrite edits or focus.
+    const field = current.matches("input, select, textarea");
+    const value = field ? current.value : null;
+    for (const attribute of [...current.attributes]) {
+        if (attribute.name === "open" && current.tagName === "DETAILS") continue;
+        if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+    }
+    for (const attribute of next.attributes) {
+        if (attribute.name === "open" && current.tagName === "DETAILS") continue;
+        if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+    }
+    if (current.matches("input, textarea")) return;
+    // Independently loaded history keeps its contents until its request finishes.
+    if (["run-history", "forecast-body"].includes(current.id) && !next.hasChildNodes()) return;
+    updateChildren(current, next);
+    if (field && [...current.options].some(option => option.value === value)) current.value = value;
+}
+
 export function escape(value) {
     return String(value ?? "").replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[character]);
 }
 
 export function numeric(value, digits = 2) {
-    return typeof value === "number" && Number.isFinite(value)
-        ? value.toLocaleString("en", {maximumFractionDigits: digits}) : "—";
+    if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+    if (!numberFormats.has(digits)) numberFormats.set(digits, new Intl.NumberFormat("en", {maximumFractionDigits: digits}));
+    return numberFormats.get(digits).format(value);
 }
 
 export function duration(seconds) {
@@ -20,7 +77,7 @@ export function duration(seconds) {
 export function dateTime(value) {
     if (!value) return "—";
     const date = new Date(value);
-    return Number.isFinite(date.valueOf()) ? date.toLocaleString("en-GB", {hour12: false}) : "—";
+    return Number.isFinite(date.valueOf()) ? dateFormat.format(date) : "—";
 }
 
 export function address(page, experiment = null, run = null, extra = {}) {
@@ -44,7 +101,7 @@ export function warning(message) {
 }
 
 export function panel(title, content, extra = "") {
-    return `<section class="panel"><div class="panel-head"><h2>${escape(title)}</h2>${extra}</div>${content}</section>`;
+    return `<section class="panel" data-key="panel:${escape(title)}"><div class="panel-head"><h2>${escape(title)}</h2>${extra}</div>${content}</section>`;
 }
 
 export function empty(title, message = "", retry = false) {
@@ -56,7 +113,7 @@ export function unavailable(error) {
 }
 
 export function stat(label, value, foot = "") {
-    return `<div class="stat"><div class="label">${escape(label)}</div><div class="value">${escape(value)}</div><div class="foot">${escape(foot)}</div></div>`;
+    return `<div class="stat" data-key="stat:${escape(label)}"><div class="label">${escape(label)}</div><div class="value">${escape(value)}</div><div class="foot">${escape(foot)}</div></div>`;
 }
 
 export function inspectButton(label, record) {
@@ -65,7 +122,7 @@ export function inspectButton(label, record) {
 
 export function table(rows, columns, facets = [], label = "records") {
     if (!rows.length) return empty("No records", "No matching observations were returned for this selection.");
-    return `<div data-table><div class="filters"><label class="field search-field">Search<input type="search" data-filter-query placeholder="Search ${escape(label)}"></label>${facets.map(([key, title]) => `<label class="field">${escape(title)}<select data-facet="${escape(key)}"><option value="">All</option>${[...new Set(rows.map(row => String(row[key] ?? "")))].filter(Boolean).sort().map(value => `<option>${escape(value)}</option>`).join("")}</select></label>`).join("")}<button class="button quiet" data-action="reset-filters">Reset</button></div><div class="table-scroll"><table><thead><tr>${columns.map(column => `<th scope="col">${escape(column[0])}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr data-row data-fields="${escape(JSON.stringify(Object.fromEntries(facets.map(([key]) => [key, String(row[key] ?? "")]))))}">${columns.map(([, render]) => `<td>${render(row)}</td>`).join("")}</tr>`).join("")}<tr data-empty-row hidden><td colspan="${columns.length}">${empty("No matches", "Change the search or reset the filters.")}</td></tr></tbody></table></div><div class="record-count" aria-live="polite"><span data-count>${rows.length}</span> of ${rows.length} loaded ${escape(label)}</div></div>`;
+    return `<div data-table><div class="filters"><label class="field search-field">Search<input type="search" data-filter-query placeholder="Search ${escape(label)}"></label>${facets.map(([key, title]) => `<label class="field">${escape(title)}<select data-facet="${escape(key)}"><option value="">All</option>${[...new Set(rows.map(row => String(row[key] ?? "")))].filter(Boolean).sort().map(value => `<option>${escape(value)}</option>`).join("")}</select></label>`).join("")}<button class="button quiet" data-action="reset-filters">Reset</button></div><div class="table-scroll"><table><thead><tr>${columns.map(column => `<th scope="col">${escape(column[0])}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr data-row data-key="${escape(recordKey(row))}" data-fields="${escape(JSON.stringify(Object.fromEntries(facets.map(([key]) => [key, String(row[key] ?? "")]))))}">${columns.map(([, render]) => `<td>${render(row)}</td>`).join("")}</tr>`).join("")}<tr data-empty-row hidden><td colspan="${columns.length}">${empty("No matches", "Change the search or reset the filters.")}</td></tr></tbody></table></div><div class="record-count" aria-live="polite"><span data-count>${rows.length}</span> of ${rows.length} loaded ${escape(label)}</div></div>`;
 }
 
 export function gauge(name, sample, unit = "%") {
@@ -91,7 +148,13 @@ export function lineChart(samples, valueKey = "value", unit = "", timeKey = "obs
         const y = 166 - Math.max(0, row[valueKey]) / maximum * 138;
         path += `${penDown ? "L" : "M"}${x},${y} `;
         penDown = true;
-        points.push(`<circle class="point" cx="${x}" cy="${y}" r="3"><title>${escape(dateTime(row[timeKey]))}: ${numeric(row[valueKey])} ${escape(unit)}</title></circle>`);
+        points.push(`<circle class="point" data-key="sample:${escape(row[timeKey])}" cx="${x}" cy="${y}" r="3"><title>${escape(dateTime(row[timeKey]))}: ${numeric(row[valueKey])} ${escape(unit)}</title></circle>`);
     }
     return `<svg class="chart" viewBox="0 0 720 205" role="img" aria-label="${escape(unit)} over time"><path class="grid" d="M55 28H670 M55 97H670 M55 166H670"/><text x="4" y="32">${numeric(maximum, 1)}</text><text x="4" y="101">${numeric(maximum / 2, 1)}</text><text x="4" y="170">0</text><path class="series" d="${path}"/>${points.join("")}<text x="55" y="195">${escape(new Date(low).toLocaleTimeString("en-GB"))}</text><text x="670" y="195" text-anchor="end">${escape(new Date(high).toLocaleTimeString("en-GB"))}</text></svg>`;
+}
+
+export function recordKey(row) {
+    const scope = [row.experiment_id || row.context?.experiment_id, row.run_id || row.context?.run_id];
+    const identity = row.event_id || row.operation_id || row.attempt_id || row.command_id || row.request_id || row.artifact_id || row.snapshot_id || row.module_id || row.instance_id || row.id || row.run_id || row.experiment_id;
+    return JSON.stringify([...scope, identity || [row.from, row.to, row.type || row.error_type, row.module_name, row.stage_id, row.phase, row.name, row.version, row.metric, row.unit, row.cycle_number]]);
 }

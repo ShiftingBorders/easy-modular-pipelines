@@ -124,9 +124,73 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_application_information_identifies_dashboard_host(self) -> None:
         response = await self.http.get("/api/application")
         self.assertEqual(response.status_code, 200)
+        self.assertIn("cache_activity", response.json())
         self.assertEqual(response.json()["dashboard_host"], socket.gethostname())
         self.assertEqual(response.json()["icmp_source"], "dashboard_host")
         self.assertEqual(self.upstream_requests, [])
+
+    async def test_compact_details_and_final_utf8_response_limit(self):
+        """T067/T070/T071/T072: compact references, generation checks and wire limits."""
+        path = "/api/system/experiments/exp-test/"
+        response = await self.http.get(
+            path + "parameters", params={"compact": "1", "limit": 1}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        document = response.json()
+        self.assertIn("summary", document)
+        self.assertIn("cached_through", document)
+        reference = document["items"][0]["detail_ref"]
+        detail = await self.http.get(
+            path + "detail", params={"ref": json.dumps(reference)}
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertIn("source_events", detail.json()["record"])
+        reference["generation"] = "replaced"
+        self.assertEqual(
+            (
+                await self.http.get(
+                    path + "detail", params={"ref": json.dumps(reference)}
+                )
+            ).status_code,
+            409,
+        )
+        self.app.state.settings["max_response_bytes"] = 50
+        oversized = await self.http.get(path + "summary")
+        self.assertEqual(oversized.status_code, 413)
+
+    async def test_cache_publication_descriptors_are_bounded_and_filter_specific(self):
+        """T068/T069: bounded paging sessions reject mismatched selection."""
+        path = "/api/system/experiments/exp-test/events"
+        for _ in range(20):
+            response = await self.http.get(path, params={"compact": "1", "limit": 1})
+            self.assertEqual(response.status_code, 200, response.text)
+        self.assertLessEqual(len(self.app.state.views._publications), 16)
+        cursor = response.json()["next_cursor"]
+        wrong_filter = await self.http.get(
+            path, params={"cursor": json.dumps(cursor), "view": "raw"}
+        )
+        self.assertEqual(wrong_filter.status_code, 409)
+
+    async def test_malformed_detail_references_return_client_errors(self):
+        """T071/T072: malformed JSON and invalid reference shapes never become 500s."""
+        base = "/api/system/experiments/exp-test/"
+        document = (
+            await self.http.get(base + "parameters", params={"compact": "1"})
+        ).json()
+        valid = document["items"][0]["detail_ref"]
+        for reference in (
+            "{",
+            "[]",
+            "null",
+            json.dumps({**valid, "event_ids": []}),
+            json.dumps({**valid, "event_ids": [1]}),
+            json.dumps({**valid, "event_ids": [""]}),
+        ):
+            with self.subTest(reference=reference):
+                response = await self.http.get(
+                    base + "detail", params={"ref": reference}
+                )
+                self.assertEqual(response.status_code, 400, response.text)
 
     async def test_html_scripts_fonts_and_api_schema_are_served(self) -> None:
         for path, content_type in [
@@ -328,8 +392,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await pending
-        self.assertIn(
-            "deadline", (await self.http.get("/api/system/compute")).json()["error"]
+        self.assertEqual(
+            "The system did not respond in time.",
+            (await self.http.get("/api/system/compute")).json()["error"],
         )
 
     async def test_icmp_configuration_and_probe_persist_on_dashboard_host(self) -> None:

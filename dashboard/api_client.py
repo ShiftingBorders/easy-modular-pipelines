@@ -55,9 +55,13 @@ class SystemAPIClient:
         document: dict | None = None,
     ) -> dict:
         if self.base_url is None:
-            raise SystemAPIError("not_configured", "System API is not configured.")
+            raise SystemAPIError(
+                "not_configured", "Cannot connect to the system. It may be offline."
+            )
         if self._client is None:
-            raise SystemAPIError("not_connected", "System API client is not running.")
+            raise SystemAPIError(
+                "not_connected", "Cannot connect to the system. It may be offline."
+            )
         try:
             async with asyncio.timeout(self.timeout):
                 async with self._client.stream(
@@ -113,11 +117,11 @@ class SystemAPIClient:
             return document
         except (TimeoutError, httpx.TimeoutException) as error:
             raise SystemAPIError(
-                "timeout", "System API did not respond before the deadline.", 504
+                "timeout", "The system did not respond in time.", 504
             ) from error
         except httpx.HTTPError as error:
             raise SystemAPIError(
-                "connection_error", "Cannot connect to the system API."
+                "connection_error", "Cannot connect to the system. It may be offline."
             ) from error
         except (TypeError, ValueError, UnicodeError) as error:
             raise SystemAPIError(

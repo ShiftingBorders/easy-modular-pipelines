@@ -3,7 +3,7 @@
 import asyncio
 import errno
 import json
-import sys
+import os
 import threading
 import unittest
 from pathlib import Path
@@ -18,16 +18,16 @@ from tests.dashboard_tests.helpers import (
 )
 
 
-@unittest.skipUnless(
-    sys.platform == "win32",
-    "State/OS-lock checks are approved for Windows in this phase.",
-)
 class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
+        if os.name != "nt":
+            signal_patch = patch("dashboard.icmp.os.killpg")
+            signal_patch.start()
+            self.addCleanup(signal_patch.stop)
         self.addAsyncCleanup(self.monitor.close)
         self.initial = {
             "settings": dict(self.monitor.settings),

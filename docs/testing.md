@@ -45,9 +45,32 @@ service. Do not point integration checks at valuable runtime data.
 ## Dashboard
 
 Dashboard backend tests are included in the normal suite.
-`tests/dashboard_tests/test_browser.py` uses headless Edge and CDP through Node
-on Windows. It explicitly skips when prerequisites are unavailable.
+`tests/dashboard_tests/test_browser.py` uses headless Edge on Windows or a
+Chromium-compatible browser (`google-chrome`, `chromium`, or `chromium-browser`
+on PATH) on Linux, controlled through CDP with Node's built-in WebSocket API.
+It explicitly skips when prerequisites are unavailable.
 It does not add an external browser-test framework.
+
+Tests select platform behavior from the current OS. They do not start Docker
+or Docker Desktop. A Linux container may be started manually to provide the
+test environment; install uv, Python 3.12, Node and the browser there, then
+run `uv sync --locked` and the same unittest commands as on the host. Put uv
+on PATH because integration fixtures launch child processes through it.
+Use a Linux-local checkout/environment instead of reusing a Windows `.venv`.
+
+The Heilbronn regression is self-contained: compressed extracted events and
+fixed reference results live in `tests/dashboard_tests/fixtures/heilbronn`.
+No original experiment directory or network access is needed to run it.
+
+Browser checks use a 500-event history and require each sampled ready-page
+navigation, including the first opening of a stopped uncached history, to
+finish within 200 ms; loading placeholders do not count. Run
+latency checks without unrelated host benchmarks. Resource tests include the
+dashboard process and its cache subprocesses: 2,000,000,000 bytes with zero or
+one caching experiment, 4,000,000,000 bytes with multiple concurrent builds.
+Reports are written under `.artifacts/logs/`. A delay beyond 300 ms is allowed
+only while a large, previously uncached experiment is actively being built,
+with the initial-build notice visible in dashboard.
 
 The live external ICMP scenario is opt-in. In PowerShell:
 

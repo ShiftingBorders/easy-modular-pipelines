@@ -6,8 +6,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from dashboard.alerts import AlertMonitor
 from dashboard.api_client import SystemAPIClient, SystemAPIError
@@ -29,6 +30,8 @@ def query_parameters(request: Request) -> dict:
         "since",
         "until",
         "revision",
+        "ref",
+        "compact",
     }
     if request.query_params.keys() - allowed:
         raise HTTPException(400, "Unknown query parameter.")
@@ -103,6 +106,7 @@ def create_app(
             "dashboard_host": monitor.host_name,
             "journals_configured": settings["project_root"] is not None,
             "data_mode": "local_journals_and_system_api",
+            "cache_activity": views.cache_activity(),
             "system_connection": {
                 "connected": bool(live.get("available") and live.get("fresh")),
                 "observed_at": live.get("observed_at"),
@@ -165,11 +169,14 @@ def create_app(
                     )
         return result
 
-    async def read_experiment(experiment_id: str, view: str, request: Request) -> dict:
+    async def read_experiment(
+        experiment_id: str, view: str, request: Request
+    ) -> Response:
         allowed_views = {
             "summary",
             "runs",
             "operations",
+            "timeline",
             "events",
             "errors",
             "measurements",
@@ -179,6 +186,7 @@ def create_app(
             "snapshots",
             "artifacts",
             "forecast",
+            "detail",
         }
         if view not in allowed_views:
             raise HTTPException(404, "Unknown experiment view.")
@@ -188,7 +196,24 @@ def create_app(
             or any(char in experiment_id for char in "/\\\x00")
         ):
             raise HTTPException(400, "Invalid experiment identifier.")
-        return await views.experiment(experiment_id, view, query_parameters(request))
+        result = await views.experiment(
+            experiment_id, view, query_parameters(request), defer_cache=True
+        )
+        encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
+        if len(encoded) > settings["max_response_bytes"]:
+            raise SystemAPIError(
+                "response_too_large",
+                "This response exceeds max_response_bytes; request a smaller page.",
+                413,
+            )
+        background = None
+        if views._cache_pool is not None and experiment_id in views._cache_requests:
+            background = BackgroundTask(views._submit_cache, experiment_id)
+        return Response(
+            content=encoded, media_type="application/json", background=background
+        )
 
     async def download_artifact(experiment_id: str, artifact_id: str) -> FileResponse:
         import asyncio

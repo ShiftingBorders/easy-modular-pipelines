@@ -2,11 +2,12 @@
 
 import asyncio
 import json
+import os
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from dashboard.api_client import SystemAPIError
@@ -22,6 +23,70 @@ from tests.helpers.dag import wait_until
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    def test_command_publication_handles_platform_reader_semantics(self):
+        """T050/T074: command-state publication survives native reader semantics."""
+        self.views._write_commands()
+        path = self.config["state_directory"] / "commands.json"
+        self.views._commands = [
+            {"command_id": str(uuid4()), "status": "pending", "polling": True}
+        ]
+        if os.name == "nt":
+            failure = PermissionError("MoveFileEx denied replacement")
+            failure.winerror = 32
+            with patch("core.runner_utils.runtimeio.os.replace", side_effect=failure):
+                self.views._write_commands()
+        else:
+            with path.open("r", encoding="utf-8") as previous:
+                self.views._write_commands()
+                self.assertEqual(json.load(previous), {"items": []})
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8")),
+            {"items": self.views._commands},
+        )
+        self.assertFalse(list(path.parent.glob(".publish-*")))
+
+    async def test_concurrent_command_polling_shares_one_history_refresh(self):
+        """T074/T075: successful command observers share the same history task."""
+        self.views.settings["project_root"] = self.root
+        self.views._cache_pool = Mock()
+        receipt = await self.views.command({"command": "pause"})
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def refresh(identifier):
+            self.assertEqual(identifier, "exp")
+            entered.set()
+            await release.wait()
+
+        with patch.object(
+            self.views, "_refresh_command_history", side_effect=refresh
+        ) as update:
+            first = asyncio.create_task(
+                self.views.command_result(receipt["command_id"])
+            )
+            await entered.wait()
+            second = asyncio.create_task(
+                self.views.command_result(receipt["command_id"])
+            )
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(first, second)
+        update.assert_awaited_once_with("exp")
+        self.assertTrue(all(result["result"] == "success" for result in results))
+        self.api.submit.assert_awaited_once()
+
+    async def test_cache_failure_does_not_reverse_successful_command_outcome(self):
+        """T076: runtime success remains success even when cache refresh fails."""
+        self.views.settings["project_root"] = self.root
+        self.views._cache_pool = Mock()
+        self.views._cache_pool.submit.side_effect = OSError("worker unavailable")
+        receipt = await self.views.command({"command": "pause"})
+        result = await self.views.command_result(receipt["command_id"])
+        self.assertEqual(result["result"], "success")
+        self.assertEqual(
+            self.views._cache_errors["exp"]["code"], "history_refresh_failed"
+        )
+        self.assertNotIn("exp", self.views._command_refreshing)
+
     async def test_failed_cancelled_and_expired_results_do_not_repeat_commands(self):
         for state in ("failed", "cancelled"):
             receipt = await self.views.command({"command": "pause"})

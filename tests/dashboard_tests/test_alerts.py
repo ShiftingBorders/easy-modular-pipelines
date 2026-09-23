@@ -9,11 +9,66 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from dashboard.alerts import AlertMonitor
-from tests.dashboard_tests.helpers import cleanup_directory, temporary_directory
+from dashboard.api_client import SystemAPIClient
+from dashboard.config import load_settings
+from dashboard.views import DashboardViews
+from tests.dashboard_tests.helpers import (
+    cleanup_directory,
+    temporary_directory,
+    write_settings,
+)
+from tests.dashboard_tests.integration_helpers import JournalWorkspace, history
 from tests.helpers.dag import wait_until
 
 
 class AlertTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_error_window_includes_old_payloads_and_preserves_unknown(
+        self,
+    ):
+        """T077/T078: indexed counts include the window boundary, not future/ignored rows."""
+        data = history(((1, 2),))
+        now = datetime.now(UTC)
+        for index, offset in enumerate((-60, -61, 0, 1, -1)):
+            data["entries"].append(
+                {
+                    **data["entries"][0],
+                    "event_id": f"alert-{index}",
+                    "sequence_number": 100 + index,
+                    "event_type": "error.recorded",
+                    "occurred_at": (now + timedelta(seconds=offset)).isoformat(),
+                    "data": {
+                        "error_id": f"error-{index}",
+                        "error_type": "Example",
+                        "message": "failure",
+                        **({"ignored": "superseded"} if index == 4 else {}),
+                    },
+                }
+            )
+        workspace = JournalWorkspace(self.root / "project", data)
+        self.addCleanup(workspace.close)
+        settings = load_settings(
+            write_settings(
+                self.root, project_root=str(workspace.root), history_window_events=1
+            )
+        )
+        actual = DashboardViews(settings, SystemAPIClient(settings))
+        self.addAsyncCleanup(actual.close)
+        dataset = actual.journals.load("exp-test", force=True)
+        self.assertEqual(len(dataset["cache"].window), 1)
+        self.assertEqual(actual.error_count(dataset, 60, now.timestamp()), 2)
+        self.views.error_count = actual.error_count
+        self.views.models.return_value = [(dataset, {"errors": []})]
+        await self.rule(
+            kind="errors", experiment_id="exp-test", threshold=2, window_seconds=60
+        )
+        with patch("dashboard.alerts.time.time", return_value=now.timestamp()):
+            await self.evaluate()
+        self.assertEqual(self.monitor.status()["active_count"], 1)
+        dataset["complete"] = False
+        with patch("dashboard.alerts.time.time", return_value=now.timestamp() + 120):
+            await self.evaluate()
+        self.assertEqual(self.monitor.status()["active_count"], 1)
+
     async def asyncSetUp(self):
         tmp = temporary_directory()
         self.addCleanup(cleanup_directory, tmp)

@@ -17,6 +17,44 @@ from tests.dashboard_tests.helpers import (
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_precache_cli_needs_no_http_and_propagates_worker_override(self):
+        """T015/T046/T051/T095: documented precache flags do not import/start HTTP."""
+        arguments = [
+            "dashboard",
+            "--config",
+            str(self.config),
+            "--mode",
+            "precache",
+            "--cache-workers",
+            "3",
+        ]
+        with (
+            patch.object(sys, "argv", arguments),
+            patch.dict(sys.modules, {"uvicorn": None}),
+            patch("dashboard.__main__.precache", return_value=0) as build,
+            self.assertRaises(SystemExit) as caught,
+        ):
+            main()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(build.call_args.args[0]["cache_workers"], 3)
+
+    def test_precache_failure_and_interrupt_exit_codes(self):
+        """T051: configuration/pool failures and interruption have distinct exits."""
+        arguments = ["dashboard", "--config", str(self.config), "--mode", "precache"]
+        for error, code in (
+            (RuntimeError("pool failed"), 2),
+            (KeyboardInterrupt(), 130),
+        ):
+            with (
+                self.subTest(code=code),
+                patch.object(sys, "argv", arguments),
+                patch("dashboard.__main__.precache", side_effect=error),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                main()
+            self.assertEqual(caught.exception.code, code)
+
     def setUp(self) -> None:
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)

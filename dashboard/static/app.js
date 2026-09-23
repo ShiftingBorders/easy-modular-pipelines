@@ -1,6 +1,6 @@
 "use strict";
 
-import {escape as e, numeric, dateTime, address, badge, warning, panel, empty, unavailable, stat, inspectButton, table, lineChart} from "./ui.js";
+import {recordKey, updateContent, escape as e, numeric, duration, dateTime, address, badge, warning, panel, empty, unavailable, stat, inspectButton, table, lineChart} from "./ui.js";
 import * as views from "./views.js";
 
 const navigation = [
@@ -13,7 +13,7 @@ const navigation = [
     ["alerts", "Alerts", "M6 8a6 6 0 0112 0v7l2 3H4l2-3zM10 21h4"],
 ];
 const runViews = [
-    ["timeline", "Execution", "operations"], ["dag", "DAG", "template"], ["errors", "Errors", "errors"],
+    ["timeline", "Execution", "timeline"], ["dag", "DAG", "template"], ["errors", "Errors", "errors"],
     ["events", "Events", "events"], ["resources", "Resources", "measurements"],
     ["artifacts", "Artifacts", "artifacts"], ["settings", "Run settings", "template"],
     ["commands", "Commands", "commands"], ["snapshots", "Snapshots", "snapshots"],
@@ -22,6 +22,7 @@ const main = document.getElementById("main");
 const state = {page: "overview", experiment: null, run: null, detail: null, info: null, icmp: null,
     experiments: [], modules: [], data: null, rows: [], cursor: null, nextCursor: null, journal: null,
     mode: "effective", metrics: [{}, {}, {}], filters: [], loading: false, request: 0,
+    timelineRange: null, timelineContext: null, timelineJournal: null, timelineDrag: null,
     abort: null, timer: null, systemAlerts: null, refresh: 5, bookmarks: [], window: "15", settingsMode: "yaml"};
 
 function readLocation() {
@@ -115,7 +116,7 @@ function applyFilters(scope) {
     const radios = [...scope.querySelectorAll('input[name="experiment"]')];
     if (radios.length) {
         const visible = radios.filter(radio => !radio.closest("tr").hidden);
-        if (!visible.some(radio => radio.checked)) {
+        if (state.experiment && !visible.some(radio => radio.checked)) {
             radios.forEach(radio => { radio.checked = radio === visible[0]; });
             void selectExperiment(visible[0]?.value || null);
         }
@@ -148,12 +149,16 @@ async function refreshConnection() {
     if (state.connectionRequest) return state.connectionRequest;
     state.connectionRequest = request("/api/application").then(info => {
         state.info = info;
+        const initial = info.cache_activity?.building || [];
+        const cacheStatus = document.getElementById("cache-activity");
+        cacheStatus.hidden = initial.length === 0;
+        cacheStatus.textContent = initial.length ? `Building history cache for ${initial.join(", ")}. Pages may respond more slowly until caching finishes.` : "";
         const connection = info.system_connection;
         const status = document.getElementById("connection-status");
         const connected = connection?.connected === true;
         status.textContent = connected ? "System connected" : "System unavailable";
         status.className = connected ? "connection online" : "connection offline";
-        status.title = connected ? `Runtime observed: ${dateTime(connection.observed_at)}` : connection?.error || (info.system_api_configured ? "Waiting for a current runtime observation." : "System API is not configured.");
+        status.title = connected ? `Runtime observed: ${dateTime(connection.observed_at)}` : connection?.error || (info.system_api_configured ? "Waiting for a current runtime observation." : "Cannot connect to the system. It may be offline.");
     }).catch(markOffline).finally(() => { state.connectionRequest = null; });
     return state.connectionRequest;
 }
@@ -172,7 +177,7 @@ async function refreshICMP() {
     try {
         state.icmp = await request("/api/icmp"); updateAlertCount();
         const container = document.getElementById("icmp-panel");
-        if (container && !container.contains(document.activeElement)) container.innerHTML = views.icmpPanel(state.icmp, state.page !== "icmp");
+        if (container && !container.contains(document.activeElement)) updateContent(container, views.icmpPanel(state.icmp, state.page !== "icmp"));
     } catch (error) {
         const container = document.getElementById("icmp-panel");
         if (container && !container.contains(document.activeElement)) container.innerHTML = panel("ICMP Echo Reply", empty("Monitor unavailable", error.message));
@@ -187,14 +192,24 @@ async function selectExperiment(identity) {
     const target = document.getElementById(state.page === "forecast" ? "forecast-body" : "run-history");
     if (!target) return;
     if (!identity) { target.innerHTML = empty("No experiment selected"); return; }
-    target.innerHTML = '<div class="loading">Loading execution history…</div>';
+    if (target.experiment !== identity) {
+        target.innerHTML = '<div class="loading">Loading execution history…</div>';
+        target.rendered = null;
+    }
+    target.experiment = identity;
+    const serial = target.request = (target.request || 0) + 1;
     try {
         const response = await systemRead(experimentPath(state.page === "forecast" ? "forecast" : "runs", identity));
         checkContext(response, identity);
-        if (state.experiment !== identity || !target.isConnected) return;
-        if (state.page === "forecast") { state.data = response; target.innerHTML = views.forecast(response, state.metrics); }
-        else target.innerHTML = views.runHistory(rows(response), identity);
-    } catch (error) { if (target.isConnected && state.experiment === identity) target.innerHTML = unavailable(error); }
+        if (state.experiment !== identity || !target.isConnected || serial !== target.request) return;
+        const content = state.page === "forecast" ? views.forecast(response, state.metrics) : views.runHistory(rows(response), identity);
+        if (state.page === "forecast") state.data = response;
+        if (target.rendered !== content) { updateContent(target, content); target.rendered = content; }
+    } catch (error) {
+        if (target.isConnected && state.experiment === identity && serial === target.request) {
+            target.innerHTML = unavailable(error); target.rendered = null;
+        }
+    }
 }
 
 function renderAlerts(document) {
@@ -228,29 +243,45 @@ function renderRun(response) {
     state.nextCursor = response.next_cursor || null;
     let content = "";
     switch (state.page) {
-        case "timeline": content = `<div class="actions" style="margin-bottom:16px"><a class="button" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button quiet" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.timeline(state.rows, response.observed_at)}`; break;
+        case "timeline": content = `<div class="actions" style="margin-bottom:16px"><a class="button" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button quiet" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.timeline(state.rows, response.observed_at, response.timeline, state.timelineRange)}`; break;
         case "dag": content = `<div class="actions" style="margin-bottom:16px"><a class="button quiet" href="${address("timeline", state.experiment, state.run)}">Timeline</a><a class="button" href="${address("dag", state.experiment, state.run)}">DAG</a></div>${views.dag(response)}`; break;
         case "events": content = views.events(state.rows, state.mode); break;
         case "errors": content = views.errors(state.rows); break;
-        case "resources": content = `<div id="metric-cards">${views.metricCards(state.rows, state.metrics)}</div>`; break;
+        case "resources": content = `<div id="metric-cards">${views.metricCards(state.data?.measurements || state.rows, state.metrics, null, state.data?.metric_summaries, state.data?.measurement_cycles)}</div>`; break;
         case "commands": content = panel("Commands", table(state.rows, [["Command", row => inspectButton(row.command || row.name, row)], ["Target", row => e(row.target || "—")], ["Status", row => badge(row.status || row.outcome)], ["Run", row => e(row.run_id)], ["Sent", row => e(dateTime(row.sent_at))]], [["kind", "Kind"], ["status", "Status"]])); break;
         case "snapshots": content = panel("Snapshots & recovery", table(state.rows, [["Snapshot", row => inspectButton(row.snapshot_id, row)], ["State", row => badge(row.status)], ["Template", row => e(row.template_revision_id)], ["Cycle", row => numeric(row.cycle_number)], ["Created", row => e(dateTime(row.created_at))], ["", row => `<button class="button quiet" data-restore="${e(row.snapshot_id)}" ${row.available === false || !state.controlAvailable ? "disabled" : ""}>Restore</button>`]], [["status", "State"]])); break;
         case "artifacts": content = panel("Artifacts", table(state.rows, [["Artifact", row => inspectButton(row.path || row.name, row)], ["Purpose", row => e(row.purpose || "—")], ["Module", row => e(row.module_name || "—")], ["Attempt", row => e(row.attempt_id || "—")], ["Size", row => row.size_bytes == null ? "—" : numeric(row.size_bytes) + " B"], ["", row => row.artifact_id ? `<a class="button quiet" href="/api/experiments/${encodeURIComponent(state.experiment)}/artifacts/${encodeURIComponent(row.artifact_id)}/download" download>Download</a>` : "—"]], [["purpose", "Purpose"], ["module_name", "Module"]])); break;
-        case "settings": content = panel("Recorded settings", `<div class="panel-body"><label class="field" style="margin-bottom:16px">Template revision<select id="template-revision"><option value="">Latest in this selection</option>${(response.revisions || []).map(row=>`<option value="${e(row.template_revision_id)}" ${state.revision === row.template_revision_id ? "selected" : ""}>${e(dateTime(row.occurred_at))} · ${e(row.template_revision_id)}</option>`).join("")}</select></label><div class="segmented" style="margin-bottom:16px"><button data-settings="yaml" class="${state.settingsMode === "yaml" ? "active" : ""}">YAML</button><button data-settings="json" class="${state.settingsMode === "json" ? "active" : ""}">JSON</button><button data-settings="parameters" class="${state.settingsMode === "parameters" ? "active" : ""}">Attempt parameters</button></div><div id="settings-content"><pre>${e(state.settingsMode === "yaml" ? response.template_yaml || "Original YAML is unavailable." : JSON.stringify(response.template || {}, null, 2))}</pre></div></div>`); break;
+        case "settings": content = panel("Recorded settings", `<div class="panel-body"><label class="field" style="margin-bottom:16px">Template revision<select id="template-revision"><option value="">Latest in this selection</option>${(response.revisions || []).map(row=>`<option value="${e(row.template_revision_id)}" ${state.revision === row.template_revision_id ? "selected" : ""}>${e(dateTime(row.occurred_at))} · ${e(row.template_revision_id)}</option>`).join("")}</select></label><div class="segmented" style="margin-bottom:16px"><button data-settings="yaml" class="${state.settingsMode === "yaml" ? "active" : ""}">YAML</button><button data-settings="json" class="${state.settingsMode === "json" ? "active" : ""}">JSON</button><button data-settings="parameters" class="${state.settingsMode === "parameters" ? "active" : ""}">Attempt parameters</button></div><div id="settings-content">${state.settingsMode === "parameters" ? views.parameters(state.parameterRows || []) : `<pre>${e(state.settingsMode === "yaml" ? response.template_yaml || "Original YAML is unavailable." : JSON.stringify(response.template || {}, null, 2))}</pre>`}</div></div>`); break;
     }
     return (response.complete === false ? `<div class="error-banner">${warning(response.error || "History is still loading. Aggregate statistics may be incomplete.")} ${e(response.error || "History is still loading.")}</div>` : "") + content + (state.nextCursor ? '<button class="button" data-action="load-more">Load more records</button>' : "");
 }
 
-async function loadPage(automatic = false) {
+async function loadPage(automatic = false, retryHistory = true) {
+    clearTimeout(state.historyTimer);
+    if (state.timelineDrag) return;
     // Paged history is a browsing session. Refresh explicitly to return to its first page.
     if (automatic && state.cursor) return;
     if (automatic && (state.loading || main.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))) return;
     state.abort?.abort(); state.abort = new AbortController(); const signal = state.abort.signal;
     const serial = ++state.request; state.loading = true; if (automatic) rememberFilters();
-    if (!automatic) main.innerHTML = header("Loading…") + '<div class="loading" role="status">Loading observations…</div>';
-    navigationChrome();
+    const context = `${state.experiment || ""}:${state.run || ""}`;
+    if (state.timelineContext !== context) {
+        state.timelineRange = null; state.timelineJournal = null; state.timelineContext = context;
+    }
+    const timelineJournal = state.timelineJournal;
+    const sameExperiment = runViews.some(([page]) => page === state.page) && main.dataset.context === context && main.querySelector(".tabs");
+    main.setAttribute("aria-busy", "true");
+    if (!automatic && !sameExperiment) {
+        main.innerHTML = header("Loading…") + '<div class="loading" role="status">Loading observations…</div>';
+    } else if (!automatic) {
+        main.querySelectorAll(".tabs a").forEach(link => link.classList.toggle("active", new URL(link.href).searchParams.get("page") === state.page));
+        const loading = document.createElement("span"); loading.id = "page-loading"; loading.className = "loading"; loading.setAttribute("role", "status"); loading.textContent = "Loading…";
+        document.getElementById("page-loading")?.remove(); main.querySelector(".heading .actions")?.prepend(loading);
+    }
+    if (!automatic) navigationChrome();
     void refreshConnection();
     let title = navigation.find(([page]) => page === state.page)?.[1] || runViews.find(([page]) => page === state.page)?.[1] || "ICMP ping";
+    let pendingHistory = false;
     try {
         let content = "", heading = header(title);
         if (state.page === "icmp") { heading = header(title, "Checks run on the dashboard host", `<a class="button quiet" href="${address("alerts")}">← Alerts</a>`); content = `<div id="icmp-panel">${views.icmpPanel(state.icmp, false)}</div>`; }
@@ -267,11 +298,17 @@ async function loadPage(automatic = false) {
         } else if (["experiments", "forecast"].includes(state.page)) {
             if (state.page === "experiments") heading = header(title, "", '<button class="button primary" data-action="run-experiment">Run experiment</button>');
             const document = await systemRead("experiments", signal); state.experiments = rows(document);
-            const candidates = state.page === "forecast" ? state.experiments.filter(row => ["running", "paused", "waiting"].includes(row.status)) : state.experiments;
-            if (!candidates.some(row => row.experiment_id === state.experiment)) state.experiment = candidates[0]?.experiment_id || null;
+            const activeStatuses = ["running", "stage_running", "paused", "waiting", "starting", "snapshotting", "rebuilding", "restoring"];
+            const candidates = state.page === "forecast" ? state.experiments.filter(row =>
+                activeStatuses.includes(row.status) || (!row.fresh && (
+                    activeStatuses.includes(row.last_recorded_status || row.phase) ||
+                    row.experiment_id === state.experiment
+                ))
+            ) : state.experiments;
+            if (!candidates.some(row => row.experiment_id === state.experiment)) state.experiment = state.page === "forecast" ? candidates[0]?.experiment_id || null : null;
             content = views.experiments(candidates, state.experiment);
             if (state.page === "forecast") content = content.replace('id="run-history"', 'id="forecast-body"');
-        } else if (state.page === "modules") { const document = await systemRead("modules", signal); state.modules = rows(document); content = views.modules(state.modules, state.detail); }
+        } else if (state.page === "modules") { const document = await systemRead("modules", signal); state.modules = rows(document); content = (document.complete === false ? `<div class="error-banner">${e(document.error || "Some experiment histories have not been cached. Open an experiment to include its statistics.")}</div>` : "") + views.modules(state.modules, state.detail); }
         else if (state.page === "services") content = views.services(rows(await systemRead("services", signal)), state.detail);
         else if (state.page === "compute") {
             const params = {};
@@ -290,18 +327,60 @@ async function loadPage(automatic = false) {
             if (!state.experiment) { content = empty("No experiment selected", "Open Experiments and select an execution history."); }
             else {
                 const selected = state.experiment;
-                const params = {limit: "200"}; if (state.run) params.run_id = state.run;
+                if (state.page === "timeline") state.timelineContext = `${state.experiment || ""}:${state.run || ""}`;
+                const params = {limit: "200", compact: "1"}; if (state.run) params.run_id = state.run;
+                if (state.page === "timeline" && state.timelineRange) {
+                    params.since = new Date(state.timelineRange.since).toISOString();
+                    params.until = new Date(state.timelineRange.until).toISOString();
+                }
                 if (state.page === "settings" && state.revision) params.revision = state.revision;
                 if (state.page === "events") params.view = state.mode;
                 if (state.cursor) params.cursor = typeof state.cursor === "string" ? state.cursor : JSON.stringify(state.cursor);
                 const endpoint = runViews.find(([page]) => page === state.page)[2];
-                const [document, summary] = await Promise.all([systemRead(experimentPath(endpoint), signal, params), systemRead(experimentPath("summary"), signal, state.run ? {run_id: state.run} : {}).catch(() => null)]);
+                const document = await systemRead(experimentPath(endpoint), signal, params);
+                if (serial !== state.request) return;
+                const journal = document.journal ? `${document.journal.journal_id}/${document.journal.generation}` : null;
+                if (state.page === "timeline" && state.timelineRange && state.timelineJournal && journal && journal !== state.timelineJournal) {
+                    state.timelineRange = null; state.cursor = null; state.rows = []; state.timelineJournal = journal;
+                    state.loading = false;
+                    return await loadPage(automatic, false);
+                }
+                if (state.page === "timeline") state.timelineJournal = journal;
+                const summary = document.summary || null;
                 checkContext(document, selected); if (summary) checkContext(summary, selected);
+                if (state.page === "settings" && state.settingsMode === "parameters") {
+                    const attempts = await systemRead(experimentPath("parameters"), signal, {compact: "1", ...(state.run ? {run_id: state.run} : {})});
+                    checkContext(attempts, selected); state.parameterRows = rows(attempts);
+                }
                 state.controlAvailable = Boolean(summary?.fresh); state.data = document; heading = runHeading(summary); content = renderRun(document);
+                pendingHistory = document.complete === false && document.cache_pending;
             }
         }
         if (serial !== state.request) return;
-        main.innerHTML = heading + content; document.title = `${title} · EMP`;
+        // Read positions immediately before patching: the user may have scrolled
+        // while the request was in flight. Keep this local to timeline refreshes.
+        const timelineViewport = main.querySelector(".timeline-viewport");
+        const timelineScroll = automatic && state.page === "timeline" && sameExperiment && timelineJournal === state.timelineJournal ? {
+            pageX: window.scrollX, pageY: window.scrollY,
+            top: timelineViewport?.scrollTop ?? 0,
+            left: timelineViewport?.scrollLeft ?? 0,
+        } : null;
+        updateContent(main, heading + content);
+        if (timelineScroll) {
+            const viewport = main.querySelector(".timeline-viewport");
+            if (viewport) {
+                viewport.scrollTop = timelineScroll.top;
+                viewport.scrollLeft = timelineScroll.left;
+            }
+            window.scrollTo({left: timelineScroll.pageX, top: timelineScroll.pageY, behavior: "instant"});
+        }
+        main.dataset.context = `${state.experiment || ""}:${state.run || ""}`;
+        const dialog = document.getElementById("details-dialog");
+        if (dialog.open && dialog.dataset.recordKey && dialog.dataset.selection === location.search) {
+            const present = [...main.querySelectorAll("[data-inspect]")].some(button => recordKey(JSON.parse(button.dataset.inspect)) === dialog.dataset.recordKey);
+            if (!present) { dialog.close(); toast("The inspected record is no longer in the current view."); }
+        }
+        document.title = `${title} · EMP`;
         if (["experiments", "forecast"].includes(state.page)) void selectExperiment(state.experiment);
         if (state.page === "compute") {
             const field = document.getElementById("resource-window");
@@ -318,13 +397,27 @@ async function loadPage(automatic = false) {
         restoreFilters(); updateAlertCount();
     } catch (error) {
         if (error.name === "AbortError" || serial !== state.request) return;
-        if (error.code === "history_changed" && state.cursor) {
-            state.cursor = null; state.rows = []; document.getElementById("details-dialog").close();
-            toast("History changed. Loading its first page.");
-            return await loadPage();
+        if (error.code === "history_changed" && retryHistory) {
+            if (state.cursor) {
+                state.cursor = null; state.rows = []; document.getElementById("details-dialog").close();
+                toast("History changed. Loading its first page.");
+            }
+            state.loading = false;
+            return await loadPage(automatic, false);
         }
-        main.innerHTML = header(title) + unavailable(error);
-    } finally { if (serial === state.request) state.loading = false; }
+        if (automatic) {
+            let banner = document.getElementById("refresh-error");
+            if (!banner) { banner = document.createElement("div"); banner.id = "refresh-error"; banner.className = "error-banner"; main.prepend(banner); }
+            banner.textContent = "Refresh failed; showing previous observations. " + error.message;
+        } else { main.innerHTML = header(title) + unavailable(error); }
+    } finally {
+        if (serial === state.request) {
+            state.loading = false; main.removeAttribute("aria-busy"); document.getElementById("page-loading")?.remove();
+            if (pendingHistory) {
+                state.historyTimer = setTimeout(() => { if (serial === state.request) void loadPage(true); }, 50);
+            }
+        }
+    }
 }
 
 function markOffline(error) {
@@ -332,6 +425,7 @@ function markOffline(error) {
 }
 
 function navigate(url) {
+    if (state.timelineDrag) state.timelineDrag = null;
     history.pushState(null, "", url); readLocation(); state.filters = []; state.cursor = null; state.rows = []; state.journal = null; state.metrics = [{}, {}, {}];
     void loadPage(); window.scrollTo(0, 0);
 }
@@ -357,9 +451,21 @@ document.addEventListener("click", async event => {
     if (button.dataset.editRule) { document.getElementById("detail-title").textContent = "Alert rule"; document.getElementById("detail-content").innerHTML = views.alertRuleForm(JSON.parse(button.dataset.editRule), state.experiments); document.getElementById("details-dialog").showModal(); return; }
     if (button.dataset.deleteRule) { try { await request("/api/alerts/rules/" + encodeURIComponent(button.dataset.deleteRule), {method: "DELETE", headers: {"X-Dashboard-Request": "1"}}); await loadPage(); } catch (error) { toast(error.message); } return; }
     if (button.dataset.inspect) {
-        const record = JSON.parse(button.dataset.inspect); const pre = document.createElement("pre"); pre.textContent = JSON.stringify(record, null, 2);
+        let record = JSON.parse(button.dataset.inspect); const pre = document.createElement("pre"); pre.textContent = JSON.stringify(record, null, 2);
         document.getElementById("detail-title").textContent = record.name || record.event_type || record.operation_type || "Recorded details";
-        document.getElementById("detail-content").replaceChildren(pre); document.getElementById("details-dialog").showModal(); return;
+        document.getElementById("detail-content").replaceChildren(pre);
+        const dialog = document.getElementById("details-dialog"); dialog.showModal();
+        dialog.dataset.recordKey = recordKey(record); dialog.dataset.selection = location.search;
+        const selected = state.experiment, selection = location.search;
+        if (record.detail_ref) {
+            try {
+                const response = await systemRead(experimentPath("detail", selected), undefined, {ref: JSON.stringify(record.detail_ref)});
+                if (!dialog.open || !pre.isConnected || selection !== location.search || state.experiment !== selected) return;
+                checkContext(response, selected);
+                pre.textContent = JSON.stringify({...record, ...response.record}, null, 2);
+            } catch (error) { if (pre.isConnected && dialog.open) pre.textContent = "Details unavailable: " + error.message; }
+        }
+        return;
     }
     if (button.dataset.mode) { state.mode = button.dataset.mode; state.cursor = null; state.rows = []; state.filters = []; await loadPage(); return; }
     if (button.dataset.settings) {
@@ -368,12 +474,18 @@ document.addEventListener("click", async event => {
         const container = document.getElementById("settings-content");
         if (state.settingsMode === "parameters") {
             container.innerHTML = '<div class="loading">Loading attempt parameters…</div>';
-            try { const result = await systemRead(experimentPath("parameters"), undefined, state.run ? {run_id: state.run} : {}); checkContext(result, state.experiment); container.innerHTML = table(rows(result), [["Attempt", row => inspectButton(row.attempt_id, row)], ["Module", row => e(row.module_name)], ["Cycle", row => numeric(row.cycle_number)]], [], "attempts"); }
-            catch (error) { container.innerHTML = unavailable(error); }
+            const selected = state.experiment, selection = location.search;
+            try {
+                const result = await systemRead(experimentPath("parameters"), undefined, {compact: "1", ...(state.run ? {run_id: state.run} : {})});
+                checkContext(result, selected);
+                if (!container.isConnected || selection !== location.search || state.settingsMode !== "parameters") return;
+                state.parameterRows = rows(result); updateContent(container, views.parameters(state.parameterRows));
+            } catch (error) { if (container.isConnected && state.settingsMode === "parameters") updateContent(container, unavailable(error)); }
         } else container.innerHTML = `<pre>${e(state.settingsMode === "yaml" ? state.data.template_yaml || "Original YAML unavailable." : JSON.stringify(state.data.template || {}, null, 2))}</pre>`;
         return;
     }
     switch (button.dataset.action) {
+        case "timeline-reset": state.timelineRange = null; state.cursor = null; state.rows = []; await loadPage(); break;
         case "reload": state.cursor = null; await loadPage(); void refreshICMP(); break;
         case "close-dialog": document.getElementById("details-dialog").close(); break;
         case "run-experiment":
@@ -467,6 +579,85 @@ document.addEventListener("change", event => {
     if(kind === "errors") form.elements.threshold.value=10;
 });
 
+function paintTimelineRange(range) {
+    const overview = document.getElementById("timeline-overview");
+    if (!overview) return;
+    const start = Number(overview.dataset.start), end = Number(overview.dataset.end);
+    const left = (range.since - start) / (end - start) * 100;
+    const right = (range.until - start) / (end - start) * 100;
+    const frame = overview.querySelector('[data-timeline-part="move"]');
+    frame.style.left = `${left}%`; frame.style.width = `${right - left}%`;
+    for (const [part, value, percent] of [["start", range.since, left], ["end", range.until, right]]) {
+        const handle = overview.querySelector(`[data-timeline-part="${part}"]`);
+        handle.style.left = `${percent}%`;
+        handle.setAttribute("aria-valuenow", String(value));
+        handle.setAttribute("aria-valuetext", new Date(value).toISOString());
+        handle.setAttribute("aria-valuemin", String(part === "start" ? start : range.since + 1));
+        handle.setAttribute("aria-valuemax", String(part === "start" ? range.until - 1 : end));
+    }
+    document.getElementById("timeline-range-label").textContent = `${dateTime(new Date(range.since).toISOString())} — ${dateTime(new Date(range.until).toISOString())} · ${duration((range.until - range.since) / 1000)}`;
+}
+
+function moveTimelineRange(range, part, delta, start, end) {
+    const next = {...range};
+    if (part === "start") next.since = Math.max(start, Math.min(range.until - 1, range.since + delta));
+    else if (part === "end") next.until = Math.min(end, Math.max(range.since + 1, range.until + delta));
+    else {
+        delta = Math.max(start - range.since, Math.min(end - range.until, delta));
+        next.since += delta; next.until += delta;
+    }
+    return {since: Math.round(next.since), until: Math.round(next.until)};
+}
+
+function commitTimelineRange(range) {
+    state.timelineRange = range; state.cursor = null; state.rows = []; state.nextCursor = null;
+    void loadPage();
+}
+
+function timelinePointer(event) {
+    if (event.type === "pointerdown") {
+        const handle = event.target.closest("[data-timeline-part]");
+        if (!handle || event.button !== 0 || state.loading) return;
+        const overview = handle.closest("#timeline-overview");
+        const start = Number(overview.dataset.start), end = Number(overview.dataset.end);
+        const range = state.timelineRange || {since: start, until: end};
+        event.preventDefault(); handle.focus(); overview.setPointerCapture(event.pointerId);
+        state.timelineDrag = {pointer: event.pointerId, part: handle.dataset.timelinePart,
+            x: event.clientX, width: overview.getBoundingClientRect().width, start, end,
+            initial: {...range}, range: {...range}};
+        return;
+    }
+    const drag = state.timelineDrag;
+    if (!drag || drag.pointer !== event.pointerId) return;
+    if (event.type === "pointermove") {
+        drag.range = moveTimelineRange(drag.initial, drag.part,
+            (event.clientX - drag.x) / Math.max(1, drag.width) * (drag.end - drag.start), drag.start, drag.end);
+        paintTimelineRange(drag.range); return;
+    }
+    state.timelineDrag = null;
+    const overview = document.getElementById("timeline-overview");
+    if (overview?.hasPointerCapture(event.pointerId)) overview.releasePointerCapture(event.pointerId);
+    if (event.type === "pointercancel") { paintTimelineRange(drag.initial); return; }
+    if (drag.range.since !== drag.initial.since || drag.range.until !== drag.initial.until) commitTimelineRange(drag.range);
+}
+
+for (const event of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) main.addEventListener(event, timelinePointer);
+main.addEventListener("keydown", event => {
+    const handle = event.target.closest("[data-timeline-part]");
+    if (!handle || !["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const overview = handle.closest("#timeline-overview");
+    const start = Number(overview.dataset.start), end = Number(overview.dataset.end);
+    const range = state.timelineRange || {since: start, until: end};
+    const step = Math.max(1, Math.round((end - start) / 1000)) * (event.shiftKey ? 10 : 1);
+    let delta = ["ArrowLeft", "ArrowDown"].includes(event.key) ? -step : step;
+    if (event.key === "Home") delta = -(end - start);
+    if (event.key === "End") delta = end - start;
+    const next = moveTimelineRange(range, handle.dataset.timelinePart, delta, start, end);
+    if (next.since === range.since && next.until === range.until) return;
+    paintTimelineRange(next); commitTimelineRange(next);
+});
+
 main.addEventListener("input", event => { const scope = event.target.closest("[data-table]"); if (scope && event.target.matches("[data-filter-query]")) applyFilters(scope); });
 main.addEventListener("change", event => {
     const field = event.target;
@@ -476,7 +667,7 @@ main.addEventListener("change", event => {
         const index = Number(field.dataset.metricModule ?? field.dataset.metricName);
         if (field.dataset.metricModule !== undefined) state.metrics[index] = {module: field.value}; else state.metrics[index].metric = field.value;
         const target = document.getElementById("metric-cards");
-        if (target) target.innerHTML = views.metricCards(state.rows, state.metrics);
+        if (target) target.innerHTML = views.metricCards(state.data?.measurements || state.rows, state.metrics, null, state.data?.metric_summaries, state.data?.measurement_cycles);
         else document.getElementById("forecast-body").innerHTML = views.forecast(state.data, state.metrics);
     }
     if (field.id === "template-revision") {

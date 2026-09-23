@@ -97,6 +97,7 @@ schema. SQLite may still use its WAL auxiliary files.
 | `get_journal_info()` | Read schema version, journal ID, and generation. |
 | `read_events(checkpoint=None, limit=100, view="raw")` | Page through raw or effective events. |
 | `read_changes(checkpoint=None, limit=100)` | Observe result confirmations and other changes, including those without a new event. |
+| `read_event_batch(event_ids=None, limit=1000, before=None)` | Read selected original events by indexed ID, or a descending cursor page of the journal tail. |
 | `read_command_result(request_id)` | Read the considered command outcome and participant observations. |
 
 Event pages contain `events`, `checkpoint`, `boundary`, and `has_more`.
@@ -108,6 +109,14 @@ Checkpoints include journal identity and generation. A rollback changes the
 generation; `JournalGenerationChanged` reports this explicitly. Refresh the
 reader's connection information and start a new history view. Do not combine
 old and new generations or silently reuse an old write client.
+
+`read_event_batch` returns `events` and the observed `boundary`. ID lookup uses
+the existing event ID unique index; tail lookup uses the cursor primary key.
+The byte budget can shorten either page. For ID lookup, request any remaining
+IDs explicitly; for a tail page, continue with `before` equal to the smallest
+returned cursor. An absent ID is not fabricated. This API adds no journal
+tables, columns, indexes, or schema migration. It returns original raw events;
+use the change feed for effective-result and confirmation metadata.
 
 ## Results and reliability
 

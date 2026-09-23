@@ -362,13 +362,24 @@ class AlertMonitor:
                                 if not rule.get("experiment_id")
                                 or dataset["experiment_id"] == rule["experiment_id"]
                             ]
-                            value = sum(
-                                0
-                                <= time.time() - (instant(error["occurred_at"]) or 0)
-                                <= rule["window_seconds"]
-                                for _, model in selected
-                                for error in model["errors"]
-                            )
+                            value = 0
+                            for dataset, model in selected:
+                                value += (
+                                    await asyncio.to_thread(
+                                        self.views.error_count,
+                                        dataset,
+                                        rule["window_seconds"],
+                                        time.time(),
+                                    )
+                                    if dataset.get("cache")
+                                    else sum(
+                                        0
+                                        <= time.time()
+                                        - (instant(error["occurred_at"]) or 0)
+                                        <= rule["window_seconds"]
+                                        for error in model["errors"]
+                                    )
+                                )
                             known = (
                                 model_error is None
                                 and bool(selected)

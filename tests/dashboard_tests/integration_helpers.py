@@ -106,14 +106,16 @@ def history(durations=((2, 3600), (4, 7200)), *, total=4):
 
 
 class JournalWorkspace:
-    def __init__(self, root: Path, dataset=None):
+    def __init__(
+        self, root: Path, dataset=None, *, identifier="exp-test", folder="recorded"
+    ):
         self.root = root
-        self.directory = root / "experiments" / "recorded"
+        self.directory = root / "experiments" / folder
         (self.directory / "runner").mkdir(parents=True)
         self.config = write_settings(
             self.directory / "journals",
             db_path="events.sqlite",
-            context={"experiment_id": "exp-test", "run_id": "run-test"},
+            context={"experiment_id": identifier, "run_id": "run-test"},
         )
         self.logger = OperationLogger(self.config)
         self.logger.open()
@@ -123,8 +125,14 @@ class JournalWorkspace:
         }
         existing_settings(self.config)
         dataset = copy.deepcopy(dataset or history())
+        dataset["experiment_id"] = identifier
+        dataset["state"]["experiment_id"] = identifier
         for event in dataset["entries"]:
-            self.logger._store.append(event)
+            event["context"]["experiment_id"] = identifier
+            if event["event_type"] == "command.result":
+                self.logger._store.append_command_result(event)
+            else:
+                self.logger._store.append(event)
         settings = json.loads(self.config.read_text(encoding="utf-8"))["logging"]
         dataset["state"]["template"]["logging"] = settings
         (self.directory / "runner/state.json").write_text(
@@ -133,9 +141,14 @@ class JournalWorkspace:
         (self.directory / "runner/journal.json").write_text(
             json.dumps(self.identity), encoding="utf-8"
         )
-        (root / "experiments.json").write_text(
-            json.dumps({"exp-test": "recorded"}), encoding="utf-8"
+        registry_path = root / "experiments.json"
+        registry = (
+            json.loads(registry_path.read_text(encoding="utf-8"))
+            if registry_path.exists()
+            else {}
         )
+        registry[identifier] = folder
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
 
     def close(self):
         self.logger.close()

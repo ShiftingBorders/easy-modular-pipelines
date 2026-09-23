@@ -2,11 +2,474 @@
 
 from __future__ import annotations
 
+import heapq
+import json
 import math
+import sqlite3
 import statistics
 from collections import defaultdict
 from datetime import datetime
 from itertools import pairwise
+
+
+def compact_event(event: dict) -> dict:
+    """Keep exact calculation inputs; original diagnostic payloads stay in the journal."""
+    fields = {
+        "attempt.parameters": (),
+        "stage.process_started": ("started_at", "process"),
+        "stage.finished": ("outcome", "result_request_id"),
+        "operation.started": (
+            "parent_operation_id",
+            "operation_type",
+            "operation_name",
+        ),
+        "operation.finished": ("status", "duration_ms", "reason_code"),
+        "error.recorded": ("error_id", "error_type", "message"),
+        "artifact.recorded": (
+            "artifact_id",
+            "path",
+            "purpose",
+            "name",
+            "size_bytes",
+            "content_hash",
+        ),
+        "runner.checkpoint": ("mode", "phase"),
+        "experiment.state": (
+            "phase",
+            "mode",
+            "cycle_number",
+            "observed_at",
+            "services",
+            "stage_position",
+        ),
+        "control.intent": (
+            "action",
+            "command",
+            "outcome",
+            "status",
+            "intent_event_id",
+            "request_id",
+        ),
+        "control.result": (
+            "action",
+            "command",
+            "outcome",
+            "status",
+            "intent_event_id",
+            "request_id",
+        ),
+        "control.reconciled": (
+            "action",
+            "command",
+            "outcome",
+            "status",
+            "intent_event_id",
+            "request_id",
+        ),
+        "command.result": (
+            "action",
+            "command",
+            "outcome",
+            "status",
+            "intent_event_id",
+            "request_id",
+        ),
+    }
+    kind, data = event["event_type"], event["data"]
+    reduced = {key: data[key] for key in fields.get(kind, ()) if key in data}
+    if kind == "attempt.parameters":
+        reduced.update(effective_settings={}, template={}, template_yaml="")
+    if kind == "resources.recorded":
+        reduced["resources"] = {
+            name: {
+                **{key: value for key, value in metric.items() if key != "attributes"},
+                "attributes": {
+                    "interval_seconds": metric.get("attributes", {}).get(
+                        "interval_seconds"
+                    )
+                },
+            }
+            for name, metric in data["resources"].items()
+            if metric["scope"] in {"operation", "process"}
+        }
+    if kind == "template.applied":
+        reduced = {
+            "template_revision_id": data["template_revision_id"],
+            "template": compact_template(data["template"]),
+            "template_yaml": "",
+        }
+    return {**event, "data": reduced}
+
+
+def compact_template(template: dict) -> dict:
+    result = {key: template[key] for key in ("name", "cycles") if key in template}
+    result["stages"] = [
+        {
+            key: stage[key]
+            for key in ("stage_id", "name", "module", "service_id")
+            if key in stage
+        }
+        for stage in template.get("stages", [])
+    ]
+    result["services"] = [
+        {key: service[key] for key in ("service_id", "module") if key in service}
+        for service in template.get("services", [])
+    ]
+    return result
+
+
+def project_scope(dataset: dict, run_id: str | None, cycle: int | None) -> dict:
+    """Recompute one affected execution cycle using the established semantics."""
+    state = {
+        **dataset["state"],
+        "template": compact_template(dataset["state"].get("template", {})),
+        "template_yaml": "",
+    }
+    model = experiment_views({**dataset, "state": state}, run_id=run_id)
+    events = dataset["entries"]
+    by_attempt, by_operation = defaultdict(list), defaultdict(list)
+    by_artifact = defaultdict(list)
+    positions = {event["event_id"]: event["cursor"] for event in events}
+    for event in events:
+        kind = event["event_type"]
+        if kind in {
+            "attempt.parameters",
+            "stage.process_started",
+            "stage.finished",
+            "call.started",
+        }:
+            by_attempt[event["context"].get("attempt_id")].append(event["event_id"])
+        if kind in {"operation.started", "operation.finished"}:
+            by_operation[event.get("operation_id")].append(event["event_id"])
+        artifact_id = event["data"].get("artifact_id")
+        if isinstance(artifact_id, str):
+            by_artifact[artifact_id].append(event["event_id"])
+    records = {}
+    identity_fields = {
+        "parameters": "attempt_id",
+        "operations": "operation_id",
+        "errors": "event_id",
+        "artifacts": "artifact_id",
+        "commands": "request_id",
+    }
+    for kind, identity_field in identity_fields.items():
+        records[kind] = []
+        for row in model[kind]:
+            key = row.get(identity_field)
+            if key is None or kind == "operations" and str(key).startswith("run:"):
+                continue
+            sources = projection_sources(kind, row, by_artifact, by_attempt, by_operation)
+            if not sources:
+                continue
+            row = {
+                key: value
+                for key, value in row.items()
+                if key
+                not in {
+                    "template",
+                    "template_yaml",
+                    "effective_settings",
+                    "observations",
+                    "attributes",
+                    "result",
+                }
+            }
+            row.update(
+                _record_key=str(key),
+                _position=min(positions[source] for source in sources),
+                detail_ref={"event_ids": sources, "kind": kind},
+            )
+            records[kind].append(row)
+    records["measurements"] = []
+    for index, row in enumerate(model["measurements"]):
+        key = json.dumps(
+            [
+                row.get(field)
+                for field in (
+                    "module_name",
+                    "module_version",
+                    "metric",
+                    "unit",
+                    "scope",
+                    "cycle_number",
+                )
+            ]
+        )
+        records["measurements"].append({**row, "_record_key": key, "_position": index})
+    forecast = model["forecast"]
+    attempts = model["parameters"]
+    stage_ids = {
+        stage["stage_id"] for stage in model["template"]["template"].get("stages", [])
+    }
+    latest_attempts = {row.get("stage_id"): row for row in attempts}
+    valid = bool(stage_ids) and all(
+        latest_attempts.get(stage, {}).get("status") == "succeeded"
+        for stage in stage_ids
+    )
+    return {
+        "records": records,
+        "summary": {
+            "cycle": cycle,
+            "duration": forecast["sample_mean_seconds"],
+            "sample_cycles": forecast["sample_cycles"],
+            "components": forecast["component_durations"],
+            "valid": valid,
+            "first_started": min(
+                (row["started_at"] for row in attempts if row.get("started_at")),
+                default=None,
+            ),
+            "last_finished": max(
+                (row["finished_at"] for row in attempts if row.get("finished_at")),
+                default=None,
+            ),
+            "all_finished": bool(attempts)
+            and all(row.get("finished_at") for row in attempts),
+        },
+    }
+
+
+def window_experiment_views(
+    dataset: dict, live: dict, run_id: str | None = None
+) -> dict:
+    """Project a complete RAM window while preserving original event contexts."""
+    attempts = {
+        event["context"].get("attempt_id"): {
+            key: value
+            for key, value in event["context"].items()
+            if key in ("run_id", "template_revision_id", "cycle_number")
+            and value is not None
+        }
+        for event in dataset["entries"]
+        if event["event_type"] == "attempt.parameters"
+        and event["context"].get("attempt_id")
+    }
+    entries = [
+        {
+            **event,
+            "context": {
+                **attempts.get(event["context"].get("attempt_id"), {}),
+                **event["context"],
+            },
+        }
+        for event in dataset["entries"]
+    ]
+    model = experiment_views({**dataset, "entries": entries}, live, run_id)
+    selected = {event["event_id"] for event in model["events"]}
+    model["events"] = [
+        event for event in dataset["entries"] if event["event_id"] in selected
+    ]
+    model["effective"] = [
+        event
+        for event in model["events"]
+        if event["effective"] and not event["ignored"]
+    ]
+    return model
+
+
+def observed_attempt_status(attempt: dict, fresh: bool) -> str:
+    """Apply runtime freshness without changing recorded completion outcomes."""
+    status = attempt.get("status", "unknown")
+    if (
+        status in {"running", "unconfirmed"}
+        and attempt.get("started_at")
+        and not attempt.get("finished_at")
+    ):
+        return "running" if fresh else "unconfirmed"
+    return status
+
+
+def projection_sources(
+    kind: str, row: dict, by_artifact: dict, by_attempt: dict, by_operation: dict
+) -> list[str]:
+    if kind == "errors":
+        return [row["event_id"]]
+    if kind == "artifacts":
+        return by_artifact.get(row["artifact_id"], [])
+    if kind == "commands":
+        return [event["event_id"] for event in row["observations"]]
+    if kind == "parameters" or str(row.get("operation_id", "")).startswith("attempt:"):
+        return by_attempt.get(row.get("attempt_id"), [])
+    return by_operation.get(row.get("operation_id"), [])
+
+
+def cached_experiment_views(
+    dataset: dict, live: dict, run_id: str | None = None
+) -> dict:
+    """Build small screen summaries from indexed projections, not historical payloads."""
+    cache = dataset["cache"]
+    selection = " AND run_id=?" if run_id else ""
+    args = (run_id,) if run_id else ()
+    latest = cache.query(
+        "SELECT compact FROM facts WHERE kind='template.applied' AND effective=1"
+        + selection
+        + " ORDER BY cursor DESC LIMIT 1",
+        args,
+    )
+    recorded = cache.query(
+        "SELECT compact FROM facts WHERE kind='experiment.state' AND effective=1"
+        + selection
+        + " ORDER BY cursor DESC LIMIT 1",
+        args,
+    )
+    entries = [json.loads(row[0]) for row in [*latest, *recorded]]
+    saved = {
+        **dataset["state"],
+        "template": compact_template(dataset["state"].get("template", {})),
+        "template_yaml": "",
+    }
+    model = experiment_views(
+        {**dataset, "state": saved, "entries": entries}, live, run_id
+    )
+    summary = model["summary"]
+    current_run = run_id or summary["run_id"]
+    revision = summary["template_revision_id"]
+    counts = cache.query(
+        "SELECT COUNT(*), MIN(occurred_at) FROM facts WHERE kind='error.recorded' AND effective=1"
+        + selection,
+        args,
+    )[0]
+    summary["error_count"] = counts[0] if dataset["complete"] else None
+    first = (
+        cache.query("SELECT MIN(started_at) FROM runs WHERE run_id=?", (run_id,))
+        if run_id
+        else cache.query("SELECT MIN(started_at) FROM runs")
+    )
+    summary["started_at"] = first[0][0]
+    cycle_stats = cache.query(
+        "SELECT COUNT(*), exact_mean(json_extract(summary,'$.duration')), MIN(json_extract(summary,'$.duration')), MAX(json_extract(summary,'$.duration')), MAX(cycle) FROM scopes WHERE run_id IS ? AND revision IS ? AND cycle IS NOT NULL AND json_extract(summary,'$.sample_cycles')>0",
+        (current_run, revision),
+    )[0]
+    count, mean, low, high, _completed = cycle_stats
+    valid_cycle = cache.query(
+        "SELECT MAX(cycle) FROM scopes WHERE run_id IS ? AND revision IS ? AND json_extract(summary,'$.valid')=1",
+        (current_run, revision),
+    )[0][0]
+    summary["completed_cycles"] = max(summary["completed_cycles"], valid_cycle or 0)
+    forecast = model["forecast"]
+    forecast.update(
+        completed_cycles=summary["completed_cycles"],
+        sample_cycles=count,
+        sample_mean_seconds=mean,
+    )
+    remaining = (
+        max(0, summary["total_cycles"] - summary["completed_cycles"])
+        if type(summary["total_cycles"]) is int
+        else None
+    )
+    usable = dataset["complete"] and count > 0 and remaining is not None
+    observed = live if summary["fresh"] else {}
+    active = cache.query(
+        "SELECT summary FROM scopes WHERE run_id IS ? AND revision IS ? AND cycle IS ?",
+        (current_run, revision, observed.get("cycle_number")),
+    )
+    spent = (
+        elapsed(
+            json.loads(active[0][0]).get("first_started"), observed.get("observed_at")
+        )
+        if active and not json.loads(active[0][0])["valid"]
+        else 0
+    )
+    forecast.update(
+        eta_seconds=max(0, remaining * mean - (spent or 0)) if usable else None,
+        eta_low_seconds=max(0, remaining * low - (spent or 0)) if usable else None,
+        eta_high_seconds=max(0, remaining * high - (spent or 0)) if usable else None,
+    )
+    components = cache.query(
+        "SELECT json_extract(component.value,'$.stage_id'), json_extract(component.value,'$.module_name'), exact_mean(json_extract(component.value,'$.mean_seconds')) FROM scopes, json_each(scopes.summary,'$.components') AS component WHERE run_id IS ? AND revision IS ? AND json_extract(summary,'$.sample_cycles')>0 GROUP BY json_extract(component.value,'$.stage_id')",
+        (current_run, revision),
+    )
+    durations = {stage: duration for stage, _module, duration in components}
+    forecast["component_durations"] = [
+        {**component, "mean_seconds": durations.get(component["stage_id"])}
+        for component in forecast["component_durations"]
+    ]
+    dag_state = (
+        live
+        if summary["fresh"]
+        else (json.loads(recorded[0][0])["data"] if recorded else saved)
+    )
+    dag_cycle = dag_state.get("cycle_number")
+    for node in model["template"]["nodes"]:
+        row = cache.query(
+            "SELECT payload FROM records WHERE kind='parameters' AND run_id IS ? AND revision IS ? AND (? IS NULL OR cycle=?) AND json_extract(payload,'$.stage_id')=? ORDER BY position DESC LIMIT 1",
+            (current_run, revision, dag_cycle, dag_cycle, node["stage_id"]),
+        )
+        if row and node["status"] not in {"running", "ready"}:
+            node["status"] = json.loads(row[0][0])["status"]
+    # Large lists have separate indexed page endpoints; summaries remain small.
+    return model
+
+
+def cached_metrics(dataset: dict, model: dict) -> dict:
+    cache = dataset["cache"]
+    summary = model["summary"]
+    args = (summary["run_id"], summary["template_revision_id"])
+    base = "kind='measurements' AND run_id IS ? AND revision IS ?"
+    groups = cache.query(
+        """
+        SELECT json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'),
+               json_extract(payload,'$.metric'), MIN(json_extract(payload,'$.unit')),
+               COUNT(*), COUNT(DISTINCT cycle), COUNT(DISTINCT json_extract(payload,'$.unit')),
+               COUNT(json_extract(payload,'$.value')), exact_mean(json_extract(payload,'$.value')),
+               SUM(json_extract(payload,'$.value')),
+               MAX(json_extract(payload,'$.complete')=0 OR json_extract(payload,'$.estimated')=1),
+               MIN(json_extract(payload,'$.aggregation')='sum')
+        FROM records WHERE """
+        + base
+        + " GROUP BY json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.metric')",
+        args,
+    )
+    summaries = []
+    for (
+        name,
+        version,
+        metric,
+        unit,
+        count,
+        cycles,
+        units,
+        known,
+        mean,
+        total,
+        incomplete,
+        additive,
+    ) in groups:
+        compatible = units == 1 and cycles == count
+        summaries.append(
+            {
+                "module_name": name,
+                "module_version": version,
+                "metric": metric,
+                "unit": unit if units == 1 else "Mixed units",
+                "sample_cycles": cycles,
+                "mean": mean if compatible and known == count else None,
+                "total": total,
+                "incomplete": not compatible
+                or known != count
+                or bool(incomplete)
+                or not dataset["complete"],
+                "additive": bool(additive),
+            }
+        )
+    recent = cache.query(
+        """
+        SELECT payload FROM (
+            SELECT payload, cycle, ROW_NUMBER() OVER (
+                PARTITION BY json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.metric')
+                ORDER BY cycle DESC, position DESC, record_key DESC
+            ) AS number FROM records WHERE """
+        + base
+        + ") WHERE number<=20 ORDER BY cycle",
+        args,
+    )
+    cycles = cache.query(
+        "SELECT COUNT(DISTINCT cycle) FROM records WHERE " + base, args
+    )[0][0]
+    return {
+        "metric_summaries": summaries,
+        "measurements": [json.loads(row[0]) for row in recent],
+        "measurement_cycles": cycles,
+    }
 
 
 def instant(value: object) -> float | None:
@@ -232,12 +695,16 @@ def experiment_views(
         )
     if current_run in runs:
         runs[current_run]["status"] = status
+    # DAG nodes and timeline scopes must use the same observed attempt status.
+    for attempt in attempts.values():
+        attempt["status"] = observed_attempt_status(attempt, fresh)
     stages = template.get("stages", [])
     service_modules = {
         service["service_id"]: service["module"]
         for service in template.get("services", [])
     }
     nodes = []
+    dag_cycle = observed.get("cycle_number")
     for position, definition in enumerate(stages, 1):
         node = {
             **definition,
@@ -253,6 +720,9 @@ def experiment_views(
             attempt
             for attempt in attempts.values()
             if attempt.get("stage_id") == definition["stage_id"]
+            and attempt.get("run_id") == current_run
+            and attempt.get("template_revision_id") == revision_id
+            and (dag_cycle is None or attempt.get("cycle_number") == dag_cycle)
         ]
         node["status"] = (
             stage_attempts[-1].get("status", "unknown") if stage_attempts else "pending"
@@ -276,8 +746,6 @@ def experiment_views(
     for attempt_id, attempt in attempts.items():
         if not attempt_id or not attempt.get("started_at"):
             continue
-        if attempt.get("status") == "running" and not fresh:
-            attempt["status"] = "unconfirmed"
         scope = f"attempt:{attempt_id}"
         operations[scope] = {
             **attempt,
@@ -351,7 +819,12 @@ def experiment_views(
                     "finished_at": max(ends),
                 }
     measurements = cycle_measurements(
-        effective, attempts, operations, valid_cycles, revision_id, current_run
+        effective,
+        attempts,
+        {**operations, **dataset.get("operation_ancestors", {})},
+        valid_cycles,
+        revision_id,
+        current_run,
     )
     total_cycles = template.get("cycles")
     completed = max(0, (observed.get("cycle_number") or 1) - 1)
@@ -602,3 +1075,115 @@ def cycle_measurements(
             }
         )
     return result
+
+
+def module_statistics(snapshots: list[tuple[dict, sqlite3.Connection]]) -> list[dict]:
+    """Exact project statistics from caller-owned SQLite read transactions."""
+    groups = {}
+    module_fields = "json_extract(payload,'$.module_name'), json_extract(payload,'$.module_version'), json_extract(payload,'$.module_hash')"
+    for dataset, connection in snapshots:
+        for name, version, digest in connection.execute(
+            "SELECT DISTINCT " + module_fields + " FROM records WHERE kind='parameters'"
+        ):
+            if not name:
+                continue
+            key = (name, version, digest)
+            group = groups.setdefault(
+                key,
+                {
+                    "module_id": "/".join(str(part or "") for part in key),
+                    "name": name,
+                    "version": version,
+                    "module_hash": digest,
+                    "runs": 0,
+                    "error_count": 0,
+                    "restarts": 0,
+                    "recent_attempts": [],
+                    "complete": True,
+                    "experiments": set(),
+                    "caches": [],
+                },
+            )
+            selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ?"
+            counts = connection.execute(
+                "SELECT COUNT(*) FROM records WHERE "
+                + selection
+                + " AND json_extract(payload,'$.started_at') IS NOT NULL",
+                key,
+            ).fetchone()[0]
+            restarts = connection.execute(
+                "SELECT COALESCE(SUM(MAX(0,n-1)),0) FROM (SELECT COUNT(*) AS n FROM records WHERE "
+                + selection
+                + " AND json_extract(payload,'$.started_at') IS NOT NULL GROUP BY run_id, cycle, json_extract(payload,'$.stage_id'))",
+                key,
+            ).fetchone()[0]
+            errors = connection.execute(
+                "SELECT COUNT(*) FROM records AS error WHERE error.kind='errors' AND EXISTS (SELECT 1 FROM records WHERE "
+                + selection
+                + " AND json_extract(payload,'$.attempt_id')=json_extract(error.payload,'$.attempt_id'))",
+                key,
+            ).fetchone()[0]
+            recent = connection.execute(
+                "SELECT payload FROM records WHERE "
+                + selection
+                + " ORDER BY json_extract(payload,'$.recorded_at') DESC LIMIT 100",
+                key,
+            )
+            group["runs"] += counts
+            group["restarts"] += restarts
+            group["error_count"] += errors
+            group["complete"] = group["complete"] and dataset["complete"]
+            group["experiments"].add(dataset["name"])
+            group["caches"].append(connection)
+            recent_attempts = []
+            for row in recent:
+                attempt = json.loads(row[0])
+                if attempt.get("detail_ref"):
+                    attempt["detail_ref"] = {
+                        **attempt["detail_ref"],
+                        **dataset["identity"],
+                    }
+                recent_attempts.append(attempt)
+            group["recent_attempts"] = sorted(
+                [
+                    *group["recent_attempts"],
+                    *recent_attempts,
+                ],
+                key=lambda row: row.get("recorded_at", ""),
+                reverse=True,
+            )[:100]
+    for key, group in groups.items():
+        selection = "kind='parameters' AND json_extract(payload,'$.module_name') IS ? AND json_extract(payload,'$.module_version') IS ? AND json_extract(payload,'$.module_hash') IS ? AND json_extract(payload,'$.duration_seconds') IS NOT NULL"
+        caches = group.pop("caches")
+        count = sum(
+            connection.execute(
+                "SELECT COUNT(*) FROM records WHERE " + selection, key
+            ).fetchone()[0]
+            for connection in caches
+        )
+        ranks = {
+            "p50_seconds": max(0, math.ceil(count * 0.5) - 1),
+            "p95_seconds": max(0, math.ceil(count * 0.95) - 1),
+        }
+        group.update(p50_seconds=None, p95_seconds=None)
+        streams = [
+            connection.execute(
+                "SELECT json_extract(payload,'$.duration_seconds') FROM records WHERE "
+                + selection
+                + " ORDER BY json_extract(payload,'$.duration_seconds')",
+                key,
+            )
+            for connection in caches
+        ]
+        try:
+            for index, (duration,) in enumerate(heapq.merge(*streams)):
+                for field, rank in ranks.items():
+                    if index == rank:
+                        group[field] = duration
+                if index >= ranks["p95_seconds"]:
+                    break
+        finally:
+            for stream in streams:
+                stream.close()
+        group["experiment_name"] = ", ".join(sorted(group.pop("experiments")))
+    return list(groups.values())
