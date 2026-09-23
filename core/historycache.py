@@ -992,18 +992,31 @@ class JournalHistoryCache:
                         tuple(batch),
                     )
                 )
-                for identifier in batch:
-                    cached = self.window.get(identifier)
-                    entries = (
-                        [cached["entry"]]
-                        if cached
-                        else source.read_event_batch([identifier])["events"]
+                entries = {
+                    identifier: self.window[identifier]["entry"]
+                    for identifier in batch
+                    if identifier in self.window
+                }
+                missing = list(
+                    dict.fromkeys(
+                        identifier for identifier in batch if identifier not in entries
                     )
-                    if not entries:
+                )
+                while missing:
+                    page = source.read_event_batch(missing)["events"]
+                    if not page:
                         raise LoggingStateError(
                             "A referenced journal event is unavailable."
                         )
-                    entry = entries[0]
+                    entries.update((entry["event"]["event_id"], entry) for entry in page)
+                    # The source byte budget can shorten an indexed batch.
+                    missing = [
+                        identifier
+                        for identifier in missing
+                        if identifier not in entries
+                    ]
+                for identifier in batch:
+                    entry = entries[identifier]
                     yield {
                         **entry["event"],
                         "cursor": entry["cursor"],

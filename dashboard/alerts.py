@@ -362,20 +362,24 @@ class AlertMonitor:
                                 if not rule.get("experiment_id")
                                 or dataset["experiment_id"] == rule["experiment_id"]
                             ]
-                            value = sum(
-                                self.views.error_count(
-                                    dataset, rule["window_seconds"], time.time()
+                            value = 0
+                            for dataset, model in selected:
+                                value += (
+                                    await asyncio.to_thread(
+                                        self.views.error_count,
+                                        dataset,
+                                        rule["window_seconds"],
+                                        time.time(),
+                                    )
+                                    if dataset.get("cache")
+                                    else sum(
+                                        0
+                                        <= time.time()
+                                        - (instant(error["occurred_at"]) or 0)
+                                        <= rule["window_seconds"]
+                                        for error in model["errors"]
+                                    )
                                 )
-                                if dataset.get("cache")
-                                else sum(
-                                    0
-                                    <= time.time()
-                                    - (instant(error["occurred_at"]) or 0)
-                                    <= rule["window_seconds"]
-                                    for error in model["errors"]
-                                )
-                                for dataset, model in selected
-                            )
                             known = (
                                 model_error is None
                                 and bool(selected)
