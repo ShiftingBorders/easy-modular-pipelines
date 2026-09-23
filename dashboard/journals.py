@@ -1149,17 +1149,33 @@ class LocalJournals:
         return result
 
     def artifact(self, identifier: str, artifact_id: str) -> Path:
-        dataset = self.load(identifier, force=True)
-        records = dataset["cache"].query(
-            "SELECT payload FROM records WHERE kind='artifacts' AND record_key=? LIMIT 1",
-            (artifact_id,),
+        # Downloads consume published data; only workers build the disk cache.
+        dataset = self.load(identifier, build=False)
+        cache = dataset.get("cache")
+        window = self._windows.get(identifier)
+        entries = []
+        if window and window[:2] == (dataset["identity"], dataset.get("file_key")):
+            entries = [item["entry"]["event"] for item in window[2].values()]
+        records = (
+            cache.query(
+                "SELECT payload FROM records WHERE kind='artifacts' AND record_key=? LIMIT 1",
+                (artifact_id,),
+            )
+            if cache is not None
+            else []
         )
         event = (
-            dataset["cache"].events(
-                json.loads(records[0][0])["detail_ref"]["event_ids"]
-            )[0]
+            cache.events(json.loads(records[0][0])["detail_ref"]["event_ids"])[0]
             if records
-            else None
+            else next(
+                (
+                    entry
+                    for entry in entries
+                    if entry["event_type"] == "artifact.recorded"
+                    and entry["data"].get("artifact_id") == artifact_id
+                ),
+                None,
+            )
         )
         if event is None:
             raise SystemAPIError(
@@ -1168,11 +1184,24 @@ class LocalJournals:
         directory = dataset["directory"]
         if event["event_type"] == "artifact.recorded":
             context = event["context"]
-            rows = dataset["cache"].query(
-                "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
-                (context.get("attempt_id"),),
+            rows = (
+                cache.query(
+                    "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
+                    (context.get("attempt_id"),),
+                )
+                if cache is not None
+                else []
             )
             parameters = json.loads(rows[0][0])["context"] if rows else {}
+            parameters = next(
+                (
+                    entry["context"]
+                    for entry in reversed(entries)
+                    if entry["event_type"] == "attempt.parameters"
+                    and entry["context"].get("attempt_id") == context.get("attempt_id")
+                ),
+                parameters,
+            )
             context = {**parameters, **context}
             if any(
                 context.get(key) is None
