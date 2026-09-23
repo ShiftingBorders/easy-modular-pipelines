@@ -391,10 +391,16 @@ def cached_experiment_views(
         {**component, "mean_seconds": durations.get(component["stage_id"])}
         for component in forecast["component_durations"]
     ]
+    dag_state = (
+        live
+        if summary["fresh"]
+        else (json.loads(recorded[0][0])["data"] if recorded else saved)
+    )
+    dag_cycle = dag_state.get("cycle_number")
     for node in model["template"]["nodes"]:
         row = cache.query(
-            "SELECT payload FROM records WHERE kind='parameters' AND run_id IS ? AND json_extract(payload,'$.stage_id')=? ORDER BY position DESC LIMIT 1",
-            (current_run, node["stage_id"]),
+            "SELECT payload FROM records WHERE kind='parameters' AND run_id IS ? AND revision IS ? AND (? IS NULL OR cycle=?) AND json_extract(payload,'$.stage_id')=? ORDER BY position DESC LIMIT 1",
+            (current_run, revision, dag_cycle, dag_cycle, node["stage_id"]),
         )
         if row and node["status"] not in {"running", "ready"}:
             node["status"] = json.loads(row[0][0])["status"]
@@ -706,6 +712,7 @@ def experiment_views(
         for service in template.get("services", [])
     }
     nodes = []
+    dag_cycle = observed.get("cycle_number")
     for position, definition in enumerate(stages, 1):
         node = {
             **definition,
@@ -721,6 +728,9 @@ def experiment_views(
             attempt
             for attempt in attempts.values()
             if attempt.get("stage_id") == definition["stage_id"]
+            and attempt.get("run_id") == current_run
+            and attempt.get("template_revision_id") == revision_id
+            and (dag_cycle is None or attempt.get("cycle_number") == dag_cycle)
         ]
         node["status"] = (
             stage_attempts[-1].get("status", "unknown") if stage_attempts else "pending"

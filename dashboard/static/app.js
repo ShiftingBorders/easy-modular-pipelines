@@ -292,7 +292,13 @@ async function loadPage(automatic = false, retryHistory = true) {
         } else if (["experiments", "forecast"].includes(state.page)) {
             if (state.page === "experiments") heading = header(title, "", '<button class="button primary" data-action="run-experiment">Run experiment</button>');
             const document = await systemRead("experiments", signal); state.experiments = rows(document);
-            const candidates = state.page === "forecast" ? state.experiments.filter(row => ["running", "paused", "waiting"].includes(row.status)) : state.experiments;
+            const activeStatuses = ["running", "stage_running", "paused", "waiting", "starting", "snapshotting", "rebuilding", "restoring"];
+            const candidates = state.page === "forecast" ? state.experiments.filter(row =>
+                activeStatuses.includes(row.status) || (!row.fresh && (
+                    activeStatuses.includes(row.last_recorded_status || row.phase) ||
+                    row.experiment_id === state.experiment
+                ))
+            ) : state.experiments;
             if (!candidates.some(row => row.experiment_id === state.experiment)) state.experiment = state.page === "forecast" ? candidates[0]?.experiment_id || null : null;
             content = views.experiments(candidates, state.experiment);
             if (state.page === "forecast") content = content.replace('id="run-history"', 'id="forecast-body"');
