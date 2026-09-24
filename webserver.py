@@ -13,6 +13,7 @@ import secrets
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 
 import uvicorn
@@ -59,7 +60,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         raise ValueError(
             "A non-loopback listener requires token_env with a configured token."
         )
-    runtime = ServerRuntime(settings)
+    runtime = ServerRuntime(
+        settings, stop_http=getattr(application.state, "stop_http", None)
+    )
     application.state.runtime = runtime
     application.state.api_token = token
     try:
@@ -137,23 +140,33 @@ async def health(request: Request) -> JSONResponse:
     )
 
 
-async def submit_command(request: Request) -> JSONResponse:
+async def submit_command(request: Request, wait: str = "false") -> JSONResponse:
     """Submit a command; HTTP 202 is admission, not completion.
 
     Maintenance accepts module.add {folder}, module.validate {folder} or
     {name, version}, and module.remove {name, version}. Successful add and
     stored validation return data.module with name/version/hash for templates.
     Module folders are absolute paths on the server. Run mode rejects module.*.
+    For server.shutdown only, wait=true keeps this response open until runtime
+    cleanup finishes; the HTTP owner drains this response before exiting.
     """
     runtime = runtime_for(request)
     document = await request_document(request, runtime)
+    query_fields(
+        request, {"wait"} if document.get("command") == "server.shutdown" else set()
+    )
+    if wait not in ("true", "false"):
+        raise ServerError("invalid_request", "wait must be true or false.", 400)
     try:
         result = runtime.submit(document)
     except (TypeError, ValueError, KeyError) as error:
         raise ServerError("invalid_request", str(error), 400) from error
+    if wait == "true" and result["state"] == "pending":
+        await asyncio.shield(runtime._restart_task)
+        result = runtime.result(result["command_id"])
     return JSONResponse(
         result,
-        status_code=202,
+        status_code=200 if wait == "true" else 202,
         headers={
             "Location": str(
                 request.url_for("command_result", command_id=result["command_id"])
@@ -512,14 +525,20 @@ def main() -> None:
         parser.error(str(error))
     app.state.settings = settings
     # The project lock also rejects competing owners started by an external manager.
-    uvicorn.run(
-        app,
-        host=settings.host,
-        port=settings.port,
-        workers=1,
-        log_level=options.log_level,
-        timeout_graceful_shutdown=math.ceil(settings.shutdown_timeout + 5),
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=settings.host,
+            port=settings.port,
+            workers=1,
+            log_level=options.log_level,
+            timeout_graceful_shutdown=math.ceil(settings.shutdown_timeout + 5),
+        )
     )
+    app.state.stop_http = partial(setattr, server, "should_exit", True)
+    server.run()
+    if not server.started:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":

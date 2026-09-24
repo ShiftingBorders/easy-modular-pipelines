@@ -186,7 +186,7 @@ class RuntimeRestartStateTests(unittest.IsolatedAsyncioTestCase):
                     "command": "server.restart",
                     "target": {"kind": "service", "position": 1},
                 },
-                {"command": "server.shutdown"},
+                {"command": "server.unknown"},
             ):
                 with (
                     self.subTest(mode=mode, document=document),

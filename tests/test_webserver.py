@@ -30,7 +30,7 @@ class HTTPContractTests(ServerTestCase):
         self.assertEqual(schema.status_code, 200)
         self.assertIn("requestBody", schema.json()["paths"]["/api/commands"]["post"])
 
-    async def test_invalid_envelopes_targets_ids_and_private_shutdown_are_rejected(
+    async def test_invalid_envelopes_targets_ids_and_unknown_commands_are_rejected(
         self,
     ):
         server = await self.start_server()
@@ -44,7 +44,7 @@ class HTTPContractTests(ServerTestCase):
             {"command": "pause", "args": []},
             {"command": "retry", "target": {"kind": "stage", "position": True}},
             {"command": "retry", "target": {"kind": "other", "position": 1}},
-            {"command": "server.shutdown"},
+            {"command": "server.unknown"},
         ):
             with self.subTest(document=document):
                 response = await server.client.post("/commands", json=document)

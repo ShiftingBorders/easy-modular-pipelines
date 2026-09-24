@@ -14,6 +14,7 @@ import threading
 import time
 import tomllib
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from multiprocessing.process import BaseProcess
@@ -719,8 +720,13 @@ class CommandRecord:
 class ServerRuntime:
     """Server-owned process and bounded command results; clients never own either."""
 
-    def __init__(self, settings: ServerSettings) -> None:
+    def __init__(
+        self, settings: ServerSettings, *, stop_http: Callable[[], None] | None = None
+    ) -> None:
         self.settings = settings
+        if stop_http is not None and not callable(stop_http):
+            raise TypeError("stop_http must be a callable or None.")
+        self._stop_http = stop_http
         self.instance_id = str(uuid4())
         self._process: BaseProcess | None = None
         self._requests: Queue | None = None
@@ -748,8 +754,11 @@ class ServerRuntime:
     async def start(self, *, restart_command: JsonObject | None = None) -> None:
         if restart_command is not None:
             if restart_command is not self._restart_command:
-                raise RuntimeError("Admit runtime restarts through submit first.")
+                raise RuntimeError(
+                    "Admit server lifecycle commands through submit first."
+                )
             previous_id = self._runtime_id
+            shutdown_requested = restart_command["command"] == "server.shutdown"
             mode = restart_command["args"].get("mode", self.settings.server_mode)
             response = {
                 "command_id": restart_command["command_id"],
@@ -793,26 +802,40 @@ class ServerRuntime:
                             raise asyncio.CancelledError
                     if self._http_closing:
                         raise asyncio.CancelledError
-                    self.settings.server_mode = mode
-                    self._runtime_id = str(uuid4())
-                    self._reader_stop = threading.Event()
-                    self._reader_thread = None
-                    self._watcher = None
-                    self._ready = None
-                    self._identity = None
-                    self._storage = None
-                    self._last_response_at = None
-                    self._error = None
-                    self._closing = False
-                    self._state = "new"
-                    await self.start()
-                response["data"] = {
-                    "previous_runtime_id": previous_id,
-                    "runtime_id": self._runtime_id,
-                    "server_mode": self.settings.server_mode,
-                    "changed": not unchanged,
-                    "controller": self._identity,
-                }
+                    if shutdown_requested:
+                        # The owner must drain accepted HTTP requests before
+                        # exiting, including a client waiting for this result.
+                        self._stop_http()
+                        self._http_closing = True
+                    else:
+                        self.settings.server_mode = mode
+                        self._runtime_id = str(uuid4())
+                        self._reader_stop = threading.Event()
+                        self._reader_thread = None
+                        self._watcher = None
+                        self._ready = None
+                        self._identity = None
+                        self._storage = None
+                        self._last_response_at = None
+                        self._error = None
+                        self._closing = False
+                        self._state = "new"
+                        await self.start()
+                response["data"] = (
+                    {
+                        "runtime_id": self._runtime_id,
+                        "runtime_stopped": True,
+                        "http_shutdown_requested": True,
+                    }
+                    if shutdown_requested
+                    else {
+                        "previous_runtime_id": previous_id,
+                        "runtime_id": self._runtime_id,
+                        "server_mode": self.settings.server_mode,
+                        "changed": not unchanged,
+                        "controller": self._identity,
+                    }
+                )
             except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - Lifecycle failures are retained command outcomes.
                 cancelled = isinstance(error, asyncio.CancelledError)
                 response.update(
@@ -821,7 +844,11 @@ class ServerRuntime:
                     error={
                         "code": "command_cancelled"
                         if cancelled
-                        else "runtime_restart_failed",
+                        else (
+                            "server_shutdown_failed"
+                            if shutdown_requested
+                            else "runtime_restart_failed"
+                        ),
                         "message": "HTTP server is stopping."
                         if cancelled
                         else str(error),
@@ -835,6 +862,8 @@ class ServerRuntime:
                     self._state = "unavailable"
                 self._accept_response(response)
                 self._restart_command = None
+                if shutdown_requested and response["state"] == "succeeded":
+                    self._state = "closed"
             return
         if self._state != "new":
             raise RuntimeError("Server runtime has already started.")
@@ -881,7 +910,13 @@ class ServerRuntime:
             "runtime_id": self._runtime_id,
             "server_mode": self.settings.server_mode,
             "storage_initialization": self._storage,
-            "state": "restarting" if self._restart_command is not None else self._state,
+            "state": (
+                "shutting_down"
+                if self._restart_command["command"] == "server.shutdown"
+                else "restarting"
+            )
+            if self._restart_command is not None
+            else self._state,
             "controller_alive": alive,
             "controller": self._identity,
             "last_response_at": self._last_response_at,
@@ -914,22 +949,26 @@ class ServerRuntime:
         if type(version) is not int or version != 1:
             raise ValueError("Only api_version 1 is supported.")
         name = require_text(command.get("command"), "command")
-        if name.startswith("server.") and name not in ("server.restart", "server.mode"):
-            raise ValueError("Server lifecycle messages are not public commands.")
+        if name.startswith("server.") and name not in (
+            "server.restart",
+            "server.mode",
+            "server.shutdown",
+        ):
+            raise ValueError("Unsupported server lifecycle command.")
         command["api_version"] = 1
         command["command_id"] = str(
             UUID(require_text(command.get("command_id", str(uuid4())), "command_id"))
         )
         command["args"] = copy_json_object(command.get("args", {}), "args")
         target = copy_json_object(command.get("target", {}), "target")
-        if name in ("server.restart", "server.mode"):
+        if name in ("server.restart", "server.mode", "server.shutdown"):
             if chain_id is not None or target:
                 raise ValueError(
                     "Runtime lifecycle commands do not accept chains or targets."
                 )
             args = command["args"]
-            if name == "server.restart" and args:
-                raise ValueError("server.restart does not accept arguments.")
+            if name in ("server.restart", "server.shutdown") and args:
+                raise ValueError(f"{name} does not accept arguments.")
             if name == "server.mode" and (
                 args.keys() != {"mode"} or args["mode"] not in ("run", "maintenance")
             ):
@@ -1036,11 +1075,22 @@ class ServerRuntime:
         lifecycle = not chain and commands[0]["command"] in (
             "server.restart",
             "server.mode",
+            "server.shutdown",
         )
         if lifecycle:
             if self._restart_command is not None:
                 raise ServerError(
-                    "restart_pending", "A runtime restart is already pending.", 409
+                    "shutdown_pending"
+                    if self._restart_command["command"] == "server.shutdown"
+                    else "restart_pending",
+                    "A server lifecycle operation is already pending.",
+                    409,
+                )
+            if commands[0]["command"] == "server.shutdown" and self._stop_http is None:
+                raise ServerError(
+                    "unsupported_feature",
+                    "This HTTP owner does not support remote shutdown.",
+                    501,
                 )
             if self._http_closing or self._state in ("new", "starting"):
                 raise ServerError(

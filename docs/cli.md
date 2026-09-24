@@ -221,6 +221,31 @@ replacement is started. Health reports `restart_blocked`; inspect the failure
 and restart the HTTP process explicitly before recovery. Never interpret an
 unfinished ordinary command marked `unknown` as proof that it had no effects.
 
+## Shut down the server
+
+```text
+uv run python -B cli.py server shutdown --wait
+uv run python -B cli.py server shutdown --no-wait
+```
+
+Shutdown stops the runtime, active experiment and owned resources, then requests
+graceful exit of the HTTP server. `--wait` (the ordinary CLI default) keeps the
+submission request open until cleanup completes, so the server can deliver its
+result while draining HTTP requests. `--wait-timeout` bounds this request.
+Success confirms runtime cleanup and the HTTP exit request, not an observation
+of OS process exit from the remote client.
+
+`--no-wait` returns admission immediately. A timeout or client disconnect does
+not cancel admitted shutdown; loss of connectivity alone does not prove success.
+Receipt polling is only available while the HTTP process is still alive.
+After shutdown, starting the server again requires an operator or an external
+process manager on the server machine.
+
+Shutdown works in both modes, accepts no target/arguments or command chains,
+and cannot overlap a runtime restart. Failed runtime cleanup leaves HTTP running
+for diagnostics and reports `server_shutdown_failed`. Embedders must supply a
+graceful HTTP shutdown hook; unsupported owners reject the request before effects.
+
 ## Start and stop individual services
 
 In run mode, pause the experiment and wait for its active stage to finish:

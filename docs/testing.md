@@ -27,6 +27,7 @@ and the `test_*.py` discovery pattern.
 | Module storage | `uv run python -m unittest tests.test_hashdb tests.test_modulemanager tests.test_seaweed -v` |
 | CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.test_experimentreader tests.test_cli_library_reads tests.test_cli_discovery -v` |
 | Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.test_runtime_restart tests.test_server_lifecycle tests.test_server_results -v` |
+| Graceful server shutdown and response delivery | `uv run python -m unittest tests.test_server_shutdown -v` |
 | Service control review regressions | `uv run python -m unittest tests.test_service_control_review -v` |
 | Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |

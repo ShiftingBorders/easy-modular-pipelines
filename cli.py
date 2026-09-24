@@ -211,13 +211,25 @@ class APIClient:
         *,
         document: JsonObject | None = None,
         params: dict[str, str | int] | None = None,
+        timeout: float | None = None,
     ) -> JsonObject:
         if self.http is None:
             raise RuntimeError("HTTP client is not open.")
+        deadline = (
+            self.timeout
+            if timeout is None
+            else require_number(timeout, "request timeout")
+        )
+        if deadline <= 0:
+            raise ValueError("Request timeout must be positive.")
         try:
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(deadline):
                 async with self.http.stream(
-                    method, self.url + path, json=document, params=params
+                    method,
+                    self.url + path,
+                    json=document,
+                    params=params,
+                    timeout=deadline,
                 ) as response:
                     payload = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -458,6 +470,11 @@ def build_parser() -> argparse.ArgumentParser:
     execution_options(
         server_actions.add_parser(
             "restart", help="Restart the runtime while keeping HTTP available."
+        )
+    )
+    execution_options(
+        server_actions.add_parser(
+            "shutdown", help="Stop the runtime and HTTP server gracefully."
         )
     )
     template = commands.add_parser("template", help="Create a local experiment draft.")
@@ -967,12 +984,30 @@ async def execute(
         identifiers = [require_text(document["command_id"], "command_id")]
         path = "/commands"
     print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
+    wait = not interactive if options.wait is None else options.wait
+    wait_for_shutdown = document.get("command") == "server.shutdown" and wait
     try:
-        receipt = await client.request("POST", path, document=document)
+        if wait_for_shutdown:
+            receipt = await client.request(
+                "POST",
+                path,
+                document=document,
+                params={"wait": "true"},
+                timeout=timeout,
+            )
+        else:
+            receipt = await client.request("POST", path, document=document)
     except ClientError as error:
         error.details.update(
             copy_json_object({"command_ids": identifiers}, "command IDs")
         )
+        if wait_for_shutdown and error.code == "http_timeout":
+            raise ClientError(
+                "Shutdown wait expired; the server operation was not cancelled.",
+                code="wait_timeout",
+                exit_code=4,
+                details=error.details,
+            ) from error
         raise
     if action != "chain":
         receipt = command_receipt(receipt)

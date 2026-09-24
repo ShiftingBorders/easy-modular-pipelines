@@ -194,8 +194,36 @@ explicitly. Controller journals are separate for each `runtime_id` under
 `controller/server`. Late messages from a previous generation cannot change
 the replacement's readiness or receipts.
 
-These commands restart the runtime, not the HTTP process. The private
-`server.shutdown` controller message is not a public API command.
+`server.shutdown` with empty `args` stops the runtime and requests graceful HTTP
+exit. It works in either mode, accepts no target and cannot appear in a chain.
+Concurrent lifecycle operations are rejected with 409 (`shutdown_pending` or
+`restart_pending`). Repeating the same retained request ID retrieves its receipt.
+
+```text
+POST /api/commands?wait=true
+Content-Type: application/json
+
+{"command": "server.shutdown", "args": {}}
+```
+
+Without `wait=true`, admission returns 202. `wait=true` is exclusive to shutdown:
+the request remains open until its outcome and returns HTTP 200 with the command
+receipt. The graceful HTTP owner drains this request before exiting. Authentication
+and input validation run before admission. A client disconnect does not cancel
+the independent operation.
+
+Successful data includes `runtime_id`, `runtime_stopped: true` and
+`http_shutdown_requested: true`. This acknowledges cleanup and the exit request;
+it is not remote proof of process exit. Failure returns a failed receipt with
+`server_shutdown_failed` and leaves HTTP available for diagnostics. Health reports
+`shutting_down`/503 while the operation is pending. Receipts cease to be available
+once the HTTP process exits.
+
+The `webserver.py` entry point supplies the shutdown hook. An external ASGI owner
+can set `app.state.stop_http` to a synchronous callable which requests graceful
+shutdown and drains accepted HTTP requests. Without this capability the command
+returns 501 `unsupported_feature` without stopping the controller. The runtime
+does not send OS signals to an arbitrary host process.
 
 ## Configuration and authentication
 
