@@ -7,6 +7,8 @@ from multiprocessing.queues import Queue
 from pathlib import Path
 from queue import Empty, Full
 
+from core.experimentassembler import ExperimentAssembler
+from core.experimentreader import ExperimentReader
 from core.logger import OperationLogger
 from core.logger_utils.events import (
     JsonObject,
@@ -29,8 +31,11 @@ class MaintenanceController:
         *,
         shutdown_requested: asyncio.Event,
         recovery_required: list[str],
+        project_root: Path,
     ) -> None:
         self._manager = manager
+        self._experiment_reader = ExperimentReader(project_root)
+        self._assembler = ExperimentAssembler(project_root, manager)
         self._logger = logger
         self._requests = requests
         self._responses = responses
@@ -38,6 +43,8 @@ class MaintenanceController:
         self._recovery_required = recovery_required
         self._incoming: asyncio.Queue = asyncio.Queue()
         self._commands: asyncio.Queue = asyncio.Queue()
+        self._read_commands: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._read_tasks: list[asyncio.Task] = []
         self._intake_stop = threading.Event()
         self._intake_thread: threading.Thread | None = None
         self._tasks: list[asyncio.Task] = []
@@ -70,9 +77,13 @@ class MaintenanceController:
             daemon=True,
         )
         self._intake_thread.start()
+        self._read_tasks = [
+            asyncio.create_task(self._work(read_only=True)) for _ in range(4)
+        ]
         self._tasks = [
             asyncio.create_task(self._receive()),
             asyncio.create_task(self._work()),
+            *self._read_tasks,
         ]
         await asyncio.gather(*self._tasks)
 
@@ -92,12 +103,31 @@ class MaintenanceController:
                 ]
             else:
                 if request["command"].startswith(("stats.", "logs.")):
-                    await self._publish(await self._execute(request))
+                    if request["command"] == "stats.state":
+                        await self._publish(await self._execute(request))
+                    else:
+                        try:
+                            self._read_commands.put_nowait(request)
+                        except asyncio.QueueFull:
+                            await self._publish(
+                                self._failure(
+                                    request,
+                                    "too_many_reads",
+                                    "Too many queued maintenance reads.",
+                                )
+                            )
                     continue
                 commands = [request]
             await self._commands.put(commands)
 
-    async def _work(self) -> None:
+    async def _work(self, *, read_only: bool = False) -> None:
+        if read_only:
+            while not self._closing and not self._shutdown_requested.is_set():
+                command = await self._read_commands.get()
+                if self._shutdown_requested.is_set():
+                    return
+                await self._publish(await self._execute(command))
+            return
         while not self._closing:
             commands = await self._commands.get()
             failed = False
@@ -129,7 +159,32 @@ class MaintenanceController:
             name = require_text(command.get("command"), "command")
             if command.get("target"):
                 raise ValueError("Maintenance commands do not accept target.")
-            if name == "stats.state":
+            if name in (
+                "stats.experiments",
+                "stats.experiment",
+                "stats.snapshots",
+                "stats.snapshot",
+                "stats.artifacts",
+                "stats.artifact",
+            ):
+                data = await asyncio.to_thread(
+                    self._experiment_reader.read, name, args, None
+                )
+            elif name == "stats.modules":
+                if args:
+                    raise ValueError("Module list does not accept arguments.")
+                data = self._manager.list_modules()
+            elif name == "stats.module":
+                if args.keys() != {"name", "version"}:
+                    raise ValueError("Module inspection requires name/version.")
+                data = await self._manager.inspect_module(**args)
+            elif name == "stats.template":
+                if args.keys() != {"template_path"}:
+                    raise ValueError("Template validation requires template_path.")
+                data = await self._assembler.validate_template(
+                    Path(require_text(args["template_path"], "template_path"))
+                )
+            elif name == "stats.state":
                 if args.keys() - {"experiment_id"}:
                     raise ValueError("Unknown stats.state arguments.")
                 if args.get("experiment_id") is not None:
@@ -266,10 +321,18 @@ class MaintenanceController:
             return
         self._shutdown_requested.set()
         self._intake_stop.set()
+        # Cancel reads immediately, while serial mutations finish safely.
+        # Storage inspection waits for its in-flight call before propagating
+        # cancellation, so the storage owner can close after these tasks finish.
+        for task in self._read_tasks:
+            task.cancel()
+        await asyncio.gather(*self._read_tasks, return_exceptions=True)
         await self._idle.wait()
         self._closing = True
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        while not self._read_commands.empty():
+            self._read_commands.get_nowait()
         if self._intake_thread is not None:
             await asyncio.to_thread(self._intake_thread.join, 1)

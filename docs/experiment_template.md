@@ -62,6 +62,12 @@ hash rather than substituting an arbitrary digest.
 A `stage_id`, when supplied, is a UUID unique across stage and service definitions;
 the assembler assigns missing definition IDs.
 
+Leading and trailing whitespace in module names and versions is removed when
+loading a template, for both stages and services. Template validation and
+assembly use these normalized references, which are also saved in the experiment's
+template. Internal whitespace and letter case are preserved. Empty or unsafe
+names and versions are rejected; the source template file is not rewritten.
+
 Module settings merge recursively with `module.yaml` defaults. Lists and scalars
 replace earlier values, and `null` is an explicit value. The accepted result
 data of a stage becomes the next stage's input. Modules must handle missing or
@@ -111,6 +117,9 @@ To call it from the DAG, add a node to `stages`:
 These are fragments to merge into the complete template, not separate runnable
 files. A service node uses `service_id` instead of `module`. Referenced services
 must have explicit IDs. Several nodes can call the same instance.
+Unreferenced services may omit `service_id`. Template validation reports this
+in its `warnings` array without rejecting the template; assembly generates the
+missing IDs.
 
 Startup settings merge defaults with `services[].settings`. Per-node settings
 are supplied separately with input data. Service request retries do not

@@ -25,6 +25,7 @@ and the `test_*.py` discovery pattern.
 | Area | Command |
 | --- | --- |
 | Module storage | `uv run python -m unittest tests.test_hashdb tests.test_modulemanager tests.test_seaweed -v` |
+| CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.test_experimentreader tests.test_cli_library_reads tests.test_cli_discovery -v` |
 | Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
 | Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
@@ -32,6 +33,13 @@ and the `test_*.py` discovery pattern.
 
 The weather suite includes real timing intervals, processes, and journal
 behavior; do not assume that all scenarios finish immediately.
+
+CLI discovery regressions reuse the storage, DAG and journal fixtures with
+direct library calls. They cover optional service IDs, normalized module
+references, event-loop progress during template loading, cancellation of
+archive checks, inherited artifact history, and maintenance read saturation
+without blocking state queries or shutdown. The same tests run on Windows
+and Linux using native filesystem paths.
 
 An additional integration entry point is outside normal `test_*.py` discovery:
 
@@ -94,6 +102,13 @@ Platform-specific cases select the actual host OS; a Windows run does not
 validate Linux or WSL. Symbolic-link tests may skip on Windows without the
 required privilege; junction checks do not replace file-symlink checks.
 External ICMP availability depends on the network.
+
+Linux process-termination fixtures require a Python build exposing
+`os.pidfd_open`. If the selected build lacks it, recreate the project environment
+with an installed Python 3.12 that provides it, for example
+`uv sync --locked --python /usr/bin/python3.12` on Ubuntu 24.04. Continue running
+tests through `uv run`; do not weaken process-identity checks to bypass this
+environment requirement.
 
 A successful process test or SQLite commit is not proof of durability under
 power loss or storage failure. Report the command, OS, skips, and dependencies

@@ -320,6 +320,21 @@ class HashDB:
             return ModuleAddResult.module_exists_err
         return ModuleAddResult.module_added
 
+    def list_module_hashes(self) -> list[dict[str, str]]:
+        if self._connection_closed:
+            raise StorageClosedError("Cannot list modules: HashDB is closed.")
+        try:
+            rows = self.hash_db.execute(
+                'SELECT "Mname", "MVersion", "MHash" FROM "MAIN" '
+                'ORDER BY "Mname", "MVersion"'
+            ).fetchall()
+        except sqlite3.Error as error:
+            self._raise_storage_error(error, "list module hashes")
+        return [
+            {"name": name, "version": version, "hash": digest}
+            for name, version, digest in rows
+        ]
+
     def get_module_hash(self, module_name: str, module_version: str) -> str:
         """Return the hash stored for a module.
 

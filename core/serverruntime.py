@@ -595,6 +595,7 @@ async def controller_main(
                     logger,
                     requests,
                     responses,
+                    project_root=settings.project_root,
                     shutdown_requested=shutdown_requested,
                     recovery_required=recovery_candidates(settings.project_root),
                 )
@@ -609,6 +610,7 @@ async def controller_main(
                     runner,
                     requests,
                     responses,
+                    module_manager=manager,
                     resource_config_path=settings.resource_config_path,
                     shutdown_requested=shutdown_requested,
                     recovery_required=recovery_candidates(settings.project_root),
@@ -706,6 +708,7 @@ class CommandRecord:
         ).encode("utf-8")
         self.fingerprint = hashlib.sha256(encoded).hexdigest()
         self.chain_id = command.get("chain_id")
+        self.command = command["command"]
         self.is_stop = command["command"] == "stop" and self.chain_id is None
         self.submitted_at = datetime.now(UTC).isoformat()
         self.finished_at: float | None = None
@@ -981,6 +984,68 @@ class ServerRuntime:
             **response,
             "server_instance_id": self.instance_id,
             "submitted_at": record.submitted_at,
+        }
+
+    def list_commands(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+        state: str | None = None,
+        command: str | None = None,
+    ) -> JsonObject:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000.")
+        if state is not None and state not in (
+            "pending",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "unknown",
+            "unavailable",
+        ):
+            raise ValueError("Unknown command state filter.")
+        if command is not None:
+            require_text(command, "command")
+        self._prune()
+        entries = list(self._records.items())
+        if after is not None:
+            after = str(UUID(after))
+            identifiers = [identifier for identifier, _ in entries]
+            if after not in identifiers:
+                raise ServerError(
+                    "unknown_command",
+                    "List cursor is unknown or expired; restart pagination.",
+                    404,
+                )
+            entries = entries[identifiers.index(after) + 1 :]
+        items = []
+        for identifier, record in entries:
+            response = record.response or {}
+            current_state = response.get("state", "pending")
+            if state is not None and current_state != state:
+                continue
+            if command is not None and record.command != command:
+                continue
+            items.append(
+                {
+                    "command_id": identifier,
+                    "command": record.command,
+                    "state": current_state,
+                    "chain_id": record.chain_id,
+                    "submitted_at": record.submitted_at,
+                    "experiment_id": response.get("experiment_id"),
+                }
+            )
+            if len(items) > limit:
+                break
+        has_more = len(items) > limit
+        items = items[:limit]
+        return {
+            "items": items,
+            "has_more": has_more,
+            "next_after": items[-1]["command_id"] if has_more else None,
+            "server_instance_id": self.instance_id,
         }
 
     async def read(self, name: str, args: JsonObject | None = None) -> JsonObject:

@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from core.logger_utils.events import JsonObject
+from core.logger_utils.events import JsonObject, require_text
 from core.modulemanifest import read_module_manifest
 from core.storage_contracts import HashDatabase, ModuleAddResult, ModuleDatabase
 from core.storage_errors import StorageConflict, StorageError, StoredObjectNotFound
@@ -69,6 +69,48 @@ class ModuleManager:
         self.hash_db = hash_db
         self.module_db = module_db
         self.temp_folder = temporary_path.resolve()
+
+    def list_modules(self) -> JsonObject:
+        return {"items": self.hash_db.list_module_hashes()}
+
+    async def inspect_module(self, name: str, version: str) -> JsonObject:
+        name = require_text(name, "module name").strip()
+        version = require_text(version, "module version").strip()
+        for field, value in (("name", name), ("version", version)):
+            if value in (".", "..") or any(
+                character in INVALID_MODULE_NAME_CHARACTERS for character in value
+            ):
+                raise ValueError(f"Unsafe module {field}.")
+        digest = self.hash_db.get_module_hash(name, version)
+        if not digest:
+            raise StoredObjectNotFound(f"No hash registered for {name}/{version}.")
+        # Keep SQLite on its owning thread; the archive client may block on HTTP.
+        operation = asyncio.create_task(
+            asyncio.to_thread(self.module_db.check_module_stored, name, version)
+        )
+        cancelled = False
+        try:
+            while True:
+                try:
+                    archive_available = await asyncio.shield(operation)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if operation.cancelled():
+                        raise
+        finally:
+            # Finish the storage call before its owner closes the client, then
+            # propagate cancellation so validation starts no further checks.
+            if cancelled:
+                raise asyncio.CancelledError
+        directory = self.module_storage_path / name / version
+        return {
+            "module": {"name": name, "version": version, "hash": digest},
+            "archive_available": archive_available,
+            "installed": directory.is_dir(),
+            "installation_path": str(directory),
+            "integrity": "not_checked",
+        }
 
     def _normalize_path(self, path: str | Path) -> Path:
         """Convert a string path without resolving it or accessing the filesystem."""

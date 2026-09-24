@@ -30,8 +30,11 @@ Point the CLI at the system API, not the dashboard.
 
 | Server mode | Available workflow |
 | --- | --- |
-| `maintenance` | Register, validate and remove modules with `module ...`. No experiment runner is started. |
-| `run` | Execute and control experiments, read runtime resources and logs, work with snapshots and exchange archives. Module maintenance commands are rejected. |
+| `maintenance` | Register, validate and remove modules. No experiment runner is started. |
+| `run` | Execute and control experiments, read runtime resources and logs, work with snapshots and exchange archives. Module mutations and `module validate` are rejected. |
+
+Module list/inspect, template validation, saved metadata, artifacts and retained
+command receipts are readable in both modes.
 
 Start the appropriate mode in another terminal:
 
@@ -71,8 +74,8 @@ own environment; see [HTTP authentication](http_api.md#configuration-and-authent
 
 | Argument | Where the file exists |
 | --- | --- |
-| `--config`, `chain FILE`, JSON `@file`, `template create DESTINATION` | On the CLI machine; relative paths resolve from its current directory. |
-| `module ... --folder`, `run --template`, archive paths and installation destination | On the server machine; pass absolute paths. The CLI does not upload these files. |
+| `--config`, `chain FILE`, JSON `@file`, `template create DESTINATION`, `artifact get --output` | On the CLI machine; relative paths resolve from its current directory. |
+| `module ... --folder`, `run --template`, `template validate PATH`, archive paths and installation destination | On the server machine; pass absolute paths. The CLI does not upload these files. |
 
 For a local PowerShell session:
 
@@ -134,6 +137,31 @@ and refuses to overwrite an existing destination. Fill its stages/services and
 registered module hashes before running it. This command neither registers
 modules nor fills their hashes automatically.
 
+## Template validation and module discovery
+
+These operations work in both server modes and do not create experiments:
+
+```text
+uv run python -B cli.py template validate "<absolute-template-path-on-server>"
+uv run python -B cli.py module list
+uv run python -B cli.py module inspect --name weather_stage --version 1.1
+```
+
+`template validate` checks the existing template schema, registered module hashes
+and archive presence. Its scope is `structure_and_registered_references`: it does
+not execute modules, inspect archive contents, verify installed code, or verify
+resource files. Relative resource paths resolve from the template directory.
+Use `module validate` in maintenance mode to check stored package integrity.
+The result includes `warnings`: services without an explicit `service_id`
+produce a warning while validation remains successful. Assembly generates
+their IDs; services referenced by DAG nodes still require explicit IDs.
+
+`module list` returns registered name/version/hash references, ordered by name
+and version. `module inspect` returns the reference, archive availability and
+local installation location/presence; `integrity: not_checked` distinguishes this
+from package validation. Storage outages fail the request instead of reporting
+a missing archive. These reads do not accept command-wait options.
+
 ## Module maintenance
 
 These commands require a maintenance server:
@@ -162,7 +190,7 @@ setup and version rules, see [module storage](storage.md).
 | Command | Options and behavior |
 | --- | --- |
 | `health` | Read server mode, storage initialization and controller health. |
-| `status` / `state` | Read selected state; `--experiment-id ID` selects saved state explicitly. `--watch [SECONDS]` repeats, default interval 1 second. |
+| `status` / `state` | Read selected runner state; `--experiment-id ID` must match its ID. `--watch [SECONDS]` repeats, default interval 1 second. Use `experiment inspect ID` for historical saved state. |
 | `resources` | Read current resource observations. Supports `--watch [SECONDS]`. |
 | `resource-history` | `--after N` (default 0, nonnegative), `--limit N` (default 100, range 1–1000). |
 | `logs` | `--experiment-id ID`, `--cursor JSON_OR_@FILE`, `--limit N` (default 100, range 1–1000), `--follow`. |
@@ -180,6 +208,39 @@ uv run python -B cli.py logs --cursor "@checkpoint.json" --limit 500
 
 These examples use the default server. Add `--config examples/weather_dag/cli.json`
 before the command for the weather server.
+
+## Browse saved experiments and snapshots
+
+These read-only commands work in both server modes:
+
+| Command | Behavior |
+| --- | --- |
+| `experiment list` | List registered experiments, saved name/phase/mode, directory, availability and whether the runner currently selects them. |
+| `experiment inspect ID` | Read the published state and directory of a registered experiment, including historical experiments. |
+| `snapshot list [--experiment-id ID]` | List published snapshot metadata for an experiment. |
+| `snapshot inspect UUID [--experiment-id ID]` | Read a snapshot manifest and its saved cycle/stage position. |
+
+Without `--experiment-id`, snapshot reads use the selected experiment in run
+mode. Maintenance mode has no selection and requires an explicit ID.
+These commands neither select nor restore an experiment. Saved state is labelled
+`source: saved_state` and does not prove that processes are currently alive.
+Use `status` for the runner's current state.
+
+Snapshot reads check metadata identity and supported schema, not file hashes or
+restorability. Their `integrity: not_checked` is not a validation result.
+Lists retain unreadable entries with `available: false` and an error; inspection
+of such an entry fails. An empty snapshot list means no published manifests
+were found. Oversized responses are rejected by the existing server limits.
+
+```text
+uv run python -B cli.py experiment list
+uv run python -B cli.py experiment inspect <experiment-id>
+uv run python -B cli.py snapshot list --experiment-id <experiment-id>
+uv run python -B cli.py snapshot inspect <snapshot-uuid> --experiment-id <experiment-id>
+```
+
+The existing `snapshot --label TEXT --wait` still creates a snapshot. Snapshot
+`list` and `inspect` do not accept creation or command-wait options.
 
 ## Execute and control experiments
 
@@ -220,6 +281,40 @@ Commands can fail when the experiment phase does not permit them. See the
 Archive paths belong to the server. Snapshots contain runtime state for restoration;
 exchange archives package code, the applied template and static resources for
 another run. They serve different purposes.
+
+## Retained commands and artifacts
+
+```text
+uv run python -B cli.py commands list --state failed --limit 50
+uv run python -B cli.py commands list --command run --after <command-uuid>
+uv run python -B cli.py artifact list --experiment-id <experiment-id>
+uv run python -B cli.py artifact get <artifact-id> --experiment-id <experiment-id> --output ./result.bin
+```
+
+`commands list` returns receipt summaries in submission order. Filters are
+`--state` and exact controller name `--command`; `--limit` defaults to 100 and
+accepts 1–1000. Continue with `--after` set to `next_after`, keeping the filters.
+An expired cursor requires restarting pagination. Receipts belong to the current
+server instance and are not the permanent history. Use `result ID` for details.
+
+`artifact list` reads `artifact.recorded` events and their attempt context from
+the experiment journal. Entries report current file availability and path errors;
+recorded sizes/hashes are metadata, not a new integrity check. It scans the
+journal through the boundary observed at the start of the request. Large lists
+remain subject to the existing read timeout and JSON response limits.
+
+Continuations include inherited artifact records with their original experiment
+IDs in the event context. File availability and downloads use the continuation's
+own experiment directory, including files restored from its source snapshot.
+
+`artifact get` downloads the first recorded matching artifact ID. Only recorded
+files within their attempt directory can be downloaded. The destination is local,
+its parent directory must exist, and an existing destination is never replaced.
+The client streams into a temporary directory beside the destination, then
+publishes the complete file using a hard link; the destination filesystem must
+support hard links. Failed/interrupted transfers remove temporary data.
+`--request-timeout` also bounds downloads; the JSON size limit does not limit
+binary artifact size. No command receipt is created for these reads.
 
 ## Generic commands and chains
 

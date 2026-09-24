@@ -17,7 +17,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from core.logger_utils.events import copy_json_object
 from core.runner_utils.state import JsonObject
@@ -196,6 +196,7 @@ async def read_controller(
             "invalid_mode": 409,
             "unsupported_feature": 501,
             "journal_unavailable": 503,
+            "too_many_reads": 429,
             "response_too_large": 502,
         }.get(str(error.get("code")), 500)
         return JSONResponse(
@@ -219,6 +220,109 @@ async def state(request: Request, experiment_id: str | None = None) -> JSONRespo
         "stats.state",
         {} if experiment_id is None else {"experiment_id": experiment_id},
     )
+
+
+async def experiments(request: Request) -> JSONResponse:
+    query_fields(request, set())
+    return await read_controller(request, "stats.experiments")
+
+
+async def experiment(request: Request, experiment_id: str) -> JSONResponse:
+    query_fields(request, {"experiment_id"})
+    return await read_controller(
+        request, "stats.experiment", {"experiment_id": experiment_id}
+    )
+
+
+async def snapshots(request: Request, experiment_id: str | None = None) -> JSONResponse:
+    query_fields(request, {"experiment_id"})
+    return await read_controller(
+        request,
+        "stats.snapshots",
+        {} if experiment_id is None else {"experiment_id": experiment_id},
+    )
+
+
+async def snapshot(
+    request: Request, snapshot_id: str, experiment_id: str | None = None
+) -> JSONResponse:
+    query_fields(request, {"snapshot_id", "experiment_id"})
+    args = {"snapshot_id": snapshot_id}
+    if experiment_id is not None:
+        args["experiment_id"] = experiment_id
+    return await read_controller(request, "stats.snapshot", args)
+
+
+async def modules(request: Request) -> JSONResponse:
+    query_fields(request, set())
+    return await read_controller(request, "stats.modules")
+
+
+async def module(request: Request, name: str, version: str) -> JSONResponse:
+    query_fields(request, {"name", "version"})
+    return await read_controller(
+        request, "stats.module", {"name": name, "version": version}
+    )
+
+
+async def validate_template(request: Request) -> JSONResponse:
+    query_fields(request, set())
+    document = await request_document(request, runtime_for(request))
+    args = copy_json_object(document, "template validation")
+    return await read_controller(request, "stats.template", args)
+
+
+async def commands(
+    request: Request,
+    after: str | None = None,
+    limit: int = 100,
+    state: str | None = None,
+    command: str | None = None,
+) -> JSONResponse:
+    query_fields(request, {"after", "limit", "state", "command"})
+    try:
+        result = runtime_for(request).list_commands(
+            after=after, limit=limit, state=state, command=command
+        )
+    except ValueError as error:
+        raise ServerError("invalid_request", str(error), 400) from error
+    response = JSONResponse(result)
+    if len(response.body) > runtime_for(request).settings.max_response_bytes:
+        raise ServerError(
+            "response_too_large",
+            "Command list exceeds the response limit; reduce limit.",
+            502,
+        )
+    return response
+
+
+async def artifacts(request: Request, experiment_id: str) -> JSONResponse:
+    query_fields(request, {"experiment_id"})
+    return await read_controller(
+        request, "stats.artifacts", {"experiment_id": experiment_id}
+    )
+
+
+async def download_artifact(request: Request, experiment_id: str, artifact_id: str):
+    query_fields(request, {"experiment_id", "artifact_id"})
+    response = await read_controller(
+        request,
+        "stats.artifact",
+        {
+            "experiment_id": experiment_id,
+            "artifact_id": artifact_id,
+        },
+    )
+    if response.status_code != 200:
+        return response
+    document = json.loads(response.body)
+    path = Path(document["path"]).resolve()
+    root = runtime_for(request).settings.project_root.resolve()
+    if not path.is_relative_to(root / "experiments"):
+        raise ServerError("invalid_artifact", "Artifact escapes the project.", 400)
+    if not path.is_file():
+        raise ServerError("not_found", "Artifact file is no longer available.", 404)
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
 
 
 async def resources(request: Request) -> JSONResponse:
@@ -321,7 +425,17 @@ app.add_api_route(
     },
 )
 app.add_api_route("/api/commands/{command_id}", command_result, methods=["GET"])
+app.add_api_route("/api/commands", commands, methods=["GET"])
+app.add_api_route("/api/modules", modules, methods=["GET"])
+app.add_api_route("/api/modules/inspect", module, methods=["GET"])
+app.add_api_route("/api/templates/validate", validate_template, methods=["POST"])
+app.add_api_route("/api/artifacts", artifacts, methods=["GET"])
+app.add_api_route("/api/artifacts/download", download_artifact, methods=["GET"])
 app.add_api_route("/api/state", state, methods=["GET"])
+app.add_api_route("/api/experiments", experiments, methods=["GET"])
+app.add_api_route("/api/experiments/inspect", experiment, methods=["GET"])
+app.add_api_route("/api/snapshots", snapshots, methods=["GET"])
+app.add_api_route("/api/snapshots/inspect", snapshot, methods=["GET"])
 app.add_api_route("/api/resources", resources, methods=["GET"])
 app.add_api_route("/api/resources/history", resource_history, methods=["GET"])
 app.add_api_route(
