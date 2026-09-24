@@ -26,6 +26,8 @@ and the `test_*.py` discovery pattern.
 | --- | --- |
 | Module storage | `uv run python -m unittest tests.test_hashdb tests.test_modulemanager tests.test_seaweed -v` |
 | CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.test_experimentreader tests.test_cli_library_reads tests.test_cli_discovery -v` |
+| Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.test_runtime_restart tests.test_server_lifecycle tests.test_server_results -v` |
+| Service control review regressions | `uv run python -m unittest tests.test_service_control_review -v` |
 | Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
 | Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
@@ -40,6 +42,17 @@ references, event-loop progress during template loading, cancellation of
 archive checks, inherited artifact history, and maintenance read saturation
 without blocking state queries or shutdown. The same tests run on Windows
 and Linux using native filesystem paths.
+
+Runtime restart tests reuse the HTTP/process and receipt fixtures. They check
+real controller replacement, active-stage/service shutdown, mode transitions,
+retained receipts, client wait timeouts, failed shutdown/startup and stale IPC
+callbacks. Fault injection is confined to tests; no production fault switches
+or extra dependencies are required.
+
+Service control regressions cover stopping during automatic retry delay,
+readiness after partial service startup, and replaying retained commands/chains
+across mode changes. They reuse the service/DAG, receipt and HTTP fixtures and
+run on Windows and Linux without additional dependencies.
 
 An additional integration entry point is outside normal `test_*.py` discovery:
 

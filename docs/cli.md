@@ -185,11 +185,85 @@ uv run python -B cli.py --config examples/weather_dag/cli.json module validate -
 Recover and stop unfinished experiments before changing modules. For storage
 setup and version rules, see [module storage](storage.md).
 
+## Restart runtime and change server mode
+
+```text
+uv run python -B cli.py server mode
+uv run python -B cli.py server restart --wait
+uv run python -B cli.py server mode maintenance --wait
+uv run python -B cli.py server mode run --wait
+```
+
+`server restart` gracefully stops the controller, its experiment and owned
+resources, then starts a fresh runtime. The HTTP process keeps serving health
+and command receipts. The new runtime does not select or resume an experiment
+automatically. This command does not reload the HTTP application's code.
+
+Changing mode follows the same procedure. Requesting the already active mode
+succeeds without restarting a healthy runtime. The selected mode applies to
+subsequent runtime restarts in this HTTP session; configuration files are not
+rewritten. Host, port and authentication settings remain the startup settings.
+
+Both mutations support normal command IDs and wait options. `--wait` completes
+only after the new controller reports readiness; `--no-wait` reports admission.
+A client timeout does not cancel the operation. Use `result COMMAND_ID --wait`
+to continue observing it. Reading `server mode` takes no execution options.
+
+During restart, health reports `state: restarting` with HTTP 503. New controller
+reads and mutations are rejected; existing receipts remain available under the
+same `server_instance_id`. Each newly started runtime has a separate `runtime_id`.
+Lifecycle commands cannot be submitted in chains or with a target. A concurrent
+lifecycle request is rejected, while repeating the same retained command ID
+returns its receipt.
+
+If shutdown times out, exits abnormally or leaves an unusable IPC reader, no
+replacement is started. Health reports `restart_blocked`; inspect the failure
+and restart the HTTP process explicitly before recovery. Never interpret an
+unfinished ordinary command marked `unknown` as proof that it had no effects.
+
+## Start and stop individual services
+
+In run mode, pause the experiment and wait for its active stage to finish:
+
+```text
+uv run python -B cli.py pause --wait
+uv run python -B cli.py service stop 1 --wait
+uv run python -B cli.py service start 1 --wait
+uv run python -B cli.py resume --wait
+```
+
+The position is one-based in the template's `services` list, matching `retry`.
+These commands require an idle pause with no snapshot, restoration, pending step,
+or other manual service operation. They affect only the selected service.
+`start` waits for its ready heartbeat; `stop` waits for confirmed process exit.
+Repeated start of a ready service and repeated stop of a confirmed stopped
+service succeed without replacing the instance. Both support the usual command
+ID and wait options; `--no-wait` reports command admission. Ordinary CLI calls
+wait by default, while the interactive shell defaults to admission only.
+
+Runner state exposes `services[].manually_stopped`. The intent is saved before
+shutdown and survives recovery. Supervision and `retry` of another service do
+not restart it. Use `service start`, rather than `retry`, for that service.
+Manual stop also cancels an automatic restart waiting in its retry delay,
+even if the previous process has already exited.
+Resume, step, and snapshot creation are rejected until all manually stopped
+services have been started. A failed or cancelled start cleans up its selected
+instance and leaves it manually stopped for an explicit retry with `service start`.
+Resume and step also require every service declared in the template to have
+been started. After partial startup, start the remaining services explicitly;
+starting one service does not start the other definitions.
+An unconfirmed shutdown remains an error; it cannot authorize another instance.
+
+Rollback to an earlier snapshot restores the services represented by that
+snapshot. Stopping the whole experiment remains available; if a stopped service
+cannot export its state, the final snapshot is reported as invalid.
+
 ## Read state, resources and logs
 
 | Command | Options and behavior |
 | --- | --- |
 | `health` | Read server mode, storage initialization and controller health. |
+| `server mode` | Read the server's current `run` or `maintenance` mode through `/health`. Supplying a mode performs the runtime transition described above. |
 | `status` / `state` | Read selected runner state; `--experiment-id ID` must match its ID. `--watch [SECONDS]` repeats, default interval 1 second. Use `experiment inspect ID` for historical saved state. |
 | `resources` | Read current resource observations. Supports `--watch [SECONDS]`. |
 | `resource-history` | `--after N` (default 0, nonnegative), `--limit N` (default 100, range 1–1000). |

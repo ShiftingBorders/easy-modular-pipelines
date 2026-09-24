@@ -242,6 +242,10 @@ class ExperimentController:
                         f"Recover unfinished experiments before issuing control commands: {sorted(self._recovery_required)}"
                     )
                 target = copy_json_object(command.get("target", {}), "target")
+                if name in ("service.start", "service.stop") and (not target or args):
+                    raise ValueError(
+                        "Service control requires a service target and empty args."
+                    )
                 if target:
                     if target.keys() != {"kind", "position"} or target["kind"] not in (
                         "stage",
@@ -250,9 +254,9 @@ class ExperimentController:
                         raise ValueError("target requires kind and position.")
                     if type(target["position"]) is not int or target["position"] < 1:
                         raise ValueError("target.position must be a positive integer.")
-                    if name == "retry":
+                    if name in ("retry", "service.start", "service.stop"):
                         if target["kind"] != "service":
-                            raise ValueError("retry targets a service.")
+                            raise ValueError(f"{name} targets a service.")
                         args["position"] = target["position"]
                     elif name in ("replace", "reset_retries"):
                         args.update(target)
@@ -271,6 +275,8 @@ class ExperimentController:
                     "step": self._runner.step,
                     "rerun": self._runner.rerun,
                     "retry": self._runner.retry,
+                    "service.start": self._runner.start_service,
+                    "service.stop": self._runner.stop_service,
                     "move": self._runner.move,
                     "reset_retries": self._runner.reset_retries,
                     "replace": self._runner.replace,

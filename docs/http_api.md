@@ -129,6 +129,74 @@ recovery, and archive operations described in the [experiment guide](basic_dag.m
 The runtime checks the current phase; an exposed route does not make every
 operation valid in every state.
 
+Individual service control uses the existing `POST /api/commands` endpoint:
+
+```json
+{
+  "api_version": 1,
+  "command": "service.stop",
+  "args": {},
+  "target": {"kind": "service", "position": 1}
+}
+```
+
+Use `service.start` with the same target to start that service. Positions are
+one-based. These commands require an idle paused experiment and empty `args`;
+their target must have `kind: service`. Maintenance mode rejects admission with
+HTTP 409 (`invalid_mode`). They use ordinary command receipts, chain ordering
+and `--wait` completion. A priority experiment `stop` cancels in-flight service
+control and still completes participant cleanup.
+
+Successful results contain `service_id`, `service_instance_id`,
+`manually_stopped`, and either `ready` for start or `stopped` for stop. Repeated
+calls do not replace a ready instance or re-stop an already stopped instance.
+The state response also exposes `services[].manually_stopped`; recovery and
+reconciliation preserve this intent. Resume, step and snapshot creation require
+those services to be explicitly started. Rollback restores the earlier snapshot's
+services. See [service commands](cli.md#start-and-stop-individual-services).
+
+## Runtime lifecycle
+
+`POST /api/commands` accepts `server.restart` with empty `args`, and
+`server.mode` with `{"mode": "run"}` or `{"mode": "maintenance"}`. These operations
+run in the HTTP owner rather than its controller. They accept no target and
+cannot appear in command chains. Existing authentication and receipt limits
+apply. For example:
+
+```json
+{"api_version": 1, "command": "server.mode", "args": {"mode": "maintenance"}}
+```
+
+Admission returns 202 and the normal retained command ID. Poll its existing
+result endpoint. Success means that shutdown completed and the replacement
+controller reported readiness; selecting the current healthy mode is a no-op.
+The result includes `previous_runtime_id`, `runtime_id`, `server_mode`, `changed`
+and `controller` OS identity. Mode changes are session-local and do not rewrite
+the configuration file. Active experiments are stopped and are not automatically
+resumed or selected by the new runtime.
+
+HTTP remains running with the same `server_instance_id` and receipt cache.
+`GET /api/health` additionally reports `runtime_id` and `restart_blocked`.
+While a lifecycle command is pending, health reports `state: restarting` and
+HTTP 503; new controller work returns `controller_unavailable`. Concurrent
+lifecycle admission returns 409 `restart_pending`. Reusing an identical retained
+command ID retrieves its existing receipt. Previous command outcomes remain
+available subject to ordinary retention limits; unresolved controller work may
+be marked `unknown` on shutdown.
+Re-submitting an identical retained service/module command also returns its
+receipt after a mode change, without executing it again. Mode restrictions apply
+to new commands; a retained ID with a different request remains a conflict.
+
+Forced, nonzero or incomplete shutdown fails the operation with
+`runtime_restart_failed` and blocks replacement. Further lifecycle mutations
+return 409 `restart_blocked`; inspect diagnostics and restart the HTTP process
+explicitly. Controller journals are separate for each `runtime_id` under
+`controller/server`. Late messages from a previous generation cannot change
+the replacement's readiness or receipts.
+
+These commands restart the runtime, not the HTTP process. The private
+`server.shutdown` controller message is not a public API command.
+
 ## Configuration and authentication
 
 Server settings are in [webserver.json](../default_settings/webserver.json).

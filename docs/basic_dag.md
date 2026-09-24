@@ -87,6 +87,13 @@ again. A lost HTTP response does not prove the action was never performed.
 
 ## Control execution
 
+To change server mode remotely, use `cli.py server mode maintenance --wait` or
+`cli.py server mode run --wait`. To restart the runtime in its current mode, use
+`cli.py server restart --wait`. These operations stop the selected experiment
+and replace the controller and its owned resources while HTTP remains available.
+They do not automatically resume an experiment or modify the configuration file.
+See [runtime lifecycle](http_api.md#runtime-lifecycle).
+
 | CLI command | Behavior |
 | --- | --- |
 | `run --template <path> --delayed-start --wait` | Prepare the experiment and services, then wait before the first stage. |

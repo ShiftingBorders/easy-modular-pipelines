@@ -113,6 +113,14 @@ restarts. A late success does not reverse an accepted timeout.
 Losing the runner connection must not automatically destroy the service.
 A live instance accepts reconnection. A restart creates a new instance identity.
 
+Operators can use `service stop POSITION` and `service start POSITION` at an idle
+experiment pause. Manual stop uses the existing `shutdown` operation; manual
+start launches a new instance and waits for a successful heartbeat. No additional
+participant operations are required. The runner persists manual-stop intent and
+does not automatically restart that service. Resume, step and snapshot creation
+are unavailable until it is explicitly started again. Rollback follows the
+selected snapshot's service state.
+
 ## Settings and state
 
 Startup settings merge module defaults with `services[].settings`.

@@ -114,7 +114,9 @@ class ServiceManager:
                     )
                     if action != "ready":
                         return action
-                action = await self.wait_ready(state)
+                # Later definitions are intentionally not launched yet. Only
+                # this startup prefix participates in the intermediate barrier.
+                action = await self.wait_ready(state, service_ids=set(state.services))
                 if action != "ready":
                     return action
         except BaseException as error:
@@ -130,6 +132,65 @@ class ServiceManager:
             await asyncio.gather(self._monitor_task, return_exceptions=True)
             raise
         return "ready"
+
+    async def start(self, state: RunnerState, service_id: str) -> ServiceInstance:
+        """Start only the selected service and wait for its first ready heartbeat."""
+        if self._closed or self._snapshot_id is not None:
+            raise RuntimeError(
+                "Service start requires an open manager without a snapshot barrier."
+            )
+        definition = next(
+            (
+                item
+                for item in state.template["services"]
+                if item["service_id"] == service_id
+            ),
+            None,
+        )
+        if definition is None:
+            raise ValueError("Unknown service definition.")
+        if service_id in self._starting or service_id in self._restarts:
+            raise RuntimeError("Wait for the current service startup or restart.")
+        instance = state.services.get(service_id)
+        if instance is not None and not instance.stopped:
+            if (
+                instance.ready
+                and not instance.stopping
+                and not instance.manually_stopped
+                and instance.blocked_action is None
+            ):
+                return instance
+            raise RuntimeError(
+                "Confirm service shutdown before starting another instance."
+            )
+        if instance is not None and (
+            instance.active_request or instance.pending_requests
+        ):
+            raise RuntimeError("Resolve pending service work before starting it.")
+        try:
+            instance = await self._start(state, definition)
+            if self._monitor_task is None or self._monitor_task.done():
+                self._monitor_task = asyncio.create_task(self.monitor(state))
+            return instance
+        except BaseException as error:
+            # A failed or cancelled launch must not leave an unsupervised process
+            # or allow the monitor to undo the caller's cleanup.
+            instance = state.services.get(service_id)
+            if instance is not None:
+                instance.manually_stopped = True
+                try:
+                    results = await self.stop_all(state, service_ids={service_id})
+                    if (
+                        not results[service_id]["stopped"]
+                        or results[service_id]["error"]
+                    ):
+                        error.add_note(
+                            f"Service startup cleanup failed: {results[service_id]}"
+                        )
+                    self._state_store.save(state)
+                except Exception as cleanup_error:  # noqa: BLE001 - Preserve the launch failure and its cleanup diagnostics.
+                    error.add_note(f"Service startup cleanup failed: {cleanup_error}")
+            raise
 
     async def _start(
         self, state: RunnerState, definition: JsonObject
@@ -323,19 +384,38 @@ class ServiceManager:
                 self._notify_resources()
             self._changed.set()
 
-    async def wait_ready(self, state: RunnerState) -> ServiceAction:
+    async def wait_ready(
+        self, state: RunnerState, *, service_ids: set[str] | None = None
+    ) -> ServiceAction:
+        required = (
+            {definition["service_id"] for definition in state.template["services"]}
+            if service_ids is None
+            else service_ids
+        )
         while not self._closed:
             if self._pending_action is not None:
                 action, self._pending_action = self._pending_action, None
                 return action
             for instance in state.services.values():
+                if instance.manually_stopped:
+                    continue
                 if instance.blocked_action is not None:
                     return instance.blocked_action
+            if required - state.services.keys():
+                return "pause"
             if all(
                 instance.ready and not instance.stopping and not instance.stopped
                 for instance in state.services.values()
+                if not instance.manually_stopped
             ):
-                return "ready"
+                return (
+                    "pause"
+                    if any(
+                        instance.manually_stopped
+                        for instance in state.services.values()
+                    )
+                    else "ready"
+                )
             if self._monitor_task is None or self._monitor_task.done():
                 if self._monitor_task is not None:
                     action = self._monitor_task.result()
@@ -417,7 +497,8 @@ class ServiceManager:
                         return action
                     continue
                 if (
-                    instance.stopped
+                    instance.manually_stopped
+                    or instance.stopped
                     or instance.stopping
                     or service_id in self._starting
                 ):
@@ -535,6 +616,10 @@ class ServiceManager:
         self, state: RunnerState, service_id: str, *, automatic: bool
     ) -> ServiceAction:
         instance = state.services[service_id]
+        if instance.manually_stopped:
+            if automatic:
+                return "pause"
+            raise RuntimeError("Use service start to start a manually stopped service.")
         retry = instance.active_request
         retry = (
             retry
@@ -596,6 +681,10 @@ class ServiceManager:
                     if waiter is not None and not waiter.done():
                         waiter.cancel()
                     raise
+            if state.services[service_id].manually_stopped:
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
+                return "pause"
             try:
                 instance = await self._start(state, instance.definition)
             except asyncio.CancelledError:
@@ -941,6 +1030,8 @@ class ServiceManager:
                 del state.services[service_id]
         for definition in template["services"]:
             instance = state.services.get(definition["service_id"])
+            if instance is not None and instance.manually_stopped:
+                continue
             if instance is not None and instance.blocked_action is not None:
                 return instance.blocked_action
             if instance is not None and not instance.stopped:
@@ -1062,6 +1153,19 @@ class ServiceManager:
             self._monitor_task = asyncio.create_task(self.monitor(state))
         for service_id, instance in state.services.items():
             try:
+                if instance.manually_stopped:
+                    # Finish an interrupted manual stop before allowing explicit
+                    # start; recovery must never relaunch this service.
+                    if not instance.stopped:
+                        results = await self.stop_all(state, service_ids={service_id})
+                        if (
+                            not results[service_id]["stopped"]
+                            or results[service_id]["error"]
+                        ):
+                            return "stop"
+                    instance.blocked_action = None
+                    self._state_store.save(state)
+                    continue
                 if instance.stopped:
                     instance.blocked_action = self._pending_action = "pause"
                     # Still reconnect the remaining live services so a partial
@@ -1215,6 +1319,10 @@ class ServiceManager:
         self, state: RunnerState, snapshot_id: str
     ) -> dict[str, Path]:
         UUID(snapshot_id)
+        if any(instance.manually_stopped for instance in state.services.values()):
+            raise RuntimeError(
+                "Start manually stopped services before exporting snapshot state."
+            )
         if self._snapshot_id is not None:
             raise RuntimeError("A service snapshot barrier is already active.")
         self._snapshot_id = snapshot_id
@@ -1762,7 +1870,12 @@ class ServiceManager:
         deadline: float | None = None,
     ) -> asyncio.Future:
         instance = state.services[service_id]
-        if self._closed or instance.stopped or instance.stopping:
+        if (
+            self._closed
+            or instance.manually_stopped
+            or instance.stopped
+            or instance.stopping
+        ):
             raise RuntimeError("Working requests require an active service.")
         require_text(command, "service command")
         if command in ("heartbeat", "shutdown", "command_state", "interrupt"):

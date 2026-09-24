@@ -624,7 +624,7 @@ async def controller_main(
                 identity = process_identity(os.getpid())
                 logger.record_event(
                     "server.controller_started",
-                    {"server_instance_id": instance_id, "process": identity},
+                    {"runtime_id": instance_id, "process": identity},
                 )
                 responses.put_nowait(
                     {
@@ -739,8 +739,103 @@ class ServerRuntime:
         self._last_response_at: str | None = None
         self._identity: JsonObject | None = None
         self._storage: JsonObject | None = None
+        self._runtime_id = str(uuid4())
+        self._restart_task: asyncio.Task | None = None
+        self._restart_command: JsonObject | None = None
+        self._restart_blocked: str | None = None
+        self._http_closing = False
 
-    async def start(self) -> None:
+    async def start(self, *, restart_command: JsonObject | None = None) -> None:
+        if restart_command is not None:
+            if restart_command is not self._restart_command:
+                raise RuntimeError("Admit runtime restarts through submit first.")
+            previous_id = self._runtime_id
+            mode = restart_command["args"].get("mode", self.settings.server_mode)
+            response = {
+                "command_id": restart_command["command_id"],
+                "chain_id": None,
+                "experiment_id": None,
+                "state": "succeeded",
+                "result": "success",
+                "data": None,
+                "error": None,
+            }
+            try:
+                unchanged = (
+                    restart_command["command"] == "server.mode"
+                    and mode == self.settings.server_mode
+                    and self._state == "ready"
+                    and self._process is not None
+                    and self._process.is_alive()
+                )
+                if not unchanged:
+                    # Finish shutdown even if the HTTP owner is itself stopping.
+                    # Replacing queues before a confirmed exit risks two owners.
+                    shutdown = asyncio.create_task(self.close(restarting=True))
+                    cancelled = False
+                    try:
+                        while True:
+                            try:
+                                await asyncio.shield(shutdown)
+                                break
+                            except asyncio.CancelledError:
+                                cancelled = True
+                                if shutdown.cancelled():
+                                    raise
+                    except Exception as error:
+                        self._restart_blocked = (
+                            self._restart_blocked
+                            or f"Runtime shutdown was not confirmed: {error}"
+                        )
+                        raise
+                    finally:
+                        if cancelled:
+                            raise asyncio.CancelledError
+                    if self._http_closing:
+                        raise asyncio.CancelledError
+                    self.settings.server_mode = mode
+                    self._runtime_id = str(uuid4())
+                    self._reader_stop = threading.Event()
+                    self._reader_thread = None
+                    self._watcher = None
+                    self._ready = None
+                    self._identity = None
+                    self._storage = None
+                    self._last_response_at = None
+                    self._error = None
+                    self._closing = False
+                    self._state = "new"
+                    await self.start()
+                response["data"] = {
+                    "previous_runtime_id": previous_id,
+                    "runtime_id": self._runtime_id,
+                    "server_mode": self.settings.server_mode,
+                    "changed": not unchanged,
+                    "controller": self._identity,
+                }
+            except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - Lifecycle failures are retained command outcomes.
+                cancelled = isinstance(error, asyncio.CancelledError)
+                response.update(
+                    state="cancelled" if cancelled else "failed",
+                    result="fail",
+                    error={
+                        "code": "command_cancelled"
+                        if cancelled
+                        else "runtime_restart_failed",
+                        "message": "HTTP server is stopping."
+                        if cancelled
+                        else str(error),
+                        "details": {"notes": list(getattr(error, "__notes__", []))},
+                    },
+                )
+                self._error = response["error"]["message"]
+            finally:
+                # A closed controller must not hide the HTTP-owned receipt.
+                if self._state == "closed":
+                    self._state = "unavailable"
+                self._accept_response(response)
+                self._restart_command = None
+            return
         if self._state != "new":
             raise RuntimeError("Server runtime has already started.")
         self._state = "starting"
@@ -751,7 +846,7 @@ class ServerRuntime:
         self._ready = asyncio.get_running_loop().create_future()
         self._process = context.Process(
             target=controller_process,
-            args=(self.settings, self._requests, self._responses, self.instance_id),
+            args=(self.settings, self._requests, self._responses, self._runtime_id),
             name="experiment-controller",
         )
         try:
@@ -783,9 +878,10 @@ class ServerRuntime:
         alive = self._process is not None and self._process.is_alive()
         return {
             "server_instance_id": self.instance_id,
+            "runtime_id": self._runtime_id,
             "server_mode": self.settings.server_mode,
             "storage_initialization": self._storage,
-            "state": self._state,
+            "state": "restarting" if self._restart_command is not None else self._state,
             "controller_alive": alive,
             "controller": self._identity,
             "last_response_at": self._last_response_at,
@@ -793,11 +889,13 @@ class ServerRuntime:
                 record.response is None for record in self._records.values()
             ),
             "error": self._error,
+            "restart_blocked": self._restart_blocked,
         }
 
     def _require_ready(self) -> Queue:
         if (
             self._closing
+            or self._restart_command is not None
             or self._state != "ready"
             or self._process is None
             or not self._process.is_alive()
@@ -816,11 +914,7 @@ class ServerRuntime:
         if type(version) is not int or version != 1:
             raise ValueError("Only api_version 1 is supported.")
         name = require_text(command.get("command"), "command")
-        if name.startswith("module.") and self.settings.server_mode != "maintenance":
-            raise ServerError(
-                "invalid_mode", "Module commands require --mode maintenance.", 409
-            )
-        if name.startswith("server."):
+        if name.startswith("server.") and name not in ("server.restart", "server.mode"):
             raise ValueError("Server lifecycle messages are not public commands.")
         command["api_version"] = 1
         command["command_id"] = str(
@@ -828,6 +922,18 @@ class ServerRuntime:
         )
         command["args"] = copy_json_object(command.get("args", {}), "args")
         target = copy_json_object(command.get("target", {}), "target")
+        if name in ("server.restart", "server.mode"):
+            if chain_id is not None or target:
+                raise ValueError(
+                    "Runtime lifecycle commands do not accept chains or targets."
+                )
+            args = command["args"]
+            if name == "server.restart" and args:
+                raise ValueError("server.restart does not accept arguments.")
+            if name == "server.mode" and (
+                args.keys() != {"mode"} or args["mode"] not in ("run", "maintenance")
+            ):
+                raise ValueError("server.mode requires mode=run|maintenance.")
         if target:
             if target.keys() != {"kind", "position"} or target["kind"] not in (
                 "stage",
@@ -844,7 +950,6 @@ class ServerRuntime:
 
     def submit(self, document: object, *, chain: bool = False) -> JsonObject:
         """Validate and enqueue without awaiting: disconnect cannot split admission."""
-        requests = self._require_ready()
         self._prune()
         chain_id = None
         if chain:
@@ -910,6 +1015,41 @@ class ServerRuntime:
                     409,
                 )
             return self._receipt(identifiers, chain_id)
+        # Replaying a retained request retrieves its receipt across mode changes;
+        # only new work is subject to the current runtime's admission policy.
+        for command in commands:
+            name = command["command"]
+            if (
+                name in ("service.start", "service.stop")
+                and self.settings.server_mode != "run"
+            ):
+                raise ServerError(
+                    "invalid_mode", "Service control requires --mode run.", 409
+                )
+            if (
+                name.startswith("module.")
+                and self.settings.server_mode != "maintenance"
+            ):
+                raise ServerError(
+                    "invalid_mode", "Module commands require --mode maintenance.", 409
+                )
+        lifecycle = not chain and commands[0]["command"] in (
+            "server.restart",
+            "server.mode",
+        )
+        if lifecycle:
+            if self._restart_command is not None:
+                raise ServerError(
+                    "restart_pending", "A runtime restart is already pending.", 409
+                )
+            if self._http_closing or self._state in ("new", "starting"):
+                raise ServerError(
+                    "controller_unavailable", "Server is starting or shutting down."
+                )
+            if self._restart_blocked is not None:
+                raise ServerError("restart_blocked", self._restart_blocked, 409)
+        else:
+            requests = self._require_ready()
         if chain_id is not None and chain_id in self._chains:
             raise ServerError(
                 "chain_id_conflict",
@@ -925,7 +1065,7 @@ class ServerRuntime:
                 "stop_pending", "A standalone stop is already pending.", 409
             )
         if len(pending) + len(commands) > self.settings.max_pending + int(
-            priority_stop
+            priority_stop or lifecycle
         ):
             raise ServerError(
                 "queue_full",
@@ -937,16 +1077,22 @@ class ServerRuntime:
             raise ServerError(
                 "queue_full", "The command record limit has been reached.", 429
             )
-        try:
-            requests.put_nowait(message)
-        except Full as error:
-            raise ServerError(
-                "queue_full", "Controller request queue is full.", 429
-            ) from error
+        if not lifecycle:
+            try:
+                requests.put_nowait(message)
+            except Full as error:
+                raise ServerError(
+                    "queue_full", "Controller request queue is full.", 429
+                ) from error
         for identifier, record in zip(identifiers, records, strict=True):
             self._records[identifier] = record
         if chain_id is not None:
             self._chains[chain_id] = identifiers
+        if lifecycle:
+            self._restart_command = message
+            self._restart_task = asyncio.create_task(
+                self.start(restart_command=message)
+            )
         return self._receipt(identifiers, chain_id)
 
     def _receipt(self, identifiers: list[str], chain_id: str | None) -> JsonObject:
@@ -1090,35 +1236,43 @@ class ServerRuntime:
 
     def _read_responses(self, loop: asyncio.AbstractEventLoop) -> None:
         responses = self._responses
+        reader_stop = self._reader_stop
+        runtime_id = self._runtime_id
         if responses is None:
             return
         try:
-            while not self._reader_stop.is_set():
+            while not reader_stop.is_set():
                 try:
                     message = responses.get(timeout=0.1)
                 except Empty:
                     continue
-                loop.call_soon_threadsafe(self._accept_response, message)
+                loop.call_soon_threadsafe(self._accept_response, message, runtime_id)
         except Exception as error:  # noqa: BLE001 - A broken IPC reader makes pending outcomes unknown.
-            if not self._reader_stop.is_set():
+            if not reader_stop.is_set():
                 try:
                     loop.call_soon_threadsafe(
                         self._unavailable,
                         f"Controller response channel failed: {error}",
+                        runtime_id,
                     )
                 except RuntimeError:
                     pass
 
     async def _watch_process(self) -> None:
         process = self._process
+        runtime_id = self._runtime_id
         if process is None:
             return
         while process.is_alive():
             await asyncio.sleep(0.1)
-        self._unavailable(f"Controller exited with code {process.exitcode}.")
+        self._unavailable(
+            f"Controller exited with code {process.exitcode}.", runtime_id
+        )
 
-    def _accept_response(self, message: object) -> None:
-        if self._state == "closed":
+    def _accept_response(self, message: object, runtime_id: str | None = None) -> None:
+        if self._state == "closed" or (
+            runtime_id is not None and runtime_id != self._runtime_id
+        ):
             return
         try:
             response = copy_json_object(message, "controller response")
@@ -1197,8 +1351,10 @@ class ServerRuntime:
         except Exception as error:  # noqa: BLE001 - Do not leave a failed response consumer reporting readiness.
             self._unavailable(f"Invalid controller response: {error}")
 
-    def _unavailable(self, message: str) -> None:
-        if self._state == "closed":
+    def _unavailable(self, message: str, runtime_id: str | None = None) -> None:
+        if self._state == "closed" or (
+            runtime_id is not None and runtime_id != self._runtime_id
+        ):
             return
         self._state = "unavailable"
         self._error = message
@@ -1208,6 +1364,11 @@ class ServerRuntime:
             if not future.done():
                 future.set_exception(ServerError("controller_unavailable", message))
         for identifier, record in self._records.items():
+            if (
+                self._restart_command is not None
+                and identifier == self._restart_command["command_id"]
+            ):
+                continue
             if record.response is None:
                 record.response = {
                     "command_id": identifier,
@@ -1248,7 +1409,13 @@ class ServerRuntime:
             if not any(identifier in self._records for identifier in identifiers):
                 del self._chains[chain_id]
 
-    async def close(self) -> None:
+    async def close(self, *, restarting: bool = False) -> None:
+        if not restarting and asyncio.current_task() is not self._restart_task:
+            self._http_closing = True
+            if self._restart_task is not None and not self._restart_task.done():
+                # Let an admitted restart finish its safe shutdown, but suppress
+                # launching a replacement after the HTTP lifespan has ended.
+                await asyncio.shield(self._restart_task)
         if self._closing:
             return
         self._closing = True
@@ -1287,6 +1454,9 @@ class ServerRuntime:
             self._unavailable(
                 "Server runtime is closed; unfinished command outcomes are unknown."
             )
+        except BaseException as error:
+            self._restart_blocked = f"Runtime shutdown was not confirmed: {error}"
+            raise
         finally:
             if self._watcher is not None:
                 self._watcher.cancel()
@@ -1298,6 +1468,8 @@ class ServerRuntime:
                     logging.getLogger(__name__).error(
                         "A corrupted IPC reader will be released when the HTTP process exits."
                     )
+                    if restarting:
+                        self._restart_blocked = "Controller IPC reader did not stop; restart the HTTP process before continuing."
             for queue in (self._requests, self._responses):
                 if queue is not None:
                     queue.cancel_join_thread()
@@ -1311,10 +1483,10 @@ class ServerRuntime:
             self._process = None
             self._state = "closed"
         if forced:
-            raise RuntimeError(
-                "Controller shutdown timed out; inspect and recover unfinished experiments before continuing."
-            )
+            self._restart_blocked = "Controller shutdown timed out; inspect and recover unfinished experiments before continuing."
+            raise RuntimeError(self._restart_blocked)
         if exit_code not in (None, 0):
-            raise RuntimeError(
-                f"Controller exited with code {exit_code}; inspect its journal before continuing."
-            )
+            self._restart_blocked = f"Controller exited with code {exit_code}; inspect its journal before continuing."
+            raise RuntimeError(self._restart_blocked)
+        if restarting and self._restart_blocked is not None:
+            raise RuntimeError(self._restart_blocked)

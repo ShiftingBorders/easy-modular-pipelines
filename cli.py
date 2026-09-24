@@ -446,6 +446,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON output; watch/follow produces JSON Lines.",
     )
     commands = parser.add_subparsers(dest="action", required=True)
+    server = commands.add_parser(
+        "server", help="Inspect or restart the server runtime."
+    )
+    server_actions = server.add_subparsers(dest="server_action", required=True)
+    server_mode = server_actions.add_parser(
+        "mode", help="Read or change the runtime mode."
+    )
+    server_mode.add_argument("mode", nargs="?", choices=("run", "maintenance"))
+    execution_options(server_mode)
+    execution_options(
+        server_actions.add_parser(
+            "restart", help="Restart the runtime while keeping HTTP available."
+        )
+    )
     template = commands.add_parser("template", help="Create a local experiment draft.")
     template_actions = template.add_subparsers(dest="template_action", required=True)
     create = template_actions.add_parser("create")
@@ -571,6 +585,16 @@ def build_parser() -> argparse.ArgumentParser:
         )
         item.add_argument("position", type=positive_integer)
         execution_options(item)
+    service = commands.add_parser(
+        "service", help="Control services in a paused experiment."
+    )
+    service_actions = service.add_subparsers(dest="service_action", required=True)
+    for name in ("start", "stop"):
+        item = service_actions.add_parser(
+            name, help=f"{name.capitalize()} one service."
+        )
+        item.add_argument("position", type=positive_integer)
+        execution_options(item)
     reset = commands.add_parser(
         "reset-retries", help="Reset a stage/service retry counter."
     )
@@ -684,6 +708,13 @@ def command_document(options: argparse.Namespace) -> JsonObject:
             "position": options.position,
         }
         name = name.replace("-", "_")
+    elif name == "service":
+        name = "service." + options.service_action
+        target = {"kind": "service", "position": options.position}
+    elif name == "server":
+        name = "server." + options.server_action
+        if options.server_action == "mode":
+            args["mode"] = options.mode
     elif name == "recover":
         args["experiment_id"] = options.experiment_id
     elif name == "snapshot" and options.label is not None:
@@ -756,6 +787,23 @@ async def execute(
     interactive: bool = False,
 ) -> int:
     action = options.action
+    if action == "server" and options.server_action == "mode" and options.mode is None:
+        if (
+            options.wait is not None
+            or options.wait_timeout is not None
+            or options.command_id is not None
+        ):
+            raise ValueError(
+                "Reading server mode does not accept command execution options."
+            )
+        document = await client.request("GET", "/health")
+        mode = document.get("server_mode")
+        if mode not in ("run", "maintenance"):
+            raise ClientError(
+                "Server returned an invalid mode.", code="invalid_response"
+            )
+        display({"server_mode": mode}, as_json=as_json)
+        return 0
     if action == "template" and options.template_action == "validate":
         document = await client.request(
             "POST", "/templates/validate", document={"template_path": options.path}
