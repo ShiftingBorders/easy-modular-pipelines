@@ -30,8 +30,11 @@ Point the CLI at the system API, not the dashboard.
 
 | Server mode | Available workflow |
 | --- | --- |
-| `maintenance` | Register, validate and remove modules with `module ...`. No experiment runner is started. |
-| `run` | Execute and control experiments, read runtime resources and logs, work with snapshots and exchange archives. Module maintenance commands are rejected. |
+| `maintenance` | Register, validate and remove modules. No experiment runner is started. |
+| `run` | Execute and control experiments, read runtime resources and logs, work with snapshots and exchange archives. Module mutations and `module validate` are rejected. |
+
+Module list/inspect, template validation, saved metadata, artifacts and retained
+command receipts are readable in both modes.
 
 Start the appropriate mode in another terminal:
 
@@ -71,8 +74,8 @@ own environment; see [HTTP authentication](http_api.md#configuration-and-authent
 
 | Argument | Where the file exists |
 | --- | --- |
-| `--config`, `chain FILE`, JSON `@file`, `template create DESTINATION` | On the CLI machine; relative paths resolve from its current directory. |
-| `module ... --folder`, `run --template`, archive paths and installation destination | On the server machine; pass absolute paths. The CLI does not upload these files. |
+| `--config`, `chain FILE`, JSON `@file`, `template create DESTINATION`, `artifact get --output` | On the CLI machine; relative paths resolve from its current directory. |
+| `module ... --folder`, `run --template`, `template validate PATH`, archive paths and installation destination | On the server machine; pass absolute paths. The CLI does not upload these files. |
 
 For a local PowerShell session:
 
@@ -134,6 +137,31 @@ and refuses to overwrite an existing destination. Fill its stages/services and
 registered module hashes before running it. This command neither registers
 modules nor fills their hashes automatically.
 
+## Template validation and module discovery
+
+These operations work in both server modes and do not create experiments:
+
+```text
+uv run python -B cli.py template validate "<absolute-template-path-on-server>"
+uv run python -B cli.py module list
+uv run python -B cli.py module inspect --name weather_stage --version 1.1
+```
+
+`template validate` checks the existing template schema, registered module hashes
+and archive presence. Its scope is `structure_and_registered_references`: it does
+not execute modules, inspect archive contents, verify installed code, or verify
+resource files. Relative resource paths resolve from the template directory.
+Use `module validate` in maintenance mode to check stored package integrity.
+The result includes `warnings`: services without an explicit `service_id`
+produce a warning while validation remains successful. Assembly generates
+their IDs; services referenced by DAG nodes still require explicit IDs.
+
+`module list` returns registered name/version/hash references, ordered by name
+and version. `module inspect` returns the reference, archive availability and
+local installation location/presence; `integrity: not_checked` distinguishes this
+from package validation. Storage outages fail the request instead of reporting
+a missing archive. These reads do not accept command-wait options.
+
 ## Module maintenance
 
 These commands require a maintenance server:
@@ -157,12 +185,111 @@ uv run python -B cli.py --config examples/weather_dag/cli.json module validate -
 Recover and stop unfinished experiments before changing modules. For storage
 setup and version rules, see [module storage](storage.md).
 
+## Restart runtime and change server mode
+
+```text
+uv run python -B cli.py server mode
+uv run python -B cli.py server restart --wait
+uv run python -B cli.py server mode maintenance --wait
+uv run python -B cli.py server mode run --wait
+```
+
+`server restart` gracefully stops the controller, its experiment and owned
+resources, then starts a fresh runtime. The HTTP process keeps serving health
+and command receipts. The new runtime does not select or resume an experiment
+automatically. This command does not reload the HTTP application's code.
+
+Changing mode follows the same procedure. Requesting the already active mode
+succeeds without restarting a healthy runtime. The selected mode applies to
+subsequent runtime restarts in this HTTP session; configuration files are not
+rewritten. Host, port and authentication settings remain the startup settings.
+
+Both mutations support normal command IDs and wait options. `--wait` completes
+only after the new controller reports readiness; `--no-wait` reports admission.
+A client timeout does not cancel the operation. Use `result COMMAND_ID --wait`
+to continue observing it. Reading `server mode` takes no execution options.
+
+During restart, health reports `state: restarting` with HTTP 503. New controller
+reads and mutations are rejected; existing receipts remain available under the
+same `server_instance_id`. Each newly started runtime has a separate `runtime_id`.
+Lifecycle commands cannot be submitted in chains or with a target. A concurrent
+lifecycle request is rejected, while repeating the same retained command ID
+returns its receipt.
+
+If shutdown times out, exits abnormally or leaves an unusable IPC reader, no
+replacement is started. Health reports `restart_blocked`; inspect the failure
+and restart the HTTP process explicitly before recovery. Never interpret an
+unfinished ordinary command marked `unknown` as proof that it had no effects.
+
+## Shut down the server
+
+```text
+uv run python -B cli.py server shutdown --wait
+uv run python -B cli.py server shutdown --no-wait
+```
+
+Shutdown stops the runtime, active experiment and owned resources, then requests
+graceful exit of the HTTP server. `--wait` (the ordinary CLI default) keeps the
+submission request open until cleanup completes, so the server can deliver its
+result while draining HTTP requests. `--wait-timeout` bounds this request.
+Success confirms runtime cleanup and the HTTP exit request, not an observation
+of OS process exit from the remote client.
+
+`--no-wait` returns admission immediately. A timeout or client disconnect does
+not cancel admitted shutdown; loss of connectivity alone does not prove success.
+Receipt polling is only available while the HTTP process is still alive.
+After shutdown, starting the server again requires an operator or an external
+process manager on the server machine.
+
+Shutdown works in both modes, accepts no target/arguments or command chains,
+and cannot overlap a runtime restart. Failed runtime cleanup leaves HTTP running
+for diagnostics and reports `server_shutdown_failed`. Embedders must supply a
+graceful HTTP shutdown hook; unsupported owners reject the request before effects.
+
+## Start and stop individual services
+
+In run mode, pause the experiment and wait for its active stage to finish:
+
+```text
+uv run python -B cli.py pause --wait
+uv run python -B cli.py service stop 1 --wait
+uv run python -B cli.py service start 1 --wait
+uv run python -B cli.py resume --wait
+```
+
+The position is one-based in the template's `services` list, matching `retry`.
+These commands require an idle pause with no snapshot, restoration, pending step,
+or other manual service operation. They affect only the selected service.
+`start` waits for its ready heartbeat; `stop` waits for confirmed process exit.
+Repeated start of a ready service and repeated stop of a confirmed stopped
+service succeed without replacing the instance. Both support the usual command
+ID and wait options; `--no-wait` reports command admission. Ordinary CLI calls
+wait by default, while the interactive shell defaults to admission only.
+
+Runner state exposes `services[].manually_stopped`. The intent is saved before
+shutdown and survives recovery. Supervision and `retry` of another service do
+not restart it. Use `service start`, rather than `retry`, for that service.
+Manual stop also cancels an automatic restart waiting in its retry delay,
+even if the previous process has already exited.
+Resume, step, and snapshot creation are rejected until all manually stopped
+services have been started. A failed or cancelled start cleans up its selected
+instance and leaves it manually stopped for an explicit retry with `service start`.
+Resume and step also require every service declared in the template to have
+been started. After partial startup, start the remaining services explicitly;
+starting one service does not start the other definitions.
+An unconfirmed shutdown remains an error; it cannot authorize another instance.
+
+Rollback to an earlier snapshot restores the services represented by that
+snapshot. Stopping the whole experiment remains available; if a stopped service
+cannot export its state, the final snapshot is reported as invalid.
+
 ## Read state, resources and logs
 
 | Command | Options and behavior |
 | --- | --- |
 | `health` | Read server mode, storage initialization and controller health. |
-| `status` / `state` | Read selected state; `--experiment-id ID` selects saved state explicitly. `--watch [SECONDS]` repeats, default interval 1 second. |
+| `server mode` | Read the server's current `run` or `maintenance` mode through `/health`. Supplying a mode performs the runtime transition described above. |
+| `status` / `state` | Read selected runner state; `--experiment-id ID` must match its ID. `--watch [SECONDS]` repeats, default interval 1 second. Use `experiment inspect ID` for historical saved state. |
 | `resources` | Read current resource observations. Supports `--watch [SECONDS]`. |
 | `resource-history` | `--after N` (default 0, nonnegative), `--limit N` (default 100, range 1–1000). |
 | `logs` | `--experiment-id ID`, `--cursor JSON_OR_@FILE`, `--limit N` (default 100, range 1–1000), `--follow`. |
@@ -180,6 +307,39 @@ uv run python -B cli.py logs --cursor "@checkpoint.json" --limit 500
 
 These examples use the default server. Add `--config examples/weather_dag/cli.json`
 before the command for the weather server.
+
+## Browse saved experiments and snapshots
+
+These read-only commands work in both server modes:
+
+| Command | Behavior |
+| --- | --- |
+| `experiment list` | List registered experiments, saved name/phase/mode, directory, availability and whether the runner currently selects them. |
+| `experiment inspect ID` | Read the published state and directory of a registered experiment, including historical experiments. |
+| `snapshot list [--experiment-id ID]` | List published snapshot metadata for an experiment. |
+| `snapshot inspect UUID [--experiment-id ID]` | Read a snapshot manifest and its saved cycle/stage position. |
+
+Without `--experiment-id`, snapshot reads use the selected experiment in run
+mode. Maintenance mode has no selection and requires an explicit ID.
+These commands neither select nor restore an experiment. Saved state is labelled
+`source: saved_state` and does not prove that processes are currently alive.
+Use `status` for the runner's current state.
+
+Snapshot reads check metadata identity and supported schema, not file hashes or
+restorability. Their `integrity: not_checked` is not a validation result.
+Lists retain unreadable entries with `available: false` and an error; inspection
+of such an entry fails. An empty snapshot list means no published manifests
+were found. Oversized responses are rejected by the existing server limits.
+
+```text
+uv run python -B cli.py experiment list
+uv run python -B cli.py experiment inspect <experiment-id>
+uv run python -B cli.py snapshot list --experiment-id <experiment-id>
+uv run python -B cli.py snapshot inspect <snapshot-uuid> --experiment-id <experiment-id>
+```
+
+The existing `snapshot --label TEXT --wait` still creates a snapshot. Snapshot
+`list` and `inspect` do not accept creation or command-wait options.
 
 ## Execute and control experiments
 
@@ -220,6 +380,40 @@ Commands can fail when the experiment phase does not permit them. See the
 Archive paths belong to the server. Snapshots contain runtime state for restoration;
 exchange archives package code, the applied template and static resources for
 another run. They serve different purposes.
+
+## Retained commands and artifacts
+
+```text
+uv run python -B cli.py commands list --state failed --limit 50
+uv run python -B cli.py commands list --command run --after <command-uuid>
+uv run python -B cli.py artifact list --experiment-id <experiment-id>
+uv run python -B cli.py artifact get <artifact-id> --experiment-id <experiment-id> --output ./result.bin
+```
+
+`commands list` returns receipt summaries in submission order. Filters are
+`--state` and exact controller name `--command`; `--limit` defaults to 100 and
+accepts 1–1000. Continue with `--after` set to `next_after`, keeping the filters.
+An expired cursor requires restarting pagination. Receipts belong to the current
+server instance and are not the permanent history. Use `result ID` for details.
+
+`artifact list` reads `artifact.recorded` events and their attempt context from
+the experiment journal. Entries report current file availability and path errors;
+recorded sizes/hashes are metadata, not a new integrity check. It scans the
+journal through the boundary observed at the start of the request. Large lists
+remain subject to the existing read timeout and JSON response limits.
+
+Continuations include inherited artifact records with their original experiment
+IDs in the event context. File availability and downloads use the continuation's
+own experiment directory, including files restored from its source snapshot.
+
+`artifact get` downloads the first recorded matching artifact ID. Only recorded
+files within their attempt directory can be downloaded. The destination is local,
+its parent directory must exist, and an existing destination is never replaced.
+The client streams into a temporary directory beside the destination, then
+publishes the complete file using a hard link; the destination filesystem must
+support hard links. Failed/interrupted transfers remove temporary data.
+`--request-timeout` also bounds downloads; the JSON size limit does not limit
+binary artifact size. No command receipt is created for these reads.
 
 ## Generic commands and chains
 

@@ -146,6 +146,7 @@ class ServiceInstance:
         self.ever_ready = False
         self.stopping = False
         self.stopped = False
+        self.manually_stopped = False
         self.blocked_action: Literal["pause", "stop"] | None = None
         self.failure: JsonObject | None = None
         self.freeze_id: str | None = None
@@ -449,6 +450,8 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
     service_request_ids = set()
     for service_id, saved in document["services"].items():
         saved = copy_json_object(saved, "service state")
+        # Earlier schema-3 states had no explicit manual-stop intent.
+        saved.setdefault("manually_stopped", False)
         instance = ServiceInstance(
             saved["service_id"],
             saved["service_instance_id"],
@@ -456,7 +459,7 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         )
         if service_id != instance.service_id or saved.keys() != vars(instance).keys():
             raise ValueError("Invalid saved service fields or identity.")
-        for key in ("ready", "ever_ready", "stopping", "stopped"):
+        for key in ("ready", "ever_ready", "stopping", "stopped", "manually_stopped"):
             if type(saved[key]) is not bool:
                 raise TypeError(f"service.{key} must be a boolean.")
         if type(saved["restart_count"]) is not int or saved["restart_count"] < 0:

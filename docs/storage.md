@@ -122,6 +122,15 @@ archive store.
 
 ## Library use
 
+The required `HashDatabase` contract includes `list_module_hashes()`, returning
+name/version/hash dictionaries ordered by name and version. Custom backends must
+implement this method: `ModuleManager` checks the contract at construction.
+
+`module list` and `module inspect --name NAME --version VERSION` are available
+in both server modes. Inspection reports archive presence and installation
+location without checking package contents. Use maintenance-mode `module validate`
+for integrity verification.
+
 `ModuleManager` accepts caller-owned `HashDatabase` and `ModuleDatabase`
 implementations. `HashDB` and `SeaweedDB` provide the normal implementations.
 `SeaweedProcess` owns a managed local server; `SeaweedDB` owns only its HTTP client.

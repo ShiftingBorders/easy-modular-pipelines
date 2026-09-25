@@ -10,11 +10,19 @@ from pathlib import Path
 from queue import Empty, Full
 from uuid import UUID
 
+from core.experimentassembler import ExperimentAssembler
+from core.experimentreader import ExperimentReader
 from core.logger_utils.events import LoggingError, copy_json_object, require_text
+from core.modulemanager import ModuleManager
 from core.resourcecollector import ResourceCollector
 from core.runner_utils.experimentrunner import ExperimentRunner
 from core.runner_utils.state import JsonObject
-from core.storage_errors import StorageCapacityError, StorageConflict, StorageError
+from core.storage_errors import (
+    StorageCapacityError,
+    StorageConflict,
+    StorageError,
+    StoredObjectNotFound,
+)
 
 
 class ExperimentController:
@@ -28,11 +36,14 @@ class ExperimentController:
         resource_config_path: Path | None = None,
         shutdown_requested: asyncio.Event | None = None,
         recovery_required: list[str] | None = None,
+        module_manager: ModuleManager | None = None,
     ) -> None:
         self._project_root = Path(project_root)
         if not self._project_root.is_absolute():
             raise ValueError("project_root must be absolute.")
         self._runner = runner
+        self._experiment_reader = ExperimentReader(self._project_root)
+        self._module_manager = module_manager
         self._requests = requests
         self._responses = responses
         self._control_queue: asyncio.Queue[list[JsonObject]] = asyncio.Queue()
@@ -231,6 +242,10 @@ class ExperimentController:
                         f"Recover unfinished experiments before issuing control commands: {sorted(self._recovery_required)}"
                     )
                 target = copy_json_object(command.get("target", {}), "target")
+                if name in ("service.start", "service.stop") and (not target or args):
+                    raise ValueError(
+                        "Service control requires a service target and empty args."
+                    )
                 if target:
                     if target.keys() != {"kind", "position"} or target["kind"] not in (
                         "stage",
@@ -239,9 +254,9 @@ class ExperimentController:
                         raise ValueError("target requires kind and position.")
                     if type(target["position"]) is not int or target["position"] < 1:
                         raise ValueError("target.position must be a positive integer.")
-                    if name == "retry":
+                    if name in ("retry", "service.start", "service.stop"):
                         if target["kind"] != "service":
-                            raise ValueError("retry targets a service.")
+                            raise ValueError(f"{name} targets a service.")
                         args["position"] = target["position"]
                     elif name in ("replace", "reset_retries"):
                         args.update(target)
@@ -260,6 +275,8 @@ class ExperimentController:
                     "step": self._runner.step,
                     "rerun": self._runner.rerun,
                     "retry": self._runner.retry,
+                    "service.start": self._runner.start_service,
+                    "service.stop": self._runner.stop_service,
                     "move": self._runner.move,
                     "reset_retries": self._runner.reset_retries,
                     "replace": self._runner.replace,
@@ -302,9 +319,13 @@ class ExperimentController:
                 "error": None,
             }
         except LoggingError as error:
-            if not name.startswith("archive.") and (
-                not name.startswith(("stats.", "logs."))
-                or getattr(error, "journal_failed", False)
+            if (
+                name not in ("stats.artifacts", "stats.artifact")
+                and not name.startswith("archive.")
+                and (
+                    not name.startswith(("stats.", "logs."))
+                    or getattr(error, "journal_failed", False)
+                )
             ):
                 await self._runner._fail(
                     error, {"command_id": command.get("command_id")}
@@ -325,6 +346,8 @@ class ExperimentController:
             return self._failure(command, "storage_conflict", str(error), error)
         except StorageCapacityError as error:
             return self._failure(command, "storage_capacity", str(error), error)
+        except StoredObjectNotFound as error:
+            return self._failure(command, "not_found", str(error), error)
         except StorageError as error:
             return self._failure(command, "storage_error", str(error), error)
         except FileNotFoundError as error:
@@ -340,6 +363,38 @@ class ExperimentController:
 
     async def _read_request(self, request: JsonObject) -> JsonObject:
         args = copy_json_object(request.get("args", {}), "args")
+        name = request["command"]
+        if name in ("stats.modules", "stats.module", "stats.template"):
+            if self._module_manager is None:
+                raise RuntimeError("Module manager is not configured for reads.")
+            if name == "stats.modules":
+                if args:
+                    raise ValueError("Module list does not accept arguments.")
+                return self._module_manager.list_modules()
+            if name == "stats.module":
+                if args.keys() != {"name", "version"}:
+                    raise ValueError("Module inspection requires name/version.")
+                return await self._module_manager.inspect_module(**args)
+            if args.keys() != {"template_path"}:
+                raise ValueError("Template validation requires template_path.")
+            assembler = ExperimentAssembler(self._project_root, self._module_manager)
+            return await assembler.validate_template(
+                Path(require_text(args["template_path"], "template_path"))
+            )
+        if request["command"] in (
+            "stats.experiments",
+            "stats.experiment",
+            "stats.snapshots",
+            "stats.snapshot",
+            "stats.artifacts",
+            "stats.artifact",
+        ):
+            return await asyncio.to_thread(
+                self._experiment_reader.read,
+                request["command"],
+                args,
+                self._runner.get_state()["experiment_id"],
+            )
         if request["command"] == "stats.resources":
             if args:
                 raise ValueError("stats.resources does not accept arguments.")

@@ -28,6 +28,7 @@ from core.runner_utils.state import (
     ModuleRole,
     RunnerState,
     RunnerStateStore,
+    ServiceInstance,
     StageAttempt,
     state_from_document,
     state_to_document,
@@ -90,6 +91,7 @@ class ExperimentRunner:
         self._service_task = None
         self._stages.bind_services(self._services)
         self._service_retrying = False
+        self._service_control_task: asyncio.Task | None = None
         self._step_future = None
         self._last_attempt = None
         self._last_response = None
@@ -595,6 +597,13 @@ class ExperimentRunner:
             raise RuntimeError("There is no experiment to resume.")
         await self._ready.wait()
         state = self._require_active()
+        if any(
+            definition["service_id"] not in state.services
+            for definition in state.template["services"]
+        ):
+            raise RuntimeError(
+                "Start all declared services before resuming the experiment."
+            )
         if (
             self._maintenance
             or state.active_attempt is not None
@@ -605,7 +614,7 @@ class ExperimentRunner:
             )
         if (
             any(
-                instance.blocked_action is not None
+                instance.blocked_action is not None or instance.manually_stopped
                 for instance in state.services.values()
             )
             or self._service_retrying
@@ -636,6 +645,13 @@ class ExperimentRunner:
             raise RuntimeError(
                 "step requires a paused experiment without an active attempt."
             )
+        if any(instance.manually_stopped for instance in state.services.values()):
+            raise RuntimeError("Start manually stopped services before stepping.")
+        if any(
+            definition["service_id"] not in state.services
+            for definition in state.template["services"]
+        ):
+            raise RuntimeError("Start all declared services before stepping.")
         self._step_future = asyncio.get_running_loop().create_future()
         future = self._step_future
         self._wake.set()
@@ -654,6 +670,13 @@ class ExperimentRunner:
 
     async def stop(self) -> JsonObject:
         self._stop_requested = True
+        if (
+            self._service_control_task is not None
+            and self._service_control_task is not asyncio.current_task()
+            and not self._service_control_task.done()
+        ):
+            self._service_control_task.cancel()
+            await asyncio.gather(self._service_control_task, return_exceptions=True)
         if (
             self._maintenance_task is not None
             and self._maintenance_task is not asyncio.current_task()
@@ -775,6 +798,100 @@ class ExperimentRunner:
         self._manual = True
         return await self.step()
 
+    async def start_service(self, position: int) -> JsonObject:
+        state = self._require_active()
+        if (
+            self._maintenance
+            or self._service_retrying
+            or self._stop_requested
+            or self._task is None
+            or self._task.done()
+            or state.mode != "paused"
+            or state.phase != "waiting"
+            or not self._idle.is_set()
+            or state.active_attempt is not None
+            or self._step_future is not None
+        ):
+            raise RuntimeError(
+                "service start requires an idle pause without another service or maintenance operation."
+            )
+        if type(position) is not int or not 1 <= position <= len(
+            state.template["services"]
+        ):
+            raise ValueError("Service position is outside the template.")
+        service_id = state.template["services"][position - 1]["service_id"]
+        self._service_retrying = True
+        self._service_control_task = asyncio.current_task()
+        try:
+            instance = await self._services.start(state, service_id)
+            self._save_state()
+            return {
+                "service_id": service_id,
+                "service_instance_id": instance.service_instance_id,
+                "ready": instance.ready,
+                "manually_stopped": instance.manually_stopped,
+            }
+        finally:
+            self._service_retrying = False
+            self._service_control_task = None
+            self._wake.set()
+
+    async def stop_service(self, position: int) -> JsonObject:
+        state = self._require_active()
+        if (
+            self._maintenance
+            or self._service_retrying
+            or self._stop_requested
+            or self._task is None
+            or self._task.done()
+            or state.mode != "paused"
+            or state.phase != "waiting"
+            or not self._idle.is_set()
+            or state.active_attempt is not None
+            or self._step_future is not None
+        ):
+            raise RuntimeError(
+                "service stop requires an idle pause without another service or maintenance operation."
+            )
+        if type(position) is not int or not 1 <= position <= len(
+            state.template["services"]
+        ):
+            raise ValueError("Service position is outside the template.")
+        definition = state.template["services"][position - 1]
+        service_id = definition["service_id"]
+        instance = state.services.get(service_id)
+        if instance is None:
+            instance = ServiceInstance(service_id, str(uuid4()), definition)
+            instance.stopped = True
+            state.services[service_id] = instance
+        self._service_retrying = True
+        self._service_control_task = asyncio.current_task()
+        try:
+            # Persist intent before touching the process so recovery can finish
+            # an interrupted stop without restarting the selected service.
+            instance.manually_stopped = True
+            self._save_state()
+            self._state_store.save(state)
+            # A stopped process can still have a delayed automatic restart.
+            # The manager must cancel that work before acknowledging manual stop.
+            results = await self._services.stop_all(state, service_ids={service_id})
+            if not results[service_id]["stopped"] or results[service_id]["error"]:
+                self._save_state()
+                raise RuntimeError(f"Service shutdown failed: {results[service_id]}")
+            instance.ready = False
+            instance.blocked_action = None
+            self._save_state()
+            return {
+                "service_id": service_id,
+                "service_instance_id": instance.service_instance_id,
+                "stopped": instance.stopped,
+                "manually_stopped": True,
+            }
+        finally:
+            self._service_retrying = False
+            self._service_control_task = None
+            self._wake.set()
+
     async def retry(self, position: int) -> JsonObject:
         if self._maintenance:
             raise RuntimeError(
@@ -796,6 +913,8 @@ class ExperimentRunner:
             raise RuntimeError(
                 "Retry the failed preceding service before starting later services."
             )
+        if instance.manually_stopped:
+            raise RuntimeError("Use service start to start a manually stopped service.")
         self._service_retrying = True
         try:
             action = await self._services.restart(state, service_id, automatic=False)
@@ -893,6 +1012,10 @@ class ExperimentRunner:
         if label is not None:
             require_text(label, "snapshot label")
         state = self._require_active()
+        if any(instance.manually_stopped for instance in state.services.values()):
+            raise RuntimeError(
+                "Start manually stopped services before creating a snapshot."
+            )
         if (
             self._maintenance
             or self._service_retrying
@@ -1402,6 +1525,13 @@ class ExperimentRunner:
         self._error = {"type": type(error).__name__, "message": str(error)}
         self._stop_requested = True
         if (
+            self._service_control_task is not None
+            and self._service_control_task is not asyncio.current_task()
+            and not self._service_control_task.done()
+        ):
+            self._service_control_task.cancel()
+            await asyncio.gather(self._service_control_task, return_exceptions=True)
+        if (
             self._maintenance_task is not None
             and self._maintenance_task is not asyncio.current_task()
             and not self._maintenance_task.done()
@@ -1654,6 +1784,8 @@ class ExperimentRunner:
                         "ready": instance is not None and instance.ready,
                         "stopping": instance is not None and instance.stopping,
                         "stopped": instance is None or instance.stopped,
+                        "manually_stopped": instance is not None
+                        and instance.manually_stopped,
                         "restart_count": 0
                         if instance is None
                         else instance.restart_count,

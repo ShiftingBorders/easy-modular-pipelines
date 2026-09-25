@@ -9,6 +9,7 @@ import json
 import os
 import shlex
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Self
@@ -210,13 +211,25 @@ class APIClient:
         *,
         document: JsonObject | None = None,
         params: dict[str, str | int] | None = None,
+        timeout: float | None = None,
     ) -> JsonObject:
         if self.http is None:
             raise RuntimeError("HTTP client is not open.")
+        deadline = (
+            self.timeout
+            if timeout is None
+            else require_number(timeout, "request timeout")
+        )
+        if deadline <= 0:
+            raise ValueError("Request timeout must be positive.")
         try:
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(deadline):
                 async with self.http.stream(
-                    method, self.url + path, json=document, params=params
+                    method,
+                    self.url + path,
+                    json=document,
+                    params=params,
+                    timeout=deadline,
                 ) as response:
                     payload = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -257,6 +270,95 @@ class APIClient:
             raise ClientError(
                 "Cannot communicate with the server; no command was automatically retried.",
                 code="connection_error",
+            ) from error
+
+    async def download(
+        self, experiment_id: str, artifact_id: str, destination: Path
+    ) -> JsonObject:
+        if self.http is None:
+            raise RuntimeError("HTTP client is not open.")
+        destination = destination.absolute()
+        if destination.exists():
+            raise FileExistsError(f"Destination already exists: {destination}")
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".emp-download-", dir=destination.parent
+            ) as work:
+                temporary = Path(work) / "artifact"
+                async with asyncio.timeout(self.timeout):
+                    async with self.http.stream(
+                        "GET",
+                        self.url + "/artifacts/download",
+                        params={
+                            "experiment_id": experiment_id,
+                            "artifact_id": artifact_id,
+                        },
+                    ) as response:
+                        if response.status_code != 200:
+                            payload = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                if len(payload) + len(chunk) > self.max_bytes:
+                                    raise ClientError(
+                                        "Download error response is too large.",
+                                        code="response_too_large",
+                                    )
+                                payload.extend(chunk)
+                            try:
+                                details = copy_json_object(
+                                    json.loads(payload), "download error"
+                                )
+                            except (ValueError, TypeError) as error:
+                                raise ClientError(
+                                    "Invalid download error response.",
+                                    code="invalid_response",
+                                ) from error
+                            failure = details.get("error", {})
+                            if not isinstance(failure, dict):
+                                raise ClientError(
+                                    "Invalid download error envelope.",
+                                    code="invalid_response",
+                                )
+                            raise ClientError(
+                                str(failure.get("message", details)),
+                                code=str(failure.get("code", "http_error")),
+                                exit_code=1,
+                                details=details,
+                            )
+                        if (
+                            response.headers.get("content-type", "").split(";")[0]
+                            != "application/octet-stream"
+                        ):
+                            raise ClientError(
+                                "Unexpected artifact response type.",
+                                code="invalid_response",
+                            )
+                        size = 0
+                        with temporary.open("xb") as output:
+                            async for chunk in response.aiter_bytes():
+                                output.write(chunk)
+                                size += len(chunk)
+                        expected = response.headers.get("content-length")
+                        if expected is not None and (
+                            not expected.isdecimal() or size != int(expected)
+                        ):
+                            raise ClientError(
+                                "Artifact download is incomplete.",
+                                code="invalid_response",
+                            )
+                # Same-volume publication refuses to replace an existing destination.
+                os.link(temporary, destination)
+            return {
+                "path": str(destination),
+                "size_bytes": size,
+                "artifact_id": artifact_id,
+            }
+        except (TimeoutError, httpx.TimeoutException) as error:
+            raise ClientError(
+                "Artifact download timed out.", code="http_timeout"
+            ) from error
+        except httpx.HTTPError as error:
+            raise ClientError(
+                "Artifact download failed.", code="connection_error"
             ) from error
 
     async def wait(self, receipt: JsonObject, timeout: float) -> JsonObject:
@@ -356,15 +458,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON output; watch/follow produces JSON Lines.",
     )
     commands = parser.add_subparsers(dest="action", required=True)
+    server = commands.add_parser(
+        "server", help="Inspect or restart the server runtime."
+    )
+    server_actions = server.add_subparsers(dest="server_action", required=True)
+    server_mode = server_actions.add_parser(
+        "mode", help="Read or change the runtime mode."
+    )
+    server_mode.add_argument("mode", nargs="?", choices=("run", "maintenance"))
+    execution_options(server_mode)
+    execution_options(
+        server_actions.add_parser(
+            "restart", help="Restart the runtime while keeping HTTP available."
+        )
+    )
+    execution_options(
+        server_actions.add_parser(
+            "shutdown", help="Stop the runtime and HTTP server gracefully."
+        )
+    )
     template = commands.add_parser("template", help="Create a local experiment draft.")
     template_actions = template.add_subparsers(dest="template_action", required=True)
     create = template_actions.add_parser("create")
     create.add_argument("destination", type=Path)
     create.add_argument("--name", required=True)
+    validate_template = template_actions.add_parser(
+        "validate", help="Validate a server-side template and module references."
+    )
+    validate_template.add_argument("path")
     module = commands.add_parser(
         "module", help="Manage modules on a maintenance server."
     )
     module_actions = module.add_subparsers(dest="module_action", required=True)
+    module_actions.add_parser("list", help="List registered module hashes.")
+    inspect_module = module_actions.add_parser(
+        "inspect", help="Read module registration and package availability."
+    )
+    inspect_module.add_argument("--name", required=True)
+    inspect_module.add_argument("--version", required=True)
     add = module_actions.add_parser("add", help="Register and install a source folder.")
     add.add_argument(
         "--folder", required=True, help="Absolute source folder on the server."
@@ -385,6 +516,42 @@ def build_parser() -> argparse.ArgumentParser:
     remove.add_argument("--version", required=True)
     execution_options(remove)
     commands.add_parser("health", help="Read server and controller-process health.")
+    receipts = commands.add_parser("commands", help="Browse retained command receipts.")
+    receipt_actions = receipts.add_subparsers(dest="commands_action", required=True)
+    receipts_list = receipt_actions.add_parser("list")
+    receipts_list.add_argument("--after", type=uuid_text)
+    receipts_list.add_argument("--limit", type=positive_integer, default=100)
+    receipts_list.add_argument(
+        "--state",
+        choices=(
+            "pending",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "unknown",
+            "unavailable",
+        ),
+    )
+    receipts_list.add_argument("--command")
+    artifact = commands.add_parser(
+        "artifact", help="Browse and download recorded artifacts."
+    )
+    artifact_actions = artifact.add_subparsers(dest="artifact_action", required=True)
+    artifacts_list = artifact_actions.add_parser("list")
+    artifacts_list.add_argument("--experiment-id", required=True)
+    artifact_get = artifact_actions.add_parser("get")
+    artifact_get.add_argument("artifact_id")
+    artifact_get.add_argument("--experiment-id", required=True)
+    artifact_get.add_argument("--output", type=Path, required=True)
+    experiment = commands.add_parser("experiment", help="Browse saved experiments.")
+    experiment_actions = experiment.add_subparsers(
+        dest="experiment_action", required=True
+    )
+    experiment_actions.add_parser("list", help="List registered experiments.")
+    inspect = experiment_actions.add_parser(
+        "inspect", help="Read saved experiment state."
+    )
+    inspect.add_argument("experiment_id")
     status = commands.add_parser(
         "status", aliases=["state"], help="Read current experiment state."
     )
@@ -435,6 +602,16 @@ def build_parser() -> argparse.ArgumentParser:
         )
         item.add_argument("position", type=positive_integer)
         execution_options(item)
+    service = commands.add_parser(
+        "service", help="Control services in a paused experiment."
+    )
+    service_actions = service.add_subparsers(dest="service_action", required=True)
+    for name in ("start", "stop"):
+        item = service_actions.add_parser(
+            name, help=f"{name.capitalize()} one service."
+        )
+        item.add_argument("position", type=positive_integer)
+        execution_options(item)
     reset = commands.add_parser(
         "reset-retries", help="Reset a stage/service retry counter."
     )
@@ -451,6 +628,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.add_argument("--label")
     execution_options(snapshot)
+    snapshot_actions = snapshot.add_subparsers(dest="snapshot_action")
+    snapshot_list = snapshot_actions.add_parser("list", help="List snapshot metadata.")
+    snapshot_list.add_argument("--experiment-id")
+    snapshot_inspect = snapshot_actions.add_parser(
+        "inspect", help="Read a snapshot manifest."
+    )
+    snapshot_inspect.add_argument("snapshot_id", type=uuid_text)
+    snapshot_inspect.add_argument("--experiment-id")
     rollback = commands.add_parser(
         "rollback", help="Restore the selected experiment from a snapshot."
     )
@@ -540,6 +725,13 @@ def command_document(options: argparse.Namespace) -> JsonObject:
             "position": options.position,
         }
         name = name.replace("-", "_")
+    elif name == "service":
+        name = "service." + options.service_action
+        target = {"kind": "service", "position": options.position}
+    elif name == "server":
+        name = "server." + options.server_action
+        if options.server_action == "mode":
+            args["mode"] = options.mode
     elif name == "recover":
         args["experiment_id"] = options.experiment_id
     elif name == "snapshot" and options.label is not None:
@@ -612,6 +804,89 @@ async def execute(
     interactive: bool = False,
 ) -> int:
     action = options.action
+    if action == "server" and options.server_action == "mode" and options.mode is None:
+        if (
+            options.wait is not None
+            or options.wait_timeout is not None
+            or options.command_id is not None
+        ):
+            raise ValueError(
+                "Reading server mode does not accept command execution options."
+            )
+        document = await client.request("GET", "/health")
+        mode = document.get("server_mode")
+        if mode not in ("run", "maintenance"):
+            raise ClientError(
+                "Server returned an invalid mode.", code="invalid_response"
+            )
+        display({"server_mode": mode}, as_json=as_json)
+        return 0
+    if action == "template" and options.template_action == "validate":
+        document = await client.request(
+            "POST", "/templates/validate", document={"template_path": options.path}
+        )
+        display(document, as_json=as_json)
+        return 0
+    if action == "module" and options.module_action in ("list", "inspect"):
+        params = (
+            {}
+            if options.module_action == "list"
+            else {"name": options.name, "version": options.version}
+        )
+        path = "/modules" if options.module_action == "list" else "/modules/inspect"
+        display(await client.request("GET", path, params=params), as_json=as_json)
+        return 0
+    if action == "commands":
+        if options.limit > 1000:
+            raise ValueError("limit must be between 1 and 1000.")
+        params = {
+            key: value
+            for key in ("after", "limit", "state", "command")
+            if (value := getattr(options, key)) is not None
+        }
+        display(
+            await client.request("GET", "/commands", params=params), as_json=as_json
+        )
+        return 0
+    if action == "artifact":
+        if options.artifact_action == "get":
+            document = await client.download(
+                options.experiment_id, options.artifact_id, options.output
+            )
+        else:
+            document = await client.request(
+                "GET", "/artifacts", params={"experiment_id": options.experiment_id}
+            )
+        display(document, as_json=as_json)
+        return 0
+    if action == "experiment" or (
+        action == "snapshot" and options.snapshot_action is not None
+    ):
+        params = {}
+        if action == "experiment":
+            path = "/experiments"
+            if options.experiment_action == "inspect":
+                path += "/inspect"
+                params["experiment_id"] = options.experiment_id
+        else:
+            if (
+                options.label is not None
+                or options.wait is not None
+                or options.wait_timeout is not None
+                or options.command_id is not None
+            ):
+                raise ValueError(
+                    "Snapshot reads do not accept creation or wait options."
+                )
+            path = "/snapshots"
+            if options.experiment_id is not None:
+                params["experiment_id"] = options.experiment_id
+            if options.snapshot_action == "inspect":
+                path += "/inspect"
+                params["snapshot_id"] = options.snapshot_id
+        document = await client.request("GET", path, params=params)
+        display(document, as_json=as_json)
+        return 0
     if action in ("health", "status", "state", "resources", "resource-history"):
         path = {
             "health": "/health",
@@ -709,12 +984,30 @@ async def execute(
         identifiers = [require_text(document["command_id"], "command_id")]
         path = "/commands"
     print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
+    wait = not interactive if options.wait is None else options.wait
+    wait_for_shutdown = document.get("command") == "server.shutdown" and wait
     try:
-        receipt = await client.request("POST", path, document=document)
+        if wait_for_shutdown:
+            receipt = await client.request(
+                "POST",
+                path,
+                document=document,
+                params={"wait": "true"},
+                timeout=timeout,
+            )
+        else:
+            receipt = await client.request("POST", path, document=document)
     except ClientError as error:
         error.details.update(
             copy_json_object({"command_ids": identifiers}, "command IDs")
         )
+        if wait_for_shutdown and error.code == "http_timeout":
+            raise ClientError(
+                "Shutdown wait expired; the server operation was not cancelled.",
+                code="wait_timeout",
+                exit_code=4,
+                details=error.details,
+            ) from error
         raise
     if action != "chain":
         receipt = command_receipt(receipt)
@@ -782,7 +1075,7 @@ async def run_command(
     as_json: bool,
     interactive: bool = False,
 ) -> int:
-    if options.action == "template":
+    if options.action == "template" and options.template_action == "create":
         from core.experimenttemplate import create_template
 
         path = create_template(options.destination.absolute(), options.name)
@@ -885,7 +1178,7 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8")
     parser = build_parser()
     options = parser.parse_args()
-    if options.action == "template":
+    if options.action == "template" and options.template_action == "create":
         try:
             code = asyncio.run(run_command(options, {}, as_json=options.json))
         except (OSError, TypeError, ValueError) as error:

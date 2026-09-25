@@ -288,7 +288,12 @@ class ArgumentTests(ModuleManagerTestCase):
     def test_constructor_checks_each_storage_method_without_calling_it(self):
         """ARG-04: structural compatibility, not inheritance."""
         contracts = {
-            "hash_db": ("add_module_hash", "get_module_hash", "remove_module_hash"),
+            "hash_db": (
+                "list_module_hashes",
+                "add_module_hash",
+                "get_module_hash",
+                "remove_module_hash",
+            ),
             "module_db": (
                 "check_module_stored",
                 "save_module",

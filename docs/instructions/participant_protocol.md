@@ -17,6 +17,10 @@ services. Start with [module authoring](modules.md) or
 These versions do not change the outer HTTP API or logger connection-settings
 schema. Incompatible older experiments and archives are rejected, not migrated.
 
+Schema-3 service records include the boolean `manually_stopped` intent. A record
+without this field defaults to `false`. Recovery preserves explicit manual stops;
+this flag does not replace observed process termination or readiness.
+
 An ordinary stage is a subprocess executing one attempt. The library's
 StageExecutor owns its process and runner connection. A module does not need
 to implement the TCP server.

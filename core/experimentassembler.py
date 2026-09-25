@@ -202,14 +202,16 @@ class ExperimentAssembler:
                 if module.keys() != {"name", "version", "hash"}:
                     raise ValueError("module requires name/version/hash.")
                 for key in ("name", "version"):
-                    value = require_text(module[key], f"module.{key}")
+                    value = require_text(module[key], f"module.{key}").strip()
                     if value in (".", "..") or any(c in value for c in '/\\:*?"<>|'):
                         raise ValueError(f"Unsafe module {key}.")
+                    module[key] = value
                 digest = require_text(module["hash"], "module.hash")
                 if len(digest) != 64 or any(
                     c not in "0123456789abcdefABCDEF" for c in digest
                 ):
                     raise ValueError("module.hash must be SHA-256.")
+                definition["module"] = module
             copy_json_object(definition["settings"], f"{role} settings")
             if (
                 role == "stage"
@@ -264,6 +266,43 @@ class ExperimentAssembler:
                 raise ValueError("resource.hash must be SHA-256 or null.")
         return text, template
 
+    async def validate_template(self, template_path: Path) -> JsonObject:
+        """Check structure and registered module references without assembling a run."""
+        try:
+            # File reads and YAML parsing must not stall the active experiment.
+            # Keep module inspection below on the thread that owns HashDB.
+            _, template = await asyncio.to_thread(self.load_template, template_path)
+        except yaml.YAMLError as error:
+            raise ValueError(f"Invalid template YAML: {error}") from error
+        warnings = [
+            f"services[{index}] has no service_id; one will be generated during assembly."
+            for index, service in enumerate(template["services"])
+            if "service_id" not in service
+        ]
+        references = {}
+        for role in ("stage", "service"):
+            for definition in template[f"{role}s"]:
+                reference = self.module_reference(template, definition)
+                key = (reference["name"], reference["version"])
+                if key not in references:
+                    references[key] = await self._module_manager.inspect_module(*key)
+                registration = references[key]
+                if registration["module"]["hash"].lower() != reference["hash"].lower():
+                    raise ValueError(f"Registered hash differs from template: {key}.")
+                if not registration["archive_available"]:
+                    raise FileNotFoundError(
+                        f"Registered module archive is missing: {key}."
+                    )
+        return {
+            "valid": True,
+            "warnings": warnings,
+            "name": template["name"],
+            "template_path": str(template_path),
+            "modules": [entry["module"] for entry in references.values()],
+            "scope": "structure_and_registered_references",
+            "archive_integrity_checked": False,
+        }
+
     def module_reference(
         self, template: JsonObject, definition: JsonObject
     ) -> JsonObject:
@@ -271,7 +310,7 @@ class ExperimentAssembler:
             return copy_json_object(definition["module"], "module")
         service_id = definition.get("service_id")
         for service in template["services"]:
-            if service["service_id"] == service_id:
+            if service_id is not None and service.get("service_id") == service_id:
                 return copy_json_object(service["module"], "service module")
         raise ValueError(f"Unknown service reference: {service_id}")
 

@@ -5,6 +5,7 @@ import asyncio
 import os
 import signal
 import socket
+from functools import partial
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from unittest.mock import patch
@@ -37,6 +38,7 @@ async def serve(config, control, fault_mode):
                 timeout_graceful_shutdown=settings.shutdown_timeout + 5,
             )
         )
+        webserver.app.state.stop_http = partial(setattr, server, "should_exit", True)
 
         async def observe():
             published = False

@@ -17,6 +17,10 @@ class ModuleAddResult(Enum):
 
 
 class HashDatabase(Protocol):
+    def list_module_hashes(self) -> list[dict[str, str]]:
+        """Return registered name/version/hash references in name/version order."""
+        ...
+
     def add_module_hash(
         self,
         module_name: str,
