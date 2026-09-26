@@ -140,9 +140,11 @@ class SnapshotWorkspace:
             gate.touch(exist_ok=True)
         for controls in self.files.files.controls.values():
             (controls / "release-fault").touch()
+            (controls / "release-load").touch()
             for name in (
                 "hold-start",
                 "hold-stop",
+                "hold-launcher-cleanup",
                 "hold-freeze",
                 "hold-save",
                 "ignore-shutdown",
@@ -171,7 +173,7 @@ class SnapshotWorkspace:
             record = read_json(path)
             identities.extend(
                 record[key]
-                for key in ("stage", "executor", "process")
+                for key in ("stage", "executor", "process", "launcher_process")
                 if record.get(key)
             )
         for identity in identities:
