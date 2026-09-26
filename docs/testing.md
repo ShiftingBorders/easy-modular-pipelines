@@ -29,6 +29,7 @@ and the `test_*.py` discovery pattern.
 | Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.test_runtime_restart tests.test_server_lifecycle tests.test_server_results -v` |
 | Graceful server shutdown and response delivery | `uv run python -m unittest tests.test_server_shutdown -v` |
 | Service control review regressions | `uv run python -m unittest tests.test_service_control_review -v` |
+| Template reload | `uv run python -m unittest tests.runner_utils.test_template_reload tests.runner_utils.test_template_reload_services tests.runner_utils.test_template_reload_failures tests.runner_utils.test_template_reload_recovery tests.test_template_reload_cli tests.test_cli -v` |
 | Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
 | Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
@@ -36,6 +37,13 @@ and the `test_*.py` discovery pattern.
 
 The weather suite includes real timing intervals, processes, and journal
 behavior; do not assume that all scenarios finish immediately.
+
+Reload tests exercise stable IDs, cursor and input changes, selective service
+state transfer, journal preservation, receipts, and actual owner-process crashes.
+Fault injection stays in test fixtures. The recovery matrix includes publication
+and rollback boundaries; it can take several minutes. File-symlink cases skip
+explicitly when the host cannot create them. Run the same suite in a native
+Linux environment to validate Linux behavior; a Windows pass is not a Linux pass.
 
 CLI discovery regressions reuse the storage, DAG and journal fixtures with
 direct library calls. They cover optional service IDs, normalized module

@@ -290,9 +290,16 @@ class ExperimentController:
                 }
                 if name not in handlers:
                     raise NotImplementedError(f"Unsupported command: {name}")
-                data = handlers[name](**args)
-                if isinstance(data, Coroutine):
-                    data = await data
+                self._runner._command_context = {
+                    "command_id": command["command_id"],
+                    "command_chain_id": command.get("chain_id"),
+                }
+                try:
+                    data = handlers[name](**args)
+                    if isinstance(data, Coroutine):
+                        data = await data
+                finally:
+                    self._runner._command_context = {}
                 if name == "recover":
                     self._recovery_required.discard(
                         require_text(args.get("experiment_id"), "experiment_id")
@@ -306,7 +313,10 @@ class ExperimentController:
                     if isinstance(identifier, str):
                         # Confirmed shutdown also permits explicit rollback after
                         # recovery reported an incomplete restoration transaction.
-                        self._recovery_required.discard(identifier)
+                        if data.get("pending_rebuild") is not None:
+                            self._recovery_required.add(identifier)
+                        else:
+                            self._recovery_required.discard(identifier)
                 if data is None:
                     data = {}
             return {

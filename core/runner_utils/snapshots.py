@@ -963,9 +963,10 @@ class ExperimentSnapshots:
             self._journal.client.finish_operation(
                 operation, attributes={"phase": "prepared"}
             )
-            self._journal.client.export_diagnostics(
-                [operation.get_operation_id()], work / "diagnostics"
-            )
+            operations = [operation.get_operation_id()]
+            if preserve_rebuild_diagnostics and state.pending_rebuild is not None:
+                operations.append(state.pending_rebuild["operation_id"])
+            self._journal.client.export_diagnostics(operations, work / "diagnostics")
             self._journal.close()
             transaction = {
                 "schema_version": 2,
@@ -1283,13 +1284,40 @@ class ExperimentSnapshots:
                     raise RuntimeError(
                         "Prepared restoration is missing its source or replacement."
                     )
-                target.replace(previous)
+                # Read-only dashboard clients open the source briefly. Give them
+                # a bounded opportunity to release it, without bypassing the
+                # barrier for a persistently open external journal on Windows.
+                deadline = time.monotonic() + 1
+                while True:
+                    try:
+                        target.replace(previous)
+                        break
+                    except OSError as error:
+                        if (
+                            os.name != "nt"
+                            or getattr(error, "winerror", None) not in (5, 32, 33)
+                            or time.monotonic() >= deadline
+                        ):
+                            raise
+                        await asyncio.sleep(0.01)
             if not target.exists():
                 if not replacement.is_dir():
                     raise RuntimeError(
                         "Restoration replacement is missing after displacement."
                     )
-                replacement.replace(target)
+                deadline = time.monotonic() + 1
+                while True:
+                    try:
+                        replacement.replace(target)
+                        break
+                    except OSError as error:
+                        if (
+                            os.name != "nt"
+                            or getattr(error, "winerror", None) not in (5, 32, 33)
+                            or time.monotonic() >= deadline
+                        ):
+                            raise
+                        await asyncio.sleep(0.01)
             elif replacement.exists():
                 raise RuntimeError(
                     "Ambiguous restoration directories; no files were overwritten."

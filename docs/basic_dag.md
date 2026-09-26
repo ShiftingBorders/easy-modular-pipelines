@@ -111,6 +111,40 @@ operations. The runtime validates the current phase and may reject a command.
 Moving or rerunning can change available input; each module must validate it.
 See [debugging](debugging.md) for a step-by-step workflow.
 
+## Update the DAG while paused
+
+Use `reload_template` to update the selected experiment without creating another
+experiment directory. Pause at a stage-free boundary, then apply a template:
+
+```text
+uv run python -B cli.py pause --wait
+uv run python -B cli.py template reload --template "<absolute-project-path>/updated.yaml" --wait
+uv run python -B cli.py status
+uv run python -B cli.py resume --wait
+```
+
+Without `--template`, reload reads the selected experiment's `experiment.yaml`.
+Only `stages` and `services` may change. Keep the UUIDs of existing definitions;
+missing IDs identify new definitions and receive generated UUIDs. Module versions
+must already be registered and installed before entering run mode.
+
+Reload creates a protective snapshot even when automatic snapshots are off.
+It retains unchanged-prefix results and invalidates result references from the
+first affected node onward. It rewinds executed work when necessary, preserving
+an explicitly earlier cursor. It stays paused; `--wait` confirms the reload,
+including service readiness, rather than completion of the remaining DAG.
+Reloading an identical normalized template performs no rebuild.
+
+Unchanged services keep running. For a restarted service with the same ID and
+module name, saved state is loaded even across versions; the service checks
+compatibility. A different module name starts with clean module data. A new ID
+starts independently. A failed state load fails reload and attempts restoration
+of the protective snapshot. See [reload recovery](debugging.md#reload-failures).
+
+The journal records full templates, field changes, cursor/result decisions,
+service actions, and rollback evidence. Prior attempt results remain historical
+facts. See [template identity](experiment_template.md#identity-during-reload).
+
 ## Results and paths
 
 The project's `experiments.json` maps IDs to experiment directories. Each
@@ -166,7 +200,7 @@ snapshots are described in the [template reference](experiment_template.md).
 ## Current limits
 
 - Stages are sequential; branching and parallel stage execution are unsupported.
-- `replace` and `reload_template` are not supported yet.
+- `replace` is not supported yet.
 - StageClient currently has a synchronous public API.
 - GPU/VRAM monitoring is unfinished and disabled.
 - Old incompatible experiment, journal, and archive formats are rejected;

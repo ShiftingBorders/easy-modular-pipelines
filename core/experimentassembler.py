@@ -44,7 +44,7 @@ def find_experiment(project_root: Path, experiment_id: str) -> Path:
 
 
 class ExperimentAssembler:
-    """Prepare checked local files; advanced rebuilds remain explicitly unavailable."""
+    """Prepare checked local files for initial assembly and protected rebuilds."""
 
     def __init__(self, project_root: Path, module_manager: ModuleManager) -> None:
         self._project_root = Path(project_root)
@@ -486,11 +486,120 @@ class ExperimentAssembler:
         return state
 
     async def rebuild(
-        self, state: RunnerState, template_yaml: str, template: JsonObject
+        self,
+        state: RunnerState,
+        template_yaml: str,
+        template: JsonObject,
+        *,
+        workspace: Path,
+        prepare_only: bool = False,
     ) -> None:
-        raise NotImplementedError(
-            "Protected rebuilding of an existing experiment is not implemented."
+        """Prepare checked additions, then publish without replacing immutable code."""
+        root = state.experiment_directory.resolve()
+        workspace = Path(workspace)
+        if (
+            not workspace.is_absolute()
+            or not workspace.resolve().is_relative_to(root / "runner/rebuilds")
+            or workspace.is_symlink()
+            or workspace.is_junction()
+        ):
+            raise ValueError("Rebuild workspace must be inside runner/rebuilds.")
+        candidate = RunnerState(
+            state.experiment_id,
+            root,
+            state.run_id,
+            state.template_path,
+            state.template_revision_id,
+            template_yaml,
+            template,
+            "paused",
         )
+        staged = RunnerState(
+            state.experiment_id,
+            workspace,
+            state.run_id,
+            workspace / "experiment.yaml",
+            state.template_revision_id,
+            template_yaml,
+            template,
+            "paused",
+        )
+        if prepare_only:
+            workspace.mkdir(parents=True, exist_ok=False)
+        elif state.pending_rebuild is None:
+            raise RuntimeError("Publication requires a recorded rebuild intent.")
+        seen = set()
+        for role in ("stage", "service"):
+            for definition in template[f"{role}s"]:
+                if role == "stage" and "service_id" in definition:
+                    continue
+                reference = definition["module"]
+                key = (reference["name"], reference["version"])
+                target = root / "modules" / key[0] / key[1]
+                prepared = workspace / "modules" / key[0] / key[1]
+                if prepare_only:
+                    source = (
+                        target
+                        if target.exists()
+                        else (self._project_root / "modules" / key[0] / key[1])
+                    )
+                    if (
+                        not source.resolve().is_relative_to(
+                            root if target.exists() else self._project_root
+                        )
+                        or source.is_symlink()
+                        or source.is_junction()
+                        or any(
+                            p.is_symlink() or p.is_junction() for p in source.rglob("*")
+                        )
+                    ):
+                        raise ValueError(
+                            "Module code must not contain filesystem links."
+                        )
+                    manifest = self.read_module(source)
+                    if (manifest["name"], manifest["version"], manifest["role"]) != (
+                        *key,
+                        role,
+                    ):
+                        raise ValueError(
+                            f"Module identity/role differs from template: {key}."
+                        )
+                    if not target.exists() and key not in seen:
+                        prepared.parent.mkdir(parents=True, exist_ok=True)
+                        copying = asyncio.create_task(
+                            asyncio.to_thread(shutil.copytree, source, prepared)
+                        )
+                        try:
+                            await asyncio.shield(copying)
+                        finally:
+                            await asyncio.gather(copying, return_exceptions=True)
+                    self.check_module(
+                        candidate if target.exists() else staged, definition
+                    )
+                else:
+                    if not target.exists():
+                        self.check_module(staged, definition)
+                        if not target.parent.resolve().is_relative_to(root):
+                            raise ValueError(
+                                "Module destination escapes the experiment."
+                            )
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        prepared.replace(target)
+                    self.check_module(candidate, definition)
+                seen.add(key)
+        checking_resources = asyncio.create_task(
+            asyncio.to_thread(self.check_resources, candidate)
+        )
+        try:
+            await asyncio.shield(checking_resources)
+        finally:
+            # Cancellation must not leave a reader running during restoration.
+            await asyncio.gather(checking_resources, return_exceptions=True)
+        if prepare_only:
+            (workspace / "experiment.yaml").write_text(template_yaml, encoding="utf-8")
+        else:
+            # The durable pending_rebuild record covers the multi-file publication.
+            (workspace / "experiment.yaml").replace(state.template_path)
 
     def check_modules(self, state: RunnerState) -> None:
         for role in ("stage", "service"):

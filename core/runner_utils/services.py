@@ -7,6 +7,7 @@ belong to their Python proxies. Global pause/stop decisions return to the runner
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -30,6 +31,7 @@ from core.runner_utils.state import (
     RunnerState,
     RunnerStateStore,
     ServiceInstance,
+    state_to_document,
 )
 
 type ServiceAction = Literal["ready", "pause", "stop"]
@@ -249,6 +251,9 @@ class ServiceManager:
                 {"action": "start_service", "argv": launch["argv"]},
                 context=context,
             )
+            if state.pending_rebuild is not None:
+                # Retain the prospective instance even if the owner dies during spawn.
+                self._save(state)
             with (
                 (directory / "stdout.log").open("ab") as stdout,
                 (directory / "stderr.log").open("ab") as stderr,
@@ -288,11 +293,13 @@ class ServiceManager:
             instance.process_identity = (
                 process_identity(process.pid) if process.poll() is None else None
             )
+            launcher_identity = instance.process_identity
             write_json(
                 directory / "process.json",
                 {
                     **context,
                     "process": instance.process_identity,
+                    "launcher_process": launcher_identity,
                     "started_at": instance.started_at,
                 },
             )
@@ -356,6 +363,7 @@ class ServiceManager:
                 {
                     **context,
                     "process": instance.process_identity,
+                    "launcher_process": launcher_identity,
                     "started_at": instance.started_at,
                 },
             )
@@ -363,6 +371,7 @@ class ServiceManager:
                 "service.started",
                 {
                     "process": instance.process_identity,
+                    "launcher_process": launcher_identity,
                     "implementation": instance.implementation,
                 },
                 context=context,
@@ -987,7 +996,9 @@ class ServiceManager:
             self._changed.set()
         return "wait" if action == "pause" else action
 
-    async def prepare_rebuild(self, state: RunnerState, template: JsonObject) -> None:
+    async def prepare_rebuild(
+        self, state: RunnerState, template: JsonObject, *, validate_only: bool = False
+    ) -> None:
         desired = {item["service_id"]: item for item in template["services"]}
         old_modules = {
             (item["module"]["name"], item["module"]["version"]): item["module"]["hash"]
@@ -1005,17 +1016,85 @@ class ServiceManager:
         for service_id, instance in list(state.services.items()):
             module = instance.definition["module"]
             if (
-                desired.get(service_id) == instance.definition
+                json.dumps(desired.get(service_id), sort_keys=True)
+                == json.dumps(instance.definition, sort_keys=True)
                 and (module["name"], module["version"]) not in changed_code
             ):
+                continue
+            process = self._processes.get(service_id)
+            process_file = (
+                state.experiment_directory
+                / "shared_artifacts/services"
+                / service_id
+                / instance.service_instance_id
+                / "process.json"
+            )
+            record = read_json(process_file) if process_file.is_file() else {}
+            launcher = record.get("launcher_process")
+            # Legacy participant metadata cannot prove its parent's identity.
+            # Reject before shutdown rather than enter a rollback with an
+            # untracked process still able to write into the restored files.
+            if launcher is None and process is None:
+                raise RuntimeError(
+                    f"Service {service_id} launcher identity is unavailable; "
+                    "rebuilding is unsafe after recovery of legacy process metadata."
+                )
+            if launcher is not None and (
+                record.get("experiment_id") != state.experiment_id
+                or record.get("participant_id") != service_id
+                or record.get("participant_instance_id") != instance.service_instance_id
+            ):
+                raise RuntimeError(
+                    f"Service {service_id} launcher ownership cannot be verified."
+                )
+            if validate_only:
                 continue
             results = await self.stop_all(
                 state, service_ids={service_id}, preserve_pending=service_id in desired
             )
-            if not results[service_id]["stopped"]:
+            if not results[service_id]["stopped"] or results[service_id]["error"]:
                 raise RuntimeError(
-                    f"Service {service_id} has not stopped; rebuilding is unsafe."
+                    f"Service {service_id} did not stop cleanly; rebuilding is unsafe: {results[service_id]}"
                 )
+            # A child participant can exit before its launcher finishes touching
+            # runtime files. Keep those files in place until both have stopped.
+            deadline = time.monotonic() + state.template["start_timeout"]
+            if process is not None and process.poll() is None:
+                try:
+                    await asyncio.to_thread(
+                        process.wait, state.template["start_timeout"]
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError(
+                        f"Service {service_id} launcher still owns runtime files; "
+                        "rebuilding is unsafe."
+                    ) from error
+            if launcher is None:
+                continue
+            while True:
+                try:
+                    if process_identity(launcher["pid"]) != launcher:
+                        break
+                    recovered_process = psutil.Process(launcher["pid"])
+                    if recovered_process.status() == psutil.STATUS_ZOMBIE:
+                        break
+                    try:
+                        recovered_process.wait(timeout=0)
+                        break
+                    except psutil.TimeoutExpired:
+                        pass
+                except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+                    break
+                except OSError as error:
+                    if getattr(error, "winerror", None) not in (87, 1168):
+                        raise
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Service {service_id} launcher {launcher['pid']} still owns "
+                        "runtime files; rebuilding is unsafe."
+                    )
+                await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
     async def reconcile(
         self, state: RunnerState, template: JsonObject
@@ -1035,7 +1114,9 @@ class ServiceManager:
             if instance is not None and instance.blocked_action is not None:
                 return instance.blocked_action
             if instance is not None and not instance.stopped:
-                if instance.definition != definition:
+                if json.dumps(instance.definition, sort_keys=True) != json.dumps(
+                    definition, sort_keys=True
+                ):
                     raise RuntimeError(
                         "Changed services must stop before reconciliation."
                     )
@@ -1418,13 +1499,22 @@ class ServiceManager:
             raise
 
     async def load_states(
-        self, state: RunnerState, service_states: dict[str, Path]
+        self,
+        state: RunnerState,
+        service_states: dict[str, Path],
+        *,
+        service_ids: set[str] | None = None,
     ) -> None:
         if service_states.keys() - state.services.keys():
             raise ValueError("State was supplied for unknown services.")
+        selected = set(state.services) if service_ids is None else service_ids
+        if selected - state.services.keys() or service_states.keys() - selected:
+            raise ValueError("State transfer must target selected existing services.")
         paths = {}
         root = state.experiment_directory.resolve()
         for service_id, instance in state.services.items():
+            if service_id not in selected:
+                continue
             supplied = service_states.get(service_id)
             if supplied is None:
                 if instance.definition["state_required"]:
@@ -1436,6 +1526,7 @@ class ServiceManager:
                     "Restored service state must exist inside the experiment."
                 )
             paths[service_id] = path.relative_to(root).as_posix()
+        loaded_instances = {}
         for service_id, path in paths.items():
             instance_id = state.services[service_id].service_instance_id
             reply = await self.request(
@@ -1447,10 +1538,18 @@ class ServiceManager:
             ):
                 raise RuntimeError(f"Service {service_id} could not restore its state.")
             state.services[service_id].ready = False
+            loaded_instances[service_id] = instance_id
             self._probes.pop(service_id, None)
             self._next_probe[service_id] = 0
         if await self.wait_ready(state) != "ready":
             raise RuntimeError("Restored services did not confirm fresh readiness.")
+        if any(
+            state.services[service_id].service_instance_id != instance_id
+            for service_id, instance_id in loaded_instances.items()
+        ):
+            raise RuntimeError(
+                "A loaded service restarted before confirming readiness."
+            )
 
     async def unfreeze(self, state: RunnerState, snapshot_id: str) -> None:
         if self._snapshot_id != snapshot_id:
@@ -1502,14 +1601,7 @@ class ServiceManager:
             instance = state.services[service_id]
             instance.ready = False
             instance.stopping = True
-            context = {
-                "experiment_id": state.experiment_id,
-                "run_id": state.run_id,
-                "service_id": service_id,
-                "service_instance_id": instance.service_instance_id,
-                "participant_id": service_id,
-                "participant_instance_id": instance.service_instance_id,
-            }
+            context = self._context(state, service_id, instance.service_instance_id)
             tasks = [
                 self._connecting.pop(service_id, None),
             ]
@@ -1745,6 +1837,54 @@ class ServiceManager:
                     raise RuntimeError(
                         "A service command still owns runtime files."
                     ) from error
+        # A recovered manager has no Popen handles. The participant can stop
+        # before its launcher finishes cleanup, so retain this separate barrier.
+        for service_id, instance in state.services.items():
+            process_file = (
+                state.experiment_directory
+                / "shared_artifacts/services"
+                / service_id
+                / instance.service_instance_id
+                / "process.json"
+            )
+            if not process_file.is_file():
+                continue
+            record = read_json(process_file)
+            launcher = record.get("launcher_process")
+            if launcher is None:
+                continue
+            if (
+                record.get("experiment_id") != state.experiment_id
+                or record.get("participant_id") != service_id
+                or record.get("participant_instance_id") != instance.service_instance_id
+            ):
+                raise RuntimeError(
+                    f"Service {service_id} launcher ownership cannot be verified."
+                )
+            while True:
+                try:
+                    if process_identity(launcher["pid"]) != launcher:
+                        break
+                    process = psutil.Process(launcher["pid"])
+                    if process.status() == psutil.STATUS_ZOMBIE:
+                        break
+                    try:
+                        process.wait(timeout=0)
+                        break
+                    except psutil.TimeoutExpired:
+                        pass
+                except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+                    break
+                except OSError as error:
+                    if getattr(error, "winerror", None) not in (87, 1168):
+                        raise
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Service {service_id} launcher {launcher['pid']} still owns "
+                        "runtime files; restoration is unsafe."
+                    )
+                await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
         self._processes.clear()
         self._launch_processes.clear()
         self._probes.clear()
@@ -1792,7 +1932,7 @@ class ServiceManager:
     def _context(
         self, state: RunnerState, service_id: str, instance_id: str
     ) -> JsonObject:
-        return {
+        context = {
             "experiment_id": state.experiment_id,
             "run_id": state.run_id,
             "service_id": service_id,
@@ -1800,8 +1940,18 @@ class ServiceManager:
             "participant_id": service_id,
             "participant_instance_id": instance_id,
         }
+        if state.pending_rebuild is not None:
+            context["parent_operation_id"] = state.pending_rebuild["operation_id"]
+        return context
 
     def _save(self, state: RunnerState) -> None:
+        if state.pending_rebuild is not None:
+            # Participant ownership must survive loss of the optional state.json copy.
+            self._journal.client.record_event(
+                "rebuild.checkpoint",
+                state_to_document(state),
+                context={"experiment_id": state.experiment_id, "run_id": state.run_id},
+            )
         try:
             self._state_store.save(state)
         except OSError as error:

@@ -77,6 +77,35 @@ incompatible input themselves.
 retention of older attempts for the same stage in the current epoch, not
 retention of journal history.
 
+## Identity during reload
+
+`reload_template` preserves definitions by `stage_id` and `service_id`, not by
+array position or module name. Preserve existing UUIDs when editing the DAG.
+A missing UUID creates a new identity; use the experiment's normalized
+`experiment.yaml` to retain IDs generated during initial assembly. An existing
+ID cannot change from a stage definition to a service definition or vice versa.
+
+Only the `stages` and `services` lists are editable through reload. Changes to
+all other top-level fields, including `cycles`, `resources`, and `logging`, are
+rejected. Relative resource paths are still interpreted from the candidate
+template's directory when checking that resources remain unchanged.
+
+Changing a stage definition, including its timeout or error policy, invalidates
+current-cycle result references for that node and its successors. A changed
+service affects its earliest DAG call and the following nodes. Journal history
+and attempt numbering are retained. Changing an unreferenced service alone does
+not invalidate stage results.
+
+Services with unchanged definitions retain their instances. Restarted services
+with the same stable ID and module name load the protective snapshot's exported
+state regardless of version; compatibility belongs to the service. Different
+module names receive no old state and use fresh module data. A service added
+after its removal also starts with fresh module data, even if its ID is reused;
+leftover files are temporarily isolated under the reload workspace and recorded
+in the journal. The protective snapshot retains them after workspace cleanup.
+New service IDs start independently. Stateless exports may omit a
+state path according to the existing `state_required` contract.
+
 ## Services
 
 Declare each service once in `services`. For example:

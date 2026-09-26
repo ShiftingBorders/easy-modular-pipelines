@@ -42,7 +42,9 @@ class CliTests(ServerTestCase):
         self.assertEqual(result["state"], "cancelled")
         self.assertTrue((await server.get("/health"))["controller_alive"])
 
-    async def test_json_target_snapshot_and_unsupported_commands_are_explicit(self):
+    async def test_json_target_snapshot_reload_noop_and_invalid_commands_are_explicit(
+        self,
+    ):
         template = self.w.template()
         server = await self.start_server()
         await server.launch(template)
@@ -51,9 +53,16 @@ class CliTests(ServerTestCase):
         self.assertEqual(reset["result"], "success", reset)
         snapshot = await client.send('snapshot --label "CLI point" --wait')
         self.assertTrue(snapshot["data"]["valid"], snapshot)
+        before = await server.get("/state")
+        reloaded = await client.send("command reload_template --wait")
+        self.assertEqual(reloaded["result"], "success", reloaded)
+        self.assertFalse(reloaded["data"]["changed"])
+        self.assertIsNone(reloaded["data"]["snapshot_id"])
+        after = await server.get("/state")
+        self.assertEqual(after["template_revision_id"], before["template_revision_id"])
+        self.assertEqual(after["stable_snapshot_id"], before["stable_snapshot_id"])
         for name, args, expected in (
             ("rollback", {"snapshot_id": "absent"}, "invalid_request"),
-            ("reload_template", {}, "unsupported_feature"),
             ("retry", {"position": 1}, "invalid_request"),
         ):
             file = self.w.root / f"{name}-args.json"

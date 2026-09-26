@@ -486,6 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", help="Validate a server-side template and module references."
     )
     validate_template.add_argument("path")
+    reload_template = template_actions.add_parser(
+        "reload", help="Apply a template to the idle paused experiment."
+    )
+    reload_template.add_argument(
+        "--template", help="Absolute template path on the server."
+    )
+    execution_options(reload_template)
     module = commands.add_parser(
         "module", help="Manage modules on a maintenance server."
     )
@@ -681,7 +688,11 @@ def command_document(options: argparse.Namespace) -> JsonObject:
     name = options.action
     args: JsonObject = {}
     target: JsonObject | None = None
-    if name == "module":
+    if name == "template" and options.template_action == "reload":
+        name = "reload_template"
+        if options.template is not None:
+            args["template_path"] = options.template
+    elif name == "module":
         name = "module." + options.module_action
         folder = getattr(options, "folder", None)
         version = getattr(options, "version", None)

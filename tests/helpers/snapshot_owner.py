@@ -7,11 +7,13 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from core.experimentassembler import ExperimentAssembler
 from core.hashdb import HashDB
+from core.logger import OperationLogger
 from core.modulemanager import ModuleManager
 from core.runner_utils.experimentrunner import ExperimentRunner
 from core.runner_utils.journal import RunnerJournal
-from core.runner_utils.runtimeio import process_identity, write_json
+from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.services import ServiceManager
 from core.runner_utils.state import RunnerStateStore
 from core.seaweed import SeaweedDB
@@ -29,6 +31,11 @@ async def run_owner(options):
     original_load = ServiceManager.load_states
     original_request = ServiceManager.request
     original_save = RunnerStateStore.save
+    original_record = OperationLogger.record_event
+    original_template = OperationLogger.record_template_applied
+    original_rebuild = ExperimentAssembler.rebuild
+    original_prepare = ServiceManager.prepare_rebuild
+    stale_rebuild_saved = False
 
     def halt(phase):
         if phase != options.phase:
@@ -46,6 +53,27 @@ async def run_owner(options):
         write_json(path, document)
         if Path(path).parent.name == "restore_transactions":
             halt(document["phase"])
+        if options.operation == "recover" and Path(path).name == "process.json":
+            halt("child_reconciled")
+
+    def read_endpoint(path, **kwargs):
+        document = read_json(path, **kwargs)
+        if (
+            options.operation == "reload"
+            and runner._state is not None
+            and runner._state.pending_rebuild is not None
+            and "endpoint" in document
+            and any(
+                instance.endpoint_path == path
+                and instance.service_instance_id
+                == document.get("participant_instance_id")
+                and instance.process_identity is not None
+                and instance.process_identity != document.get("process")
+                for instance in runner._state.services.values()
+            )
+        ):
+            halt("child_endpoint")
+        return document
 
     def move(source, destination):
         result = original_replace(source, destination)
@@ -56,7 +84,61 @@ async def run_owner(options):
             and Path(destination) == runner._state.experiment_directory
         ):
             halt("new_installed")
+        if options.operation == "reload" and runner._state is not None:
+            if Path(destination) == runner._state.template_path:
+                halt("template_published")
+            if Path(destination).parent.name == "previous_data":
+                halt("module_data_moved")
+            if Path(source).is_relative_to(
+                runner._state.experiment_directory / "runner/rebuilds"
+            ) and Path(destination).is_relative_to(
+                runner._state.experiment_directory / "modules"
+            ):
+                halt("module_published")
         return result
+
+    def record(logger, kind, data=None, **kwargs):
+        result = original_record(logger, kind, data, **kwargs)
+        if options.operation == "reload" and runner._state is not None:
+            if kind == "runner.checkpoint":
+                if data["pending_rebuild"] is not None:
+                    halt("rebuild_intent")
+                elif data["template_revision_id"] != initial_revision:
+                    halt("rebuild_committed")
+                    halt("committed_stale_file")
+            if kind == "service.started" and runner._state.pending_rebuild:
+                halt("service_started")
+            if kind == "rebuild.checkpoint" and any(
+                not s["stopped"] and s["process_identity"] is None
+                for s in data["services"].values()
+            ):
+                halt("service_spawn_intent")
+        return result
+
+    def applied(logger, *args, **kwargs):
+        result = original_template(logger, *args, **kwargs)
+        if options.operation == "reload":
+            halt("template_applied")
+        return result
+
+    async def rebuild(assembler, *args, **kwargs):
+        await original_rebuild(assembler, *args, **kwargs)
+        if options.operation == "reload":
+            if kwargs.get("prepare_only"):
+                halt("rebuild_prepared")
+            elif options.phase in (
+                "staging",
+                "old_moved",
+                "new_installed",
+                "journal_committed",
+                "services_starting",
+            ):
+                raise OSError("Trigger automatic reload rollback")
+
+    async def prepare(services, *args, **kwargs):
+        await original_prepare(services, *args, **kwargs)
+        if options.operation == "reload":
+            halt("service_stopped")
 
     def complete(journal, *args, **kwargs):
         result = original_complete(journal, *args, **kwargs)
@@ -74,11 +156,44 @@ async def run_owner(options):
         return reply
 
     def save(store, state):
+        nonlocal stale_rebuild_saved
+        if options.phase == "committed_stale_file":
+            if stale_rebuild_saved:
+                raise OSError("Optional state publication refused after run change.")
+            if (
+                state.pending_rebuild is not None
+                and state.template_revision_id != initial_revision
+            ):
+                result = original_save(store, state)
+                stale_rebuild_saved = True
+                return result
         if options.phase == "stage_without_state" and state.active_attempt is not None:
             raise OSError("Optional state publication refused after stage intent.")
-        return original_save(store, state)
+        if state.pending_rebuild is not None and any(
+            instance.stopped for instance in state.services.values()
+        ):
+            halt("service_stopped_uncheckpointed")
+        result = original_save(store, state)
+        if (
+            options.operation == "recover"
+            and state.pending_rebuild is not None
+            and any(
+                instance.stopped
+                and instance.definition["settings"].get("launcher_cleanup")
+                for instance in state.services.values()
+            )
+        ):
+            halt("child_stopped")
+        return result
 
     try:
+        if options.operation == "recover":
+            with (
+                patch("core.runner_utils.experimentrunner.write_json", publish),
+                patch.object(RunnerStateStore, "save", save),
+            ):
+                await runner.recover(options.experiment)
+            return
         if options.operation == "run":
             await runner.run(
                 options.root / "template.yaml",
@@ -95,6 +210,7 @@ async def run_owner(options):
                 "process": process_identity(os.getpid()),
             },
         )
+        initial_revision = runner._state.template_revision_id
         with (
             patch("core.runner_utils.snapshots.write_json", publish),
             patch.object(Path, "replace", move),
@@ -102,11 +218,18 @@ async def run_owner(options):
             patch.object(ServiceManager, "load_states", load),
             patch.object(ServiceManager, "request", request),
             patch.object(RunnerStateStore, "save", save),
+            patch.object(OperationLogger, "record_event", record),
+            patch.object(OperationLogger, "record_template_applied", applied),
+            patch.object(ExperimentAssembler, "rebuild", rebuild),
+            patch.object(ServiceManager, "prepare_rebuild", prepare),
+            patch("core.runner_utils.services.read_json", read_endpoint),
         ):
             if options.operation == "rollback":
                 await runner.rollback(options.snapshot)
             elif options.operation == "snapshot":
                 await runner.snapshot("owner snapshot")
+            elif options.operation == "reload":
+                await runner.reload_template(options.root / "reload.yaml")
             elif options.operation == "stage":
                 step = asyncio.create_task(runner.step())
                 while (
@@ -142,7 +265,9 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--experiment", required=True)
     parser.add_argument(
-        "--operation", choices=("run", "rollback", "snapshot", "stage"), required=True
+        "--operation",
+        choices=("run", "rollback", "snapshot", "stage", "reload", "recover"),
+        required=True,
     )
     parser.add_argument("--snapshot")
     parser.add_argument("--phase", required=True)

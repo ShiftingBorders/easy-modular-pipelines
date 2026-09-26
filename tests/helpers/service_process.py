@@ -7,6 +7,8 @@ import asyncio
 import json
 import os
 import struct
+import subprocess
+import sys
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -35,6 +37,7 @@ class PythonService:
         self.pending = []
         self.used = set()
         self.counter = 0
+        self.loaded = False
         self.frozen = False
         self.client_number = 0
 
@@ -177,6 +180,10 @@ class PythonService:
                             "request_id": request_id,
                             "result": "fail"
                             if (self.controls / "fail-health").exists()
+                            or (
+                                self.loaded
+                                and self.context["settings"].get("fail_after_load")
+                            )
                             else "success",
                             "data": {"counter": self.counter, "frozen": self.frozen},
                         },
@@ -283,12 +290,20 @@ class PythonService:
                         ).as_posix()
                     }
             elif command == "load_state":
-                if (self.controls / "fail-load").exists():
+                while (
+                    self.context["settings"].get("hold_load")
+                    and not (self.controls / "release-load").exists()
+                ):
+                    await asyncio.sleep(0.025)
+                if (self.controls / "fail-load").exists() or self.context[
+                    "settings"
+                ].get("reject_state"):
                     result, data = "fail", {"reason": "restore rejected"}
                 else:
                     self.counter = read_json(
                         Path(self.context["experiment_directory"]) / args["state_path"]
                     )["counter"]
+                    self.loaded = True
                     data = {"loaded": self.counter}
             elif command == "unfreeze_writes":
                 if (self.controls / "fail-unfreeze").exists():
@@ -319,6 +334,7 @@ class PythonService:
                 response,
                 author="participant",
                 outcome="succeeded" if result == "success" else "failed",
+                context=args.get("context") if command == "execute" else None,
             )
             self.trace("work_finished", **entry, response=response)
             self.current = None
@@ -402,8 +418,35 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--emp-context", type=Path, required=True)
     parser.add_argument("--action", choices=("start", "stop"), default="start")
+    parser.add_argument("--child", action="store_true")
     options = parser.parse_args()
     context = read_json(options.emp_context)
+    if context["settings"].get("launch_child") and not options.child:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                __file__,
+                "--emp-context",
+                str(options.emp_context),
+                "--child",
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ) as child:
+            result = child.wait()
+            if context["settings"].get("launcher_cleanup"):
+                controls = Path(context["settings"]["controls"])
+                write_json(
+                    controls / "launcher-cleanup-started.json",
+                    {"process": process_identity(os.getpid())},
+                )
+                while (controls / "hold-launcher-cleanup").exists():
+                    time.sleep(0.025)
+                (
+                    Path(context["module_data_directory"]) / "launcher-cleanup.txt"
+                ).write_text("old launcher cleanup", encoding="utf-8")
+                (controls / "launcher-cleanup-finished").touch()
+            raise SystemExit(result)
     asyncio.run(PythonService(context).run())
 
 
