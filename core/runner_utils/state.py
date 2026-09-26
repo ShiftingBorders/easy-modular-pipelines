@@ -415,6 +415,21 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         "pending_rebuild",
     ):
         setattr(state, key, document[key])
+    if state.pending_rebuild is not None:
+        pending = copy_json_object(state.pending_rebuild, "pending_rebuild")
+        if pending.keys() != {
+            "operation_id",
+            "snapshot_id",
+            "template_revision_id",
+            "run_id",
+        }:
+            raise ValueError("Invalid pending rebuild fields.")
+        for key in ("operation_id", "snapshot_id", "template_revision_id"):
+            UUID(require_text(pending[key], f"pending_rebuild.{key}"))
+        require_text(pending["run_id"], "pending_rebuild.run_id")
+        if state.stable_snapshot_id != pending["snapshot_id"]:
+            raise ValueError("Pending rebuild must retain its protective snapshot.")
+        state.pending_rebuild = pending
     if type(document["used_request_ids"]) is not list:
         raise TypeError("used_request_ids must be an array.")
     for request_id in document["used_request_ids"]:

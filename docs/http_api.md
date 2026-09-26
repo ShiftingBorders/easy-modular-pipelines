@@ -155,6 +155,34 @@ reconciliation preserve this intent. Resume, step and snapshot creation require
 those services to be explicitly started. Rollback restores the earlier snapshot's
 services. See [service commands](cli.md#start-and-stop-individual-services).
 
+## Reload the selected template
+
+Use the existing command endpoint in run mode:
+
+```json
+{
+  "command": "reload_template",
+  "args": {"template_path": "<absolute-server-path>/updated.yaml"}
+}
+```
+
+Empty args select the experiment's `experiment.yaml`. No target is accepted.
+The experiment must be idle and paused, with no unresolved attempt, maintenance
+operation, or blocked/manually stopped service. Only `stages` and `services`
+may change. Normal receipts and chain ordering apply; success means the reload
+has committed and its services are ready. The experiment remains paused.
+
+Results identify the old/new template revisions, protective snapshot, cursor,
+and change summary. An identical normalized template returns `changed: false`
+and `snapshot_id: null`. State responses expose `run_id`, `template_revision_id`,
+and `pending_rebuild`. An interrupted rebuild requires `recover` before further
+DAG control; priority `stop` stops participants and retains that requirement.
+
+New reload commands in maintenance mode are rejected with `invalid_mode`.
+Invalid templates/unsupported field changes return `invalid_request`; an
+unavailable execution boundary returns `invalid_state`. As with all commands,
+HTTP admission is distinct from the eventual command outcome.
+
 ## Runtime lifecycle
 
 `POST /api/commands` accepts `server.restart` with empty `args`, and

@@ -433,8 +433,20 @@ uv run python -B cli.py command reset_retries --target "@target.json" --wait
 ```
 
 Generic controller names use underscores where applicable. The generic command
-does not bypass mode or state checks. In particular, `replace` and
-`reload_template` currently return `unsupported_feature`.
+does not bypass mode or state checks. `replace` currently returns
+`unsupported_feature`.
+
+`template reload [--template <absolute-server-path>] --wait` sends the controller
+command `reload_template`. Without a path it reads the selected experiment's
+`experiment.yaml`. This command requires run mode and an idle paused experiment
+with ready services. Only stage and service definitions may change. It leaves
+execution paused after recording the new revision and confirming service
+readiness. Keep stable definition IDs to retain existing identities.
+
+The generic equivalent accepts `{"template_path":"<absolute-server-path>"}`
+or empty args. Results include `changed`, `previous_template_revision_id`,
+`template_revision_id`, `snapshot_id`, `stage_position`, `pending_advance`, and
+a compact `changes` list. Full before/after values are in the experiment journal.
 
 `chain FILE` reads a nonempty JSON command array or an envelope with `commands`
 and optional `chain_id`. For an active run, a checkpoint chain can contain:

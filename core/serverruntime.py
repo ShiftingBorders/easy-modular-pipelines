@@ -450,6 +450,9 @@ def recovery_candidates(project_root: Path) -> list[str]:
                 # Assembler-only drafts have never started an executor or services.
                 continue
             state = RunnerStateStore().load(root)
+            if state.pending_rebuild is not None:
+                candidates.append(experiment_id)
+                continue
             if (
                 state.phase == "idle"
                 and state.owner_identity is None
@@ -605,6 +608,7 @@ async def controller_main(
                     settings.project_root,
                     manager,
                     archive_config_path=settings.archive_config_path,
+                    control_logger=logger,
                 )
                 controller = ExperimentController(
                     settings.project_root,
@@ -1059,11 +1063,13 @@ class ServerRuntime:
         for command in commands:
             name = command["command"]
             if (
-                name in ("service.start", "service.stop")
+                name in ("service.start", "service.stop", "reload_template")
                 and self.settings.server_mode != "run"
             ):
                 raise ServerError(
-                    "invalid_mode", "Service control requires --mode run.", 409
+                    "invalid_mode",
+                    "Service control and template reload require --mode run.",
+                    409,
                 )
             if (
                 name.startswith("module.")

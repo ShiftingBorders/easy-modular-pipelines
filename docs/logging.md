@@ -137,6 +137,22 @@ of disk failure or power loss. Unknown commit outcomes prevent further writes
 by that client. Missing, mismatched, or incompatible journals are not silently
 recreated. An obligatory journal failure stops execution.
 
+## Template reload audit
+
+Reload uses a root `reload_template` operation. Its records include full old and
+candidate templates, definition changes with field paths and before/after
+values, execution-boundary decisions, affected result references, and service
+state-transfer observations. Absent fields and JSON null are distinguished.
+The applied revision uses the existing `template.applied` record.
+
+Rollback exports the reload operation tree through `export_diagnostics` and
+imports it through the existing journal restoration transaction. Diagnostic
+records preserve the failed candidate and actual effects; they do not publish
+that candidate as the restored current template or execution checkpoint.
+Restored records retain event IDs but may have new local cursors. Read them
+with the new journal generation. A failed mandatory journal write prevents a
+successful reload receipt.
+
 ## Configuration
 
 Template logging settings are documented in the

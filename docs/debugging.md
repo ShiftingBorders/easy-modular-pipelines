@@ -74,6 +74,7 @@ prove that a process is currently alive.
 | Missing artifact | Check experiment-relative vs attempt-relative paths and attempt retention. A journal entry can outlive its file. |
 | Dashboard shows history but no live connection | Verify both `project_root` and `system_api_url` refer to the same runtime. |
 | Windows access denied while publishing `state.json` | Shared JSON readers permit delete sharing; publication falls back to an atomic native rename when `os.replace` rejects an open reader. Transient read/write conflicts are retried for at most one second. Persistent errors still require checking permissions, external file locks and filesystem support. |
+| Windows access denied while replacing an experiment during rollback | Directory publication retries transient sharing/access errors for at most one second per rename. A persistently open external journal still blocks restoration; close that reader before recovery. The restoration marker retains the completed file-move boundary. |
 
 JSON readers close the file before parsing its contents. On Linux, publication
 uses the normal atomic `os.replace`: an existing reader may finish reading the
@@ -128,6 +129,54 @@ and start a new experiment. For reusable diagnostics, use StageClient progress
 and state reporting and structured [logging](logging.md).
 
 ## Snapshots and interrupted runs
+
+### Reload failures
+
+`template reload --wait` leaves the experiment paused. Inspect its receipt,
+`status`, and journal before resuming. Validation failures leave the applied
+template unchanged. Failures during application attempt restoration of the
+protective snapshot; the reload still returns failure after a successful rollback.
+This restores managed experiment files and service state, not arbitrary external
+effects performed by services.
+
+If protective snapshot creation fails before changes are applied, reload leaves
+the experiment paused when the original services remain healthy and any snapshot
+freeze has been released. For example, insufficient snapshot disk space does not
+stop those services or discard DAG progress. The command still reports and logs
+the failure; resolve its cause before retrying. Unconfirmed write resumption
+continues to require stopping the experiment.
+
+If the command was cancelled or the server stopped during application,
+`pending_rebuild` identifies the unfinished operation and protective snapshot.
+Use `recover <experiment-id> --wait`; it restores the last protected state and
+retains the reload audit. Do not bypass recovery by editing state files, starting
+another run, or issuing ordinary rollback. Unconfirmed participant termination
+prevents file restoration.
+
+For a service launched through a parent process, restoration also waits for
+that launcher to finish cleanup. The runner retains launcher and participant
+identities across recovery. If the launcher remains alive beyond `start_timeout`,
+restoration fails before replacing runtime files; resolve its unfinished cleanup
+and retry recovery.
+
+Reload also waits for the launchers of changed or removed services before
+replacing their runtime files, including after an ordinary recovery by a new
+controller. This uses the saved launcher identity when no local process handle
+is available. Unchanged services continue running during this wait.
+
+If an older experiment has no saved launcher identity and the controller has
+no local launcher handle, reload rejects changes to that service before creating
+the protective snapshot or stopping services. The participant identity alone
+does not prove that a parent launcher has finished. The experiment stays paused
+with its applied template; changes that leave such services untouched remain
+available. Do not fabricate launcher metadata to bypass this check.
+
+For incompatible service data, inspect the service's `load_state` result and
+the recorded old/new module versions. Matching names authorize transfer across
+versions; they do not establish compatibility. Failed reload changes, errors,
+and rollback observations remain available in the journal after restoration.
+
+### Manual snapshots and recovery
 
 At an idle pause, `snapshot --label <label> --wait` records a restoration point.
 Use `rollback <snapshot-id> --wait` only when you intend to replace the current
