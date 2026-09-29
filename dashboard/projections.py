@@ -33,7 +33,19 @@ def compact_event(event: dict) -> dict:
             "size_bytes",
             "content_hash",
         ),
-        "runner.checkpoint": ("mode", "phase"),
+        "runner.checkpoint": (
+            "mode",
+            "phase",
+            "run_id",
+            "template_revision_id",
+            "cycle_number",
+            "stage_position",
+            "stage_result_ids",
+            "pending_advance",
+            "checkpoint_id",
+            "last_dag_decision",
+            "pending_input",
+        ),
         "experiment.state": (
             "phase",
             "mode",
@@ -41,6 +53,14 @@ def compact_event(event: dict) -> dict:
             "observed_at",
             "services",
             "stage_position",
+            "run_id",
+            "template_revision_id",
+            "stage_result_ids",
+            "pending_advance",
+            "active_attempt_id",
+            "attempt_id",
+            "dag_decision",
+            "pending_input",
         ),
         "control.intent": (
             "action",
@@ -79,6 +99,9 @@ def compact_event(event: dict) -> dict:
     reduced = {key: data[key] for key in fields.get(kind, ()) if key in data}
     if kind == "attempt.parameters":
         reduced.update(effective_settings={}, template={}, template_yaml="")
+    if kind == "runner.checkpoint":
+        active = data.get("active_attempt")
+        reduced["active_attempt_id"] = active.get("attempt_id") if active else None
     if kind == "resources.recorded":
         reduced["resources"] = {
             name: {
@@ -106,7 +129,7 @@ def compact_template(template: dict) -> dict:
     result["stages"] = [
         {
             key: stage[key]
-            for key in ("stage_id", "name", "module", "service_id")
+            for key in ("stage_id", "name", "module", "service_id", "returns_data")
             if key in stage
         }
         for stage in template.get("stages", [])
@@ -158,7 +181,9 @@ def project_scope(dataset: dict, run_id: str | None, cycle: int | None) -> dict:
             key = row.get(identity_field)
             if key is None or kind == "operations" and str(key).startswith("run:"):
                 continue
-            sources = projection_sources(kind, row, by_artifact, by_attempt, by_operation)
+            sources = projection_sources(
+                kind, row, by_artifact, by_attempt, by_operation
+            )
             if not sources:
                 continue
             row = {
@@ -278,6 +303,44 @@ def observed_attempt_status(attempt: dict, fresh: bool) -> str:
     return status
 
 
+def dag_node_status(
+    stage_id: str,
+    position: int,
+    attempt: dict | None,
+    state: dict,
+    fresh: bool,
+    invalidated_after: int | None = 0,
+) -> str:
+    """Display current DAG validity independently of historical attempt outcomes."""
+    cursor = state.get("stage_position")
+    phase = state.get("phase")
+    if position == cursor and (
+        phase == "stage_running" or state.get("active_attempt_id")
+    ):
+        return "running" if fresh and phase == "stage_running" else "unconfirmed"
+    if invalidated_after is None:
+        return "pending"
+    accepted = state.get("stage_result_ids")
+    if isinstance(accepted, dict):
+        if isinstance(accepted.get(stage_id), str) and accepted[stage_id]:
+            return "succeeded"
+        if position > (cursor or 0):
+            return "pending"
+        if (
+            attempt is None
+            or invalidated_after is None
+            or (attempt.get("started_cursor") or 0) <= invalidated_after
+        ):
+            return "pending"
+        status = observed_attempt_status(attempt, fresh)
+        if status in {"succeeded", "success", "completed"}:
+            return "pending"
+        return status
+    if fresh and position == cursor:
+        return "ready"
+    return observed_attempt_status(attempt, fresh) if attempt else "pending"
+
+
 def projection_sources(
     kind: str, row: dict, by_artifact: dict, by_attempt: dict, by_operation: dict
 ) -> list[str]:
@@ -311,7 +374,51 @@ def cached_experiment_views(
         + " ORDER BY cursor DESC LIMIT 1",
         args,
     )
-    entries = [json.loads(row[0]) for row in [*latest, *recorded]]
+    checkpoint = cache.query(
+        "SELECT compact FROM facts WHERE kind='runner.checkpoint' AND effective=1"
+        + selection
+        + " ORDER BY cursor DESC LIMIT 1",
+        args,
+    )
+    latest_template = json.loads(latest[0][0]) if latest else {}
+    latest_state = (
+        json.loads(checkpoint[0][0])["data"] if checkpoint else dataset["state"]
+    )
+    move_run = (
+        run_id
+        or dataset["state"].get("run_id")
+        or latest_template.get("context", {}).get("run_id")
+    )
+    move_revision = latest_template.get("data", {}).get(
+        "template_revision_id", dataset["state"].get("template_revision_id")
+    )
+    move_cycle = latest_state.get("cycle_number")
+    if (
+        live.get("fresh")
+        and live.get("experiment_id") == dataset["experiment_id"]
+        and live.get("run_id") in (None, move_run)
+    ):
+        move_cycle = live.get("cycle_number", move_cycle)
+    moves = cache.query(
+        "SELECT json_remove(compact,'$.data.stage_result_ids') FROM facts"
+        " WHERE kind='runner.checkpoint' AND effective=1"
+        " AND run_id IS ? AND json_extract(compact,'$.data.template_revision_id') IS ?"
+        " AND json_extract(compact,'$.data.cycle_number') IS ?"
+        " AND json_extract(compact,'$.data.last_dag_decision.decision.command')='move'"
+        " GROUP BY"
+        " json_extract(compact,'$.data.last_dag_decision.source_stage_id'),"
+        " json_extract(compact,'$.data.last_dag_decision.decision.stage_id')"
+        " HAVING cursor=MAX(cursor)",
+        (move_run, move_revision, move_cycle),
+    )
+    entries = list(
+        {
+            event["event_id"]: event
+            for row in [*moves, *latest, *recorded, *checkpoint]
+            for event in [json.loads(row[0])]
+        }.values()
+    )
+    entries.sort(key=lambda event: event["cursor"])
     saved = {
         **dataset["state"],
         "template": compact_template(dataset["state"].get("template", {})),
@@ -383,19 +490,21 @@ def cached_experiment_views(
         {**component, "mean_seconds": durations.get(component["stage_id"])}
         for component in forecast["component_durations"]
     ]
-    dag_state = (
-        live
-        if summary["fresh"]
-        else (json.loads(recorded[0][0])["data"] if recorded else saved)
-    )
+    dag_state = model["_dag_state"]
     dag_cycle = dag_state.get("cycle_number")
     for node in model["template"]["nodes"]:
         row = cache.query(
             "SELECT payload FROM records WHERE kind='parameters' AND run_id IS ? AND revision IS ? AND (? IS NULL OR cycle=?) AND json_extract(payload,'$.stage_id')=? ORDER BY position DESC LIMIT 1",
             (current_run, revision, dag_cycle, dag_cycle, node["stage_id"]),
         )
-        if row and node["status"] not in {"running", "ready"}:
-            node["status"] = json.loads(row[0][0])["status"]
+        node["status"] = dag_node_status(
+            node["stage_id"],
+            node["position"],
+            json.loads(row[0][0]) if row else None,
+            dag_state,
+            summary["fresh"],
+            model["_dag_invalidations"].get(node["stage_id"], 0),
+        )
     # Large lists have separate indexed page endpoints; summaries remain small.
     return model
 
@@ -539,6 +648,7 @@ def experiment_views(
             if attempt_id:
                 attempts[attempt_id] = {
                     **context,
+                    "started_cursor": event.get("cursor", 0),
                     "recorded_at": event["occurred_at"],
                     "effective_settings": data["effective_settings"],
                     "template": data["template"],
@@ -550,9 +660,11 @@ def experiment_views(
                 }
         elif kind == "call.started" and context.get("attempt_id"):
             attempt = attempts.setdefault(context["attempt_id"], dict(context))
+            attempt.setdefault("started_cursor", event.get("cursor", 0))
             attempt.update(started_at=event["occurred_at"], status="running")
         elif kind == "stage.process_started":
             attempt = attempts.setdefault(context.get("attempt_id"), dict(context))
+            attempt.setdefault("started_cursor", event.get("cursor", 0))
             attempt.update(
                 started_at=data.get("started_at", event["occurred_at"]),
                 process=data.get("process"),
@@ -560,6 +672,7 @@ def experiment_views(
             )
         elif kind == "stage.finished":
             attempt = attempts.setdefault(context.get("attempt_id"), dict(context))
+            attempt.setdefault("started_cursor", event.get("cursor", 0))
             attempt.update(context)
             attempt.update(
                 finished_at=event["occurred_at"],
@@ -672,6 +785,8 @@ def experiment_views(
         and live.get("experiment_id") == identifier
         and live.get("fresh")
         and (run_id is None or run_id == saved.get("run_id"))
+        and live.get("run_id") in (None, current_run)
+        and live.get("template_revision_id") in (None, revision_id)
     )
     recorded_state = next(
         (
@@ -682,6 +797,46 @@ def experiment_views(
         saved,
     )
     observed = live if fresh else recorded_state
+    dag_state = {}
+    if (
+        saved.get("run_id") == current_run
+        and saved.get("template_revision_id") == revision_id
+    ):
+        dag_state = saved
+    for event, data in checkpoints:
+        if (
+            event["context"].get("run_id") == current_run
+            and data.get("template_revision_id", revision_id) == revision_id
+            and "stage_result_ids" in data
+        ):
+            dag_state = data
+    if fresh or not dag_state:
+        if dag_state.get("cycle_number") != observed.get("cycle_number"):
+            dag_state = {}
+        dag_state = {**dag_state, **observed}
+    active = dag_state.get("active_attempt")
+    active_id = dag_state.get(
+        "active_attempt_id", active.get("attempt_id") if active else None
+    )
+    dag_state = {
+        key: dag_state[key]
+        for key in (
+            "run_id",
+            "template_revision_id",
+            "cycle_number",
+            "stage_position",
+            "mode",
+            "phase",
+            "stage_result_ids",
+            "pending_advance",
+            "attempt_id",
+            "dag_decision",
+            "last_dag_decision",
+            "pending_input",
+        )
+        if key in dag_state
+    }
+    dag_state["active_attempt_id"] = active_id
     phase = observed.get("phase", "unknown")
     if not fresh and phase not in {"completed", "failed", "stopped"}:
         status = "unknown"
@@ -704,7 +859,53 @@ def experiment_views(
         for service in template.get("services", [])
     }
     nodes = []
-    dag_cycle = observed.get("cycle_number")
+    dag_cycle = dag_state.get("cycle_number")
+    positions = {stage["stage_id"]: index for index, stage in enumerate(stages, 1)}
+    moves = {}
+    invalidations = {}
+    for event, data in checkpoints:
+        applied = data.get("last_dag_decision") or {}
+        decision = applied.get("decision") or {}
+        source, target = applied.get("source_stage_id"), decision.get("stage_id")
+        if (
+            decision.get("command") != "move"
+            or source not in positions
+            or target not in positions
+            or event["context"].get("run_id") != current_run
+            or data.get("template_revision_id", revision_id) != revision_id
+            or data.get("cycle_number") != dag_cycle
+        ):
+            continue
+        moves[source, target] = {
+            "from": source,
+            "to": target,
+            "kind": "conditional_move",
+            "condition": "move",
+            "request_id": applied["request_id"],
+        }
+        for definition in stages[positions[target] - 1 :]:
+            identifier_stage = definition["stage_id"]
+            invalidations[identifier_stage] = max(
+                invalidations.get(identifier_stage, 0), event.get("cursor", 0)
+            )
+    transfer = dag_state.get("pending_input") or {}
+    source, target = transfer.get("source_stage_id"), transfer.get("stage_id")
+    if source in positions and target in positions:
+        moves[source, target] = {
+            "from": source,
+            "to": target,
+            "kind": "conditional_move",
+            "condition": "move",
+            "request_id": transfer["request_id"],
+            "active": not dag_state.get("pending_advance", False),
+        }
+    decision = dag_state.get("dag_decision", dag_state.get("last_dag_decision")) or {}
+    if decision.get("decision", {}).get("command") == "move":
+        target = decision["decision"].get("stage_id")
+        if target in positions:
+            # Live cursor changes can precede ingestion of their journal event.
+            for definition in stages[positions[target] - 1 :]:
+                invalidations[definition["stage_id"]] = None
     for position, definition in enumerate(stages, 1):
         node = {
             **definition,
@@ -724,11 +925,19 @@ def experiment_views(
             and attempt.get("template_revision_id") == revision_id
             and (dag_cycle is None or attempt.get("cycle_number") == dag_cycle)
         ]
-        node["status"] = (
-            stage_attempts[-1].get("status", "unknown") if stage_attempts else "pending"
+        node["status"] = dag_node_status(
+            definition["stage_id"],
+            position,
+            stage_attempts[-1] if stage_attempts else None,
+            dag_state,
+            fresh,
+            invalidations.get(definition["stage_id"], 0),
         )
-        if fresh and observed.get("stage_position") == position:
-            node["status"] = "running" if phase == "stage_running" else "ready"
+        node["current"] = bool(
+            fresh
+            and dag_state.get("stage_position") == position
+            and phase not in {"completed", "stopped", "failed"}
+        )
         nodes.append(node)
     edges = [
         {"from": left["stage_id"], "to": right["stage_id"]}
@@ -742,6 +951,7 @@ def experiment_views(
                 "condition": f"completed cycles < {template['cycles']}",
             }
         )
+    edges.extend(moves.values())
     # Attempts are explicit execution scopes even if a module records no nested operations.
     for attempt_id, attempt in attempts.items():
         if not attempt_id or not attempt.get("started_at"):
@@ -906,6 +1116,8 @@ def experiment_views(
         "error": dataset.get("error"),
     }
     return {
+        "_dag_state": dag_state,
+        "_dag_invalidations": invalidations,
         "summary": summary,
         "runs": list(runs.values()),
         "operations": list(operations.values()),

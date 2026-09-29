@@ -141,6 +141,8 @@ class LocalJournals:
             if not metadata.get("reader_revision") or "version" not in metadata:
                 return self._pending_dataset(identifier)
             source = json.loads(metadata["source"])
+            if source.get("version") != JournalHistoryCache.SCHEMA_VERSION:
+                return self._pending_dataset(identifier)
             status = path.stat()
             signature = (
                 status.st_dev,

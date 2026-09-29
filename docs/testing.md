@@ -46,6 +46,19 @@ artifact reads, and snapshot/rollback/continuation. Owner-crash fixtures exercis
 accepted results, committed moves, and already running targets. Fault injection
 is confined to test helpers; production code has no test fault switches.
 
+For conditional DAG display and refresh behavior:
+
+```text
+uv run python -m unittest tests.dashboard_tests.test_conditional_dag tests.dashboard_tests.test_conditional_browser -v
+```
+
+These checks cover current node badges versus historical attempt outcomes,
+raw/RAM/disk-cache agreement, run/cycle isolation, cache format 1, and actual
+runner progress fields. The focused browser check uses the production DAG
+renderer and DOM updater in headless Chromium. It requires the same browser and
+Node tooling as the existing browser suite and writes its screenshot under
+`.artifacts/logs/dashboard-conditional-move.png`.
+
 Reload tests exercise stable IDs, cursor and input changes, selective service
 state transfer, journal preservation, receipts, and actual owner-process crashes.
 Fault injection stays in test fixtures. The recovery matrix includes publication

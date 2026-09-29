@@ -213,8 +213,23 @@ conditions or insufficient observations return null estimates.
 
 IDs and source data remain distinct: experiment, logical run, template revision,
 stage, attempt, operation, cycle, service instance and observed process are not
-interchangeable. DAG edges come from the template; operation parents belong to
-the timeline and do not synthesize DAG dependencies.
+interchangeable. DAG edges include the template's sequential/cycle flow and
+committed conditional moves in the selected run, revision, and cycle. Move edges
+have `kind: conditional_move`, `condition: move`, and the source `request_id`;
+`active: true` identifies the currently assigned input transfer. Repeated moves
+between the same nodes share one edge. Operation parents belong to the timeline
+and do not synthesize DAG dependencies.
+
+DAG nodes preserve `returns_data` for conditional definitions and expose `current`
+for the live cursor. Their status reflects current accepted result references:
+backwards moves reset invalidated nodes to `pending`, and an executing target is
+`running`. Recorded attempt outcomes remain available unchanged in history.
+The disposable cache format stays at version 1 until the first release. Caches
+with a different format number rebuild from the journal. During development,
+incompatible format/projection changes require explicitly discarding and
+rebuilding disposable caches, including caches already marked version 1.
+The publication counter still changes when cached observations change; it is
+used for refresh consistency and is distinct from the format version.
 
 Artifact `path_base` distinguishes `experiment` for stage result files from
 `attempt` for `record_artifact` paths. Downloads require enough recorded context

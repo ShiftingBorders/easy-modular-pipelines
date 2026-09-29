@@ -76,6 +76,10 @@ def acquire_cache_writer(path: Path) -> BinaryIO:
 
 
 class JournalHistoryCache:
+    # Keep the pre-release format at 1. Incompatible development changes require
+    # rebuilding the disposable cache, not incrementing this number.
+    SCHEMA_VERSION = 1
+
     def __init__(
         self,
         path: Path,
@@ -115,7 +119,7 @@ class JournalHistoryCache:
                 raise LoggingStateError("Journal changed before cache initialization.")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             expected = {
-                "version": 5,
+                "version": self.SCHEMA_VERSION,
                 "identity": self.identity,
                 "file_key": list(self.file_key),
                 "experiment_id": self.experiment_id,
@@ -735,9 +739,11 @@ class JournalHistoryCache:
                 db.execute("BEGIN")
                 metadata = dict(db.execute("SELECT key, value FROM metadata"))
                 recorded = json.loads(metadata.get("source", "{}"))
-                if recorded.get("identity") != self.identity or recorded.get(
-                    "file_key"
-                ) != list(self.file_key):
+                if (
+                    recorded.get("version") != self.SCHEMA_VERSION
+                    or recorded.get("identity") != self.identity
+                    or recorded.get("file_key") != list(self.file_key)
+                ):
                     return empty
                 if "checkpoint" not in metadata:
                     return empty
@@ -782,6 +788,7 @@ class JournalHistoryCache:
             if (
                 int(metadata.get("version", -1)) != version
                 or json.loads(metadata["source"])["identity"] != self.identity
+                or json.loads(metadata["source"]).get("version") != self.SCHEMA_VERSION
             ):
                 raise HistoryCacheChanged(
                     "The cache publication changed; refresh the selection."
@@ -1008,7 +1015,9 @@ class JournalHistoryCache:
                         raise LoggingStateError(
                             "A referenced journal event is unavailable."
                         )
-                    entries.update((entry["event"]["event_id"], entry) for entry in page)
+                    entries.update(
+                        (entry["event"]["event_id"], entry) for entry in page
+                    )
                     # The source byte budget can shorten an indexed batch.
                     missing = [
                         identifier

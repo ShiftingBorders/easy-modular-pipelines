@@ -129,17 +129,27 @@ export function dag(document) {
     const nodes = document.nodes || document.template?.stages || [];
     if (!nodes.length) return panel("DAG", empty("No DAG definition recorded"));
     const positions = new Map(nodes.map((node, index) => [node.stage_id, 30 + index * 255]));
+    const names = new Map(nodes.map(node => [node.stage_id, node.name || node.module?.name || node.stage_id]));
     const edges = (document.edges || []).filter(edge => positions.has(edge.from) && positions.has(edge.to));
     const paths = edges.map(edge => {
         const from = positions.get(edge.from), to = positions.get(edge.to);
-        const forward = to > from;
-        const path = forward ? `M${from + 210},100 C${from + 240},100 ${to - 25},100 ${to},100`
-            : `M${from + 105},152 C${from + 105},260 ${to + 105},260 ${to + 105},152`;
-        return `<path data-key="edge:${e(edge.from)}:${e(edge.to)}" d="${path}" fill="none" stroke="${forward ? "#719bcf" : "#c0a0dc"}" stroke-width="2" marker-end="url(#dag-arrow)"><title>${e(edge.condition || `${edge.from} → ${edge.to}`)}</title></path>`;
+        const move = edge.kind === "conditional_move";
+        let path;
+        if (from === to) path = `M${from + 60},80 C${from - 5},6 ${from + 220},6 ${from + 150},80`;
+        else if (move && to > from) path = `M${from + 150},80 C${from + 150},24 ${to + 60},24 ${to + 60},80`;
+        else if (to > from) path = `M${from + 210},144 C${from + 240},144 ${to - 25},144 ${to},144`;
+        else path = `M${from + 140},216 C${from + 140},300 ${to + 70},300 ${to + 70},216`;
+        const label = `${move ? "move" : edge.condition || "Next"}${edge.active ? " · Input assigned" : ""}`;
+        const color = move ? edge.active ? "#f1cc81" : "#bd985d" : to > from ? "#719bcf" : "#c0a0dc";
+        const text = move ? `<text x="${(from + to) / 2 + 105}" y="${to < from ? 294 : 24}" text-anchor="middle" fill="${color}" font-size="12">${e(label)}</text>` : "";
+        return `<g data-key="edge:${e(edge.kind || "sequence")}:${e(edge.from)}:${e(edge.to)}"><path d="${path}" fill="none" stroke="${color}" stroke-width="${edge.active ? 3 : 2}" ${move ? 'stroke-dasharray="7 4"' : ""} marker-end="url(#dag-arrow)"><title>${e(`${names.get(edge.from)} → ${names.get(edge.to)} · ${label}`)}</title></path>${text}</g>`;
     }).join("");
     const width = Math.max(760, nodes.length * 255 + 30);
-    const graph = `<div class="table-scroll"><svg class="dag-canvas" width="${width}" height="285" viewBox="0 0 ${width} 285" role="group" aria-label="DAG stages and explicit dependencies"><defs><marker id="dag-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8dafdb"/></marker></defs>${paths}${nodes.map(node => `<foreignObject data-key="stage:${e(node.stage_id)}" x="${positions.get(node.stage_id)}" y="48" width="210" height="110"><button xmlns="http://www.w3.org/1999/xhtml" class="dag-node" data-inspect="${e(JSON.stringify(node))}"><strong>${e(node.name || node.stage_id)}</strong><small>${e(node.module?.name || node.module_name || "")} ${e(node.module?.version || "")}</small>${node.status ? badge(node.status) : ""}</button></foreignObject>`).join("")}</svg></div>`;
-    return panel("DAG", graph) + panel("Dependencies", table(document.edges || [], [["From", row => e(row.from)], ["To", row => e(row.to)], ["Condition", row => e(row.condition || "—")]], [], "edges"));
+    const graph = `<div class="table-scroll"><svg class="dag-canvas" width="${width}" height="325" viewBox="0 0 ${width} 325" role="group" aria-label="DAG stages and recorded transitions"><defs><marker id="dag-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8dafdb"/></marker></defs>${paths}${nodes.map(node => {
+        const conditional = typeof node.returns_data === "boolean";
+        return `<foreignObject data-key="stage:${e(node.stage_id)}" x="${positions.get(node.stage_id)}" y="80" width="210" height="140"><button xmlns="http://www.w3.org/1999/xhtml" class="dag-node${conditional ? " conditional" : ""}${node.current ? " current" : ""}" data-inspect="${e(JSON.stringify(node))}" title="${node.current ? "Current cursor · " : ""}${e(node.name || node.stage_id)}"><strong>${e(node.name || node.stage_id)}</strong><small>${e(node.module?.name || node.module_name || "")} ${e(node.module?.version || "")}</small>${conditional ? `<small>Conditional · ${node.returns_data ? "Returns data" : "Passes input"}</small>` : ""}${node.status ? badge(node.status) : ""}</button></foreignObject>`;
+    }).join("")}</svg></div><p class="source-note">Dashed amber arrows show recorded conditional moves in this cycle. Input assigned marks the current transfer; the outlined node marks the live cursor.</p>`;
+    return panel("DAG", graph) + panel("Flow and recorded transitions", table(document.edges || [], [["From", row => e(names.get(row.from) || row.from)], ["To", row => e(names.get(row.to) || row.to)], ["Condition", row => e(`${row.condition || "Next"}${row.active ? " · Input assigned" : ""}`)]], [], "edges"));
 }
 
 export function metricCards(rows, selections, forecast = null, summaries = null, cycleCount = null) {

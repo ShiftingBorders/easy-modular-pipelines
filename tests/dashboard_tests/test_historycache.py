@@ -438,7 +438,7 @@ class HistoryCacheTests(unittest.TestCase):
                 0
             ]
         )
-        self.assertEqual(source["version"], 5)
+        self.assertEqual(source["version"], 1)
         with closing(sqlite3.connect(migrated["cache"].path)) as db, db:
             db.execute("DELETE FROM facts WHERE cursor=(SELECT MIN(cursor) FROM facts)")
         with self.assertRaisesRegex(SystemAPIError, "skips source"):

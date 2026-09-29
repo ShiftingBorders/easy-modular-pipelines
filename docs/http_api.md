@@ -111,6 +111,10 @@ commands originate in a stage result and do not submit an HTTP command receipt.
 The input assignment remains visible while the cursor names its target,
 including after completion, so a manual rerun can reuse that input. Ordinary
 advancement clears it before selecting the following node's input.
+State also exposes `stage_result_ids`, `pending_advance`, and `active_attempt_id`
+for current DAG progress. `stage_result_ids` contains only currently accepted
+successful outputs and is invalidated by conditional moves. Historical successful
+attempts must not be used to infer that an invalidated node is still complete.
 
 An identical explicit ID can retrieve a retained identical submission.
 A conflicting reuse is rejected. This is not a permanent exactly-once guarantee:

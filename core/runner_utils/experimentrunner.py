@@ -3005,6 +3005,11 @@ class ExperimentRunner:
             "mode": state.mode if state is not None else self._desired_mode,
             "cycle_number": None if state is None else state.cycle_number,
             "stage_position": None if state is None else state.stage_position,
+            "stage_result_ids": {} if state is None else dict(state.stage_result_ids),
+            "pending_advance": self._pending_advance if state is not None else False,
+            "active_attempt_id": None
+            if state is None or state.active_attempt is None
+            else state.active_attempt.attempt_id,
             "pending_input": None if state is None else state.pending_input,
             "dag_decision": None if state is None else state.last_dag_decision,
             "attempt_id": None if attempt is None else attempt.attempt_id,

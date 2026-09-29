@@ -156,6 +156,35 @@ remote access requires a suitably protected external proxy.
 Search and filters operate on loaded records. History has pagination and JSON
 inspection. The interface is English and uses local fonts.
 
+### Conditional transitions in the DAG
+
+Conditional nodes identify whether they return data or pass their input through.
+Dashed amber arrows show committed `move` transitions in the selected logical
+run, template revision, and cycle, including backwards and self-directed moves.
+Repeated moves between the same nodes share one edge. The current input transfer
+is highlighted, and an outline marks the live cursor. Sequential flow and the
+configured cycle edge remain visible separately.
+
+Node status reflects the runner's currently accepted result references. A
+conditional move resets the target and subsequent invalidated nodes to Pending;
+earlier accepted nodes stay successful. The target becomes Running when its next
+attempt starts, then successful only when its new output is accepted. Historical
+attempt outcomes remain unchanged in the timeline and attempt details. Stale
+runtime observations do not claim that a process is running.
+
+The same status calculation is used for the RAM window and the disk cache.
+The cache format stays at version 1 until the first release. Caches with a
+different format number rebuild automatically; the dashboard does not rewrite
+experiment state or journals.
+
+Before the first release, version 1 does not guarantee compatibility between
+development revisions. After an incompatible format or projection change, stop
+the dashboard and its cache workers, remove only its disposable `*.cache.sqlite`
+databases and their SQLite sidecar files from `state_directory/readers`, and
+restart to rebuild from the original journals. This also applies to caches
+already marked version 1. The cache's publication counter continues to advance
+for normal refreshes; it is separate from the format version.
+
 Background refresh updates existing rows and blocks by stable identifiers.
 Unchanged DOM nodes, focus, input values, expanded details, and scroll containers
 are retained. A pending refresh keeps the preceding observations visible;
