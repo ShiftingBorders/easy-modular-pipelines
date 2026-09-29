@@ -164,6 +164,7 @@ class DagWorkspace:
         *,
         implementation="full",
         source=None,
+        stage_kind=None,
     ) -> dict:
         directory = self.root / "modules" / name / version
         directory.mkdir(parents=True)
@@ -178,6 +179,7 @@ class DagWorkspace:
                     "name": name,
                     "version": version,
                     "role": "stage",
+                    **({"stage_kind": stage_kind} if stage_kind is not None else {}),
                     "implementation": implementation,
                     "commands": commands,
                     "defaults": {} if defaults is None else defaults,
@@ -358,7 +360,9 @@ class DagSession:
                 if attempt is not None:
                     directory = attempt.artifacts_directory
                     try:
-                        ready = await asyncio.to_thread(read_json, directory / "ready.json")
+                        ready = await asyncio.to_thread(
+                            read_json, directory / "ready.json"
+                        )
                     except FileNotFoundError:
                         pass
                     else:

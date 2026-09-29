@@ -10,12 +10,14 @@ services. Start with [module authoring](modules.md) or
 | --- | --- |
 | Module manifest and experiment template | `schema_version: 2` |
 | Participant TCP and module launch context | `protocol_version: 2` |
-| Runner state | `schema_version: 3` |
+| Runner state | `schema_version: 4` (schema 3 remains readable) |
 | Journal events and storage | Version 2 |
 | Experiment snapshot, restoration transaction, exchange archive | `schema_version: 2` |
 
 These versions do not change the outer HTTP API or logger connection-settings
-schema. Incompatible older experiments and archives are rejected, not migrated.
+schema. Runner schema 4 adds conditional decisions, pending input references,
+and retained artifact paths. Schema-3 states load with these fields empty;
+other incompatible older experiments and archives are rejected.
 
 Schema-3 service records include the boolean `manually_stopped` intent. A record
 without this field defaults to `false`. Recovery preserves explicit manual stops;
@@ -168,6 +170,11 @@ It is not a sandbox for untrusted module code.
 ## Results and restoration
 
 Stage stdout still carries `{"result": "success"|"fail", "data": ...}`.
+For [conditional stages](modules.md#conditional-stages), stdout `data` describes
+the decision. The runner's accepted response contains the effective application
+output in `data` and the validated control decision in `execution.dag_decision`.
+The participant observation retains the original decision. Neither the TCP
+protocol nor StageClient requires a separate command channel for conditions.
 StageExecutor validates stdout and exit code, then records the result in
 `journals/events.sqlite`. There is no separate result JSON file.
 Artifacts stay on disk with experiment-relative links in result data.

@@ -125,6 +125,16 @@ in files. The participant records observed completion, while the runner records
 its accepted outcome. The runner's outcome has priority; a late response after
 timeout remains diagnostic evidence rather than a new success.
 
+For conditional stages the participant observation retains the raw decision.
+The accepted runner response stores the effective application output in `data`
+and the validated decision in `execution.dag_decision`. `stage.finished` reports
+that accepted response. Runner checkpoints record the applied decision, cursor,
+pending input reference, and protected artifact paths together. Attempt
+checkpoints also retain input and retry ownership before the next DAG transition.
+Control decisions are applied once per accepted attempt; each loop visit has
+fresh attempt IDs. Result history does not imply that a superseded visit remains
+an input source for the current cursor.
+
 StageExecutor and ParticipantServer write their results. Module authors should
 not write a competing `record_command_result` for the same request.
 

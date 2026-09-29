@@ -32,12 +32,23 @@ class ServiceDagWorkspace:
         )
         return definition
 
-    def stage(self, *, settings=None, retries=0, on_exhausted="pause", timeout=None):
+    def stage(
+        self,
+        *,
+        settings=None,
+        retries=0,
+        on_exhausted="pause",
+        timeout=None,
+        source=None,
+        stage_kind=None,
+    ):
         self.stage_count += 1
         name = f"stage-{self.stage_count}"
         code = self.root / "modules" / name / "1"
         code.mkdir(parents=True)
-        shutil.copy2(Path(__file__).with_name("dag_stage.py"), code / "main.py")
+        shutil.copy2(
+            source or Path(__file__).with_name("dag_stage.py"), code / "main.py"
+        )
         (code / "module.yaml").write_text(
             yaml.safe_dump(
                 {
@@ -45,6 +56,7 @@ class ServiceDagWorkspace:
                     "name": name,
                     "version": "1",
                     "role": "stage",
+                    **({"stage_kind": stage_kind} if stage_kind is not None else {}),
                     "implementation": "full",
                     "commands": {"start": ["python", "-B", "main.py"]},
                     "defaults": {},

@@ -33,11 +33,13 @@ from core.runner_utils.snapshots import ExperimentSnapshots
 from core.runner_utils.stages import StageRunner
 from core.runner_utils.state import (
     JsonObject,
+    JsonValue,
     ModuleRole,
     RunnerState,
     RunnerStateStore,
     ServiceInstance,
     StageAttempt,
+    StageOutcome,
     state_from_document,
     state_to_document,
 )
@@ -226,6 +228,13 @@ class ExperimentRunner:
         wake_task = None
         readiness_task = None
         try:
+            if (
+                self._state is not None
+                and self._state.last_dag_decision is not None
+                and self._state.last_dag_decision["decision"]["command"] == "stop"
+            ):
+                await self._stop_from_stage(recovering=True)
+                return
             if self._state is None and self._continue_source is not None:
                 manifest = await asyncio.to_thread(
                     self._snapshots.latest_valid, self._continue_source
@@ -239,6 +248,10 @@ class ExperimentRunner:
                     saved["pending_advance"]
                     and saved["cycle_number"] == saved["template"]["cycles"]
                     and saved["stage_position"] == len(saved["template"]["stages"])
+                    and not (
+                        saved.get("last_dag_decision") is not None
+                        and saved["last_dag_decision"]["decision"]["command"] == "pause"
+                    )
                 ):
                     raise RuntimeError(
                         "The snapshot has no remaining cycles; use experiment rerun."
@@ -322,6 +335,12 @@ class ExperimentRunner:
             if action == "pause":
                 self._desired_mode = "paused"
             state.mode = self._desired_mode
+            if (
+                state.mode == "running"
+                and state.last_dag_decision is not None
+                and state.last_dag_decision["decision"]["command"] == "pause"
+            ):
+                state.last_dag_decision = None
             state.phase = (
                 "stage_running"
                 if state.active_attempt is not None
@@ -404,39 +423,25 @@ class ExperimentRunner:
                         state.stage_result_ids.pop(outcome.attempt.stage_id, None)
                         state.stage_result_origins.pop(outcome.attempt.stage_id, None)
                         raise RuntimeError("Stage execution requires experiment stop.")
-                    state.active_attempt = None
                     response = outcome.result
-                    if response is not None and response["result"] == "success":
-                        state.last_result = response["data"]
-                        state.last_result_id = outcome.attempt.result_request_id
-                        state.stage_result_ids[outcome.attempt.stage_id] = (
-                            outcome.attempt.result_request_id
-                        )
-                        state.stage_result_origins[outcome.attempt.stage_id] = (
-                            state.experiment_id
-                        )
-                    else:
-                        state.last_result = None
-                        state.last_result_id = None
-                        state.stage_result_ids.pop(outcome.attempt.stage_id, None)
-                        state.stage_result_origins.pop(outcome.attempt.stage_id, None)
-                    self._pending_advance = outcome.action == "advance"
-                    if outcome.action == "pause":
-                        state.mode = self._desired_mode = "paused"
-                    final = (
-                        self._pending_advance
-                        and state.stage_position == len(state.template["stages"])
-                        and state.cycle_number == state.template["cycles"]
-                    )
+                    self._apply_stage_outcome(outcome)
+                    final = self._at_dag_end()
                     state.phase = "waiting"
                     self._save_state()
+                    if (
+                        state.last_dag_decision is not None
+                        and state.last_dag_decision["decision"]["command"] == "stop"
+                    ):
+                        await self._stop_from_stage()
+                        return
                     mode = state.template["snapshots"]["mode"]
                     if (
-                        self._pending_advance
+                        outcome.action == "advance"
                         and not final
                         and (
                             mode == "after_stage"
                             or mode == "after_epoch"
+                            and self._pending_advance
                             and state.stage_position == len(state.template["stages"])
                         )
                     ):
@@ -474,11 +479,7 @@ class ExperimentRunner:
                 if wake_task.done():
                     self._wake.clear()
                     wake_task = asyncio.create_task(self._wake.wait())
-                    final = (
-                        self._pending_advance
-                        and state.stage_position == len(state.template["stages"])
-                        and state.cycle_number == state.template["cycles"]
-                    )
+                    final = self._at_dag_end()
                     if (
                         self._stage_task is None
                         and readiness_task is None
@@ -513,11 +514,7 @@ class ExperimentRunner:
                 # Manual recovery must finish before a new stage or final shutdown.
                 if self._service_retrying or self._maintenance:
                     continue
-                final = (
-                    self._pending_advance
-                    and state.stage_position == len(state.template["stages"])
-                    and state.cycle_number == state.template["cycles"]
-                )
+                final = self._at_dag_end()
                 if final:
                     state.pending_advance = self._pending_advance
                     self._maintenance = True
@@ -554,6 +551,7 @@ class ExperimentRunner:
                     continue
                 self._idle.clear()
                 if self._pending_advance:
+                    state.pending_input = None
                     state.stage_position += 1
                     if state.stage_position > len(state.template["stages"]):
                         state.cycle_number += 1
@@ -566,6 +564,7 @@ class ExperimentRunner:
                         for instance in state.services.values():
                             instance.restart_count = 0
                     self._pending_advance = False
+                state.last_dag_decision = None
                 state.pause_requested = False
                 state.phase = "stage_running"
                 self._save_state()
@@ -591,6 +590,137 @@ class ExperimentRunner:
             self._publish_resources()
             self._ready.set()
             self._idle.set()
+
+    def _at_dag_end(self) -> bool:
+        state = self._state
+        conditional_pause = (
+            state.last_dag_decision is not None
+            and state.last_dag_decision["decision"]["command"] == "pause"
+        )
+        return (
+            self._pending_advance
+            and state.stage_position == len(state.template["stages"])
+            and state.cycle_number == state.template["cycles"]
+            and not conditional_pause
+        )
+
+    def _apply_stage_outcome(self, outcome: StageOutcome) -> None:
+        """Commit output and its cursor decision together at a stage boundary."""
+        state = self._state
+        response = outcome.result
+        stage_id = outcome.attempt.stage_id
+        state.active_attempt = None
+        state.last_dag_decision = None
+        self._pending_advance = outcome.action == "advance"
+        if outcome.action == "pause":
+            state.mode = self._desired_mode = "paused"
+        if response is None or response["result"] != "success":
+            state.last_result = state.last_result_id = None
+            state.stage_result_ids.pop(stage_id, None)
+            state.stage_result_origins.pop(stage_id, None)
+            return
+        # Keep a transferred input while the cursor still names its target:
+        # manual rerun must receive the same input even after successful output.
+        state.last_result = response["data"]
+        state.last_result_id = outcome.attempt.result_request_id
+        state.stage_result_ids[stage_id] = outcome.attempt.result_request_id
+        state.stage_result_origins[stage_id] = state.experiment_id
+        definition = state.template["stages"][state.stage_position - 1]
+        if "returns_data" not in definition:
+            return
+        decision = response["execution"]["dag_decision"]
+        source = {
+            "request_id": outcome.attempt.result_request_id,
+            "source_stage_id": stage_id,
+            "experiment_id": state.experiment_id,
+        }
+        state.last_dag_decision = {**source, "decision": decision}
+        self._retain_input_artifacts(response["data"])
+        command = decision["command"]
+        if command == "pause":
+            state.mode = self._desired_mode = "paused"
+            state.pause_requested = True
+        elif command == "move":
+            target = decision["stage_id"]
+            position = next(
+                index
+                for index, item in enumerate(state.template["stages"], 1)
+                if item["stage_id"] == target
+            )
+            # The source remains in the journal even when a backwards jump
+            # invalidates its current result reference.
+            state.pending_input = {**source, "stage_id": target}
+            for item in state.template["stages"][position - 1 :]:
+                state.stage_result_ids.pop(item["stage_id"], None)
+                state.stage_result_origins.pop(item["stage_id"], None)
+                state.stage_retry_counts.pop(item["stage_id"], None)
+            state.stage_position = position
+            self._pending_advance = False
+
+    def _retain_input_artifacts(self, data: JsonValue) -> None:
+        """Protect experiment-relative artifact references carried through a jump."""
+        state = self._state
+        root = state.experiment_directory.resolve()
+        artifacts = root / "shared_artifacts"
+        pending = [data]
+        retained = set(state.retained_artifacts)
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+            elif isinstance(value, str):
+                try:
+                    relative = Path(value)
+                    if relative.anchor:
+                        continue
+                    resolved = (root / relative).resolve()
+                    if resolved.is_relative_to(artifacts) and resolved.exists():
+                        retained.add(resolved.relative_to(root).as_posix())
+                except (OSError, ValueError):
+                    # Arbitrary application strings need not be filesystem paths.
+                    continue
+        state.retained_artifacts = sorted(retained)
+
+    async def _stop_from_stage(self, *, recovering: bool = False) -> None:
+        """Use ordinary shutdown without cancelling or awaiting this DAG task."""
+        future, self._step_future = self._step_future, None
+        try:
+            if recovering:
+                # A crash may leave completed snapshot calls in saved queues.
+                # Preserve their accepted outcomes before stopping unresolved work.
+                for instance in self._state.services.values():
+                    requests = list(instance.pending_requests)
+                    if instance.active_request is not None:
+                        requests.append(instance.active_request)
+                    for request in requests:
+                        record = self._journal.client.read_command_result(
+                            request["request_id"]
+                        )
+                        if record is None or record["author"] != "runner":
+                            continue
+                        if request is instance.active_request:
+                            instance.active_request = None
+                        else:
+                            instance.pending_requests.remove(request)
+                self._save_state()
+            await self._stop(finalize_snapshot=not recovering)
+        except BaseException as error:
+            if future is not None and not future.done():
+                future.set_exception(error)
+            raise
+        if future is not None and not future.done():
+            future.set_result(
+                {
+                    "attempt_id": None
+                    if self._last_attempt is None
+                    else self._last_attempt.attempt_id,
+                    "result": self._last_response,
+                    "phase": self._state.phase,
+                }
+            )
 
     async def pause(self) -> None:
         if self._task is None or self._task.done():
@@ -642,6 +772,11 @@ class ExperimentRunner:
         state.mode = "running"
         self._desired_mode = "running"
         state.pause_requested = False
+        if (
+            state.last_dag_decision is not None
+            and state.last_dag_decision["decision"]["command"] == "pause"
+        ):
+            state.last_dag_decision = None
         self._save_state()
         self._wake.set()
 
@@ -668,12 +803,21 @@ class ExperimentRunner:
             for definition in state.template["services"]
         ):
             raise RuntimeError("Start all declared services before stepping.")
+        if (
+            state.last_dag_decision is not None
+            and state.last_dag_decision["decision"]["command"] == "pause"
+        ):
+            state.last_dag_decision = None
+            self._save_state()
         self._step_future = asyncio.get_running_loop().create_future()
         future = self._step_future
         self._wake.set()
         try:
             result = await asyncio.shield(future)
-            if result.get("phase") == "completed" and self._task is not None:
+            if (
+                result.get("phase") in ("completed", "stopped")
+                and self._task is not None
+            ):
                 # A final step includes publishing its snapshot and closing the
                 # DAG task, so a following command can use the completed state.
                 await asyncio.shield(self._task)
@@ -685,6 +829,9 @@ class ExperimentRunner:
             raise
 
     async def stop(self) -> JsonObject:
+        return await self._stop(finalize_snapshot=True)
+
+    async def _stop(self, *, finalize_snapshot: bool) -> JsonObject:
         self._stop_requested = True
         if (
             self._service_control_task is not None
@@ -700,7 +847,11 @@ class ExperimentRunner:
         ):
             self._maintenance_task.cancel()
             await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        if self._task is not None and not self._task.done():
+        if (
+            self._task is not None
+            and self._task is not asyncio.current_task()
+            and not self._task.done()
+        ):
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         if self._state is not None:
@@ -721,6 +872,7 @@ class ExperimentRunner:
             try:
                 if (
                     stopped
+                    and finalize_snapshot
                     and self._state.pending_rebuild is None
                     and self._state.phase
                     not in (
@@ -975,6 +1127,10 @@ class ExperimentRunner:
         ):
             raise ValueError("Position is outside the DAG.")
         state.stage_position = position
+        state.pending_input = None
+        state.last_dag_decision = None
+        if state.last_result_id not in state.stage_result_ids.values():
+            state.last_result = state.last_result_id = None
         self._pending_advance = False
         self._save_state()
 
@@ -1520,6 +1676,19 @@ class ExperimentRunner:
             }
             state.stage_position = new_position
             self._pending_advance = state.pending_advance = new_pending
+            if state.pending_input is not None and (
+                state.pending_input["source_stage_id"] not in preserved
+                or state.pending_input["stage_id"] not in preserved
+                or state.pending_input["stage_id"]
+                != new_stages[new_position - 1]["stage_id"]
+            ):
+                state.pending_input = None
+            if state.last_dag_decision is not None and (
+                state.last_dag_decision["source_stage_id"] not in preserved
+                or state.last_dag_decision["decision"].get("stage_id") is not None
+                and state.pending_input is None
+            ):
+                state.last_dag_decision = None
             state.last_result = state.last_result_id = None
             predecessor = next_position - 1
             if predecessor >= 0:
@@ -2836,6 +3005,8 @@ class ExperimentRunner:
             "mode": state.mode if state is not None else self._desired_mode,
             "cycle_number": None if state is None else state.cycle_number,
             "stage_position": None if state is None else state.stage_position,
+            "pending_input": None if state is None else state.pending_input,
+            "dag_decision": None if state is None else state.last_dag_decision,
             "attempt_id": None if attempt is None else attempt.attempt_id,
             "executor": None if attempt is None else attempt.executor_status,
             "result": None if state is None else state.last_result,

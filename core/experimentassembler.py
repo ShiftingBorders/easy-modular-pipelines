@@ -177,6 +177,14 @@ class ExperimentAssembler:
             required = {"module", "settings"}
             if role == "stage":
                 required.update({"timeout_seconds", "errors"})
+                if "returns_data" in definition:
+                    if "service_id" in definition:
+                        raise ValueError(
+                            "returns_data belongs to conditional stage modules."
+                        )
+                    if type(definition["returns_data"]) is not bool:
+                        raise TypeError("returns_data must be a boolean.")
+                    required.add("returns_data")
                 if "service_id" in definition:
                     required.remove("module")
                     required.add("service_id")
@@ -624,6 +632,13 @@ class ExperimentAssembler:
         directory = state.experiment_directory / "modules" / name / version
         if not directory.resolve().is_relative_to(state.experiment_directory.resolve()):
             raise ValueError("Module code escapes the experiment.")
+        manifest = self.read_module(directory)
+        conditional = manifest.get("stage_kind") == "conditional"
+        if conditional != ("returns_data" in definition):
+            raise ValueError(
+                "Conditional stages require returns_data in the template; "
+                "ordinary stages and services must omit it."
+            )
         actual = self._module_manager.module_hash(name, target_folder=directory)
         registered = self._module_manager.hash_db.get_module_hash(name, version)
         if (

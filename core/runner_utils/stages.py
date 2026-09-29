@@ -18,7 +18,11 @@ from core.logger_utils.events import LoggingError
 from core.runner_utils.connection import ParticipantConnection
 from core.runner_utils.journal import RunnerJournal
 from core.runner_utils.launch import ModuleLauncher
-from core.runner_utils.results import read_result
+from core.runner_utils.results import (
+    MissingConditionalDataError,
+    normalize_conditional_result,
+    read_result,
+)
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.state import (
     JsonObject,
@@ -27,6 +31,7 @@ from core.runner_utils.state import (
     RunnerStateStore,
     StageAttempt,
     StageOutcome,
+    state_to_document,
 )
 
 
@@ -72,6 +77,7 @@ class StageRunner:
         input_data = (
             self.select_input(state) if recovered is None else recovered.input_data
         )
+        execution_id = recovered.stage_execution_id if recovered else str(uuid4())
         if manual:
             state.stage_result_ids.pop(stage_id, None)
             state.stage_result_origins.pop(stage_id, None)
@@ -81,7 +87,9 @@ class StageRunner:
             attempt = (
                 recovered
                 if recovered is not None and recovered.outcome != "unknown_stopped"
-                else await self._start_attempt(state, input_data)
+                else await self._start_attempt(
+                    state, input_data, execution_id=execution_id
+                )
             )
             recovered = None
             response = await self._collect_result(state, attempt)
@@ -104,11 +112,7 @@ class StageRunner:
             used = state.stage_retry_counts.get(stage_id, 0)
             if used >= policy["retries"]:
                 return StageOutcome(
-                    attempt,
-                    response,
-                    "advance"
-                    if policy["on_exhausted"] == "skip"
-                    else policy["on_exhausted"],
+                    attempt, response, self._exhausted_action(definition, response)
                 )
             await asyncio.sleep(policy["retry_delay_seconds"])
             if state.pause_requested:
@@ -122,7 +126,47 @@ class StageRunner:
             state.stage_retry_counts[stage_id] = used + 1
             self._save_state(state)
 
+    def _exhausted_action(
+        self, definition: JsonObject, response: JsonObject | None
+    ) -> Literal["advance", "pause", "stop"]:
+        """Select failure policy separately from attempt execution and retries."""
+        if (
+            definition.get("returns_data") is True
+            and response is not None
+            and (response.get("error") or {}).get("code") == "conditional_missing_data"
+        ):
+            return "stop"
+        action = definition["errors"]["on_exhausted"]
+        return "advance" if action == "skip" else action
+
     def select_input(self, state: RunnerState) -> JsonValue:
+        if state.pending_input is not None:
+            transfer = state.pending_input
+            if (
+                transfer["stage_id"]
+                != state.template["stages"][state.stage_position - 1]["stage_id"]
+            ):
+                raise ValueError("Pending input belongs to another stage.")
+            record = read_result(
+                self._journal.client,
+                transfer["request_id"],
+                expected={
+                    "experiment_id": transfer["experiment_id"],
+                    "stage_id": transfer["source_stage_id"],
+                },
+                accepted=True,
+            )
+            if (
+                record is None
+                or record["outcome"] != "succeeded"
+                or record["response"]["result"] != "success"
+                or record["response"].get("execution", {}).get("dag_decision")
+                != {"command": "move", "stage_id": transfer["stage_id"]}
+            ):
+                raise ValueError(
+                    "Move input has no accepted successful journal result."
+                )
+            return record["response"]["data"]
         if state.stage_position == 1:
             return None
         previous = state.template["stages"][state.stage_position - 2]["stage_id"]
@@ -177,7 +221,11 @@ class StageRunner:
         }
 
     async def _start_attempt(
-        self, state: RunnerState, input_data: JsonValue
+        self,
+        state: RunnerState,
+        input_data: JsonValue,
+        *,
+        execution_id: str | None = None,
     ) -> StageAttempt:
         definition = state.template["stages"][state.stage_position - 1]
         module = self._launcher._assembler.module_reference(state.template, definition)
@@ -195,7 +243,7 @@ class StageRunner:
         attempt = StageAttempt(
             attempt_id,
             stage_id,
-            str(uuid4()),
+            execution_id or str(uuid4()),
             state.cycle_number,
             number,
             directory,
@@ -267,6 +315,10 @@ class StageRunner:
             context=context,
         )
         self._save_state(state)
+        if state.pending_input is not None or number > 1:
+            # A self/backwards jump may reuse an attempt directory's parent
+            # immediately after the old executor published its result.
+            await self.close(state)
         self._prune_artifacts(state, attempt)
         if self._notify_resources is not None:
             self._notify_resources()
@@ -388,6 +440,43 @@ class StageRunner:
         response: JsonObject,
         outcome: str,
     ) -> JsonObject:
+        definition = state.template["stages"][state.stage_position - 1]
+        if "returns_data" in definition and response["result"] == "success":
+            decision = response["data"]
+            try:
+                response = normalize_conditional_result(
+                    response, attempt.input_data, definition, state.template
+                )
+            except (ValueError, TypeError) as error:
+                code = (
+                    "conditional_missing_data"
+                    if isinstance(error, MissingConditionalDataError)
+                    else "invalid_conditional_result"
+                )
+                response = {
+                    **response,
+                    "result": "fail",
+                    "data": {
+                        "reason": code,
+                        "message": str(error),
+                    },
+                    "error": {"code": code, "message": str(error)},
+                }
+                outcome = "failed"
+            else:
+                if (
+                    not definition["returns_data"]
+                    and isinstance(decision, dict)
+                    and "data" in decision
+                ):
+                    self._journal.client.record_error(
+                        ValueError(
+                            "Conditional stage returned data with returns_data=false; "
+                            "the payload was ignored."
+                        ),
+                        error_code="conditional_unexpected_data",
+                        context=self._context(state, attempt),
+                    )
         state.used_request_ids.add(attempt.request_id)
         self._journal.client.record_command_result(
             attempt.request_id,
@@ -537,7 +626,7 @@ class StageRunner:
                         attempt.executor_status = reply["data"]
                         attempt.process_identity = reply["data"].get("process")
                         attempt.started_at = reply["data"].get("started_at")
-                        self._save_state(state)
+                        self._save_state(state, checkpoint=first_observation)
                         if first_observation and self._notify_resources is not None:
                             self._notify_resources()
                     except (OSError, EOFError):
@@ -555,7 +644,9 @@ class StageRunner:
                             # reconnecting. Reenter normal result validation and
                             # deadline handling before declaring the attempt unknown.
                             if (
-                                self._journal.client.read_command_result(attempt.request_id)
+                                self._journal.client.read_command_result(
+                                    attempt.request_id
+                                )
                                 is not None
                             ):
                                 continue
@@ -714,11 +805,14 @@ class StageRunner:
                 except (OSError, EOFError):
                     # The executor may finish between the journal read and connect.
                     # A matching committed result no longer needs a live endpoint.
-                    if read_result(
-                        self._journal.client,
-                        attempt.request_id,
-                        expected=attempt.participant,
-                    ) is None:
+                    if (
+                        read_result(
+                            self._journal.client,
+                            attempt.request_id,
+                            expected=attempt.participant,
+                        )
+                        is None
+                    ):
                         raise
             self._journal.client.record_event(
                 "stage.reconnected", {}, context=self._context(state, attempt)
@@ -776,6 +870,17 @@ class StageRunner:
                 continue
             suffix = path.name.removeprefix("attempt_")
             if suffix.isdigit() and int(suffix) <= attempt.attempt_number - keep:
+                resolved = path.resolve()
+                if any(
+                    (state.experiment_directory / retained)
+                    .resolve()
+                    .is_relative_to(resolved)
+                    or resolved.is_relative_to(
+                        (state.experiment_directory / retained).resolve()
+                    )
+                    for retained in state.retained_artifacts
+                ):
+                    continue
                 if not path.resolve().is_relative_to(
                     state.experiment_directory.resolve()
                 ):
@@ -810,7 +915,16 @@ class StageRunner:
                 return True
             raise
 
-    def _save_state(self, state: RunnerState) -> None:
+    def _save_state(self, state: RunnerState, *, checkpoint: bool = True) -> None:
+        # Retry/input ownership must survive loss of the optional state.json
+        # copy, including a crash between acceptance and the DAG transition.
+        if checkpoint:
+            state.checkpoint_id = str(uuid4())
+            self._journal.client.record_event(
+                "runner.checkpoint",
+                state_to_document(state),
+                context={"experiment_id": state.experiment_id, "run_id": state.run_id},
+            )
         try:
             self._state_store.save(state)
         except OSError as error:
@@ -842,7 +956,11 @@ class StageRunner:
                 )
         self._executor_processes = remaining
         if state is not None:
-            for request_id in state.stage_result_ids.values():
+            request_ids = set(state.stage_result_ids.values())
+            for transfer in (state.pending_input, state.last_dag_decision):
+                if transfer is not None:
+                    request_ids.add(transfer["request_id"])
+            for request_id in request_ids:
                 record = self._journal.client.read_command_result(request_id)
                 if record is None:
                     raise ValueError("An accepted result is missing from the journal.")

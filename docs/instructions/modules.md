@@ -34,7 +34,8 @@ defaults:
   message: Hello from EMP
 ```
 
-These seven top-level fields are required; unknown fields are rejected.
+These seven top-level fields are required. A conditional stage additionally
+declares `stage_kind: conditional`; other unknown fields are rejected.
 `name` and `version` must be valid portable folder names.
 Keep versions quoted so YAML reads them as strings.
 
@@ -129,6 +130,51 @@ A successful attempt requires **exit code 0 and exactly one stdout JSON**:
 not exit the process; return from your code afterward. A failure result,
 nonzero exit code, missing JSON, or invalid JSON fails the attempt.
 Failure data is not passed to the next stage.
+
+### Conditional stages
+
+A conditional module keeps `role: stage` and adds `stage_kind: conditional`
+to its manifest. Each template node using it must declare the boolean
+`returns_data` outside `settings`. Ordinary stages and services omit both
+conditional-specific fields.
+
+Use the same StageClient and successful process-exit contract. The following
+are alternative final results; publish exactly one and return:
+
+```python
+client.succeed(None)  # returns_data=false: continue with the original input.
+client.succeed({"command": "pause"})  # returns_data=false
+client.succeed({"command": "stop"})  # returns_data=false
+client.succeed({
+    "command": "move",
+    "stage_id": client.settings["target_stage_id"],
+    "data": {"value": 42},
+})
+```
+
+`data` passed to `succeed` is a decision object, or `None` for no command when
+`returns_data` is false.
+The nested `data` is the application output. With `returns_data: true` it is
+required, including in a decision without a command. An explicit `null` counts
+as supplied data. A missing field fails the attempt, uses the configured retries,
+and stops the DAG after they are exhausted, even if `on_exhausted` is `pause` or
+`skip`. With a command, supplied data replaces the input.
+With `returns_data: false`, nested data is ignored and the input is forwarded.
+Supplying that disabled payload records a `conditional_unexpected_data` error
+in the journal without failing the attempt or suppressing a valid command.
+A valid decision without a command advances normally and forwards the input, even
+if nested data was supplied. An empty stdout remains a failed attempt.
+
+Only `pause`, `stop`, and `move` are supported. The experiment is implicit.
+Only `move` accepts `stage_id`, which names an existing DAG node, including a
+service-call node, an earlier node, or the conditional node itself. Unknown
+commands, fields, and invalid targets fail the attempt under its error policy.
+Commands in failed or timed-out attempts never take effect.
+
+The runner accepts application output separately from the participant's raw
+decision and applies it at the completed-stage boundary. See
+[conditional execution](../basic_dag.md#conditional-execution) for pause, step,
+retries, loops, and recovery behavior.
 
 Send diagnostics to stderr or the [library logger](../logging.md). Do not print
 banners, dependency installation output, or intermediate results to stdout.

@@ -73,9 +73,55 @@ replace earlier values, and `null` is an explicit value. The accepted result
 data of a stage becomes the next stage's input. Modules must handle missing or
 incompatible input themselves.
 
+### Conditional nodes
+
+A module whose manifest declares `role: stage` and `stage_kind: conditional`
+requires `returns_data` on every referencing node:
+
+```yaml
+- stage_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  module:
+    name: condition
+    version: "1.0"
+    hash: "<hash-returned-by-module-add>"
+  returns_data: true
+  settings:
+    target_stage_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  timeout_seconds: 30
+  errors:
+    retries: 0
+    retry_delay_seconds: 1
+    on_exhausted: pause
+```
+
+This is a fragment: register the conditional module and include the target node
+in the full template. The target setting belongs to the module's application
+contract; the runner validates the actual `move` decision when it is returned.
+Use explicit stable UUIDs for nodes addressed by conditions.
+
+`returns_data: true` requires a nested `data` field in every successful decision,
+including one without a command. Explicit null is supplied data. Omission fails
+the attempt; after the configured retries are exhausted, the DAG stops regardless
+of `errors.on_exhausted`. With a command, supplied data replaces the stage input.
+`false` ignores the supplied payload and forwards the input. A valid decision
+without a command advances normally with the original input. The boolean is
+required even when false, and must be omitted on ordinary stages and service-call
+nodes.
+Supplying a payload when `returns_data` is false records a
+`conditional_unexpected_data` error; the ignored payload does not fail the
+attempt or prevent normal command handling.
+
+Changing `returns_data` during reload changes the node definition and invalidates
+results under the normal reload rules. See the
+[result contract](instructions/modules.md#conditional-stages).
+
 `cycles` and `keep_attempts` are positive integers. `keep_attempts` controls
 retention of older attempts for the same stage in the current epoch, not
 retention of journal history.
+Artifact paths carried by successful conditional results are protected from
+attempt pruning for the remainder of the experiment, including subsequent
+visits and cycles. They can therefore exceed `keep_attempts`. Internal artifact
+references must be standalone experiment-relative path strings in result data.
 
 ## Identity during reload
 
@@ -95,6 +141,9 @@ current-cycle result references for that node and its successors. A changed
 service affects its earliest DAG call and the following nodes. Journal history
 and attempt numbering are retained. Changing an unreferenced service alone does
 not invalidate stage results.
+Pending conditional input survives reload only when its source and target
+remain in the preserved prefix and the cursor still selects that target.
+Otherwise the transfer is cleared; the next attempt uses normal input selection.
 
 Services with unchanged definitions retain their instances. Restarted services
 with the same stable ID and module name load the protective snapshot's exported

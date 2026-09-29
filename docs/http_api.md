@@ -102,6 +102,16 @@ leaves `pending`. Completed responses carry `state`, `result`, `data`, and
 `error`. Success of `run` signals launch; it does not mean the DAG completed.
 Use `/state` to observe the experiment.
 
+For conditional execution, state additionally exposes `dag_decision` and
+`pending_input`. A decision identifies its source request/stage/experiment and
+the accepted command. Pending input identifies the move target and the journal
+result supplying its input; it is not a second copy of the payload. These fields
+are null when no corresponding decision or transfer remains active. Conditional
+commands originate in a stage result and do not submit an HTTP command receipt.
+The input assignment remains visible while the cursor names its target,
+including after completion, so a manual rerun can reuse that input. Ordinary
+advancement clears it before selecting the following node's input.
+
 An identical explicit ID can retrieve a retained identical submission.
 A conflicting reuse is rejected. This is not a permanent exactly-once guarantee:
 receipt retention is bounded, and loss of a response does not prove absence of

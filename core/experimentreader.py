@@ -47,7 +47,7 @@ class ExperimentReader:
         state = read_json(self._path(directory, "runner/state.json"))
         if state.get("experiment_id") != experiment_id:
             raise ValueError("Saved state belongs to another experiment.")
-        if state.get("schema_version") != 3:
+        if state.get("schema_version") not in (3, 4):
             raise ValueError("Unsupported saved experiment state schema.")
         return {
             "experiment_id": experiment_id,
@@ -66,7 +66,7 @@ class ExperimentReader:
                 state = read_json(self._path(directory, "runner/state.json"))
                 if state.get("experiment_id") != identifier:
                     raise ValueError("Saved state belongs to another experiment.")
-                if state.get("schema_version") != 3:
+                if state.get("schema_version") not in (3, 4):
                     raise ValueError("Unsupported saved experiment state schema.")
                 template = copy_json_object(state.get("template"), "saved template")
                 item.update(

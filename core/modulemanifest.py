@@ -37,7 +37,7 @@ def read_module_manifest(module_directory: Path) -> JsonObject:
         "defaults",
     }
     if (
-        module.keys() != required
+        module.keys() - {"stage_kind"} != required
         or type(module["schema_version"]) is not int
         or module["schema_version"] != 2
     ):
@@ -62,6 +62,12 @@ def read_module_manifest(module_directory: Path) -> JsonObject:
     ):
         raise NotImplementedError(
             "Modules require a stage/service role and full/action implementation."
+        )
+    if "stage_kind" in module and (
+        module["role"] != "stage" or module["stage_kind"] != "conditional"
+    ):
+        raise ValueError(
+            "stage_kind is only supported as conditional for stage modules."
         )
     commands = copy_json_object(module["commands"], "commands")
     if commands.keys() != {"start"}:

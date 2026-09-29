@@ -641,6 +641,8 @@ class ExperimentSnapshots:
                 if (
                     metadata["role"]
                     != ("service" if "service_id" in definition else role)
+                    or (metadata.get("stage_kind") == "conditional")
+                    != ("returns_data" in definition)
                     or (metadata["name"], metadata["version"]) != key
                     or digest != reference["hash"]
                 ):
@@ -659,12 +661,19 @@ class ExperimentSnapshots:
         if (
             state.last_result_id is not None
             and state.last_result_id not in state.stage_result_ids.values()
+            and (
+                state.pending_input is None
+                or state.last_result_id != state.pending_input["request_id"]
+            )
         ):
             raise ValueError(
                 "Snapshot retained result has no matching journal reference."
             )
         if state.last_result_id is None and state.last_result is not None:
             raise ValueError("Snapshot retained data has no journal reference.")
+        for relative in state.retained_artifacts:
+            if not (directory / "files" / relative).exists():
+                raise ValueError("Snapshot is missing a retained conditional artifact.")
         if set(state.services) != {
             item["service_id"] for item in state.template["services"]
         }:
@@ -738,6 +747,44 @@ class ExperimentSnapshots:
             try:
                 store.open()
                 try:
+                    for transfer in (state.pending_input, state.last_dag_decision):
+                        if transfer is None:
+                            continue
+                        record = read_result(
+                            store,
+                            transfer["request_id"],
+                            expected={
+                                "experiment_id": transfer["experiment_id"],
+                                "stage_id": transfer["source_stage_id"],
+                            },
+                            accepted=True,
+                        )
+                        if (
+                            record is None
+                            or record["outcome"] != "succeeded"
+                            or record["response"]["result"] != "success"
+                        ):
+                            raise ValueError(
+                                "Snapshot transition has no accepted result."
+                            )
+                        decision = (
+                            record["response"].get("execution", {}).get("dag_decision")
+                        )
+                        expected = transfer.get(
+                            "decision",
+                            {"command": "move", "stage_id": transfer.get("stage_id")},
+                        )
+                        if decision != expected:
+                            raise ValueError(
+                                "Snapshot transition differs from its journal decision."
+                            )
+                        if (
+                            transfer["request_id"] == state.last_result_id
+                            and record["response"]["data"] != state.last_result
+                        ):
+                            raise ValueError(
+                                "Snapshot transferred data differs from its journal result."
+                            )
                     for stage_id, request_id in state.stage_result_ids.items():
                         record = read_result(
                             store,
@@ -1235,6 +1282,14 @@ class ExperimentSnapshots:
             )
             document["checkpoint_id"] = None
             document["owner_identity"] = None
+            if (
+                manifest["state"]["phase"] == "stopped"
+                and document.get("last_dag_decision") is not None
+                and document["last_dag_decision"]["decision"]["command"] == "stop"
+            ):
+                # The stop completed in this snapshot. A continuation resumes
+                # after the condition, rather than issuing the stop again.
+                document["last_dag_decision"] = None
             document["used_request_ids"] = sorted(
                 set(document["used_request_ids"])
                 | set(transaction["stopped_state"]["used_request_ids"])

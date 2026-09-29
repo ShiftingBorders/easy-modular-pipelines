@@ -111,6 +111,50 @@ operations. The runtime validates the current phase and may reject a command.
 Moving or rerunning can change available input; each module must validate it.
 See [debugging](debugging.md) for a step-by-step workflow.
 
+## Conditional execution
+
+[Conditional stage modules](instructions/modules.md#conditional-stages) return
+an optional command after examining their input. The runner validates the
+successful result before changing execution:
+
+- No command advances to the next node and forwards the original input.
+- `pause` accepts the output and pauses before the next node. Resume does not
+  repeat the conditional node. A pause on the final node also delays finalization.
+- `stop` accepts the output and performs ordinary experiment/service shutdown.
+- `move` transfers the output to the named node and executes that node next.
+  Normal advancement resumes after the target finishes.
+
+A move can jump forwards, backwards, or to the same node. It starts new visits
+with fresh retry budgets; retries within a visit keep the same input and
+execution identity. A jump invalidates current results and retry counts for
+the target and subsequent nodes, while journal history remains available.
+The input transfer is captured before invalidation, including a jump back over
+its own source.
+
+`cycles` counts full passes: it increments only on ordinary advancement past
+the last node. A backwards or self-directed move does not increment it. There
+is no implicit jump limit; conditions must provide their own exit decision.
+Ordinary cycle advancement and manual rerun retain their existing retry-counter
+behavior; `move` starts fresh budgets for its target and the following nodes.
+External pause and stop remain available. A `step` executes one visit, applies
+its decision, and pauses before a move target starts; a conditional stop finishes
+shutdown before the step returns.
+
+The runner persists the accepted result, cursor decision, and pending input.
+Recovery reconciles an unfinished attempt or resumes from the committed
+transition without applying that transition twice. Snapshots, rollback, and
+continuations preserve pending input and its original journal identity. A
+continuation of a completed conditional stop does not issue that stop again.
+Recovery of an interrupted conditional shutdown stops remaining owned processes
+without restarting services or attempting a new final snapshot. Previously
+published valid snapshots remain the restoration points in that case.
+An explicit CLI move clears any pending conditional input and uses ordinary
+positional input selection.
+The input assignment remains attached to its target until the cursor advances,
+so a manual rerun of that target receives the original transferred input even
+after a successful visit. Advancing normally clears the assignment and uses
+the target's accepted output for the next node.
+
 ## Update the DAG while paused
 
 Use `reload_template` to update the selected experiment without creating another
@@ -199,7 +243,8 @@ snapshots are described in the [template reference](experiment_template.md).
 
 ## Current limits
 
-- Stages are sequential; branching and parallel stage execution are unsupported.
+- Stages execute sequentially. Conditional jumps and loops are supported;
+  parallel stage execution and dependency-based fan-out/fan-in are unsupported.
 - `replace` is not supported yet.
 - StageClient currently has a synchronous public API.
 - GPU/VRAM monitoring is unfinished and disabled.

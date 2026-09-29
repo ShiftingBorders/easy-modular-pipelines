@@ -31,12 +31,20 @@ and the `test_*.py` discovery pattern.
 | Service control review regressions | `uv run python -m unittest tests.test_service_control_review -v` |
 | Template reload | `uv run python -m unittest tests.runner_utils.test_template_reload tests.runner_utils.test_template_reload_services tests.runner_utils.test_template_reload_failures tests.runner_utils.test_template_reload_recovery tests.test_template_reload_cli tests.test_cli -v` |
 | Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
+| Conditional stages | `uv run python -m unittest tests.runner_utils.test_conditional_stages tests.runner_utils.test_conditional_transitions tests.runner_utils.test_conditional_recovery -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
 | Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
 | Dashboard | `uv run python -m unittest discover -s tests/dashboard_tests -t . -p "test_*.py" -v` |
 
 The weather suite includes real timing intervals, processes, and journal
 behavior; do not assume that all scenarios finish immediately.
+
+Conditional tests use real stage/service processes and the SQLite journal.
+They cover result errors and retries, exact move inputs, backwards/self visits,
+pause/stop/step boundaries, service-call targets, template reload, protected
+artifact reads, and snapshot/rollback/continuation. Owner-crash fixtures exercise
+accepted results, committed moves, and already running targets. Fault injection
+is confined to test helpers; production code has no test fault switches.
 
 Reload tests exercise stable IDs, cursor and input changes, selective service
 state transfer, journal preservation, receipts, and actual owner-process crashes.

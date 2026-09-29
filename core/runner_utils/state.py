@@ -230,6 +230,9 @@ class RunnerState:
         self.stage_result_origins: dict[str, str] = {}
         self.checkpoint_id: str | None = None
         self.owner_identity: JsonObject | None = None
+        self.pending_input: JsonObject | None = None
+        self.last_dag_decision: JsonObject | None = None
+        self.retained_artifacts: list[str] = []
 
 
 class StageOutcome:
@@ -287,7 +290,7 @@ def state_to_document(state: RunnerState) -> JsonObject:
     root = state.experiment_directory.resolve()
     document = dict(vars(state))
     document.pop("experiment_directory")
-    document["schema_version"] = 3
+    document["schema_version"] = 4
     template_path = state.template_path.resolve()
     document["template_path"] = (
         template_path.relative_to(root).as_posix()
@@ -325,6 +328,10 @@ def state_to_document(state: RunnerState) -> JsonObject:
 
 def state_from_document(root: Path, document: JsonObject) -> RunnerState:
     document = copy_json_object(document, "runner state")
+    if type(document.get("schema_version")) is int and document["schema_version"] == 3:
+        document.setdefault("pending_input", None)
+        document.setdefault("last_dag_decision", None)
+        document.setdefault("retained_artifacts", [])
     fields = {
         "schema_version",
         "experiment_id",
@@ -353,11 +360,14 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         "stage_result_origins",
         "checkpoint_id",
         "owner_identity",
+        "pending_input",
+        "last_dag_decision",
+        "retained_artifacts",
     }
     if (
         document.keys() != fields
         or type(document["schema_version"]) is not int
-        or document["schema_version"] != 3
+        or document["schema_version"] not in (3, 4)
     ):
         raise ValueError("Unsupported runner state schema.")
     template_path = Path(document["template_path"])
@@ -462,6 +472,50 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         UUID(stage_id)
         require_text(origin, "result experiment ID")
     state.stage_result_origins = origins
+    stage_ids = {item["stage_id"] for item in state.template["stages"]}
+    for key in ("pending_input", "last_dag_decision"):
+        value = document[key]
+        if value is None:
+            continue
+        value = copy_json_object(value, key)
+        expected = {"request_id", "source_stage_id", "experiment_id"}
+        expected.add("stage_id" if key == "pending_input" else "decision")
+        if value.keys() != expected:
+            raise ValueError(f"Invalid {key} fields.")
+        UUID(require_text(value["request_id"], "transition request_id"))
+        UUID(require_text(value["source_stage_id"], "transition source_stage_id"))
+        require_text(value["experiment_id"], "transition experiment_id")
+        if value["source_stage_id"] not in stage_ids:
+            raise ValueError("Saved transition refers to an unknown source stage.")
+        if key == "pending_input":
+            if value["stage_id"] not in stage_ids:
+                raise ValueError("Pending input targets an unknown stage.")
+            if (
+                state.stage_position > len(state.template["stages"])
+                or value["stage_id"]
+                != state.template["stages"][state.stage_position - 1]["stage_id"]
+            ):
+                raise ValueError("Pending input must belong to the current cursor.")
+        else:
+            decision = copy_json_object(value["decision"], "DAG decision")
+            command = decision.get("command")
+            if command not in (None, "pause", "stop", "move"):
+                raise ValueError("Invalid saved DAG command.")
+            fields = {"command", "stage_id"} if command == "move" else {"command"}
+            if decision.keys() != fields:
+                raise ValueError("Invalid saved DAG decision fields.")
+            if command == "move" and decision["stage_id"] not in stage_ids:
+                raise ValueError("Saved move targets an unknown stage.")
+        setattr(state, key, value)
+    retained = document["retained_artifacts"]
+    if type(retained) is not list or len(retained) != len(set(retained)):
+        raise ValueError("retained_artifacts must be a unique array of paths.")
+    artifacts_root = (root / "shared_artifacts").resolve()
+    for relative in retained:
+        path = Path(require_text(relative, "retained artifact"))
+        if path.anchor or not (root / path).resolve().is_relative_to(artifacts_root):
+            raise ValueError("Retained artifact path escapes shared_artifacts.")
+    state.retained_artifacts = retained
     service_request_ids = set()
     for service_id, saved in document["services"].items():
         saved = copy_json_object(saved, "service state")
