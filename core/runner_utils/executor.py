@@ -173,47 +173,7 @@ class StageExecutor:
         error = None
         response = None
         try:
-            environment = dict(os.environ)
-            library_root = str(Path(__file__).resolve().parents[2])
-            environment["PYTHONPATH"] = os.pathsep.join(
-                filter(None, (library_root, environment.get("PYTHONPATH")))
-            )
-            spawn = asyncio.create_task(
-                asyncio.create_subprocess_exec(
-                    *self._launch["argv"],
-                    cwd=self._launch["code_directory"],
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=environment,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            )
-            try:
-                self._process = await asyncio.shield(spawn)
-            except asyncio.CancelledError:
-                self._process = await spawn
-                raise
-            self._started_at = datetime.now(UTC).isoformat()
-            self._started_monotonic = time.monotonic()
-            try:
-                self._process_identity = process_identity(self._process.pid)
-            except OSError:
-                if self._process.returncode is None:
-                    raise
-            write_json(
-                self._directory / "process.json",
-                {
-                    **self._context,
-                    "executor": process_identity(os.getpid()),
-                    "stage": self._process_identity,
-                    "started_at": self._started_at,
-                    "started_monotonic": self._started_monotonic,
-                },
-            )
-            self._logger.record_event(
-                "stage.process_started", self._describe(), context=self._context
-            )
+            await self._start_process()
             streams = asyncio.gather(
                 self._process.wait(),
                 capture_stream(
@@ -267,6 +227,49 @@ class StageExecutor:
                 "execution": execution,
             }
         return {**response, "execution": execution}
+
+    async def _start_process(self) -> None:
+        environment = dict(os.environ)
+        library_root = str(Path(__file__).resolve().parents[2])
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (library_root, environment.get("PYTHONPATH")))
+        )
+        spawn = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *self._launch["argv"],
+                cwd=self._launch["code_directory"],
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        )
+        try:
+            self._process = await asyncio.shield(spawn)
+        except asyncio.CancelledError:
+            self._process = await spawn
+            raise
+        self._started_at = datetime.now(UTC).isoformat()
+        self._started_monotonic = time.monotonic()
+        try:
+            self._process_identity = process_identity(self._process.pid)
+        except OSError:
+            if self._process.returncode is None:
+                raise
+        write_json(
+            self._directory / "process.json",
+            {
+                **self._context,
+                "executor": process_identity(os.getpid()),
+                "stage": self._process_identity,
+                "started_at": self._started_at,
+                "started_monotonic": self._started_monotonic,
+            },
+        )
+        self._logger.record_event(
+            "stage.process_started", self._describe(), context=self._context
+        )
 
     async def _interrupt(self, reason: str) -> None:
         async with self._stop_lock:
