@@ -81,23 +81,7 @@ class ParticipantServer:
             )
         if self.endpoint_path.exists():
             previous = read_json(self.endpoint_path)
-            identity = previous.get("process")
-            if isinstance(identity, dict):
-                try:
-                    # Windows retains creation identity while another process
-                    # holds a handle to an already terminated child.
-                    if (
-                        process_running(identity["pid"])
-                        and process_identity(identity["pid"]) == identity
-                    ):
-                        raise RuntimeError(
-                            "The endpoint is still owned by a live participant."
-                        )
-                except (FileNotFoundError, ProcessLookupError):
-                    pass
-                except OSError as error:
-                    if getattr(error, "winerror", None) not in (87, 1168):
-                        raise
+            self._check_previous_endpoint(previous)
         self.endpoint_path.parent.mkdir(parents=True, exist_ok=True)
         self._token = secrets.token_urlsafe(48)
         self._token_path.write_text(self._token, encoding="utf-8")
@@ -120,6 +104,25 @@ class ParticipantServer:
         except BaseException:
             await self.close()
             raise
+
+    def _check_previous_endpoint(self, previous: JsonObject) -> None:
+        identity = previous.get("process")
+        if isinstance(identity, dict):
+            try:
+                # Windows retains creation identity while another process
+                # holds a handle to an already terminated child.
+                if (
+                    process_running(identity["pid"])
+                    and process_identity(identity["pid"]) == identity
+                ):
+                    raise RuntimeError(
+                        "The endpoint is still owned by a live participant."
+                    )
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (87, 1168):
+                    raise
 
     async def _send(self, writer: asyncio.StreamWriter, message: JsonObject) -> None:
         entry = self._clients.get(writer)
@@ -219,20 +222,7 @@ class ParticipantServer:
             if role == "module":
                 response = await self._module_handler(request)
             elif command == "command_state":
-                response = {
-                    "result": "success",
-                    "data": {
-                        **({} if self._describe is None else self._describe()),
-                        "current": None
-                        if self._current is None
-                        else self._requests[self._current],
-                        "pending": [
-                            entry
-                            for key, entry in self._requests.items()
-                            if key != self._current
-                        ],
-                    },
-                }
+                response = self._command_state()
             elif command == "heartbeat" and (
                 self._failure is not None or self._stopping
             ):
@@ -245,32 +235,7 @@ class ParticipantServer:
                     },
                 }
             elif command in ("heartbeat", "interrupt", "shutdown"):
-                if command == "shutdown":
-                    self._stopping = True
-                response = await self._handler(request)
-                if (
-                    command in ("interrupt", "shutdown")
-                    and response.get("result") == "success"
-                ):
-                    target = request["args"].get("request_id")
-                    tasks = [
-                        job
-                        for key, job in self._work.items()
-                        if target is None or key == target
-                    ]
-                    for job in tasks:
-                        job.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                if command in ("interrupt", "shutdown"):
-                    self._logger.record_command_result(
-                        request["request_id"],
-                        validate_response(response),
-                        author="participant",
-                        outcome="succeeded"
-                        if response["result"] == "success"
-                        else "failed",
-                        context={**self._context, "request_id": request["request_id"]},
-                    )
+                response = await self._handle_control(request, command)
             else:
                 request_id = request["request_id"]
                 self._requests[request_id] = {
@@ -309,6 +274,47 @@ class ParticipantServer:
                 )
             except OSError:
                 pass
+
+    def _command_state(self) -> JsonObject:
+        response = {
+            "result": "success",
+            "data": {
+                **({} if self._describe is None else self._describe()),
+                "current": None
+                if self._current is None
+                else self._requests[self._current],
+                "pending": [
+                    entry
+                    for key, entry in self._requests.items()
+                    if key != self._current
+                ],
+            },
+        }
+        return response
+
+    async def _handle_control(self, request: JsonObject, command: str) -> JsonObject:
+        if command == "shutdown":
+            self._stopping = True
+        response = await self._handler(request)
+        if command in ("interrupt", "shutdown") and response.get("result") == "success":
+            target = request["args"].get("request_id")
+            tasks = [
+                job
+                for key, job in self._work.items()
+                if target is None or key == target
+            ]
+            for job in tasks:
+                job.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if command in ("interrupt", "shutdown"):
+            self._logger.record_command_result(
+                request["request_id"],
+                validate_response(response),
+                author="participant",
+                outcome="succeeded" if response["result"] == "success" else "failed",
+                context={**self._context, "request_id": request["request_id"]},
+            )
+        return response
 
     def _observe_work(self, request: JsonObject, task: asyncio.Task) -> None:
         request_id = request["request_id"]
