@@ -38,31 +38,13 @@ class HardwareSampler:
 
     def sample(self) -> dict[str, dict]:
         result = {}
-        disk_names = {
-            "total": "byte",
-            "used": "byte",
-            "free": "byte",
-            "percent": "percent",
-        }
         try:
             if not self.settings.disk_path:
                 raise ValueError("disk_not_configured")
             disk = psutil.disk_usage(self.settings.disk_path)
-            for field, unit in disk_names.items():
-                result[f"host_disk_{field}" + ("_bytes" if unit == "byte" else "")] = {
-                    "value": getattr(disk, field),
-                    "unit": unit,
-                    "attributes": {"path": self.settings.disk_path},
-                    "reason": None,
-                }
+            result.update(self._disk_metrics(disk, None))
         except (OSError, ValueError) as error:
-            for field, unit in disk_names.items():
-                result[f"host_disk_{field}" + ("_bytes" if unit == "byte" else "")] = {
-                    "value": None,
-                    "unit": unit,
-                    "attributes": {"path": self.settings.disk_path},
-                    "reason": str(error),
-                }
+            result.update(self._disk_metrics(None, error))
         now = time.monotonic()
         interface = self.settings.network_interface
         reason = None
@@ -127,6 +109,23 @@ class HardwareSampler:
                 },
             }
         # GPU/VRAM support is unfinished; do not call _sample_gpu here.
+        return result
+
+    def _disk_metrics(self, disk: object, error: BaseException | None) -> dict[str, dict]:
+        disk_names = {
+            "total": "byte",
+            "used": "byte",
+            "free": "byte",
+            "percent": "percent",
+        }
+        result = {}
+        for field, unit in disk_names.items():
+            result[f"host_disk_{field}" + ("_bytes" if unit == "byte" else "")] = {
+                "value": getattr(disk, field) if error is None else None,
+                "unit": unit,
+                "attributes": {"path": self.settings.disk_path},
+                "reason": None if error is None else str(error),
+            }
         return result
 
     def _sample_gpu(self) -> dict[str, dict]:
