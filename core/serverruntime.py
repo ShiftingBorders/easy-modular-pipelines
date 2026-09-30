@@ -21,13 +21,18 @@ from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 from pathlib import Path
 from queue import Empty, Full
-from typing import BinaryIO, Self
+from typing import TYPE_CHECKING, BinaryIO, Self
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from core.logger_utils.events import copy_json_object, require_number, require_text
-from core.runner_utils.runtimeio import read_json, write_json
+from core.runner_utils.runtimeio import _lock_open_stream, read_json, write_json
 from core.runner_utils.state import JsonObject
+
+if TYPE_CHECKING:
+    from core.logger import OperationLogger
+    from core.runner_utils.state import RunnerState
+
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "default_settings/webserver.json"
 SETTING_FIELDS = frozenset(
@@ -244,14 +249,7 @@ class ProjectLock:
                 stream.write(b"\0")
                 stream.flush()
             stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_open_stream(stream)
         except BaseException:
             stream.close()
             raise
@@ -323,40 +321,11 @@ def prepare_work_directory(settings: ServerSettings) -> tuple[Path, Path | None]
     seaweed_root = None
     seaweed_document = None
     if settings.filer_url is None:
-        seaweed_root = db_path.parent.parent / "seaweedfs"
-        if (
-            seaweed_root == db_path.parent
-            or seaweed_root in db_path.parent.parents
-            or db_path.parent in seaweed_root.parents
-        ):
-            raise ValueError(
-                "HashDB and SeaweedFS must use distinct sibling directories."
-            )
-        seaweed_config = seaweed_root / "config/seaweed.json"
-        if seaweed_config.exists():
-            seaweed_document = read_json(seaweed_config)
-        else:
-            seaweed_document = read_json(settings.seaweed_config_path)
-            for key in ("dir", "master.dir", "volume.dir.idx"):
-                if key in seaweed_document["start_args"]:
-                    raise ValueError(
-                        f"Local storage manages {key}; remove it from SeaweedFS defaults."
-                    )
-            seaweed_document["start_args"]["master.dir"] = "../master"
+        seaweed_root, seaweed_config, seaweed_document = _read_local_seaweed(
+            settings, db_path
+        )
         SeaWeedConfig.model_validate(seaweed_document)
-        if seaweed_document["start_args"].get("master.dir") != "../master":
-            raise ValueError("Local SeaweedFS requires master.dir=../master.")
-        if any(
-            key in seaweed_document["start_args"] for key in ("dir", "volume.dir.idx")
-        ):
-            raise ValueError("Local SeaweedFS volume paths are managed by the server.")
-        filer_config = seaweed_root / "config/filer.toml"
-        if filer_config.exists():
-            filer = tomllib.loads(filer_config.read_text(encoding="utf-8"))
-            if filer != {"leveldb2": {"enabled": True, "dir": "../filer"}}:
-                raise ValueError(
-                    "Local filer.toml must use only leveldb2 with dir=../filer."
-                )
+        filer_config = _validate_local_storage_paths(seaweed_root, seaweed_document)
     paths = [
         config_path,
         schema_path,
@@ -416,6 +385,47 @@ def prepare_work_directory(settings: ServerSettings) -> tuple[Path, Path | None]
     return db_path, seaweed_root
 
 
+def _read_local_seaweed(
+    settings: ServerSettings, db_path: Path
+) -> tuple[Path, Path, JsonObject]:
+    seaweed_root = db_path.parent.parent / "seaweedfs"
+    if (
+        seaweed_root == db_path.parent
+        or seaweed_root in db_path.parent.parents
+        or db_path.parent in seaweed_root.parents
+    ):
+        raise ValueError("HashDB and SeaweedFS must use distinct sibling directories.")
+    seaweed_config = seaweed_root / "config/seaweed.json"
+    if seaweed_config.exists():
+        seaweed_document = read_json(seaweed_config)
+    else:
+        seaweed_document = read_json(settings.seaweed_config_path)
+        for key in ("dir", "master.dir", "volume.dir.idx"):
+            if key in seaweed_document["start_args"]:
+                raise ValueError(
+                    f"Local storage manages {key}; remove it from SeaweedFS defaults."
+                )
+        seaweed_document["start_args"]["master.dir"] = "../master"
+    return seaweed_root, seaweed_config, seaweed_document
+
+
+def _validate_local_storage_paths(
+    seaweed_root: Path, seaweed_document: JsonObject
+) -> Path:
+    if seaweed_document["start_args"].get("master.dir") != "../master":
+        raise ValueError("Local SeaweedFS requires master.dir=../master.")
+    if any(key in seaweed_document["start_args"] for key in ("dir", "volume.dir.idx")):
+        raise ValueError("Local SeaweedFS volume paths are managed by the server.")
+    filer_config = seaweed_root / "config/filer.toml"
+    if filer_config.exists():
+        filer = tomllib.loads(filer_config.read_text(encoding="utf-8"))
+        if filer != {"leveldb2": {"enabled": True, "dir": "../filer"}}:
+            raise ValueError(
+                "Local filer.toml must use only leveldb2 with dir=../filer."
+            )
+    return filer_config
+
+
 def recovery_candidates(project_root: Path) -> list[str]:
     """A new owner must explicitly recover unfinished or unreadable previous runs."""
     import psutil
@@ -450,66 +460,70 @@ def recovery_candidates(project_root: Path) -> list[str]:
                 # Assembler-only drafts have never started an executor or services.
                 continue
             state = RunnerStateStore().load(root)
-            if state.pending_rebuild is not None:
-                candidates.append(experiment_id)
+            if not _needs_recovery(state, root, local):
                 continue
-            if (
-                state.phase == "idle"
-                and state.owner_identity is None
-                and state.active_attempt is None
-                and not state.services
-            ):
-                continue
-            if (
-                state.phase in ("stopped", "completed", "failed")
-                and state.active_attempt is None
-                and all(instance.stopped for instance in state.services.values())
-            ):
-                identities = [
-                    state.owner_identity,
-                    *(
-                        instance.process_identity
-                        for instance in state.services.values()
-                    ),
-                ]
-                lock = root / "executor.lock.json"
-                if lock.exists():
-                    identities.append(
-                        copy_json_object(
-                            read_json(lock).get("executor"), "executor identity"
-                        )
-                    )
-                alive = False
-                for identity in identities:
-                    if identity is None:
-                        continue
-                    if identity["host_id"] != local["host_id"]:
-                        alive = True
-                        break
-                    if identity["boot_id"] != local["boot_id"]:
-                        continue
-                    pid = identity["pid"]
-                    if type(pid) is not int or pid <= 0:
-                        raise ValueError("Invalid saved process identity.")
-                    try:
-                        process = psutil.Process(pid)
-                        if process_identity(pid) == identity:
-                            process.wait(timeout=0)
-                    except (
-                        psutil.NoSuchProcess,
-                        ProcessLookupError,
-                        FileNotFoundError,
-                    ):
-                        continue
-                    except psutil.TimeoutExpired:
-                        alive = True
-                        break
-                if not alive:
-                    continue
         except (OSError, ValueError, TypeError, KeyError, psutil.Error):
             pass
         candidates.append(experiment_id)
     return candidates
+
+
+def _needs_recovery(state: RunnerState, root: Path, local: JsonObject) -> bool:
+    import psutil
+
+    from core.runner_utils.runtimeio import process_identity
+
+    if state.pending_rebuild is not None:
+        return True
+    if (
+        state.phase == "idle"
+        and state.owner_identity is None
+        and state.active_attempt is None
+        and not state.services
+    ):
+        return False
+    if (
+        state.phase in ("stopped", "completed", "failed")
+        and state.active_attempt is None
+        and all(instance.stopped for instance in state.services.values())
+    ):
+        identities = [
+            state.owner_identity,
+            *(instance.process_identity for instance in state.services.values()),
+        ]
+        lock = root / "executor.lock.json"
+        if lock.exists():
+            identities.append(
+                copy_json_object(read_json(lock).get("executor"), "executor identity")
+            )
+        alive = False
+        for identity in identities:
+            if identity is None:
+                continue
+            if identity["host_id"] != local["host_id"]:
+                alive = True
+                break
+            if identity["boot_id"] != local["boot_id"]:
+                continue
+            pid = identity["pid"]
+            if type(pid) is not int or pid <= 0:
+                raise ValueError("Invalid saved process identity.")
+            try:
+                process = psutil.Process(pid)
+                if process_identity(pid) == identity:
+                    process.wait(timeout=0)
+            except (
+                psutil.NoSuchProcess,
+                ProcessLookupError,
+                FileNotFoundError,
+            ):
+                continue
+            except psutil.TimeoutExpired:
+                alive = True
+                break
+        if not alive:
+            return False
+    return True
 
 
 async def controller_main(
@@ -529,40 +543,7 @@ async def controller_main(
     with ExitStack() as stack:
         stack.enter_context(ProjectLock(settings.project_root))
         db_path, seaweed_root = prepare_work_directory(settings)
-        directory = settings.project_root / "controller/server" / instance_id
-        logging_settings = read_json(DEFAULT_CONFIG.with_name("logging.json"))
-        logging_settings.update(
-            {
-                "db_path": str(directory / "events.sqlite"),
-                "open_mode": "create",
-                "expected_journal": None,
-            }
-        )
-        logging_config = directory / "logging.json"
-        write_json(
-            logging_config,
-            {
-                "logging": logging_settings,
-                "operation_context": {"source": "server_controller"},
-            },
-        )
-        logger = stack.enter_context(OperationLogger(logging_config))
-        identity = logger.get_journal_info()
-        logging_settings.update(
-            {
-                "open_mode": "existing",
-                "expected_journal": {
-                    key: identity[key] for key in ("journal_id", "generation")
-                },
-            }
-        )
-        write_json(
-            directory / "reader.json",
-            {
-                "logging": logging_settings,
-                "operation_context": {"source": "server_controller"},
-            },
-        )
+        logger = _open_control_journal(settings, instance_id, stack, OperationLogger)
         try:
             process_resources = stack.enter_context(ExitStack())
             hashes = HashDB(settings.hash_config_path)
@@ -678,6 +659,49 @@ async def controller_main(
             raise
 
 
+def _open_control_journal(
+    settings: ServerSettings,
+    instance_id: str,
+    stack: ExitStack,
+    logger_type: type[OperationLogger],
+) -> OperationLogger:
+    directory = settings.project_root / "controller/server" / instance_id
+    logging_settings = read_json(DEFAULT_CONFIG.with_name("logging.json"))
+    logging_settings.update(
+        {
+            "db_path": str(directory / "events.sqlite"),
+            "open_mode": "create",
+            "expected_journal": None,
+        }
+    )
+    logging_config = directory / "logging.json"
+    write_json(
+        logging_config,
+        {
+            "logging": logging_settings,
+            "operation_context": {"source": "server_controller"},
+        },
+    )
+    logger = stack.enter_context(logger_type(logging_config))
+    identity = logger.get_journal_info()
+    logging_settings.update(
+        {
+            "open_mode": "existing",
+            "expected_journal": {
+                key: identity[key] for key in ("journal_id", "generation")
+            },
+        }
+    )
+    write_json(
+        directory / "reader.json",
+        {
+            "logging": logging_settings,
+            "operation_context": {"source": "server_controller"},
+        },
+    )
+    return logger
+
+
 def controller_process(
     settings: ServerSettings, requests: Queue, responses: Queue, instance_id: str
 ) -> None:
@@ -757,118 +781,7 @@ class ServerRuntime:
 
     async def start(self, *, restart_command: JsonObject | None = None) -> None:
         if restart_command is not None:
-            if restart_command is not self._restart_command:
-                raise RuntimeError(
-                    "Admit server lifecycle commands through submit first."
-                )
-            previous_id = self._runtime_id
-            shutdown_requested = restart_command["command"] == "server.shutdown"
-            mode = restart_command["args"].get("mode", self.settings.server_mode)
-            response = {
-                "command_id": restart_command["command_id"],
-                "chain_id": None,
-                "experiment_id": None,
-                "state": "succeeded",
-                "result": "success",
-                "data": None,
-                "error": None,
-            }
-            try:
-                unchanged = (
-                    restart_command["command"] == "server.mode"
-                    and mode == self.settings.server_mode
-                    and self._state == "ready"
-                    and self._process is not None
-                    and self._process.is_alive()
-                )
-                if not unchanged:
-                    # Finish shutdown even if the HTTP owner is itself stopping.
-                    # Replacing queues before a confirmed exit risks two owners.
-                    shutdown = asyncio.create_task(self.close(restarting=True))
-                    cancelled = False
-                    try:
-                        while True:
-                            try:
-                                await asyncio.shield(shutdown)
-                                break
-                            except asyncio.CancelledError:
-                                cancelled = True
-                                if shutdown.cancelled():
-                                    raise
-                    except Exception as error:
-                        self._restart_blocked = (
-                            self._restart_blocked
-                            or f"Runtime shutdown was not confirmed: {error}"
-                        )
-                        raise
-                    finally:
-                        if cancelled:
-                            raise asyncio.CancelledError
-                    if self._http_closing:
-                        raise asyncio.CancelledError
-                    if shutdown_requested:
-                        # The owner must drain accepted HTTP requests before
-                        # exiting, including a client waiting for this result.
-                        self._stop_http()
-                        self._http_closing = True
-                    else:
-                        self.settings.server_mode = mode
-                        self._runtime_id = str(uuid4())
-                        self._reader_stop = threading.Event()
-                        self._reader_thread = None
-                        self._watcher = None
-                        self._ready = None
-                        self._identity = None
-                        self._storage = None
-                        self._last_response_at = None
-                        self._error = None
-                        self._closing = False
-                        self._state = "new"
-                        await self.start()
-                response["data"] = (
-                    {
-                        "runtime_id": self._runtime_id,
-                        "runtime_stopped": True,
-                        "http_shutdown_requested": True,
-                    }
-                    if shutdown_requested
-                    else {
-                        "previous_runtime_id": previous_id,
-                        "runtime_id": self._runtime_id,
-                        "server_mode": self.settings.server_mode,
-                        "changed": not unchanged,
-                        "controller": self._identity,
-                    }
-                )
-            except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - Lifecycle failures are retained command outcomes.
-                cancelled = isinstance(error, asyncio.CancelledError)
-                response.update(
-                    state="cancelled" if cancelled else "failed",
-                    result="fail",
-                    error={
-                        "code": "command_cancelled"
-                        if cancelled
-                        else (
-                            "server_shutdown_failed"
-                            if shutdown_requested
-                            else "runtime_restart_failed"
-                        ),
-                        "message": "HTTP server is stopping."
-                        if cancelled
-                        else str(error),
-                        "details": {"notes": list(getattr(error, "__notes__", []))},
-                    },
-                )
-                self._error = response["error"]["message"]
-            finally:
-                # A closed controller must not hide the HTTP-owned receipt.
-                if self._state == "closed":
-                    self._state = "unavailable"
-                self._accept_response(response)
-                self._restart_command = None
-                if shutdown_requested and response["state"] == "succeeded":
-                    self._state = "closed"
-            return
+            return await self._run_lifecycle_command(restart_command)
         if self._state != "new":
             raise RuntimeError("Server runtime has already started.")
         self._state = "starting"
@@ -906,6 +819,115 @@ class ServerRuntime:
             except Exception as cleanup_error:  # noqa: BLE001 - Preserve the startup failure.
                 error.add_note(f"Runtime cleanup also failed: {cleanup_error}")
             raise
+
+    async def _run_lifecycle_command(self, restart_command: JsonObject) -> None:
+        if restart_command is not self._restart_command:
+            raise RuntimeError("Admit server lifecycle commands through submit first.")
+        previous_id = self._runtime_id
+        shutdown_requested = restart_command["command"] == "server.shutdown"
+        mode = restart_command["args"].get("mode", self.settings.server_mode)
+        response = {
+            "command_id": restart_command["command_id"],
+            "chain_id": None,
+            "experiment_id": None,
+            "state": "succeeded",
+            "result": "success",
+            "data": None,
+            "error": None,
+        }
+        try:
+            unchanged = (
+                restart_command["command"] == "server.mode"
+                and mode == self.settings.server_mode
+                and self._state == "ready"
+                and self._process is not None
+                and self._process.is_alive()
+            )
+            if not unchanged:
+                # Finish shutdown even if the HTTP owner is itself stopping.
+                # Replacing queues before a confirmed exit risks two owners.
+                shutdown = asyncio.create_task(self.close(restarting=True))
+                cancelled = False
+                try:
+                    while True:
+                        try:
+                            await asyncio.shield(shutdown)
+                            break
+                        except asyncio.CancelledError:
+                            cancelled = True
+                            if shutdown.cancelled():
+                                raise
+                except Exception as error:
+                    self._restart_blocked = (
+                        self._restart_blocked
+                        or f"Runtime shutdown was not confirmed: {error}"
+                    )
+                    raise
+                finally:
+                    if cancelled:
+                        raise asyncio.CancelledError
+                if self._http_closing:
+                    raise asyncio.CancelledError
+                if shutdown_requested:
+                    # The owner must drain accepted HTTP requests before
+                    # exiting, including a client waiting for this result.
+                    self._stop_http()
+                    self._http_closing = True
+                else:
+                    self.settings.server_mode = mode
+                    self._runtime_id = str(uuid4())
+                    self._reader_stop = threading.Event()
+                    self._reader_thread = None
+                    self._watcher = None
+                    self._ready = None
+                    self._identity = None
+                    self._storage = None
+                    self._last_response_at = None
+                    self._error = None
+                    self._closing = False
+                    self._state = "new"
+                    await self.start()
+            response["data"] = (
+                {
+                    "runtime_id": self._runtime_id,
+                    "runtime_stopped": True,
+                    "http_shutdown_requested": True,
+                }
+                if shutdown_requested
+                else {
+                    "previous_runtime_id": previous_id,
+                    "runtime_id": self._runtime_id,
+                    "server_mode": self.settings.server_mode,
+                    "changed": not unchanged,
+                    "controller": self._identity,
+                }
+            )
+        except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - Lifecycle failures are retained command outcomes.
+            cancelled = isinstance(error, asyncio.CancelledError)
+            response.update(
+                state="cancelled" if cancelled else "failed",
+                result="fail",
+                error={
+                    "code": "command_cancelled"
+                    if cancelled
+                    else (
+                        "server_shutdown_failed"
+                        if shutdown_requested
+                        else "runtime_restart_failed"
+                    ),
+                    "message": "HTTP server is stopping." if cancelled else str(error),
+                    "details": {"notes": list(getattr(error, "__notes__", []))},
+                },
+            )
+            self._error = response["error"]["message"]
+        finally:
+            # A closed controller must not hide the HTTP-owned receipt.
+            if self._state == "closed":
+                self._state = "unavailable"
+            self._accept_response(response)
+            self._restart_command = None
+            if shutdown_requested and response["state"] == "succeeded":
+                self._state = "closed"
 
     def health(self) -> JsonObject:
         alive = self._process is not None and self._process.is_alive()
@@ -966,17 +988,7 @@ class ServerRuntime:
         command["args"] = copy_json_object(command.get("args", {}), "args")
         target = copy_json_object(command.get("target", {}), "target")
         if name in ("server.restart", "server.mode", "server.shutdown"):
-            if chain_id is not None or target:
-                raise ValueError(
-                    "Runtime lifecycle commands do not accept chains or targets."
-                )
-            args = command["args"]
-            if name in ("server.restart", "server.shutdown") and args:
-                raise ValueError(f"{name} does not accept arguments.")
-            if name == "server.mode" and (
-                args.keys() != {"mode"} or args["mode"] not in ("run", "maintenance")
-            ):
-                raise ValueError("server.mode requires mode=run|maintenance.")
+            self._validate_lifecycle_command(name, command, target, chain_id)
         if target:
             if target.keys() != {"kind", "position"} or target["kind"] not in (
                 "stage",
@@ -991,30 +1003,25 @@ class ServerRuntime:
             command["chain_id"] = chain_id
         return command
 
+    def _validate_lifecycle_command(
+        self, name: str, command: JsonObject, target: JsonObject, chain_id: str | None
+    ) -> None:
+        if chain_id is not None or target:
+            raise ValueError(
+                "Runtime lifecycle commands do not accept chains or targets."
+            )
+        args = command["args"]
+        if name in ("server.restart", "server.shutdown") and args:
+            raise ValueError(f"{name} does not accept arguments.")
+        if name == "server.mode" and (
+            args.keys() != {"mode"} or args["mode"] not in ("run", "maintenance")
+        ):
+            raise ValueError("server.mode requires mode=run|maintenance.")
+
     def submit(self, document: object, *, chain: bool = False) -> JsonObject:
         """Validate and enqueue without awaiting: disconnect cannot split admission."""
         self._prune()
-        chain_id = None
-        if chain:
-            value = copy_json_object(document, "chain")
-            if value.keys() - {"api_version", "chain_id", "commands"}:
-                raise ValueError("Unknown chain fields.")
-            version = value.get("api_version", 1)
-            if type(version) is not int or version != 1:
-                raise ValueError("Only api_version 1 is supported.")
-            chain_id = str(
-                UUID(require_text(value.get("chain_id", str(uuid4())), "chain_id"))
-            )
-            entries = value.get("commands")
-            if not isinstance(entries, list) or not entries:
-                raise ValueError("commands must be a nonempty array.")
-            commands = [self._command(item, chain_id=chain_id) for item in entries]
-            message = copy_json_object(
-                {"api_version": 1, "chain_id": chain_id, "commands": commands}, "chain"
-            )
-        else:
-            message = self._command(document)
-            commands = [message]
+        chain_id, commands, message = self._normalize_submission(document, chain)
         if (
             len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
             > self.settings.max_request_bytes
@@ -1084,26 +1091,7 @@ class ServerRuntime:
             "server.shutdown",
         )
         if lifecycle:
-            if self._restart_command is not None:
-                raise ServerError(
-                    "shutdown_pending"
-                    if self._restart_command["command"] == "server.shutdown"
-                    else "restart_pending",
-                    "A server lifecycle operation is already pending.",
-                    409,
-                )
-            if commands[0]["command"] == "server.shutdown" and self._stop_http is None:
-                raise ServerError(
-                    "unsupported_feature",
-                    "This HTTP owner does not support remote shutdown.",
-                    501,
-                )
-            if self._http_closing or self._state in ("new", "starting"):
-                raise ServerError(
-                    "controller_unavailable", "Server is starting or shutting down."
-                )
-            if self._restart_blocked is not None:
-                raise ServerError("restart_blocked", self._restart_blocked, 409)
+            self._admit_lifecycle_command(commands)
         else:
             requests = self._require_ready()
         if chain_id is not None and chain_id in self._chains:
@@ -1150,6 +1138,54 @@ class ServerRuntime:
                 self.start(restart_command=message)
             )
         return self._receipt(identifiers, chain_id)
+
+    def _normalize_submission(
+        self, document: object, chain: bool
+    ) -> tuple[str | None, list[JsonObject], JsonObject]:
+        chain_id = None
+        if chain:
+            value = copy_json_object(document, "chain")
+            if value.keys() - {"api_version", "chain_id", "commands"}:
+                raise ValueError("Unknown chain fields.")
+            version = value.get("api_version", 1)
+            if type(version) is not int or version != 1:
+                raise ValueError("Only api_version 1 is supported.")
+            chain_id = str(
+                UUID(require_text(value.get("chain_id", str(uuid4())), "chain_id"))
+            )
+            entries = value.get("commands")
+            if not isinstance(entries, list) or not entries:
+                raise ValueError("commands must be a nonempty array.")
+            commands = [self._command(item, chain_id=chain_id) for item in entries]
+            message = copy_json_object(
+                {"api_version": 1, "chain_id": chain_id, "commands": commands}, "chain"
+            )
+        else:
+            message = self._command(document)
+            commands = [message]
+        return chain_id, commands, message
+
+    def _admit_lifecycle_command(self, commands: list[JsonObject]) -> None:
+        if self._restart_command is not None:
+            raise ServerError(
+                "shutdown_pending"
+                if self._restart_command["command"] == "server.shutdown"
+                else "restart_pending",
+                "A server lifecycle operation is already pending.",
+                409,
+            )
+        if commands[0]["command"] == "server.shutdown" and self._stop_http is None:
+            raise ServerError(
+                "unsupported_feature",
+                "This HTTP owner does not support remote shutdown.",
+                501,
+            )
+        if self._http_closing or self._state in ("new", "starting"):
+            raise ServerError(
+                "controller_unavailable", "Server is starting or shutting down."
+            )
+        if self._restart_blocked is not None:
+            raise ServerError("restart_blocked", self._restart_blocked, 409)
 
     def _receipt(self, identifiers: list[str], chain_id: str | None) -> JsonObject:
         if chain_id is None:
@@ -1334,27 +1370,7 @@ class ServerRuntime:
             response = copy_json_object(message, "controller response")
             self._last_response_at = datetime.now(UTC).isoformat()
             kind = response.get("_runtime")
-            if kind == "ready":
-                if (
-                    self._closing
-                    or self._process is None
-                    or not self._process.is_alive()
-                ):
-                    return
-                self._identity = copy_json_object(
-                    response.get("process"), "process identity"
-                )
-                self._storage = copy_json_object(
-                    response.get("storage", {}), "storage initialization"
-                )
-                self._state = "ready"
-                if self._ready is not None and not self._ready.done():
-                    self._ready.set_result(None)
-                return
-            if kind in ("stopped", "error"):
-                self._unavailable(str(response.get("message", "Controller stopped.")))
-                if kind == "stopped":
-                    self._state = "stopped"
+            if self._accept_runtime_response(response, kind):
                 return
             identifier = str(
                 UUID(require_text(response.get("command_id"), "command_id"))
@@ -1388,9 +1404,7 @@ class ServerRuntime:
                     },
                 }
                 encoded_size = len(json.dumps(response).encode("utf-8"))
-            waiter = self._reads.get(identifier)
-            if waiter is not None and not waiter.done():
-                waiter.set_result(response)
+            if self._accept_read_response(identifier, response):
                 return
             record = self._records.get(identifier)
             if record is not None and (
@@ -1406,6 +1420,34 @@ class ServerRuntime:
                 self._prune()
         except Exception as error:  # noqa: BLE001 - Do not leave a failed response consumer reporting readiness.
             self._unavailable(f"Invalid controller response: {error}")
+
+    def _accept_runtime_response(self, response: JsonObject, kind: object) -> bool:
+        if kind == "ready":
+            if self._closing or self._process is None or not self._process.is_alive():
+                return True
+            self._identity = copy_json_object(
+                response.get("process"), "process identity"
+            )
+            self._storage = copy_json_object(
+                response.get("storage", {}), "storage initialization"
+            )
+            self._state = "ready"
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_result(None)
+            return True
+        if kind in ("stopped", "error"):
+            self._unavailable(str(response.get("message", "Controller stopped.")))
+            if kind == "stopped":
+                self._state = "stopped"
+            return True
+        return False
+
+    def _accept_read_response(self, identifier: str, response: JsonObject) -> bool:
+        waiter = self._reads.get(identifier)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(response)
+            return True
+        return False
 
     def _unavailable(self, message: str, runtime_id: str | None = None) -> None:
         if self._state == "closed" or (
@@ -1514,30 +1556,7 @@ class ServerRuntime:
             self._restart_blocked = f"Runtime shutdown was not confirmed: {error}"
             raise
         finally:
-            if self._watcher is not None:
-                self._watcher.cancel()
-                await asyncio.gather(self._watcher, return_exceptions=True)
-            self._reader_stop.set()
-            if self._reader_thread is not None:
-                await asyncio.to_thread(self._reader_thread.join, 1)
-                if self._reader_thread.is_alive():
-                    logging.getLogger(__name__).error(
-                        "A corrupted IPC reader will be released when the HTTP process exits."
-                    )
-                    if restarting:
-                        self._restart_blocked = "Controller IPC reader did not stop; restart the HTTP process before continuing."
-            for queue in (self._requests, self._responses):
-                if queue is not None:
-                    queue.cancel_join_thread()
-                    queue.close()
-            if (
-                process is not None
-                and process.pid is not None
-                and not process.is_alive()
-            ):
-                process.close()
-            self._process = None
-            self._state = "closed"
+            await self._close_runtime_channels(process, restarting)
         if forced:
             self._restart_blocked = "Controller shutdown timed out; inspect and recover unfinished experiments before continuing."
             raise RuntimeError(self._restart_blocked)
@@ -1546,3 +1565,27 @@ class ServerRuntime:
             raise RuntimeError(self._restart_blocked)
         if restarting and self._restart_blocked is not None:
             raise RuntimeError(self._restart_blocked)
+
+    async def _close_runtime_channels(
+        self, process: BaseProcess | None, restarting: bool
+    ) -> None:
+        if self._watcher is not None:
+            self._watcher.cancel()
+            await asyncio.gather(self._watcher, return_exceptions=True)
+        self._reader_stop.set()
+        if self._reader_thread is not None:
+            await asyncio.to_thread(self._reader_thread.join, 1)
+            if self._reader_thread.is_alive():
+                logging.getLogger(__name__).error(
+                    "A corrupted IPC reader will be released when the HTTP process exits."
+                )
+                if restarting:
+                    self._restart_blocked = "Controller IPC reader did not stop; restart the HTTP process before continuing."
+        for queue in (self._requests, self._responses):
+            if queue is not None:
+                queue.cancel_join_thread()
+                queue.close()
+        if process is not None and process.pid is not None and not process.is_alive():
+            process.close()
+        self._process = None
+        self._state = "closed"
