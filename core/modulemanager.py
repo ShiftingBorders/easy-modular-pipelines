@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import TracebackType
 
 from core.logger_utils.events import JsonObject, require_text
 from core.modulemanifest import read_module_manifest
@@ -17,6 +18,42 @@ from core.validation_constants import (
     INVALID_MODULE_VERSION_CHARACTERS,
 )
 from utils.modulemanager_utils.modulemanager_errors import HashMismatch
+
+
+class _ModuleWorkspace:
+    """Clean a preparation workspace without replacing the operation's error."""
+
+    def __init__(
+        self,
+        temporary: tempfile.TemporaryDirectory[str],
+        completion: str,
+        destination: Path,
+    ) -> None:
+        self._temporary = temporary
+        self._work = temporary.name
+        self._completion = completion
+        self._destination = destination
+
+    def __enter__(self) -> str:
+        return self._work
+
+    def __exit__(
+        self,
+        error_type: type[BaseException] | None,
+        failure: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self._temporary.cleanup()
+        except OSError as cleanup_error:
+            note = f"Temporary cleanup failed at {self._work}: {cleanup_error}"
+            if failure is not None:
+                failure.add_note(note)
+            else:
+                cleanup_error.add_note(
+                    f"{self._completion} {self._destination}. {note}"
+                )
+                raise
 
 
 class ModuleManager:
@@ -129,6 +166,35 @@ class ModuleManager:
             else self._normalize_path(temp_folder)
         )
 
+    def _optional_module_folder(self, value: str | Path | None) -> Path | None:
+        if value is None:
+            return None
+        folder = self._normalize_path(value)
+        if not folder.is_absolute():
+            raise ValueError("Module folder path must be absolute.")
+        if folder.is_symlink() or folder.is_junction():
+            raise ValueError("Module folder must not be a filesystem link.")
+        return folder
+
+    def _validate_version(self, module_version: str) -> None:
+        if not isinstance(module_version, str):
+            raise TypeError("module_version must be a string.")
+        if not module_version.strip() or module_version.strip() in {".", ".."}:
+            raise ValueError("module_version must not be empty or a dot segment.")
+        if any(
+            character in INVALID_MODULE_VERSION_CHARACTERS
+            for character in module_version
+        ):
+            raise ValueError("module_version contains invalid characters.")
+
+    def _validate_module_hash(self, digest: str) -> None:
+        if not isinstance(digest, str):
+            raise TypeError("Module hash must be a string.")
+        if len(digest) != 64 or any(character not in HEX_DIGITS for character in digest):
+            raise ValueError(
+                "Module hash must contain exactly 64 hexadecimal characters."
+            )
+
     def _ensure_folder(self, temp_folder: str | Path | None) -> bool:
         target_path = self._get_temp_folder(temp_folder)
         return bool(target_path.exists() and target_path.is_dir())
@@ -147,29 +213,7 @@ class ModuleManager:
 
     def _replace_folder(self, target_location: str | Path, source_location: str | Path):
         """Replace a folder with a copy of the source, retaining the source."""
-        source = self._validate_folder_path(source_location)
-        target = self._normalize_path(target_location)
-        if not target.is_absolute():
-            raise ValueError("Target path must be absolute.")
-        if target.is_symlink() or target.is_junction():
-            raise ValueError("Target folder must not be a filesystem link.")
-        target = target.resolve()
-        if target == source or target in source.parents or source in target.parents:
-            raise ValueError("Source and target folders must not overlap.")
-        if target.exists() and not target.is_dir():
-            raise NotADirectoryError(f"Target is not a folder: {target}")
-        if target in {Path(__file__).resolve().parent.parent, Path.home().resolve()}:
-            raise ValueError("Cannot replace the project or home folder.")
-
-        folders = [source]
-        while folders:
-            for entry in folders.pop().iterdir():
-                if entry.is_symlink() or entry.is_junction():
-                    raise ValueError(f"Source contains a filesystem link: {entry}")
-                if entry.is_dir():
-                    folders.append(entry)
-                elif not entry.is_file():
-                    raise ValueError(f"Source contains a special file: {entry}")
+        source, target = self._replacement_paths(target_location, source_location)
 
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = tempfile.TemporaryDirectory(prefix=".replace-", dir=target.parent)
@@ -179,42 +223,13 @@ class ModuleManager:
         try:
             staging = Path(work) / "new"
             shutil.copytree(source, staging, symlinks=True)
-            backup_folder = None
-            if target.exists():
-                # A failed restore must leave the backup outside automatic cleanup.
-                backup_folder = Path(
-                    tempfile.mkdtemp(prefix=".backup-", dir=target.parent)
-                )
-                try:
-                    target.rename(backup_folder / "previous")
-                except OSError as error:
-                    try:
-                        backup_folder.rmdir()
-                    except OSError as cleanup_error:
-                        error.add_note(
-                            f"Cleanup failed at {backup_folder}: {cleanup_error}"
-                        )
-                    raise
+            backup_folder = self._backup_existing_folder(target)
             try:
                 staging.rename(target)
                 installed = True
             except OSError as error:
                 if backup_folder is not None:
-                    try:
-                        (backup_folder / "previous").rename(target)
-                    except OSError as restore_error:
-                        error.add_note(
-                            f"Restore failed: {restore_error}. Previous folder remains at "
-                            f"{backup_folder / 'previous'}."
-                        )
-                    else:
-                        try:
-                            backup_folder.rmdir()
-                        except OSError as cleanup_error:
-                            error.add_note(
-                                f"Previous folder restored; cleanup failed at "
-                                f"{backup_folder}: {cleanup_error}"
-                            )
+                    self._restore_previous_folder(backup_folder, target, error)
                 raise
             if backup_folder is not None:
                 try:
@@ -240,6 +255,72 @@ class ModuleManager:
                         cleanup_error.add_note(f"Folder already installed at {target}.")
                     cleanup_error.add_note(note)
                     raise
+
+    def _replacement_paths(
+        self, target_location: str | Path, source_location: str | Path
+    ) -> tuple[Path, Path]:
+        source = self._validate_folder_path(source_location)
+        target = self._normalize_path(target_location)
+        if not target.is_absolute():
+            raise ValueError("Target path must be absolute.")
+        if target.is_symlink() or target.is_junction():
+            raise ValueError("Target folder must not be a filesystem link.")
+        target = target.resolve()
+        if target == source or target in source.parents or source in target.parents:
+            raise ValueError("Source and target folders must not overlap.")
+        if target.exists() and not target.is_dir():
+            raise NotADirectoryError(f"Target is not a folder: {target}")
+        if target in {Path(__file__).resolve().parent.parent, Path.home().resolve()}:
+            raise ValueError("Cannot replace the project or home folder.")
+
+        folders = [source]
+        while folders:
+            for entry in folders.pop().iterdir():
+                if entry.is_symlink() or entry.is_junction():
+                    raise ValueError(f"Source contains a filesystem link: {entry}")
+                if entry.is_dir():
+                    folders.append(entry)
+                elif not entry.is_file():
+                    raise ValueError(f"Source contains a special file: {entry}")
+        return source, target
+
+    def _backup_existing_folder(self, target: Path) -> Path | None:
+        backup_folder = None
+        if target.exists():
+            # A failed restore must leave the backup outside automatic cleanup.
+            backup_folder = Path(
+                tempfile.mkdtemp(prefix=".backup-", dir=target.parent)
+            )
+            try:
+                target.rename(backup_folder / "previous")
+            except OSError as error:
+                try:
+                    backup_folder.rmdir()
+                except OSError as cleanup_error:
+                    error.add_note(
+                        f"Cleanup failed at {backup_folder}: {cleanup_error}"
+                    )
+                raise
+        return backup_folder
+
+    def _restore_previous_folder(
+        self, backup_folder: Path, target: Path, error: OSError
+    ) -> None:
+        try:
+            (backup_folder / "previous").rename(target)
+        except OSError as restore_error:
+            error.add_note(
+                f"Restore failed: {restore_error}. Previous folder remains at "
+                f"{backup_folder / 'previous'}."
+            )
+        else:
+            try:
+                backup_folder.rmdir()
+            except OSError as cleanup_error:
+                error.add_note(
+                    f"Previous folder restored; cleanup failed at "
+                    f"{backup_folder}: {cleanup_error}"
+                )
 
     def _validate_module_folder(
         self, module_name: str, *, require_exists: bool = True
@@ -321,9 +402,9 @@ class ModuleManager:
         output.mkdir(parents=True, exist_ok=True)
         archive_path = output / f"{folder.name}.tar.xz"
         temporary = tempfile.TemporaryDirectory(prefix=".compress-", dir=output)
-        work = temporary.name
-        failure = None
-        try:
+        with _ModuleWorkspace(
+            temporary, "Archive already saved at", archive_path
+        ) as work:
             staging = Path(work) / "archive.tar.xz"
             with tarfile.open(
                 staging, "w:xz", preset=9 | lzma.PRESET_EXTREME, dereference=True
@@ -335,21 +416,6 @@ class ModuleManager:
                         recursive=False,
                     )
             staging.replace(archive_path)
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
-            try:
-                temporary.cleanup()
-            except OSError as cleanup_error:
-                note = f"Temporary cleanup failed at {work}: {cleanup_error}"
-                if failure is not None:
-                    failure.add_note(note)
-                else:
-                    cleanup_error.add_note(
-                        f"Archive already saved at {archive_path}. {note}"
-                    )
-                    raise
         return archive_path
 
     def _uncompress_folder(
@@ -360,6 +426,27 @@ class ModuleManager:
         package: bool = False,
     ) -> Path:
         """Extract tar.xz into a staged folder, then replace the destination."""
+        archive_path, target = self._uncompression_paths(archive_path, target_path)
+
+        with tarfile.open(archive_path, "r:xz") as archive:
+            members = archive.getmembers()
+            self._validate_archive_members(members, target, package)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = tempfile.TemporaryDirectory(
+                prefix=".extract-", dir=target.parent
+            )
+            with _ModuleWorkspace(
+                temporary, "Folder already installed at", target
+            ) as work:
+                staging = Path(work) / "contents"
+                staging.mkdir()
+                archive.extractall(staging, members=members, filter="data")
+                self._replace_folder(target, staging)
+        return target
+
+    def _uncompression_paths(
+        self, archive_path: str | Path, target_path: str | Path
+    ) -> tuple[Path, Path]:
         archive_path = self._normalize_path(archive_path)
         target = self._normalize_path(target_path)
         if not archive_path.is_absolute() or not target.is_absolute():
@@ -374,101 +461,54 @@ class ModuleManager:
             raise ValueError("The archive must be outside the target folder.")
         if target.exists() and not target.is_dir():
             raise NotADirectoryError(f"Target is not a folder: {target}")
+        return archive_path, target
 
-        with tarfile.open(archive_path, "r:xz") as archive:
-            members = archive.getmembers()
-            seen_paths = set()
-            for member in members:
-                member_path = PurePosixPath(member.name)
-                if (
-                    not member.name
-                    or member_path.is_absolute()
-                    or ".." in member_path.parts
-                    or "\\" in member.name
-                    or ":" in member.name
-                    or not (member.isfile() or member.isdir())
-                ):
-                    raise ValueError(f"Unsupported archive entry: {member.name!r}")
-                # Compare normalized paths, including case aliases on Windows.
-                destination = target / member_path.as_posix()
-                if destination in seen_paths:
-                    raise ValueError(f"Duplicate archive path: {member.name!r}")
-                seen_paths.add(destination)
-                if package and (
-                    not member.isfile()
-                    or len(member_path.parts) != 1
-                    or member.name != member_path.name
-                ):
-                    raise ValueError("Package entries must be files at its root.")
-            if package:
-                names = [member.name for member in members]
-                if (
-                    len(names) != 2
-                    or "hash.txt" not in names
-                    or sum(name.endswith(".tar.xz") for name in names) != 1
-                ):
-                    raise ValueError(
-                        "Package must contain only hash.txt and one tar.xz archive."
-                    )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = tempfile.TemporaryDirectory(
-                prefix=".extract-", dir=target.parent
-            )
-            work = temporary.name
-            failure = None
-            try:
-                staging = Path(work) / "contents"
-                staging.mkdir()
-                archive.extractall(staging, members=members, filter="data")
-                self._replace_folder(target, staging)
-            except BaseException as error:
-                failure = error
-                raise
-            finally:
-                try:
-                    temporary.cleanup()
-                except OSError as cleanup_error:
-                    note = f"Temporary cleanup failed at {work}: {cleanup_error}"
-                    if failure is not None:
-                        failure.add_note(note)
-                    else:
-                        cleanup_error.add_note(
-                            f"Folder already installed at {target}. {note}"
-                        )
-                        raise
-        return target
+    def _validate_archive_members(
+        self, members: list[tarfile.TarInfo], target: Path, package: bool
+    ) -> None:
+        seen_paths = set()
+        for member in members:
+            member_path = PurePosixPath(member.name)
+            if (
+                not member.name
+                or member_path.is_absolute()
+                or ".." in member_path.parts
+                or "\\" in member.name
+                or ":" in member.name
+                or not (member.isfile() or member.isdir())
+            ):
+                raise ValueError(f"Unsupported archive entry: {member.name!r}")
+            # Compare normalized paths, including case aliases on Windows.
+            destination = target / member_path.as_posix()
+            if destination in seen_paths:
+                raise ValueError(f"Duplicate archive path: {member.name!r}")
+            seen_paths.add(destination)
+            if package and (
+                not member.isfile()
+                or len(member_path.parts) != 1
+                or member.name != member_path.name
+            ):
+                raise ValueError("Package entries must be files at its root.")
+        if package:
+            names = [member.name for member in members]
+            if (
+                len(names) != 2
+                or "hash.txt" not in names
+                or sum(name.endswith(".tar.xz") for name in names) != 1
+            ):
+                raise ValueError(
+                    "Package must contain only hash.txt and one tar.xz archive."
+                )
 
     def _add_hash_file(self, hash: str, module_temp_folder: str | Path):
         """Write a SHA-256 digest to hash.txt in the module staging folder."""
-        if not isinstance(hash, str):
-            raise TypeError("Module hash must be a string.")
-        if len(hash) != 64 or any(character not in HEX_DIGITS for character in hash):
-            raise ValueError(
-                "Module hash must contain exactly 64 hexadecimal characters."
-            )
+        self._validate_module_hash(hash)
         folder = self._validate_folder_path(module_temp_folder)
         temporary = tempfile.TemporaryDirectory(prefix=".hash-", dir=folder)
-        work = temporary.name
-        failure = None
-        try:
+        with _ModuleWorkspace(temporary, "hash.txt already saved in", folder) as work:
             staging = Path(work) / "hash.txt"
             staging.write_text(hash.lower() + "\n", encoding="UTF-8", newline="\n")
             staging.replace(folder / "hash.txt")
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
-            try:
-                temporary.cleanup()
-            except OSError as cleanup_error:
-                note = f"Temporary cleanup failed at {work}: {cleanup_error}"
-                if failure is not None:
-                    failure.add_note(note)
-                else:
-                    cleanup_error.add_note(
-                        f"hash.txt already saved in {folder}. {note}"
-                    )
-                    raise
 
     def module_hash(
         self, module_name: str, target_folder: str | Path | None = None
@@ -482,12 +522,7 @@ class ModuleManager:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
-        if target_folder is not None:
-            target_folder = self._normalize_path(target_folder)
-            if not target_folder.is_absolute():
-                raise ValueError("Module folder path must be absolute.")
-            if target_folder.is_symlink() or target_folder.is_junction():
-                raise ValueError("Module folder must not be a filesystem link.")
+        target_folder = self._optional_module_folder(target_folder)
         if target_folder is not None and self._ensure_folder(target_folder):
             module_folder = self._validate_folder_path(target_folder)
         else:
@@ -526,10 +561,7 @@ class ModuleManager:
             module_name, module_version, module_folder
         )
         manifest = read_module_manifest(source_folder)
-        if (manifest["name"], manifest["version"]) != (module_name, module_version):
-            raise ValueError(
-                "module.yaml name/version differ from registration arguments."
-            )
+        self._validate_registration_manifest(manifest, module_name, module_version)
         module_hash = self.module_hash(module_name, source_folder)
         archive_exists = self.module_db.check_module_stored(module_name, module_version)
         if self._registration_exists(
@@ -552,16 +584,10 @@ class ModuleManager:
                 archive_exists = self.module_db.check_module_stored(
                     module_name, module_version
                 )
-                if (
-                    result == ModuleAddResult.module_exists_err
-                    and self._registration_exists(
-                        module_name, module_version, module_hash, archive_exists
-                    )
-                ):
-                    return False
-                raise StorageConflict(
-                    "The hash database did not add the module record."
+                self._validate_registration_result(
+                    result, module_name, module_version, module_hash, archive_exists
                 )
+                return False
             try:
                 self.module_db.save_module(module_name, module_version, archive_path)
             except StorageError as upload_error:
@@ -591,14 +617,17 @@ class ModuleManager:
         operation = asyncio.create_task(
             self._register_module_async(module_name, module_version, module_folder)
         )
+        return await self._await_outcome(operation)
+
+    async def _await_outcome[T](self, operation: asyncio.Task[T]) -> T:
+        """Wait for the actual outcome, even if the caller is cancelled."""
         while True:
             try:
                 return await asyncio.shield(operation)
             except asyncio.CancelledError:
                 if operation.cancelled():
                     raise
-                # An upload may already have committed; report its actual result.
-                continue
+                # Storage may have committed; finish before the owner closes it.
 
     async def _register_module_async(
         self, module_name: str, module_version: str, module_folder: str | Path | None
@@ -607,10 +636,7 @@ class ModuleManager:
             module_name, module_version, module_folder
         )
         manifest = await asyncio.to_thread(read_module_manifest, source_folder)
-        if (manifest["name"], manifest["version"]) != (module_name, module_version):
-            raise ValueError(
-                "module.yaml name/version differ from registration arguments."
-            )
+        self._validate_registration_manifest(manifest, module_name, module_version)
         module_hash = await asyncio.to_thread(
             self.module_hash, module_name, source_folder
         )
@@ -640,16 +666,10 @@ class ModuleManager:
                 archive_exists = await asyncio.to_thread(
                     self.module_db.check_module_stored, module_name, module_version
                 )
-                if (
-                    result == ModuleAddResult.module_exists_err
-                    and self._registration_exists(
-                        module_name, module_version, module_hash, archive_exists
-                    )
-                ):
-                    return False
-                raise StorageConflict(
-                    "The hash database did not add the module record."
+                self._validate_registration_result(
+                    result, module_name, module_version, module_hash, archive_exists
                 )
+                return False
             try:
                 await asyncio.to_thread(
                     self.module_db.save_module,
@@ -671,21 +691,39 @@ class ModuleManager:
             )
         return True
 
+    def _validate_registration_manifest(
+        self, manifest: JsonObject, module_name: str, module_version: str
+    ) -> None:
+        if (manifest["name"], manifest["version"]) != (module_name, module_version):
+            raise ValueError(
+                "module.yaml name/version differ from registration arguments."
+            )
+
+    def _validate_registration_result(
+        self,
+        result: ModuleAddResult,
+        module_name: str,
+        module_version: str,
+        module_hash: str,
+        archive_exists: bool,
+    ) -> None:
+        """Accept a duplicate insert only when the stored pair is identical."""
+        if (
+            result == ModuleAddResult.module_exists_err
+            and self._registration_exists(
+                module_name, module_version, module_hash, archive_exists
+            )
+        ):
+            return
+        raise StorageConflict("The hash database did not add the module record.")
+
     def _registration_source(
         self, module_name: str, module_version: str, module_folder: str | Path | None
     ) -> tuple[str, Path, Path]:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
-        if not isinstance(module_version, str):
-            raise TypeError("module_version must be a string.")
-        if not module_version.strip() or module_version.strip() in {".", ".."}:
-            raise ValueError("module_version must not be empty or a dot segment.")
-        if any(
-            character in INVALID_MODULE_VERSION_CHARACTERS
-            for character in module_version
-        ):
-            raise ValueError("module_version contains invalid characters.")
+        self._validate_version(module_version)
         source_folder = (
             self._validate_module_folder(module_name)
             if module_folder is None
@@ -710,18 +748,18 @@ class ModuleManager:
         archive_exists: bool,
     ) -> bool:
         stored_hash = self.hash_db.get_module_hash(module_name, module_version)
-        if stored_hash != "" or archive_exists:
-            if (
-                stored_hash != ""
-                and archive_exists
-                and stored_hash.lower() == module_hash
-            ):
-                return True
-            raise StorageConflict(
-                f"Cannot register module {module_name!r}, version {module_version!r}: "
-                "the stored hash differs or the hash/archive pair is incomplete."
-            )
-        return False
+        if stored_hash == "" and not archive_exists:
+            return False
+        if (
+            stored_hash != ""
+            and archive_exists
+            and stored_hash.lower() == module_hash
+        ):
+            return True
+        raise StorageConflict(
+            f"Cannot register module {module_name!r}, version {module_version!r}: "
+            "the stored hash differs or the hash/archive pair is incomplete."
+        )
 
     def _registration_package(self, source: Path, work: Path, digest: str) -> Path:
         package = work / "package"
@@ -815,12 +853,7 @@ class ModuleManager:
             asyncio.to_thread(self._verify_stored_module, name, version, digest.lower())
         )
         # Never release the databases while a worker still uses their clients.
-        while True:
-            try:
-                return await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                if operation.cancelled():
-                    raise
+        return await self._await_outcome(operation)
 
     def _copy_module_source(self, source: Path, destination: Path) -> None:
         destination.mkdir()
@@ -829,6 +862,13 @@ class ModuleManager:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / relative, target)
 
+    async def _prepare_install_copy(
+        self, staged: Path, publish: Path, name: str, digest: str
+    ) -> None:
+        await asyncio.to_thread(shutil.copytree, staged, publish)
+        if await asyncio.to_thread(self.module_hash, name, publish) != digest:
+            raise HashMismatch("Installation changed during copying.")
+
     async def register_and_install_module_async(
         self, module_folder: Path
     ) -> JsonObject:
@@ -836,30 +876,13 @@ class ModuleManager:
         operation = asyncio.create_task(
             self._register_and_install_module(module_folder)
         )
-        while True:
-            try:
-                return await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                if operation.cancelled():
-                    raise
+        return await self._await_outcome(operation)
 
     async def _register_and_install_module(self, module_folder: Path) -> JsonObject:
         manifest = await asyncio.to_thread(read_module_manifest, Path(module_folder))
         source = self._validate_folder_path(module_folder)
         name, version = manifest["name"], manifest["version"]
-        target = self.module_storage_path / name / version
-        for path in (target, *target.parents):
-            if path.is_symlink() or path.is_junction():
-                raise ValueError(
-                    "Installation path must not traverse filesystem links."
-                )
-        if not target.resolve().is_relative_to(self.module_storage_path):
-            raise ValueError("Installation path escapes module storage.")
-        work_root = self.temp_folder
-        if work_root == source or source in work_root.parents:
-            raise ValueError(
-                "Temporary folder must be outside the module source folder."
-            )
+        target, work_root = self._installation_paths(source, name, version)
         work_root.mkdir(parents=True, exist_ok=True)
         temporary = tempfile.TemporaryDirectory(prefix="install-module-", dir=work_root)
         failure = None
@@ -867,18 +890,8 @@ class ModuleManager:
         installed = False
         try:
             staged = Path(temporary.name) / "source"
-            await asyncio.to_thread(self._copy_module_source, source, staged)
-            copied = await asyncio.to_thread(read_module_manifest, staged)
-            if copied != manifest:
-                raise ValueError("Module manifest changed while copying the source.")
-            digest = await asyncio.to_thread(self.module_hash, name, staged)
-            target_exists = target.exists()
-            if target_exists:
-                await asyncio.to_thread(read_module_manifest, target)
-                if await asyncio.to_thread(self.module_hash, name, target) != digest:
-                    raise StorageConflict(
-                        f"A different module is installed at {target}."
-                    )
+            digest = await self._prepare_install_source(source, staged, manifest, name)
+            target_exists = await self._check_existing_installation(target, name, digest)
             registered = await self.register_module_async(name, version, staged)
             reference = await self.validate_stored_module_async(name, version)
             if reference["hash"] != digest:
@@ -892,12 +905,7 @@ class ModuleManager:
                     prefix=".install-", dir=target.parent
                 ) as local:
                     publish = Path(local) / "code"
-                    await asyncio.to_thread(shutil.copytree, staged, publish)
-                    if (
-                        await asyncio.to_thread(self.module_hash, name, publish)
-                        != digest
-                    ):
-                        raise HashMismatch("Installation changed during copying.")
+                    await self._prepare_install_copy(staged, publish, name, digest)
                     if target.exists():
                         raise StorageConflict(
                             f"Installation destination appeared: {target}."
@@ -923,6 +931,46 @@ class ModuleManager:
                 self._cleanup_registration, temporary, work_root, failure
             )
 
+    def _installation_paths(
+        self, source: Path, name: str, version: str
+    ) -> tuple[Path, Path]:
+        target = self.module_storage_path / name / version
+        for path in (target, *target.parents):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError(
+                    "Installation path must not traverse filesystem links."
+                )
+        if not target.resolve().is_relative_to(self.module_storage_path):
+            raise ValueError("Installation path escapes module storage.")
+        work_root = self.temp_folder
+        if work_root == source or source in work_root.parents:
+            raise ValueError(
+                "Temporary folder must be outside the module source folder."
+            )
+        return target, work_root
+
+    async def _prepare_install_source(
+        self, source: Path, staged: Path, manifest: JsonObject, name: str
+    ) -> str:
+        await asyncio.to_thread(self._copy_module_source, source, staged)
+        copied = await asyncio.to_thread(read_module_manifest, staged)
+        if copied != manifest:
+            raise ValueError("Module manifest changed while copying the source.")
+        digest = await asyncio.to_thread(self.module_hash, name, staged)
+        return digest
+
+    async def _check_existing_installation(
+        self, target: Path, name: str, digest: str
+    ) -> bool:
+        target_exists = target.exists()
+        if target_exists:
+            await asyncio.to_thread(read_module_manifest, target)
+            if await asyncio.to_thread(self.module_hash, name, target) != digest:
+                raise StorageConflict(
+                    f"A different module is installed at {target}."
+                )
+        return target_exists
+
     def _remove_archive_if_present(self, name: str, version: str) -> bool:
         # Filer can acknowledge DELETE with 2xx even when the entry is absent.
         if not self.module_db.check_module_stored(name, version):
@@ -936,13 +984,7 @@ class ModuleManager:
         operation = asyncio.create_task(
             asyncio.to_thread(self._remove_archive_if_present, name, version)
         )
-        while True:
-            try:
-                removed = await asyncio.shield(operation)
-                break
-            except asyncio.CancelledError:
-                if operation.cancelled():
-                    raise
+        removed = await self._await_outcome(operation)
         try:
             hash_removed = self.hash_db.remove_module_hash(name, version)
         except StorageError as error:
@@ -964,15 +1006,7 @@ class ModuleManager:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
-        if not isinstance(module_version, str):
-            raise TypeError("module_version must be a string.")
-        if not module_version.strip() or module_version.strip() in {".", ".."}:
-            raise ValueError("module_version must not be empty or a dot segment.")
-        if any(
-            character in INVALID_MODULE_VERSION_CHARACTERS
-            for character in module_version
-        ):
-            raise ValueError("module_version contains invalid characters.")
+        self._validate_version(module_version)
         module_removed = self.module_db.delete_module(module_name, module_version)
         try:
             hash_removed = self.hash_db.remove_module_hash(module_name, module_version)
@@ -991,15 +1025,7 @@ class ModuleManager:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
-        if not isinstance(module_version, str):
-            raise TypeError("module_version must be a string.")
-        if not module_version.strip() or module_version.strip() in {".", ".."}:
-            raise ValueError("module_version must not be empty or a dot segment.")
-        if any(
-            character in INVALID_MODULE_VERSION_CHARACTERS
-            for character in module_version
-        ):
-            raise ValueError("module_version contains invalid characters.")
+        self._validate_version(module_version)
         archive = self._normalize_path(compressed_module_path)
         if not archive.is_absolute():
             raise ValueError("Archive path must be absolute.")
@@ -1026,15 +1052,24 @@ class ModuleManager:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
-        if not isinstance(module_version, str):
-            raise TypeError("module_version must be a string.")
-        if not module_version.strip() or module_version.strip() in {".", ".."}:
-            raise ValueError("module_version must not be empty or a dot segment.")
-        if any(
-            character in INVALID_MODULE_VERSION_CHARACTERS
-            for character in module_version
-        ):
-            raise ValueError("module_version contains invalid characters.")
+        self._validate_version(module_version)
+        target, work_root = self._extraction_paths(module_name, temp_folder)
+        stored_hash = self._extraction_hash(module_name, module_version)
+
+        work_root.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="extract-module-", dir=work_root)
+        with _ModuleWorkspace(temporary, "Module already installed at", target) as work:
+            work_path = Path(work)
+            code_folder = self._download_verified_module(
+                module_name, module_version, stored_hash, work_path
+            )
+
+            self._replace_folder(target, code_folder)
+        return target
+
+    def _extraction_paths(
+        self, module_name: str, temp_folder: str | Path | None
+    ) -> tuple[Path, Path]:
         try:
             target = self._validate_module_folder(module_name)
         except FileNotFoundError:
@@ -1049,7 +1084,9 @@ class ModuleManager:
         work_root = work_root.resolve()
         if work_root == target or target in work_root.parents:
             raise ValueError("Temporary folder must be outside the module folder.")
+        return target, work_root
 
+    def _extraction_hash(self, module_name: str, module_version: str) -> str:
         stored_hash = self.hash_db.get_module_hash(module_name, module_version)
         if stored_hash == "":
             raise StoredObjectNotFound(
@@ -1066,34 +1103,7 @@ class ModuleManager:
             raise StoredObjectNotFound(
                 f"No archive stored for module {module_name!r}, version {module_version!r}."
             )
-
-        work_root.mkdir(parents=True, exist_ok=True)
-        temporary = tempfile.TemporaryDirectory(prefix="extract-module-", dir=work_root)
-        work = temporary.name
-        failure = None
-        try:
-            work_path = Path(work)
-            code_folder = self._download_verified_module(
-                module_name, module_version, stored_hash, work_path
-            )
-
-            self._replace_folder(target, code_folder)
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
-            try:
-                temporary.cleanup()
-            except OSError as cleanup_error:
-                note = f"Temporary cleanup failed at {work}: {cleanup_error}"
-                if failure is not None:
-                    failure.add_note(note)
-                else:
-                    cleanup_error.add_note(
-                        f"Module already installed at {target}. {note}"
-                    )
-                    raise
-        return target
+        return stored_hash
 
     def validate_module(
         self,
@@ -1112,30 +1122,10 @@ class ModuleManager:
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
-        if not isinstance(module_version, str):
-            raise TypeError("module_version must be a string.")
-        if not module_version.strip() or module_version.strip() in {".", ".."}:
-            raise ValueError("module_version must not be empty or a dot segment.")
-        if any(
-            character in INVALID_MODULE_VERSION_CHARACTERS
-            for character in module_version
-        ):
-            raise ValueError("module_version contains invalid characters.")
-        if module_folder is not None:
-            module_folder = self._normalize_path(module_folder)
-            if not module_folder.is_absolute():
-                raise ValueError("Module folder path must be absolute.")
-            if module_folder.is_symlink() or module_folder.is_junction():
-                raise ValueError("Module folder must not be a filesystem link.")
+        self._validate_version(module_version)
+        module_folder = self._optional_module_folder(module_folder)
         if module_hash is not None:
-            if not isinstance(module_hash, str):
-                raise TypeError("Module hash must be a string.")
-            if len(module_hash) != 64 or any(
-                character not in HEX_DIGITS for character in module_hash
-            ):
-                raise ValueError(
-                    "Module hash must contain exactly 64 hexadecimal characters."
-                )
+            self._validate_module_hash(module_hash)
 
         module_stored_hash = self.hash_db.get_module_hash(module_name, module_version)
         if module_stored_hash == "":
