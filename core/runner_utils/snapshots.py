@@ -128,48 +128,9 @@ class ExperimentSnapshots:
                 else:
                     failure.add_note(f"Final shutdown also failed: {error}")
             if failure is not None:
-                diagnostic = (
-                    self._project_root
-                    / "controller"
-                    / "snapshot_failures"
-                    / f"{snapshot_id}.json"
+                return self._finalization_failure(
+                    state, snapshot_id, failure, shutdown_failed, terminal_phase
                 )
-                if not diagnostic.resolve().is_relative_to(self._project_root):
-                    raise ValueError(
-                        "Snapshot diagnostic path escapes the project."
-                    ) from failure
-                write_json(
-                    diagnostic,
-                    {
-                        "snapshot_id": snapshot_id,
-                        "experiment_id": state.experiment_id,
-                        "valid": False,
-                        "error": f"{type(failure).__name__}: {failure}",
-                    },
-                )
-                if (
-                    isinstance(failure, Exception)
-                    and not isinstance(failure, LoggingError)
-                    and not shutdown_failed
-                ):
-                    state.phase = terminal_phase
-                    if self._notify_resources is not None:
-                        self._notify_resources()
-                    result = {
-                        "snapshot_id": snapshot_id,
-                        "valid": False,
-                        "error": f"{type(failure).__name__}: {failure}",
-                    }
-                    self._journal.client.record_event(
-                        "snapshot.failed",
-                        result,
-                        context={
-                            "experiment_id": state.experiment_id,
-                            "run_id": state.run_id,
-                        },
-                    )
-                    return result
-                raise failure
             state.phase = terminal_phase
             if self._notify_resources is not None:
                 self._notify_resources()
@@ -179,6 +140,57 @@ class ExperimentSnapshots:
                 context={"experiment_id": state.experiment_id, "run_id": state.run_id},
             )
             return await self._publish(state, snapshot_id, exports, "final", None)
+
+    def _finalization_failure(
+        self,
+        state: RunnerState,
+        snapshot_id: str,
+        failure: BaseException,
+        shutdown_failed: bool,
+        terminal_phase: str,
+    ) -> JsonObject:
+        diagnostic = (
+            self._project_root
+            / "controller"
+            / "snapshot_failures"
+            / f"{snapshot_id}.json"
+        )
+        if not diagnostic.resolve().is_relative_to(self._project_root):
+            raise ValueError(
+                "Snapshot diagnostic path escapes the project."
+            ) from failure
+        write_json(
+            diagnostic,
+            {
+                "snapshot_id": snapshot_id,
+                "experiment_id": state.experiment_id,
+                "valid": False,
+                "error": f"{type(failure).__name__}: {failure}",
+            },
+        )
+        if (
+            isinstance(failure, Exception)
+            and not isinstance(failure, LoggingError)
+            and not shutdown_failed
+        ):
+            state.phase = terminal_phase
+            if self._notify_resources is not None:
+                self._notify_resources()
+            result = {
+                "snapshot_id": snapshot_id,
+                "valid": False,
+                "error": f"{type(failure).__name__}: {failure}",
+            }
+            self._journal.client.record_event(
+                "snapshot.failed",
+                result,
+                context={
+                    "experiment_id": state.experiment_id,
+                    "run_id": state.run_id,
+                },
+            )
+            return result
+        raise failure
 
     def _build_snapshot(
         self,
@@ -245,28 +257,9 @@ class ExperimentSnapshots:
                         )
                 for filename in filenames:
                     path = current / filename
-                    if path.is_symlink() or path.is_junction() or not path.is_file():
-                        raise ValueError("Snapshot sources must be regular files.")
-                    if (
-                        len(relative.parts) == 5
-                        and relative.parts[0] == "shared_artifacts"
-                        and relative.parts[1].startswith("epoch_")
-                        and relative.parts[4].startswith("attempt_")
-                        and (
-                            filename in self._STAGE_CONTROL_FILES
-                            or filename.startswith("executor.lock.")
-                            and filename.endswith(".token")
-                        )
-                    ):
-                        continue
-                    if (
-                        shutil.disk_usage(directory).free
-                        < path.stat().st_size + reserve
-                    ):
-                        raise OSError(
-                            "Insufficient free space while copying a snapshot."
-                        )
-                    shutil.copy2(path, destination / filename)
+                    self._copy_snapshot_file(
+                        path, relative, filename, destination, directory, reserve
+                    )
         (payload / "experiment.yaml").write_text(
             document["template_yaml"], encoding="utf-8"
         )
@@ -314,6 +307,33 @@ class ExperimentSnapshots:
         }
         self._validate_snapshot(directory, manifest=manifest)
         return manifest
+
+    def _copy_snapshot_file(
+        self,
+        path: Path,
+        relative: Path,
+        filename: str,
+        destination: Path,
+        directory: Path,
+        reserve: int,
+    ) -> None:
+        if path.is_symlink() or path.is_junction() or not path.is_file():
+            raise ValueError("Snapshot sources must be regular files.")
+        if (
+            len(relative.parts) == 5
+            and relative.parts[0] == "shared_artifacts"
+            and relative.parts[1].startswith("epoch_")
+            and relative.parts[4].startswith("attempt_")
+            and (
+                filename in self._STAGE_CONTROL_FILES
+                or filename.startswith("executor.lock.")
+                and filename.endswith(".token")
+            )
+        ):
+            return
+        if shutil.disk_usage(directory).free < path.stat().st_size + reserve:
+            raise OSError("Insufficient free space while copying a snapshot.")
+        shutil.copy2(path, destination / filename)
 
     async def _publish(
         self,
@@ -426,6 +446,16 @@ class ExperimentSnapshots:
             self._journal.client.record_error(
                 error, context={"experiment_id": state.experiment_id}
             )
+        await self._retain_snapshots(directory, state)
+        return {
+            "valid": True,
+            **{
+                key: manifest[key]
+                for key in ("snapshot_id", "created_at", "sequence", "kind", "label")
+            },
+        }
+
+    async def _retain_snapshots(self, directory: Path, state: RunnerState) -> None:
         valid = []
         for path in directory.parent.glob("*/manifest.json"):
             try:
@@ -448,13 +478,6 @@ class ExperimentSnapshots:
             ):
                 raise ValueError("Unsafe snapshot retention target.")
             await asyncio.to_thread(shutil.rmtree, path)
-        return {
-            "valid": True,
-            **{
-                key: manifest[key]
-                for key in ("snapshot_id", "created_at", "sequence", "kind", "label")
-            },
-        }
 
     def _validate_snapshot(
         self, directory: Path, *, manifest: JsonObject | None = None
@@ -480,6 +503,97 @@ class ExperimentSnapshots:
             if manifest is None
             else copy_json_object(manifest, "snapshot manifest")
         )
+        self._validate_snapshot_manifest(document)
+        self._validate_snapshot_files(directory, document)
+        state = state_from_document(directory / "files", document["state"])
+        if (
+            state.experiment_id != document["experiment_id"]
+            or state.active_attempt is not None
+            or state.template_path != directory / "files" / "experiment.yaml"
+        ):
+            raise ValueError("Snapshot runner state is inconsistent.")
+        yaml_text, template = self._assembler.load_template(state.template_path)
+        if yaml_text != state.template_yaml or template != state.template:
+            raise ValueError("Snapshot template differs from its applied revision.")
+        self._validate_snapshot_modules(directory, template)
+        if state.cycle_number > state.template["cycles"] or state.stage_position > len(
+            state.template["stages"]
+        ):
+            raise ValueError("Snapshot cursor is outside its DAG.")
+        stage_ids = {item["stage_id"] for item in state.template["stages"]}
+        for stage_id, request_id in state.stage_result_ids.items():
+            if stage_id not in stage_ids:
+                raise ValueError("Snapshot result belongs to an unknown DAG node.")
+            UUID(require_text(request_id, "result request ID"))
+        if (
+            state.last_result_id is not None
+            and state.last_result_id not in state.stage_result_ids.values()
+            and (
+                state.pending_input is None
+                or state.last_result_id != state.pending_input["request_id"]
+            )
+        ):
+            raise ValueError(
+                "Snapshot retained result has no matching journal reference."
+            )
+        if state.last_result_id is None and state.last_result is not None:
+            raise ValueError("Snapshot retained data has no journal reference.")
+        for relative in state.retained_artifacts:
+            if not (directory / "files" / relative).exists():
+                raise ValueError("Snapshot is missing a retained conditional artifact.")
+        self._validate_snapshot_exports(directory, document, state)
+        if read_json(directory / "journal/manifest.json") != document["journal"]:
+            raise ValueError("Journal manifest differs from the experiment snapshot.")
+        # Reuse the journal's public full-content validator on a disposable copy.
+        # Never open a journal client against the immutable archived database.
+        scratch = self._project_root / "controller/snapshot_validation"
+        if not scratch.resolve().is_relative_to(self._project_root):
+            raise ValueError("Snapshot validation path escapes the project.")
+        scratch.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=scratch)
+        try:
+            database = Path(temporary.name) / "journal.sqlite"
+            shutil.copyfile(directory / "journal/journal.sqlite", database)
+            settings = state.template["logging"]
+            store = SQLiteEventStore(
+                database,
+                busy_timeout_seconds=settings["busy_timeout_seconds"],
+                max_event_bytes=settings["max_event_bytes"],
+                min_free_bytes=0,
+                open_mode="existing",
+                expected_journal={
+                    key: document["journal"][key]
+                    for key in ("journal_id", "generation")
+                },
+            )
+            try:
+                store.open()
+                try:
+                    self._validate_journal_results(state, store)
+                finally:
+                    store.close()
+                store.complete_restore(
+                    document["journal"],
+                    restoration_id=str(uuid4()),
+                    new_generation=str(uuid4()),
+                )
+            finally:
+                store.close()
+        finally:
+            for attempt in range(10):
+                try:
+                    temporary.cleanup()
+                    break
+                except OSError as error:
+                    if (
+                        getattr(error, "winerror", None) not in (32, 145)
+                        or attempt == 9
+                    ):
+                        raise
+                    time.sleep(0.1)
+        return document
+
+    def _validate_snapshot_manifest(self, document: JsonObject) -> None:
         required = {
             "schema_version",
             "snapshot_id",
@@ -522,6 +636,8 @@ class ExperimentSnapshots:
             raise ValueError("Snapshot time must be UTC.")
         if document["label"] is not None:
             require_text(document["label"], "snapshot label")
+
+    def _validate_snapshot_files(self, directory: Path, document: JsonObject) -> None:
         files = copy_json_object(document["files"], "snapshot files")
         directories = document["directories"]
         if type(directories) is not list or any(
@@ -616,16 +732,8 @@ class ExperimentSnapshots:
                         raise ValueError(f"Snapshot file checksum mismatch: {relative}")
         if observed_files != set(files) or observed_directories != set(directories):
             raise ValueError("Snapshot members differ from the inventory.")
-        state = state_from_document(directory / "files", document["state"])
-        if (
-            state.experiment_id != document["experiment_id"]
-            or state.active_attempt is not None
-            or state.template_path != directory / "files" / "experiment.yaml"
-        ):
-            raise ValueError("Snapshot runner state is inconsistent.")
-        yaml_text, template = self._assembler.load_template(state.template_path)
-        if yaml_text != state.template_yaml or template != state.template:
-            raise ValueError("Snapshot template differs from its applied revision.")
+
+    def _validate_snapshot_modules(self, directory: Path, template: JsonObject) -> None:
         checked_modules = {}
         for role in ("stage", "service"):
             for definition in template[f"{role}s"]:
@@ -649,31 +757,10 @@ class ExperimentSnapshots:
                     raise ValueError(
                         "Snapshot module identity or contents differ from its template."
                     )
-        if state.cycle_number > state.template["cycles"] or state.stage_position > len(
-            state.template["stages"]
-        ):
-            raise ValueError("Snapshot cursor is outside its DAG.")
-        stage_ids = {item["stage_id"] for item in state.template["stages"]}
-        for stage_id, request_id in state.stage_result_ids.items():
-            if stage_id not in stage_ids:
-                raise ValueError("Snapshot result belongs to an unknown DAG node.")
-            UUID(require_text(request_id, "result request ID"))
-        if (
-            state.last_result_id is not None
-            and state.last_result_id not in state.stage_result_ids.values()
-            and (
-                state.pending_input is None
-                or state.last_result_id != state.pending_input["request_id"]
-            )
-        ):
-            raise ValueError(
-                "Snapshot retained result has no matching journal reference."
-            )
-        if state.last_result_id is None and state.last_result is not None:
-            raise ValueError("Snapshot retained data has no journal reference.")
-        for relative in state.retained_artifacts:
-            if not (directory / "files" / relative).exists():
-                raise ValueError("Snapshot is missing a retained conditional artifact.")
+
+    def _validate_snapshot_exports(
+        self, directory: Path, document: JsonObject, state: RunnerState
+    ) -> None:
         if set(state.services) != {
             item["service_id"] for item in state.template["services"]
         }:
@@ -720,120 +807,71 @@ class ExperimentSnapshots:
                 raise ValueError(
                     "Service export escapes its allocated snapshot directory."
                 )
-        if read_json(directory / "journal/manifest.json") != document["journal"]:
-            raise ValueError("Journal manifest differs from the experiment snapshot.")
-        # Reuse the journal's public full-content validator on a disposable copy.
-        # Never open a journal client against the immutable archived database.
-        scratch = self._project_root / "controller/snapshot_validation"
-        if not scratch.resolve().is_relative_to(self._project_root):
-            raise ValueError("Snapshot validation path escapes the project.")
-        scratch.mkdir(parents=True, exist_ok=True)
-        temporary = tempfile.TemporaryDirectory(dir=scratch)
-        try:
-            database = Path(temporary.name) / "journal.sqlite"
-            shutil.copyfile(directory / "journal/journal.sqlite", database)
-            settings = state.template["logging"]
-            store = SQLiteEventStore(
-                database,
-                busy_timeout_seconds=settings["busy_timeout_seconds"],
-                max_event_bytes=settings["max_event_bytes"],
-                min_free_bytes=0,
-                open_mode="existing",
-                expected_journal={
-                    key: document["journal"][key]
-                    for key in ("journal_id", "generation")
+
+    def _validate_journal_results(
+        self, state: RunnerState, store: SQLiteEventStore
+    ) -> None:
+        for transfer in (state.pending_input, state.last_dag_decision):
+            if transfer is None:
+                continue
+            record = read_result(
+                store,
+                transfer["request_id"],
+                expected={
+                    "experiment_id": transfer["experiment_id"],
+                    "stage_id": transfer["source_stage_id"],
                 },
+                accepted=True,
             )
-            try:
-                store.open()
-                try:
-                    for transfer in (state.pending_input, state.last_dag_decision):
-                        if transfer is None:
-                            continue
-                        record = read_result(
-                            store,
-                            transfer["request_id"],
-                            expected={
-                                "experiment_id": transfer["experiment_id"],
-                                "stage_id": transfer["source_stage_id"],
-                            },
-                            accepted=True,
-                        )
-                        if (
-                            record is None
-                            or record["outcome"] != "succeeded"
-                            or record["response"]["result"] != "success"
-                        ):
-                            raise ValueError(
-                                "Snapshot transition has no accepted result."
-                            )
-                        decision = (
-                            record["response"].get("execution", {}).get("dag_decision")
-                        )
-                        expected = transfer.get(
-                            "decision",
-                            {"command": "move", "stage_id": transfer.get("stage_id")},
-                        )
-                        if decision != expected:
-                            raise ValueError(
-                                "Snapshot transition differs from its journal decision."
-                            )
-                        if (
-                            transfer["request_id"] == state.last_result_id
-                            and record["response"]["data"] != state.last_result
-                        ):
-                            raise ValueError(
-                                "Snapshot transferred data differs from its journal result."
-                            )
-                    for stage_id, request_id in state.stage_result_ids.items():
-                        record = read_result(
-                            store,
-                            request_id,
-                            expected={
-                                "experiment_id": state.stage_result_origins.get(
-                                    stage_id, state.experiment_id
-                                ),
-                                "stage_id": stage_id,
-                            },
-                            accepted=True,
-                        )
-                        if (
-                            record is None
-                            or record["outcome"] != "succeeded"
-                            or record["response"]["result"] != "success"
-                        ):
-                            raise ValueError(
-                                "Snapshot result is missing or unsuccessful in its journal."
-                            )
-                        if (
-                            request_id == state.last_result_id
-                            and record["response"]["data"] != state.last_result
-                        ):
-                            raise ValueError(
-                                "Snapshot retained data differs from its journal result."
-                            )
-                finally:
-                    store.close()
-                store.complete_restore(
-                    document["journal"],
-                    restoration_id=str(uuid4()),
-                    new_generation=str(uuid4()),
+            if (
+                record is None
+                or record["outcome"] != "succeeded"
+                or record["response"]["result"] != "success"
+            ):
+                raise ValueError("Snapshot transition has no accepted result.")
+            decision = record["response"].get("execution", {}).get("dag_decision")
+            expected = transfer.get(
+                "decision",
+                {"command": "move", "stage_id": transfer.get("stage_id")},
+            )
+            if decision != expected:
+                raise ValueError(
+                    "Snapshot transition differs from its journal decision."
                 )
-            finally:
-                store.close()
-        finally:
-            for attempt in range(10):
-                try:
-                    temporary.cleanup()
-                    break
-                except OSError as error:
-                    if (
-                        getattr(error, "winerror", None) not in (32, 145)
-                        or attempt == 9
-                    ):
-                        raise
-                    time.sleep(0.1)
-        return document
+            if (
+                transfer["request_id"] == state.last_result_id
+                and record["response"]["data"] != state.last_result
+            ):
+                raise ValueError(
+                    "Snapshot transferred data differs from its journal result."
+                )
+        for stage_id, request_id in state.stage_result_ids.items():
+            record = read_result(
+                store,
+                request_id,
+                expected={
+                    "experiment_id": state.stage_result_origins.get(
+                        stage_id, state.experiment_id
+                    ),
+                    "stage_id": stage_id,
+                },
+                accepted=True,
+            )
+            if (
+                record is None
+                or record["outcome"] != "succeeded"
+                or record["response"]["result"] != "success"
+            ):
+                raise ValueError(
+                    "Snapshot result is missing or unsuccessful in its journal."
+                )
+            if (
+                request_id == state.last_result_id
+                and record["response"]["data"] != state.last_result
+            ):
+                raise ValueError(
+                    "Snapshot retained data differs from its journal result."
+                )
 
     def latest_valid(self, experiment_directory: Path) -> JsonObject:
         root = Path(experiment_directory)
@@ -978,20 +1016,7 @@ class ExperimentSnapshots:
             # Bootstrap a clone's private journal to record its own restore intent.
             # The source experiment and archived journal are never opened for writing.
             if source_directory is not None:
-                target.mkdir(parents=True, exist_ok=True)
-                (target / "journals").mkdir(exist_ok=True)
-                shutil.copyfile(
-                    archive / "journal/journal.sqlite",
-                    target / "journals/events.sqlite",
-                )
-                write_json(
-                    target / "runner/journal.json",
-                    {
-                        key: manifest["journal"][key]
-                        for key in ("journal_id", "generation")
-                    },
-                )
-                self._journal.open(state, create=False)
+                self._bootstrap_clone_journal(state, archive, manifest, target)
             operation = self._journal.client.start_operation(
                 "restore_prepare",
                 "experiment.restore_intent",
@@ -1033,6 +1058,21 @@ class ExperimentSnapshots:
             }
             write_json(marker, transaction)
             return await self._finish_restore(state, transaction, marker)
+
+    def _bootstrap_clone_journal(
+        self, state: RunnerState, archive: Path, manifest: JsonObject, target: Path
+    ) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "journals").mkdir(exist_ok=True)
+        shutil.copyfile(
+            archive / "journal/journal.sqlite",
+            target / "journals/events.sqlite",
+        )
+        write_json(
+            target / "runner/journal.json",
+            {key: manifest["journal"][key] for key in ("journal_id", "generation")},
+        )
+        self._journal.open(state, create=False)
 
     async def _finish_restore(
         self,
@@ -1342,37 +1382,13 @@ class ExperimentSnapshots:
                 # Read-only dashboard clients open the source briefly. Give them
                 # a bounded opportunity to release it, without bypassing the
                 # barrier for a persistently open external journal on Windows.
-                deadline = time.monotonic() + 1
-                while True:
-                    try:
-                        target.replace(previous)
-                        break
-                    except OSError as error:
-                        if (
-                            os.name != "nt"
-                            or getattr(error, "winerror", None) not in (5, 32, 33)
-                            or time.monotonic() >= deadline
-                        ):
-                            raise
-                        await asyncio.sleep(0.01)
+                await self._replace_restore_directory(target, previous)
             if not target.exists():
                 if not replacement.is_dir():
                     raise RuntimeError(
                         "Restoration replacement is missing after displacement."
                     )
-                deadline = time.monotonic() + 1
-                while True:
-                    try:
-                        replacement.replace(target)
-                        break
-                    except OSError as error:
-                        if (
-                            os.name != "nt"
-                            or getattr(error, "winerror", None) not in (5, 32, 33)
-                            or time.monotonic() >= deadline
-                        ):
-                            raise
-                        await asyncio.sleep(0.01)
+                await self._replace_restore_directory(replacement, target)
             elif replacement.exists():
                 raise RuntimeError(
                     "Ambiguous restoration directories; no files were overwritten."
@@ -1436,3 +1452,18 @@ class ExperimentSnapshots:
                     continue
                 await asyncio.to_thread(shutil.rmtree, path)
         return state
+
+    async def _replace_restore_directory(self, source: Path, target: Path) -> None:
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                source.replace(target)
+                break
+            except OSError as error:
+                if (
+                    os.name != "nt"
+                    or getattr(error, "winerror", None) not in (5, 32, 33)
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                await asyncio.sleep(0.01)
