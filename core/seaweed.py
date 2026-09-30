@@ -92,18 +92,20 @@ class SeaweedDB:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             status = response.status_code
-            if status == 404:
-                failure = StoredObjectNotFound
-            elif status == 409:
-                failure = StorageConflict
-            elif status in {401, 403}:
-                failure = StorageAccessError
-            elif status in {413, 507}:
-                failure = StorageCapacityError
-            elif status in {408, 429, 502, 503, 504}:
-                failure = StorageUnavailable
-            else:
-                failure = StorageError
+            failures_by_status = {
+                404: StoredObjectNotFound,
+                409: StorageConflict,
+                401: StorageAccessError,
+                403: StorageAccessError,
+                413: StorageCapacityError,
+                507: StorageCapacityError,
+                408: StorageUnavailable,
+                429: StorageUnavailable,
+                502: StorageUnavailable,
+                503: StorageUnavailable,
+                504: StorageUnavailable,
+            }
+            failure = failures_by_status.get(status, StorageError)
             raise failure(
                 f"Filer rejected the operation with HTTP status {status}."
             ) from error
