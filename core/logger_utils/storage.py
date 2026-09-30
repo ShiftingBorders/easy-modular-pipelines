@@ -10,6 +10,7 @@ import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID, uuid4
 
 from core.logger_utils.events import (
@@ -76,6 +77,26 @@ _TABLES = {
     "journal_restorations": _CREATE_RESTORATIONS,
 }
 _PAGE_BYTES = 16777216
+
+
+def _matches_table_definition(
+    kind: str, name: str, sql: object, expected: dict[str, str]
+) -> bool:
+    return not (
+        kind != "table"
+        or name not in expected
+        or not isinstance(sql, str)
+        or " ".join(sql.split()) != " ".join(expected[name].split())
+    )
+
+
+def _write_stderr_best_effort(message: str) -> None:
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+    except BaseException:  # noqa: BLE001, S110 - Last-resort sink.
+        pass
 
 
 class SQLiteEventStore:
@@ -167,12 +188,7 @@ class SQLiteEventStore:
         )
         compatible = compatible and len(objects) == len(expected)
         for kind, name, sql in objects:
-            if (
-                kind != "table"
-                or name not in expected
-                or not isinstance(sql, str)
-                or " ".join(sql.split()) != " ".join(expected[name].split())
-            ):
+            if not _matches_table_definition(kind, name, sql, expected):
                 compatible = False
         if not compatible:
             raise LoggingConfigurationError(
@@ -302,12 +318,7 @@ class SQLiteEventStore:
                 f"Emergency journal diagnostic failed at {diagnostic_path}: "
                 f"{type(diagnostic_error).__name__}."
             )
-            try:
-                if sys.stderr is not None:
-                    sys.stderr.write(note + "\n")
-                    sys.stderr.flush()
-            except BaseException:  # noqa: BLE001, S110 - Last-resort sink.
-                pass
+            _write_stderr_best_effort(note)
         try:
             if event is not None:
                 error.event_id = event["event_id"]
@@ -432,9 +443,7 @@ class SQLiteEventStore:
                             raise LoggingStorageError(
                                 "The known journal lost its schema."
                             )
-                        self._create_tables(connection)
-                        connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
-                        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                        self._initialize_empty_journal(connection)
                     connection.execute("COMMIT")
                     if (
                         connection.execute("PRAGMA journal_mode=WAL")
@@ -483,6 +492,11 @@ class SQLiteEventStore:
                     self._report_failure(error, "open")
                     raise
                 raise self._storage_failure(error, "open")
+
+    def _initialize_empty_journal(self, connection: sqlite3.Connection) -> None:
+        self._create_tables(connection)
+        connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _insert_event(
         self,
@@ -570,21 +584,9 @@ class SQLiteEventStore:
                 result = []
                 page_bytes = 0
                 try:
-                    for row in rows:
-                        entry = self._decode_row(row)
-                        if view == "effective":
-                            entry = self._effective_entry(entry, self._connection)
-                        if entry is None:
-                            after = row[0]
-                            continue
-                        size = len(row[4].encode("utf-8"))
-                        if result and page_bytes + size > _PAGE_BYTES:
-                            break
-                        result.append(entry)
-                        page_bytes += size
-                        after = row[0]
-                        if len(result) == limit:
-                            break
+                    result, after = self._read_event_page(
+                        rows, view, limit, after, result, page_bytes
+                    )
                 finally:
                     rows.close()
                 self._connection.execute("COMMIT")
@@ -601,6 +603,32 @@ class SQLiteEventStore:
             except BaseException as error:  # noqa: BLE001 - Fail closed on interrupted I/O.
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read events")
+
+    def _read_event_page(
+        self,
+        rows: sqlite3.Cursor,
+        view: str,
+        limit: int,
+        after: int,
+        result: list[JsonObject],
+        page_bytes: int,
+    ) -> tuple[list[JsonObject], int]:
+        for row in rows:
+            entry = self._decode_row(row)
+            if view == "effective":
+                entry = self._effective_entry(entry, self._connection)
+            if entry is None:
+                after = row[0]
+                continue
+            size = len(row[4].encode("utf-8"))
+            if result and page_bytes + size > _PAGE_BYTES:
+                break
+            result.append(entry)
+            page_bytes += size
+            after = row[0]
+            if len(result) == limit:
+                break
+        return result, after
 
     def read_event_batch(
         self,
@@ -628,21 +656,7 @@ class SQLiteEventStore:
                 self._check_health()
                 self._connection.execute("BEGIN")
                 boundary = self._read_boundary(self._connection)
-                columns = "cursor, event_id, producer_instance_id, sequence_number, event_json"
-                if event_ids is not None:
-                    placeholders = ",".join("?" for _ in event_ids)
-                    rows = self._connection.execute(
-                        f"SELECT {columns} FROM events WHERE event_id IN ({placeholders}) ORDER BY cursor",
-                        event_ids,
-                    )
-                else:
-                    rows = self._connection.execute(
-                        f"SELECT {columns} FROM events WHERE cursor < ? ORDER BY cursor DESC LIMIT ?",
-                        (
-                            before if before is not None else boundary["cursor"] + 1,
-                            limit,
-                        ),
-                    )
+                rows = self._select_event_batch_rows(event_ids, before, boundary, limit)
                 entries, size = [], 0
                 try:
                     for row in rows:
@@ -662,6 +676,30 @@ class SQLiteEventStore:
             except BaseException as error:  # noqa: BLE001 - Roll back interrupted read transactions.
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read event batch")
+
+    def _select_event_batch_rows(
+        self,
+        event_ids: list[str] | None,
+        before: int | None,
+        boundary: JsonObject,
+        limit: int,
+    ) -> sqlite3.Cursor:
+        columns = "cursor, event_id, producer_instance_id, sequence_number, event_json"
+        if event_ids is not None:
+            placeholders = ",".join("?" for _ in event_ids)
+            rows = self._connection.execute(
+                f"SELECT {columns} FROM events WHERE event_id IN ({placeholders}) ORDER BY cursor",
+                event_ids,
+            )
+        else:
+            rows = self._connection.execute(
+                f"SELECT {columns} FROM events WHERE cursor < ? ORDER BY cursor DESC LIMIT ?",
+                (
+                    before if before is not None else boundary["cursor"] + 1,
+                    limit,
+                ),
+            )
+        return rows
 
     def _read_boundary(self, connection: sqlite3.Connection) -> JsonObject:
         info = self._read_journal_info(connection)
@@ -820,69 +858,7 @@ class SQLiteEventStore:
             ):
                 raise LoggingStorageError("Invalid ordinary event change.")
         elif change["kind"] == "command.result":
-            require_text(change["request_id"], "request_id")
-            if change["effective_author"] not in ("runner", "participant"):
-                raise LoggingStorageError("Invalid effective change author.")
-            if change["provisional"] != (change["effective_author"] == "participant"):
-                raise LoggingStorageError(
-                    "Change confirmation state disagrees with author."
-                )
-            for related_id in related:
-                event = self._event_entry(related_id, connection)["event"]
-                if event["event_type"] != "command.result":
-                    raise LoggingStorageError("Change refers to an unrelated event.")
-                if (
-                    validate_command_result(event["data"])["request_id"]
-                    != change["request_id"]
-                ):
-                    raise LoggingStorageError("Change refers to another request.")
-                if any(
-                    event["context"].get(key) != entry["event"]["context"].get(key)
-                    for key in (
-                        "experiment_id",
-                        "participant_id",
-                        "participant_instance_id",
-                        "request_id",
-                    )
-                ):
-                    raise LoggingStorageError("Change mixes request owners.")
-            observation = change["observation"]
-            if observation is not None:
-                if (
-                    type(observation) is not dict
-                    or observation.keys()
-                    != {
-                        "author",
-                        "producer_instance_id",
-                        "occurred_at",
-                        "context",
-                        "operation_id",
-                    }
-                    or observation["author"] not in ("runner", "participant")
-                ):
-                    raise LoggingStorageError("Invalid change observer.")
-                if observation["operation_id"] is not None:
-                    require_text(observation["operation_id"], "operation_id")
-                require_text(
-                    observation["producer_instance_id"], "producer_instance_id"
-                )
-                if datetime.fromisoformat(
-                    observation["occurred_at"]
-                ).utcoffset() != UTC.utcoffset(None):
-                    raise LoggingStorageError("Change observation time must be UTC.")
-                context = validate_context(observation["context"])
-                if any(
-                    context.get(key) != entry["event"]["context"].get(key)
-                    for key in (
-                        "experiment_id",
-                        "participant_id",
-                        "participant_instance_id",
-                        "request_id",
-                    )
-                ):
-                    raise LoggingStorageError(
-                        "Change observer belongs to another request."
-                    )
+            self._validate_command_change(change, entry, connection, related)
         else:
             raise LoggingStorageError("Unknown change kind.")
         return {
@@ -896,6 +872,73 @@ class SQLiteEventStore:
             },
             "observed_event": observed["event"],
         }
+
+    def _validate_command_change(
+        self,
+        change: JsonObject,
+        entry: JsonObject,
+        connection: sqlite3.Connection,
+        related: list[str],
+    ) -> None:
+        require_text(change["request_id"], "request_id")
+        if change["effective_author"] not in ("runner", "participant"):
+            raise LoggingStorageError("Invalid effective change author.")
+        if change["provisional"] != (change["effective_author"] == "participant"):
+            raise LoggingStorageError(
+                "Change confirmation state disagrees with author."
+            )
+        for related_id in related:
+            event = self._event_entry(related_id, connection)["event"]
+            if event["event_type"] != "command.result":
+                raise LoggingStorageError("Change refers to an unrelated event.")
+            if (
+                validate_command_result(event["data"])["request_id"]
+                != change["request_id"]
+            ):
+                raise LoggingStorageError("Change refers to another request.")
+            if any(
+                event["context"].get(key) != entry["event"]["context"].get(key)
+                for key in (
+                    "experiment_id",
+                    "participant_id",
+                    "participant_instance_id",
+                    "request_id",
+                )
+            ):
+                raise LoggingStorageError("Change mixes request owners.")
+        observation = change["observation"]
+        if observation is not None:
+            if (
+                type(observation) is not dict
+                or observation.keys()
+                != {
+                    "author",
+                    "producer_instance_id",
+                    "occurred_at",
+                    "context",
+                    "operation_id",
+                }
+                or observation["author"] not in ("runner", "participant")
+            ):
+                raise LoggingStorageError("Invalid change observer.")
+            if observation["operation_id"] is not None:
+                require_text(observation["operation_id"], "operation_id")
+            require_text(observation["producer_instance_id"], "producer_instance_id")
+            if datetime.fromisoformat(
+                observation["occurred_at"]
+            ).utcoffset() != UTC.utcoffset(None):
+                raise LoggingStorageError("Change observation time must be UTC.")
+            context = validate_context(observation["context"])
+            if any(
+                context.get(key) != entry["event"]["context"].get(key)
+                for key in (
+                    "experiment_id",
+                    "participant_id",
+                    "participant_instance_id",
+                    "request_id",
+                )
+            ):
+                raise LoggingStorageError("Change observer belongs to another request.")
 
     def read_changes(
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
@@ -911,22 +954,7 @@ class SQLiteEventStore:
                 self._connection.execute("BEGIN")
                 boundary = self._read_boundary(self._connection)
                 after = self._checkpoint_position(checkpoint, boundary, "change_cursor")
-                result = []
-                size = 0
-                for row in self._connection.execute(
-                    "SELECT change_cursor, event_id, change_json FROM journal_changes "
-                    "WHERE change_cursor > ? ORDER BY change_cursor LIMIT ?",
-                    (after, limit),
-                ):
-                    item = self._decode_change(row, self._connection)
-                    item_size = len(
-                        json.dumps(item, ensure_ascii=False).encode("utf-8")
-                    )
-                    if result and size + item_size > _PAGE_BYTES:
-                        break
-                    result.append(item)
-                    size += item_size
-                    after = row[0]
+                result, after = self._read_change_page(after, limit)
                 self._connection.execute("COMMIT")
                 self._check_health()
                 return {
@@ -941,6 +969,23 @@ class SQLiteEventStore:
             except BaseException as error:  # noqa: BLE001 - Include interrupted reads.
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read changes")
+
+    def _read_change_page(self, after: int, limit: int) -> tuple[list[JsonObject], int]:
+        result = []
+        size = 0
+        for row in self._connection.execute(
+            "SELECT change_cursor, event_id, change_json FROM journal_changes "
+            "WHERE change_cursor > ? ORDER BY change_cursor LIMIT ?",
+            (after, limit),
+        ):
+            item = self._decode_change(row, self._connection)
+            item_size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+            if result and size + item_size > _PAGE_BYTES:
+                break
+            result.append(item)
+            size += item_size
+            after = row[0]
+        return result, after
 
     def get_journal_info(self) -> JsonObject:
         self._check_process()
@@ -998,123 +1043,123 @@ class SQLiteEventStore:
                 if stored is None:
                     raise ValueError("Command result refers to a missing event.")
                 event = self._decode_row(stored)["event"]
-                if (
-                    event["schema_version"] != SCHEMA_VERSION
-                    or event["event_type"] != "command.result"
-                ):
-                    raise ValueError("Command result refers to an unrelated event.")
-                data = validate_command_result(event["data"])
-                if (
-                    data["request_id"] != request_id
-                    or event["context"].get("request_id") != request_id
-                ):
-                    raise ValueError("Command result request identity does not match.")
-                if {key: event["context"].get(key) for key in identity} != identity:
-                    raise ValueError(
-                        "Command result belongs to another request context."
-                    )
-                observation = copy_json_object(
-                    json.loads(observation_json), "observation"
+                observation = self._decode_author_observation(
+                    event, observation_json, request_id, identity
                 )
-                if observation.keys() != {
-                    "producer_instance_id",
-                    "occurred_at",
-                    "context",
-                    "operation_id",
-                }:
-                    raise ValueError("Invalid observation fields.")
-                if observation["operation_id"] is not None:
-                    require_text(observation["operation_id"], "operation_id")
-                require_text(
-                    observation["producer_instance_id"], "producer_instance_id"
-                )
-                timestamp = datetime.fromisoformat(observation["occurred_at"])
-                if timestamp.utcoffset() != UTC.utcoffset(None):
-                    raise ValueError("Observation time must be UTC.")
-                context = validate_context(observation["context"])
-                if context.get("request_id") != request_id:
-                    raise ValueError("Observation request_id does not match.")
-                if {key: context.get(key) for key in identity} != identity:
-                    raise ValueError("Observation belongs to another request context.")
                 result[author] = {
                     "event_id": event_id,
                     "event": event,
                     "observation": observation,
                 }
-            runner = result["runner"]
-            participant = result["participant"]
-            shared_event = (
-                runner is not None
-                and participant is not None
-                and runner["event_id"] == participant["event_id"]
-            )
-            if not shared_event:
-                for author in ("runner", "participant"):
-                    entry = result[author]
-                    if entry is not None and entry["event"]["data"]["author"] != author:
-                        raise ValueError(
-                            "Command event author does not match its index."
-                        )
-            effective_author = (
-                "runner" if result["runner"] is not None else "participant"
-            )
-            effective = result[effective_author]
-            if (
-                effective is None
-                or row[6] != effective_author
-                or row[5] != effective["event_id"]
-            ):
-                raise ValueError("Invalid effective command result.")
-            if runner is None and participant["event"]["data"]["ignored"] is not None:
-                raise ValueError(
-                    "An ignored participant response requires a runner result."
-                )
-            if shared_event:
-                shared_data = effective["event"]["data"]
-                if shared_data["ignored"] is not None or shared_data["supersedes"]:
-                    raise ValueError("A shared result cannot be ignored or superseded.")
-            else:
-                if (
-                    participant is not None
-                    and participant["event"]["data"]["supersedes"]
-                ):
-                    raise ValueError("A participant response cannot supersede runner.")
-                if runner is not None:
-                    runner_data = runner["event"]["data"]
-                    if runner_data["ignored"] is not None:
-                        raise ValueError("A runner result cannot be ignored.")
-                    supersedes = runner_data["supersedes"]
-                    if supersedes and (
-                        participant is None
-                        or supersedes
-                        != [
-                            {
-                                "event_id": participant["event_id"],
-                                "ignored": self._ignored_reason(runner["event"]),
-                            }
-                        ]
-                    ):
-                        raise ValueError("Invalid superseded participant reference.")
-                    if participant is not None:
-                        participant_data = participant["event"]["data"]
-                        reason = participant_data["ignored"]
-                        if reason is not None and reason != self._ignored_reason(
-                            runner["event"]
-                        ):
-                            raise ValueError("Invalid ignored participant reason.")
-                        if json.dumps(
-                            [runner_data["outcome"], runner_data["response"]],
-                            sort_keys=True,
-                        ) == json.dumps(
-                            [participant_data["outcome"], participant_data["response"]],
-                            sort_keys=True,
-                        ):
-                            raise ValueError(
-                                "Matching results must share one event ID."
-                            )
+            self._validate_result_precedence(result, row)
             return result
         except (TypeError, ValueError, RecursionError) as error:
             raise LoggingStorageError("Corrupt command-result index.") from error
+
+    def _validate_result_precedence(self, result: dict, row: tuple) -> None:
+        runner = result["runner"]
+        participant = result["participant"]
+        shared_event = (
+            runner is not None
+            and participant is not None
+            and runner["event_id"] == participant["event_id"]
+        )
+        if not shared_event:
+            for author in ("runner", "participant"):
+                entry = result[author]
+                if entry is not None and entry["event"]["data"]["author"] != author:
+                    raise ValueError("Command event author does not match its index.")
+        effective_author = "runner" if result["runner"] is not None else "participant"
+        effective = result[effective_author]
+        if (
+            effective is None
+            or row[6] != effective_author
+            or row[5] != effective["event_id"]
+        ):
+            raise ValueError("Invalid effective command result.")
+        if runner is None and participant["event"]["data"]["ignored"] is not None:
+            raise ValueError(
+                "An ignored participant response requires a runner result."
+            )
+        if shared_event:
+            shared_data = effective["event"]["data"]
+            if shared_data["ignored"] is not None or shared_data["supersedes"]:
+                raise ValueError("A shared result cannot be ignored or superseded.")
+        else:
+            if participant is not None and participant["event"]["data"]["supersedes"]:
+                raise ValueError("A participant response cannot supersede runner.")
+            if runner is not None:
+                runner_data = runner["event"]["data"]
+                if runner_data["ignored"] is not None:
+                    raise ValueError("A runner result cannot be ignored.")
+                supersedes = runner_data["supersedes"]
+                if supersedes and (
+                    participant is None
+                    or supersedes
+                    != [
+                        {
+                            "event_id": participant["event_id"],
+                            "ignored": self._ignored_reason(runner["event"]),
+                        }
+                    ]
+                ):
+                    raise ValueError("Invalid superseded participant reference.")
+                if participant is not None:
+                    participant_data = participant["event"]["data"]
+                    reason = participant_data["ignored"]
+                    if reason is not None and reason != self._ignored_reason(
+                        runner["event"]
+                    ):
+                        raise ValueError("Invalid ignored participant reason.")
+                    if json.dumps(
+                        [runner_data["outcome"], runner_data["response"]],
+                        sort_keys=True,
+                    ) == json.dumps(
+                        [participant_data["outcome"], participant_data["response"]],
+                        sort_keys=True,
+                    ):
+                        raise ValueError("Matching results must share one event ID.")
+
+    def _decode_author_observation(
+        self,
+        event: JsonObject,
+        observation_json: str,
+        request_id: str,
+        identity: JsonObject,
+    ) -> JsonObject:
+        if (
+            event["schema_version"] != SCHEMA_VERSION
+            or event["event_type"] != "command.result"
+        ):
+            raise ValueError("Command result refers to an unrelated event.")
+        data = validate_command_result(event["data"])
+        if (
+            data["request_id"] != request_id
+            or event["context"].get("request_id") != request_id
+        ):
+            raise ValueError("Command result request identity does not match.")
+        if {key: event["context"].get(key) for key in identity} != identity:
+            raise ValueError("Command result belongs to another request context.")
+        observation = copy_json_object(json.loads(observation_json), "observation")
+        if observation.keys() != {
+            "producer_instance_id",
+            "occurred_at",
+            "context",
+            "operation_id",
+        }:
+            raise ValueError("Invalid observation fields.")
+        if observation["operation_id"] is not None:
+            require_text(observation["operation_id"], "operation_id")
+        require_text(observation["producer_instance_id"], "producer_instance_id")
+        timestamp = datetime.fromisoformat(observation["occurred_at"])
+        if timestamp.utcoffset() != UTC.utcoffset(None):
+            raise ValueError("Observation time must be UTC.")
+        context = validate_context(observation["context"])
+        if context.get("request_id") != request_id:
+            raise ValueError("Observation request_id does not match.")
+        if {key: context.get(key) for key in identity} != identity:
+            raise ValueError("Observation belongs to another request context.")
+        return observation
 
     def _ignored_reason(self, runner_event: JsonObject) -> str:
         return {
@@ -1189,28 +1234,10 @@ class SQLiteEventStore:
                         )
                     event_id = own["event_id"]
                 else:
-                    other_key = None
-                    if other is not None:
-                        other_data = other["event"]["data"]
-                        other_key = json.dumps(
-                            [other_data["outcome"], other_data["response"]],
-                            sort_keys=True,
-                            ensure_ascii=True,
-                        )
-                    if response_key == other_key:
-                        event_id = other["event_id"]
-                    else:
-                        if author == "participant" and other is not None:
-                            snapshot["data"]["ignored"] = self._ignored_reason(
-                                other["event"]
-                            )
-                        elif author == "runner" and other is not None:
-                            snapshot["data"]["supersedes"] = [
-                                {
-                                    "event_id": other["event_id"],
-                                    "ignored": self._ignored_reason(snapshot),
-                                }
-                            ]
+                    reused, event_id = self._prepare_other_author_result(
+                        response_key, other, author, snapshot
+                    )
+                    if not reused:
                         encoded = encode_event(snapshot, self._max_event_bytes)
                         writing_started = True
                         self._insert_event(snapshot, encoded)
@@ -1243,6 +1270,31 @@ class SQLiteEventStore:
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "reconcile command", snapshot)
 
+    def _prepare_other_author_result(
+        self, response_key: str, other: dict | None, author: str, snapshot: JsonObject
+    ) -> tuple[bool, str | None]:
+        other_key = None
+        if other is not None:
+            other_data = other["event"]["data"]
+            other_key = json.dumps(
+                [other_data["outcome"], other_data["response"]],
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+        if response_key == other_key:
+            return True, other["event_id"]
+        else:
+            if author == "participant" and other is not None:
+                snapshot["data"]["ignored"] = self._ignored_reason(other["event"])
+            elif author == "runner" and other is not None:
+                snapshot["data"]["supersedes"] = [
+                    {
+                        "event_id": other["event_id"],
+                        "ignored": self._ignored_reason(snapshot),
+                    }
+                ]
+        return False, None
+
     def read_command_result(self, request_id: str) -> JsonObject | None:
         self._check_process()
         require_text(request_id, "request_id")
@@ -1256,45 +1308,49 @@ class SQLiteEventStore:
                 if state is None:
                     result = None
                 else:
-                    effective = state[state["effective_author"]]
-                    data = effective["event"]["data"]
-                    observations = []
-                    for author in ("runner", "participant"):
-                        entry = state[author]
-                        if entry is None:
-                            continue
-                        ignored = None
-                        if (
-                            author == "participant"
-                            and state["runner"] is not None
-                            and entry["event_id"] != state["runner"]["event_id"]
-                        ):
-                            ignored = self._ignored_reason(state["runner"]["event"])
-                        observations.append(
-                            {
-                                "author": author,
-                                "event_id": entry["event_id"],
-                                "event": entry["event"],
-                                "observation": entry["observation"],
-                                "ignored": ignored,
-                            }
-                        )
-                    result = {
-                        "request_id": request_id,
-                        "event_id": effective["event_id"],
-                        "author": state["effective_author"],
-                        "outcome": data["outcome"],
-                        "response": data["response"],
-                        "event": effective["event"],
-                        "observations": observations,
-                        "provisional": state["runner"] is None,
-                    }
+                    result = self._command_result_document(request_id, state)
                 self._connection.execute("COMMIT")
                 self._check_health()
                 return result
             except BaseException as error:  # noqa: BLE001 - Include interrupted transactions.
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read command result")
+
+    def _command_result_document(self, request_id: str, state: dict) -> JsonObject:
+        effective = state[state["effective_author"]]
+        data = effective["event"]["data"]
+        observations = []
+        for author in ("runner", "participant"):
+            entry = state[author]
+            if entry is None:
+                continue
+            ignored = None
+            if (
+                author == "participant"
+                and state["runner"] is not None
+                and entry["event_id"] != state["runner"]["event_id"]
+            ):
+                ignored = self._ignored_reason(state["runner"]["event"])
+            observations.append(
+                {
+                    "author": author,
+                    "event_id": entry["event_id"],
+                    "event": entry["event"],
+                    "observation": entry["observation"],
+                    "ignored": ignored,
+                }
+            )
+        result = {
+            "request_id": request_id,
+            "event_id": effective["event_id"],
+            "author": state["effective_author"],
+            "outcome": data["outcome"],
+            "response": data["response"],
+            "event": effective["event"],
+            "observations": observations,
+            "provisional": state["runner"] is None,
+        }
+        return result
 
     def _validate_snapshot_source(self, reader: sqlite3.Connection) -> None:
         """Validate envelopes and result references inside the selected read view."""
@@ -1452,19 +1508,7 @@ class SQLiteEventStore:
                     "database": "journal.sqlite",
                 }
                 self._check_health()
-                temporary_manifest = target / "manifest.json.part"
-                with temporary_manifest.open("x", encoding="utf-8") as manifest_file:
-                    json.dump(manifest, manifest_file, ensure_ascii=True, indent=2)
-                    manifest_file.write("\n")
-                    manifest_file.flush()
-                    os.fsync(manifest_file.fileno())
-                temporary_manifest.rename(target / "manifest.json")
-                if os.name != "nt":
-                    descriptor = os.open(target, os.O_RDONLY)
-                    try:
-                        os.fsync(descriptor)
-                    finally:
-                        os.close(descriptor)
+                self._publish_manifest(target, manifest)
             except BaseException as error:  # noqa: BLE001 - Preserve failure through cleanup.
                 failure = error
             finally:
@@ -1633,11 +1677,7 @@ class SQLiteEventStore:
                             "kind": "event",
                             "event": self._event_entry(event_id, reader)["event"],
                         }
-                        line = (json.dumps(record, ensure_ascii=True) + "\n").encode(
-                            "ascii"
-                        )
-                        output.write(line)
-                        digest.update(line)
+                        self._write_diagnostic_record(output, digest, record)
                     for request_id, state in requests.items():
                         record = {
                             "kind": "command",
@@ -1652,11 +1692,7 @@ class SQLiteEventStore:
                                     field: state[author][field]
                                     for field in ("event_id", "observation")
                                 }
-                        line = (json.dumps(record, ensure_ascii=True) + "\n").encode(
-                            "ascii"
-                        )
-                        output.write(line)
-                        digest.update(line)
+                        self._write_diagnostic_record(output, digest, record)
                     output.flush()
                     os.fsync(output.fileno())
                 reader.execute("ROLLBACK")
@@ -1696,6 +1732,13 @@ class SQLiteEventStore:
             finally:
                 if reader is not None:
                     self._close_preserving_failure(reader)
+
+    def _write_diagnostic_record(
+        self, output: BinaryIO, digest, record: JsonObject
+    ) -> None:
+        line = (json.dumps(record, ensure_ascii=True) + "\n").encode("ascii")
+        output.write(line)
+        digest.update(line)
 
     def _close_preserving_failure(
         self, connection: sqlite3.Connection | sqlite3.Cursor
@@ -1799,51 +1842,7 @@ class SQLiteEventStore:
                     "runner",
                     "participant",
                 }:
-                    request_id = require_text(record["request_id"], "request_id")
-                    if request_id in request_ids:
-                        raise ValueError("Duplicate diagnostic request ID.")
-                    request_ids.add(request_id)
-                    identity = validate_context(record["identity"])
-                    if identity.keys() != {
-                        "experiment_id",
-                        "participant_id",
-                        "participant_instance_id",
-                    }:
-                        raise ValueError("Invalid diagnostic request identity.")
-                    require_text(identity["experiment_id"], "experiment_id")
-                    require_text(identity["participant_id"], "participant_id")
-                    if record["runner"] is None and record["participant"] is None:
-                        raise ValueError("Diagnostic result requires an observation.")
-                    for author in ("runner", "participant"):
-                        entry = record[author]
-                        if entry is None:
-                            continue
-                        if type(entry) is not dict or entry.keys() != {
-                            "event_id",
-                            "observation",
-                        }:
-                            raise ValueError("Invalid diagnostic observation fields.")
-                        require_text(entry["event_id"], "event_id")
-                        observation = copy_json_object(
-                            entry["observation"], "observation"
-                        )
-                        if observation.keys() != {
-                            "producer_instance_id",
-                            "occurred_at",
-                            "context",
-                            "operation_id",
-                        }:
-                            raise ValueError("Invalid diagnostic observer.")
-                        if observation["operation_id"] is not None:
-                            require_text(observation["operation_id"], "operation_id")
-                        require_text(
-                            observation["producer_instance_id"], "producer_instance_id"
-                        )
-                        timestamp = datetime.fromisoformat(observation["occurred_at"])
-                        if timestamp.utcoffset() != UTC.utcoffset(None):
-                            raise ValueError("Observation timestamp must be UTC.")
-                        validate_context(observation["context"])
-                    commands.append(record)
+                    self._validate_diagnostic_command(record, request_ids, commands)
                 else:
                     raise ValueError("Unknown diagnostic record format.")
         if digest.hexdigest() != manifest["records_sha256"]:
@@ -1861,6 +1860,51 @@ class SQLiteEventStore:
                 ):
                     raise ValueError("Diagnostic result refers outside its bundle.")
         return manifest, events, commands
+
+    def _validate_diagnostic_command(
+        self, record: JsonObject, request_ids: set[str], commands: list[JsonObject]
+    ) -> None:
+        request_id = require_text(record["request_id"], "request_id")
+        if request_id in request_ids:
+            raise ValueError("Duplicate diagnostic request ID.")
+        request_ids.add(request_id)
+        identity = validate_context(record["identity"])
+        if identity.keys() != {
+            "experiment_id",
+            "participant_id",
+            "participant_instance_id",
+        }:
+            raise ValueError("Invalid diagnostic request identity.")
+        require_text(identity["experiment_id"], "experiment_id")
+        require_text(identity["participant_id"], "participant_id")
+        if record["runner"] is None and record["participant"] is None:
+            raise ValueError("Diagnostic result requires an observation.")
+        for author in ("runner", "participant"):
+            entry = record[author]
+            if entry is None:
+                continue
+            if type(entry) is not dict or entry.keys() != {
+                "event_id",
+                "observation",
+            }:
+                raise ValueError("Invalid diagnostic observation fields.")
+            require_text(entry["event_id"], "event_id")
+            observation = copy_json_object(entry["observation"], "observation")
+            if observation.keys() != {
+                "producer_instance_id",
+                "occurred_at",
+                "context",
+                "operation_id",
+            }:
+                raise ValueError("Invalid diagnostic observer.")
+            if observation["operation_id"] is not None:
+                require_text(observation["operation_id"], "operation_id")
+            require_text(observation["producer_instance_id"], "producer_instance_id")
+            timestamp = datetime.fromisoformat(observation["occurred_at"])
+            if timestamp.utcoffset() != UTC.utcoffset(None):
+                raise ValueError("Observation timestamp must be UTC.")
+            validate_context(observation["context"])
+        commands.append(record)
 
     def _save_command_state(
         self, connection: sqlite3.Connection, request_id: str, state: dict
@@ -1901,51 +1945,11 @@ class SQLiteEventStore:
                 "A read-only journal cannot finalize a restoration."
             )
         self._check_process()
-        manifest = copy_json_object(snapshot_manifest, "snapshot manifest")
-        if manifest.keys() != {
-            "schema_version",
-            "snapshot_id",
-            "journal_id",
-            "generation",
-            "storage_schema_version",
-            "cursor",
-            "event_count",
-            "change_cursor",
-            "content_sha256",
-            "created_at",
-            "database",
-        }:
-            raise ValueError("Snapshot manifest fields do not match the format.")
-        if (
-            type(manifest["schema_version"]) is not int
-            or manifest["schema_version"] != SCHEMA_VERSION
-            or type(manifest["storage_schema_version"]) is not int
-            or manifest["storage_schema_version"] != SCHEMA_VERSION
-            or manifest["database"] != "journal.sqlite"
-        ):
-            raise ValueError("Unsupported snapshot manifest.")
-        identity = validate_journal_identity(
-            {name: manifest[name] for name in ("journal_id", "generation")}
+        manifest, identity, restoration_id, new_generation = (
+            self._validate_restore_input(
+                snapshot_manifest, restoration_id, new_generation
+            )
         )
-        UUID(require_text(manifest["snapshot_id"], "snapshot_id"))
-        restoration_id = UUID(require_text(restoration_id, "restoration_id")).hex
-        new_generation = UUID(require_text(new_generation, "new_generation")).hex
-        if new_generation == identity["generation"]:
-            raise ValueError("Restoration requires a fresh generation.")
-        for field in ("cursor", "event_count", "change_cursor"):
-            if (
-                type(manifest[field]) is not int
-                or not 0 <= manifest[field] <= 9223372036854775807
-            ):
-                raise ValueError(f"Invalid snapshot {field}.")
-        timestamp = datetime.fromisoformat(manifest["created_at"])
-        if timestamp.utcoffset() != UTC.utcoffset(None):
-            raise ValueError("Snapshot creation time must be UTC.")
-        digest_text = require_text(manifest["content_sha256"], "content_sha256")
-        if len(digest_text) != 64 or any(
-            char not in "0123456789abcdef" for char in digest_text
-        ):
-            raise ValueError("Invalid snapshot content checksum.")
         with self._lock:
             if self._connection is not None:
                 raise LoggingStateError(
@@ -2184,6 +2188,56 @@ class SQLiteEventStore:
             finally:
                 if connection is not None:
                     self._close_preserving_failure(connection)
+
+    def _validate_restore_input(
+        self, snapshot_manifest: JsonObject, restoration_id: str, new_generation: str
+    ) -> tuple[JsonObject, JsonObject, str, str]:
+        manifest = copy_json_object(snapshot_manifest, "snapshot manifest")
+        if manifest.keys() != {
+            "schema_version",
+            "snapshot_id",
+            "journal_id",
+            "generation",
+            "storage_schema_version",
+            "cursor",
+            "event_count",
+            "change_cursor",
+            "content_sha256",
+            "created_at",
+            "database",
+        }:
+            raise ValueError("Snapshot manifest fields do not match the format.")
+        if (
+            type(manifest["schema_version"]) is not int
+            or manifest["schema_version"] != SCHEMA_VERSION
+            or type(manifest["storage_schema_version"]) is not int
+            or manifest["storage_schema_version"] != SCHEMA_VERSION
+            or manifest["database"] != "journal.sqlite"
+        ):
+            raise ValueError("Unsupported snapshot manifest.")
+        identity = validate_journal_identity(
+            {name: manifest[name] for name in ("journal_id", "generation")}
+        )
+        UUID(require_text(manifest["snapshot_id"], "snapshot_id"))
+        restoration_id = UUID(require_text(restoration_id, "restoration_id")).hex
+        new_generation = UUID(require_text(new_generation, "new_generation")).hex
+        if new_generation == identity["generation"]:
+            raise ValueError("Restoration requires a fresh generation.")
+        for field in ("cursor", "event_count", "change_cursor"):
+            if (
+                type(manifest[field]) is not int
+                or not 0 <= manifest[field] <= 9223372036854775807
+            ):
+                raise ValueError(f"Invalid snapshot {field}.")
+        timestamp = datetime.fromisoformat(manifest["created_at"])
+        if timestamp.utcoffset() != UTC.utcoffset(None):
+            raise ValueError("Snapshot creation time must be UTC.")
+        digest_text = require_text(manifest["content_sha256"], "content_sha256")
+        if len(digest_text) != 64 or any(
+            char not in "0123456789abcdef" for char in digest_text
+        ):
+            raise ValueError("Invalid snapshot content checksum.")
+        return manifest, identity, restoration_id, new_generation
 
     def close(self) -> None:
         self._check_process()
