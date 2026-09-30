@@ -13,6 +13,7 @@ from uuid import UUID
 from core.experimentassembler import ExperimentAssembler
 from core.experimentreader import ExperimentReader
 from core.logger_utils.events import LoggingError, copy_json_object, require_text
+from core.maintenancecontroller import _validate_module_read_args
 from core.modulemanager import ModuleManager
 from core.resourcecollector import ResourceCollector
 from core.runner_utils.experimentrunner import ExperimentRunner
@@ -131,23 +132,7 @@ class ExperimentController:
                 ):
                     raise ValueError("api_version must be 1.")
                 if "commands" in request:
-                    UUID(require_text(request.get("chain_id"), "chain_id"))
-                    commands = request["commands"]
-                    if not isinstance(commands, list) or not commands:
-                        raise ValueError("A command chain must be nonempty.")
-                    batch = []
-                    for command in commands:
-                        command = copy_json_object(command, "chain command")
-                        UUID(require_text(command.get("command_id"), "command_id"))
-                        if "commands" in command:
-                            raise ValueError("Nested chains are not supported.")
-                        batch.append(
-                            {
-                                **command,
-                                "api_version": 1,
-                                "chain_id": request["chain_id"],
-                            }
-                        )
+                    batch = self._read_chain(request)
                 else:
                     UUID(require_text(request.get("command_id"), "command_id"))
                     name = require_text(request.get("command"), "command")
@@ -165,20 +150,7 @@ class ExperimentController:
                         continue
                     batch = [request]
                     if name == "stop":
-                        cancelled = list(self._active_tail)
-                        self._active_tail.clear()
-                        while not self._control_queue.empty():
-                            cancelled.extend(self._control_queue.get_nowait())
-                        if self._active_task is not None:
-                            self._active_task.cancel()
-                        for command in cancelled:
-                            await self._publish_response(
-                                self._failure(
-                                    command,
-                                    "command_cancelled",
-                                    "Cancelled by standalone stop.",
-                                )
-                            )
+                        await self._cancel_queued_commands()
                 await self._control_queue.put(batch)
             except (TypeError, ValueError, KeyError) as error:
                 command = request if isinstance(request, dict) else {}
@@ -186,24 +158,48 @@ class ExperimentController:
                     self._failure(command, "invalid_request", str(error))
                 )
 
+    def _read_chain(self, request: JsonObject) -> list[JsonObject]:
+        UUID(require_text(request.get("chain_id"), "chain_id"))
+        commands = request["commands"]
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("A command chain must be nonempty.")
+        batch = []
+        for command in commands:
+            command = copy_json_object(command, "chain command")
+            UUID(require_text(command.get("command_id"), "command_id"))
+            if "commands" in command:
+                raise ValueError("Nested chains are not supported.")
+            batch.append(
+                {
+                    **command,
+                    "api_version": 1,
+                    "chain_id": request["chain_id"],
+                }
+            )
+        return batch
+
+    async def _cancel_queued_commands(self) -> None:
+        cancelled = list(self._active_tail)
+        self._active_tail.clear()
+        while not self._control_queue.empty():
+            cancelled.extend(self._control_queue.get_nowait())
+        if self._active_task is not None:
+            self._active_task.cancel()
+        for command in cancelled:
+            await self._publish_response(
+                self._failure(
+                    command,
+                    "command_cancelled",
+                    "Cancelled by standalone stop.",
+                )
+            )
+
     async def _execute_commands(self) -> None:
         while not self._closing:
             self._active_tail = await self._control_queue.get()
             while self._active_tail and not self._closing:
                 command = self._active_tail.pop(0)
-                self._current_command = command
-                self._active_task = asyncio.create_task(self._execute_command(command))
-                try:
-                    response = await self._active_task
-                except asyncio.CancelledError:
-                    if self._closing:
-                        raise
-                    response = self._failure(
-                        command, "command_cancelled", "Interrupted by standalone stop."
-                    )
-                finally:
-                    self._active_task = None
-                    self._current_command = None
+                response = await self._execute_queued_command(command)
                 await self._publish_response(response)
                 if response["result"] == "fail":
                     cancelled, self._active_tail = self._active_tail, []
@@ -215,6 +211,22 @@ class ExperimentController:
                                 "Previous command failed.",
                             )
                         )
+
+    async def _execute_queued_command(self, command: JsonObject) -> JsonObject:
+        self._current_command = command
+        self._active_task = asyncio.create_task(self._execute_command(command))
+        try:
+            response = await self._active_task
+        except asyncio.CancelledError:
+            if self._closing:
+                raise
+            response = self._failure(
+                command, "command_cancelled", "Interrupted by standalone stop."
+            )
+        finally:
+            self._active_task = None
+            self._current_command = None
+        return response
 
     async def _execute_command(self, command: JsonObject) -> JsonObject:
         name = ""
@@ -241,65 +253,7 @@ class ExperimentController:
                     raise RuntimeError(
                         f"Recover unfinished experiments before issuing control commands: {sorted(self._recovery_required)}"
                     )
-                target = copy_json_object(command.get("target", {}), "target")
-                if name in ("service.start", "service.stop") and (not target or args):
-                    raise ValueError(
-                        "Service control requires a service target and empty args."
-                    )
-                if target:
-                    if target.keys() != {"kind", "position"} or target["kind"] not in (
-                        "stage",
-                        "service",
-                    ):
-                        raise ValueError("target requires kind and position.")
-                    if type(target["position"]) is not int or target["position"] < 1:
-                        raise ValueError("target.position must be a positive integer.")
-                    if name in ("retry", "service.start", "service.stop"):
-                        if target["kind"] != "service":
-                            raise ValueError(f"{name} targets a service.")
-                        args["position"] = target["position"]
-                    elif name in ("replace", "reset_retries"):
-                        args.update(target)
-                    else:
-                        raise ValueError("This command does not accept target.")
-                if name == "run" and "continue" in args:
-                    args["continue_run"] = args.pop("continue")
-                for field in ("template_path", "archive_path", "destination"):
-                    if field in args and args[field] is not None:
-                        args[field] = Path(require_text(args[field], field))
-                handlers = {
-                    "run": self._runner.run,
-                    "pause": self._runner.pause,
-                    "resume": self._runner.resume,
-                    "stop": self._runner.stop,
-                    "step": self._runner.step,
-                    "rerun": self._runner.rerun,
-                    "retry": self._runner.retry,
-                    "service.start": self._runner.start_service,
-                    "service.stop": self._runner.stop_service,
-                    "move": self._runner.move,
-                    "reset_retries": self._runner.reset_retries,
-                    "replace": self._runner.replace,
-                    "reload_template": self._runner.reload_template,
-                    "snapshot": self._runner.snapshot,
-                    "rollback": self._runner.rollback,
-                    "recover": self._runner.recover,
-                    "archive.create": self._runner.create_archive,
-                    "archive.inspect": self._runner.inspect_archive,
-                    "archive.install": self._runner.install_archive,
-                }
-                if name not in handlers:
-                    raise NotImplementedError(f"Unsupported command: {name}")
-                self._runner._command_context = {
-                    "command_id": command["command_id"],
-                    "command_chain_id": command.get("chain_id"),
-                }
-                try:
-                    data = handlers[name](**args)
-                    if isinstance(data, Coroutine):
-                        data = await data
-                finally:
-                    self._runner._command_context = {}
+                data = await self._execute_control_command(name, args, command)
                 if name == "recover":
                     self._recovery_required.discard(
                         require_text(args.get("experiment_id"), "experiment_id")
@@ -371,22 +325,81 @@ class ExperimentController:
                 command, "operation_failed", f"{type(error).__name__}: {error}", error
             )
 
+    async def _execute_control_command(
+        self, name: str, args: JsonObject, command: JsonObject
+    ) -> JsonObject | None:
+        target = copy_json_object(command.get("target", {}), "target")
+        if name in ("service.start", "service.stop") and (not target or args):
+            raise ValueError(
+                "Service control requires a service target and empty args."
+            )
+        if target:
+            if target.keys() != {"kind", "position"} or target["kind"] not in (
+                "stage",
+                "service",
+            ):
+                raise ValueError("target requires kind and position.")
+            if type(target["position"]) is not int or target["position"] < 1:
+                raise ValueError("target.position must be a positive integer.")
+            if name in ("retry", "service.start", "service.stop"):
+                if target["kind"] != "service":
+                    raise ValueError(f"{name} targets a service.")
+                args["position"] = target["position"]
+            elif name in ("replace", "reset_retries"):
+                args.update(target)
+            else:
+                raise ValueError("This command does not accept target.")
+        if name == "run" and "continue" in args:
+            args["continue_run"] = args.pop("continue")
+        for field in ("template_path", "archive_path", "destination"):
+            if field in args and args[field] is not None:
+                args[field] = Path(require_text(args[field], field))
+        handlers = {
+            "run": self._runner.run,
+            "pause": self._runner.pause,
+            "resume": self._runner.resume,
+            "stop": self._runner.stop,
+            "step": self._runner.step,
+            "rerun": self._runner.rerun,
+            "retry": self._runner.retry,
+            "service.start": self._runner.start_service,
+            "service.stop": self._runner.stop_service,
+            "move": self._runner.move,
+            "reset_retries": self._runner.reset_retries,
+            "replace": self._runner.replace,
+            "reload_template": self._runner.reload_template,
+            "snapshot": self._runner.snapshot,
+            "rollback": self._runner.rollback,
+            "recover": self._runner.recover,
+            "archive.create": self._runner.create_archive,
+            "archive.inspect": self._runner.inspect_archive,
+            "archive.install": self._runner.install_archive,
+        }
+        if name not in handlers:
+            raise NotImplementedError(f"Unsupported command: {name}")
+        self._runner._command_context = {
+            "command_id": command["command_id"],
+            "command_chain_id": command.get("chain_id"),
+        }
+        try:
+            data = handlers[name](**args)
+            if isinstance(data, Coroutine):
+                data = await data
+        finally:
+            self._runner._command_context = {}
+        return data
+
     async def _read_request(self, request: JsonObject) -> JsonObject:
         args = copy_json_object(request.get("args", {}), "args")
         name = request["command"]
         if name in ("stats.modules", "stats.module", "stats.template"):
             if self._module_manager is None:
                 raise RuntimeError("Module manager is not configured for reads.")
+            _validate_module_read_args(name, args)
             if name == "stats.modules":
-                if args:
-                    raise ValueError("Module list does not accept arguments.")
                 return self._module_manager.list_modules()
             if name == "stats.module":
-                if args.keys() != {"name", "version"}:
-                    raise ValueError("Module inspection requires name/version.")
                 return await self._module_manager.inspect_module(**args)
-            if args.keys() != {"template_path"}:
-                raise ValueError("Template validation requires template_path.")
             assembler = ExperimentAssembler(self._project_root, self._module_manager)
             return await assembler.validate_template(
                 Path(require_text(args["template_path"], "template_path"))
