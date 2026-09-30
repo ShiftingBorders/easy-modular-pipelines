@@ -21,6 +21,15 @@ from core.modulemanifest import read_module_manifest
 from core.storage_errors import StorageConflict, StorageError, StoredObjectNotFound
 
 
+def _validate_module_read_args(name: str, args: JsonObject) -> None:
+    if name == "stats.modules" and args:
+        raise ValueError("Module list does not accept arguments.")
+    if name == "stats.module" and args.keys() != {"name", "version"}:
+        raise ValueError("Module inspection requires name/version.")
+    if name == "stats.template" and args.keys() != {"template_path"}:
+        raise ValueError("Template validation requires template_path.")
+
+
 class MaintenanceController:
     def __init__(
         self,
@@ -106,28 +115,26 @@ class MaintenanceController:
                     if request["command"] == "stats.state":
                         await self._publish(await self._execute(request))
                     else:
-                        try:
-                            self._read_commands.put_nowait(request)
-                        except asyncio.QueueFull:
-                            await self._publish(
-                                self._failure(
-                                    request,
-                                    "too_many_reads",
-                                    "Too many queued maintenance reads.",
-                                )
-                            )
+                        await self._admit_read(request)
                     continue
                 commands = [request]
             await self._commands.put(commands)
 
+    async def _admit_read(self, request: JsonObject) -> None:
+        try:
+            self._read_commands.put_nowait(request)
+        except asyncio.QueueFull:
+            await self._publish(
+                self._failure(
+                    request,
+                    "too_many_reads",
+                    "Too many queued maintenance reads.",
+                )
+            )
+
     async def _work(self, *, read_only: bool = False) -> None:
         if read_only:
-            while not self._closing and not self._shutdown_requested.is_set():
-                command = await self._read_commands.get()
-                if self._shutdown_requested.is_set():
-                    return
-                await self._publish(await self._execute(command))
-            return
+            return await self._work_reads()
         while not self._closing:
             commands = await self._commands.get()
             failed = False
@@ -153,6 +160,14 @@ class MaintenanceController:
                     self._current_command = None
                     self._idle.set()
 
+    async def _work_reads(self) -> None:
+        while not self._closing and not self._shutdown_requested.is_set():
+            command = await self._read_commands.get()
+            if self._shutdown_requested.is_set():
+                return
+            await self._publish(await self._execute(command))
+        return
+
     async def _execute(self, command: JsonObject) -> JsonObject:
         try:
             args = copy_json_object(command.get("args", {}), "args")
@@ -171,16 +186,13 @@ class MaintenanceController:
                     self._experiment_reader.read, name, args, None
                 )
             elif name == "stats.modules":
-                if args:
-                    raise ValueError("Module list does not accept arguments.")
+                _validate_module_read_args(name, args)
                 data = self._manager.list_modules()
             elif name == "stats.module":
-                if args.keys() != {"name", "version"}:
-                    raise ValueError("Module inspection requires name/version.")
+                _validate_module_read_args(name, args)
                 data = await self._manager.inspect_module(**args)
             elif name == "stats.template":
-                if args.keys() != {"template_path"}:
-                    raise ValueError("Template validation requires template_path.")
+                _validate_module_read_args(name, args)
                 data = await self._assembler.validate_template(
                     Path(require_text(args["template_path"], "template_path"))
                 )
@@ -203,47 +215,7 @@ class MaintenanceController:
                         "Recover and stop unfinished experiments in run mode before changing modules: "
                         + ", ".join(self._recovery_required),
                     )
-                self._logger.record_event(
-                    "module.command_started", {"command": command}
-                )
-                if name == "module.add":
-                    if args.keys() != {"folder"}:
-                        raise ValueError("module.add requires only folder.")
-                    data = await self._manager.register_and_install_module_async(
-                        Path(require_text(args["folder"], "folder"))
-                    )
-                elif name == "module.validate" and "folder" in args:
-                    if args.keys() != {"folder"}:
-                        raise ValueError("Source validation requires only folder.")
-                    manifest = await asyncio.to_thread(
-                        read_module_manifest,
-                        Path(require_text(args["folder"], "folder")),
-                    )
-                    data = {"scope": "source", "valid": True, "manifest": manifest}
-                else:
-                    if args.keys() != {"name", "version"}:
-                        raise ValueError(
-                            "Stored module operations require name and version."
-                        )
-                    module_name = require_text(args["name"], "name")
-                    version = require_text(args["version"], "version")
-                    if name == "module.validate":
-                        reference = await self._manager.validate_stored_module_async(
-                            module_name, version
-                        )
-                        data = {"scope": "stored", "valid": True, "module": reference}
-                    else:
-                        removed = await self._manager.unregister_module_async(
-                            module_name, version
-                        )
-                        data = {"status": "removed" if removed else "already_absent"}
-                self._logger.record_event(
-                    "module.command_completed",
-                    {
-                        "command_id": command["command_id"],
-                        "data": data,
-                    },
-                )
+                data = await self._execute_module_command(command, name, args)
             else:
                 return self._failure(
                     command,
@@ -281,6 +253,48 @@ class MaintenanceController:
                 except Exception as logging_error:  # noqa: BLE001 - Preserve both failures.
                     error.add_note(f"Logging the failure also failed: {logging_error}")
             return self._failure(command, code, str(error), error)
+
+    async def _execute_module_command(
+        self, command: JsonObject, name: str, args: JsonObject
+    ) -> JsonObject:
+        self._logger.record_event("module.command_started", {"command": command})
+        if name == "module.add":
+            if args.keys() != {"folder"}:
+                raise ValueError("module.add requires only folder.")
+            data = await self._manager.register_and_install_module_async(
+                Path(require_text(args["folder"], "folder"))
+            )
+        elif name == "module.validate" and "folder" in args:
+            if args.keys() != {"folder"}:
+                raise ValueError("Source validation requires only folder.")
+            manifest = await asyncio.to_thread(
+                read_module_manifest,
+                Path(require_text(args["folder"], "folder")),
+            )
+            data = {"scope": "source", "valid": True, "manifest": manifest}
+        else:
+            if args.keys() != {"name", "version"}:
+                raise ValueError("Stored module operations require name and version.")
+            module_name = require_text(args["name"], "name")
+            version = require_text(args["version"], "version")
+            if name == "module.validate":
+                reference = await self._manager.validate_stored_module_async(
+                    module_name, version
+                )
+                data = {"scope": "stored", "valid": True, "module": reference}
+            else:
+                removed = await self._manager.unregister_module_async(
+                    module_name, version
+                )
+                data = {"status": "removed" if removed else "already_absent"}
+        self._logger.record_event(
+            "module.command_completed",
+            {
+                "command_id": command["command_id"],
+                "data": data,
+            },
+        )
+        return data
 
     def _failure(
         self,
