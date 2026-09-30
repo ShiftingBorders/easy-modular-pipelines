@@ -220,37 +220,9 @@ def load_logging_settings(config_path: Path) -> tuple[JsonObject, JsonObject]:
         unknown = settings.keys() - required
         if unknown:
             raise ValueError(f"Unknown logging fields: {', '.join(sorted(unknown))}.")
-        configured_path = require_text(settings.get("db_path"), "logging.db_path")
-        db_path = Path(configured_path)
-        if not db_path.is_absolute():
-            # Drive-relative/root-relative Windows paths cannot be anchored reliably.
-            if db_path.drive or db_path.root:
-                raise ValueError("db_path must be absolute or relative to the config.")
-            db_path = config_path.parent / db_path
-        timeout = require_number(settings["busy_timeout_seconds"], "timeout")
-        if not 0 < timeout <= 60:
-            raise ValueError(
-                "busy_timeout_seconds must be greater than 0 and at most 60."
-            )
-        max_bytes = settings["max_event_bytes"]
-        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
-            raise ValueError("max_event_bytes must be a positive integer or null.")
-        open_mode = settings["open_mode"]
-        if open_mode not in ("create", "existing"):
-            raise ValueError("logging.open_mode must be create or existing.")
-        min_free_bytes = settings["min_free_bytes"]
-        if type(min_free_bytes) is not int or min_free_bytes < 0:
-            raise ValueError("logging.min_free_bytes must be a nonnegative integer.")
-        expected = settings["expected_journal"]
-        if open_mode == "existing":
-            expected = validate_journal_identity(expected)
-        elif expected is not None:
-            raise ValueError("create requires expected_journal=null.")
-        refresh = require_number(
-            settings["filtered_refresh_interval_seconds"], "refresh interval"
+        db_path, timeout, max_bytes, open_mode, min_free_bytes, expected, refresh = (
+            _normalize_logging_values(settings, config_path)
         )
-        if refresh <= 0:
-            raise ValueError("filtered_refresh_interval_seconds must be positive.")
         context = validate_context(document.get("operation_context", {}))
         settings = {
             "db_path": str(db_path),
@@ -266,6 +238,43 @@ def load_logging_settings(config_path: Path) -> tuple[JsonObject, JsonObject]:
             f"Cannot load logging configuration {config_path}: {error}"
         ) from error
     return settings, context
+
+
+def _normalize_logging_values(
+    settings: JsonObject, config_path: Path
+) -> tuple[Path, int | float, int | None, str, int, JsonObject | None, int | float]:
+    configured_path = require_text(settings.get("db_path"), "logging.db_path")
+    db_path = Path(configured_path)
+    if not db_path.is_absolute():
+        # Drive-relative/root-relative Windows paths cannot be anchored reliably.
+        if db_path.drive or db_path.root:
+            raise ValueError("db_path must be absolute or relative to the config.")
+        db_path = config_path.parent / db_path
+    timeout = require_number(settings["busy_timeout_seconds"], "timeout")
+    if not 0 < timeout <= 60:
+        raise ValueError(
+            "busy_timeout_seconds must be greater than 0 and at most 60."
+        )
+    max_bytes = settings["max_event_bytes"]
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
+        raise ValueError("max_event_bytes must be a positive integer or null.")
+    open_mode = settings["open_mode"]
+    if open_mode not in ("create", "existing"):
+        raise ValueError("logging.open_mode must be create or existing.")
+    min_free_bytes = settings["min_free_bytes"]
+    if type(min_free_bytes) is not int or min_free_bytes < 0:
+        raise ValueError("logging.min_free_bytes must be a nonnegative integer.")
+    expected = settings["expected_journal"]
+    if open_mode == "existing":
+        expected = validate_journal_identity(expected)
+    elif expected is not None:
+        raise ValueError("create requires expected_journal=null.")
+    refresh = require_number(
+        settings["filtered_refresh_interval_seconds"], "refresh interval"
+    )
+    if refresh <= 0:
+        raise ValueError("filtered_refresh_interval_seconds must be positive.")
+    return db_path, timeout, max_bytes, open_mode, min_free_bytes, expected, refresh
 
 
 def encode_event(event: object, max_bytes: int | None) -> str:
