@@ -147,6 +147,36 @@ class ResourceSampler:
     def _process_sample(self, target: ResourceTarget) -> JsonObject:
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
+        cpu, memory, reason, cpu_reason, interval = self._observe_process(target, now)
+        return {
+            "series_id": target.series_id,
+            "context": target.context,
+            "observed_at": observed_at,
+            "observed_monotonic": now,
+            "resources": {
+                "process_cpu_percent": self._measurement(
+                    cpu,
+                    "percent",
+                    "process",
+                    observed_at,
+                    reason=reason or cpu_reason,
+                    interval=interval,
+                    identity=target.identity,
+                ),
+                "process_memory_rss_bytes": self._measurement(
+                    memory,
+                    "byte",
+                    "process",
+                    observed_at,
+                    reason=reason,
+                    identity=target.identity,
+                ),
+            },
+        }
+
+    def _observe_process(
+        self, target: ResourceTarget, now: float
+    ) -> tuple[float | None, int | None, str | None, str | None, float | None]:
         cpu = memory = None
         reason = cpu_reason = None
         interval = None
@@ -189,31 +219,7 @@ class ResourceSampler:
             reason = type(error).__name__
         if reason is not None:
             self._process_previous.pop(target.series_id, None)
-        return {
-            "series_id": target.series_id,
-            "context": target.context,
-            "observed_at": observed_at,
-            "observed_monotonic": now,
-            "resources": {
-                "process_cpu_percent": self._measurement(
-                    cpu,
-                    "percent",
-                    "process",
-                    observed_at,
-                    reason=reason or cpu_reason,
-                    interval=interval,
-                    identity=target.identity,
-                ),
-                "process_memory_rss_bytes": self._measurement(
-                    memory,
-                    "byte",
-                    "process",
-                    observed_at,
-                    reason=reason,
-                    identity=target.identity,
-                ),
-            },
-        }
+        return cpu, memory, reason, cpu_reason, interval
 
 
 class ResourceWriter:
@@ -248,22 +254,7 @@ class ResourceWriter:
             return
         try:
             if self._client is None:
-                settings, _ = load_logging_settings(self._source)
-                settings["db_path"] = str(settings["db_path"])
-                settings["busy_timeout_seconds"] = (
-                    self._settings.logging_busy_timeout_seconds
-                )
-                settings["open_mode"] = "existing"
-                path = self._source.parent / f"resource-{self._collector_id}.json"
-                write_json(
-                    path,
-                    {
-                        "logging": settings,
-                        "operation_context": {"source": "resource_collector"},
-                    },
-                )
-                self._client = OperationLogger(path)
-                self._client.open()
+                self._open_selected_journal()
             context = {**sample["context"], "source": "resource_collector"}
             if self.restart_notice is not None:
                 notice, self.restart_notice = self.restart_notice, None
@@ -289,6 +280,22 @@ class ResourceWriter:
             self.error = f"{type(error).__name__}: {error}"
             self.close()
             self._retry_at = time.monotonic() + self._settings.logging_retry_seconds
+
+    def _open_selected_journal(self) -> None:
+        settings, _ = load_logging_settings(self._source)
+        settings["db_path"] = str(settings["db_path"])
+        settings["busy_timeout_seconds"] = self._settings.logging_busy_timeout_seconds
+        settings["open_mode"] = "existing"
+        path = self._source.parent / f"resource-{self._collector_id}.json"
+        write_json(
+            path,
+            {
+                "logging": settings,
+                "operation_context": {"source": "resource_collector"},
+            },
+        )
+        self._client = OperationLogger(path)
+        self._client.open()
 
     def close(self) -> None:
         if self._client is not None:
@@ -325,25 +332,18 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
                 if message["command"] == "stop":
                     return
                 last_owner = time.monotonic()
-                if not received_notice and message.get("restart_notice") is not None:
-                    writer.restart_notice = message["restart_notice"]
-                    received_notice = True
-                if message["revision"] != revision:
-                    incoming = message["snapshot"]
-                    if (
-                        incoming["context"] != snapshot["context"]
-                        or incoming["logging_config_path"]
-                        != snapshot["logging_config_path"]
-                    ):
-                        sampler.reset()
-                    writer.select(incoming["logging_config_path"])
-                    targets = [
-                        ResourceTarget.from_document(item)
-                        for item in incoming["targets"]
-                    ]
-                    snapshot = incoming
-                    revision = message["revision"]
-                    changed = True
+                snapshot, targets, revision, received_notice, changed = (
+                    _apply_collector_update(
+                        message,
+                        writer,
+                        sampler,
+                        snapshot,
+                        targets,
+                        revision,
+                        received_notice,
+                        changed,
+                    )
+                )
             now = time.monotonic()
             samples = []
             if now >= next_sample:
@@ -376,3 +376,31 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
             writer.close()
         finally:
             connection.close()
+
+
+def _apply_collector_update(
+    message: JsonObject,
+    writer: ResourceWriter,
+    sampler: ResourceSampler,
+    snapshot: JsonObject,
+    targets: list[ResourceTarget],
+    revision: int,
+    received_notice: bool,
+    changed: bool,
+) -> tuple[JsonObject, list[ResourceTarget], int, bool, bool]:
+    if not received_notice and message.get("restart_notice") is not None:
+        writer.restart_notice = message["restart_notice"]
+        received_notice = True
+    if message["revision"] != revision:
+        incoming = message["snapshot"]
+        if (
+            incoming["context"] != snapshot["context"]
+            or incoming["logging_config_path"] != snapshot["logging_config_path"]
+        ):
+            sampler.reset()
+        writer.select(incoming["logging_config_path"])
+        targets = [ResourceTarget.from_document(item) for item in incoming["targets"]]
+        snapshot = incoming
+        revision = message["revision"]
+        changed = True
+    return snapshot, targets, revision, received_notice, changed
