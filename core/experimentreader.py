@@ -44,11 +44,7 @@ class ExperimentReader:
 
     def inspect_experiment(self, experiment_id: str) -> JsonObject:
         directory = self._directory(experiment_id, self._registry())
-        state = read_json(self._path(directory, "runner/state.json"))
-        if state.get("experiment_id") != experiment_id:
-            raise ValueError("Saved state belongs to another experiment.")
-        if state.get("schema_version") not in (3, 4):
-            raise ValueError("Unsupported saved experiment state schema.")
+        state = self._read_saved_state(directory, experiment_id)
         return {
             "experiment_id": experiment_id,
             "directory": str(directory),
@@ -63,11 +59,7 @@ class ExperimentReader:
             item = {"experiment_id": identifier, "source": "saved_state"}
             try:
                 directory = self._directory(identifier, registry)
-                state = read_json(self._path(directory, "runner/state.json"))
-                if state.get("experiment_id") != identifier:
-                    raise ValueError("Saved state belongs to another experiment.")
-                if state.get("schema_version") not in (3, 4):
-                    raise ValueError("Unsupported saved experiment state schema.")
+                state = self._read_saved_state(directory, identifier)
                 template = copy_json_object(state.get("template"), "saved template")
                 item.update(
                     directory=str(directory),
@@ -81,6 +73,14 @@ class ExperimentReader:
                 item.update(available=False, error=str(error))
             items.append(item)
         return {"items": items}
+
+    def _read_saved_state(self, directory: Path, experiment_id: str) -> JsonObject:
+        state = read_json(self._path(directory, "runner/state.json"))
+        if state.get("experiment_id") != experiment_id:
+            raise ValueError("Saved state belongs to another experiment.")
+        if state.get("schema_version") not in (3, 4):
+            raise ValueError("Unsupported saved experiment state schema.")
+        return state
 
     def inspect_snapshot(self, experiment_id: str, snapshot_id: str) -> JsonObject:
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
@@ -155,20 +155,28 @@ class ExperimentReader:
                     if entry["cursor"] > boundary:
                         return
                     event = entry["event"]
-                    context = event["context"]
-                    # Continuations inherit events with their original experiment
-                    # IDs. The store checks journal identity; artifact paths are
-                    # resolved within the requested experiment's directory.
-                    attempt_id = context.get("attempt_id")
-                    if event["event_type"] == "attempt.parameters" and attempt_id:
-                        attempts[attempt_id] = context
-                    elif event["event_type"] == "artifact.recorded":
-                        yield event, {**attempts.get(attempt_id, {}), **context}
+                    artifact = self._artifact_entry(event, attempts)
+                    if artifact is not None:
+                        yield artifact
                 checkpoint = page["checkpoint"]
                 if checkpoint["cursor"] >= boundary or not page["has_more"]:
                     return
         finally:
             store.close()
+
+    def _artifact_entry(
+        self, event: JsonObject, attempts: dict[str, JsonObject]
+    ) -> tuple[JsonObject, JsonObject] | None:
+        context = event["context"]
+        # Continuations inherit events with their original experiment
+        # IDs. The store checks journal identity; artifact paths are
+        # resolved within the requested experiment's directory.
+        attempt_id = context.get("attempt_id")
+        if event["event_type"] == "attempt.parameters" and attempt_id:
+            attempts[attempt_id] = context
+        elif event["event_type"] == "artifact.recorded":
+            return event, {**attempts.get(attempt_id, {}), **context}
+        return None
 
     def _artifact_path(
         self, directory: Path, event: JsonObject, context: JsonObject
