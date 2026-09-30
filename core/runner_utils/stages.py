@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 import psutil
@@ -29,10 +29,22 @@ from core.runner_utils.state import (
     JsonValue,
     RunnerState,
     RunnerStateStore,
+    ServiceInstance,
     StageAttempt,
     StageOutcome,
     state_to_document,
 )
+
+if TYPE_CHECKING:
+    from core.logger import OperationLogger
+
+
+def _record_runner_checkpoint(logger: OperationLogger, state: RunnerState) -> None:
+    logger.record_event(
+        "runner.checkpoint",
+        state_to_document(state),
+        context={"experiment_id": state.experiment_id, "run_id": state.run_id},
+    )
 
 
 class StageRunner:
@@ -142,31 +154,7 @@ class StageRunner:
     def select_input(self, state: RunnerState) -> JsonValue:
         if state.pending_input is not None:
             transfer = state.pending_input
-            if (
-                transfer["stage_id"]
-                != state.template["stages"][state.stage_position - 1]["stage_id"]
-            ):
-                raise ValueError("Pending input belongs to another stage.")
-            record = read_result(
-                self._journal.client,
-                transfer["request_id"],
-                expected={
-                    "experiment_id": transfer["experiment_id"],
-                    "stage_id": transfer["source_stage_id"],
-                },
-                accepted=True,
-            )
-            if (
-                record is None
-                or record["outcome"] != "succeeded"
-                or record["response"]["result"] != "success"
-                or record["response"].get("execution", {}).get("dag_decision")
-                != {"command": "move", "stage_id": transfer["stage_id"]}
-            ):
-                raise ValueError(
-                    "Move input has no accepted successful journal result."
-                )
-            return record["response"]["data"]
+            return self._read_move_input(state, transfer)
         if state.stage_position == 1:
             return None
         previous = state.template["stages"][state.stage_position - 2]["stage_id"]
@@ -192,6 +180,33 @@ class StageRunner:
             and record["response"]["result"] == "success"
             else None
         )
+
+    def _read_move_input(self, state: RunnerState, transfer: JsonObject) -> JsonValue:
+        if (
+            transfer["stage_id"]
+            != state.template["stages"][state.stage_position - 1]["stage_id"]
+        ):
+            raise ValueError("Pending input belongs to another stage.")
+        record = read_result(
+            self._journal.client,
+            transfer["request_id"],
+            expected={
+                "experiment_id": transfer["experiment_id"],
+                "stage_id": transfer["source_stage_id"],
+            },
+            accepted=True,
+        )
+        if (
+            record is None
+            or record["outcome"] != "succeeded"
+            or record["response"]["result"] != "success"
+            or record["response"].get("execution", {}).get("dag_decision")
+            != {"command": "move", "stage_id": transfer["stage_id"]}
+        ):
+            raise ValueError(
+                "Move input has no accepted successful journal result."
+            )
+        return record["response"]["data"]
 
     def _context(self, state: RunnerState, attempt: StageAttempt) -> JsonObject:
         definition = next(
@@ -326,20 +341,42 @@ class StageRunner:
         if deadline is not None and time.monotonic() >= deadline:
             return attempt
         if instance is not None:
-            if self._services is None:
-                raise RuntimeError("Service attempts require a bound ServiceManager.")
-            if state.services[instance.service_id] is not instance:
-                return attempt
-            self._call_future = self._services.enqueue(
-                state,
-                instance.service_id,
-                attempt.request_id,
-                "execute",
-                launch["call"],
-                deadline=deadline,
+            return await self._start_service_call(
+                state, attempt, instance, launch, deadline
             )
-            self._unstarted_attempt_id = None
+        return await self._start_executor(attempt, attempt_id, directory, launch, deadline)
+
+    async def _start_service_call(
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        instance: ServiceInstance,
+        launch: JsonObject,
+        deadline: float | None,
+    ) -> StageAttempt:
+        if self._services is None:
+            raise RuntimeError("Service attempts require a bound ServiceManager.")
+        if state.services[instance.service_id] is not instance:
             return attempt
+        self._call_future = self._services.enqueue(
+            state,
+            instance.service_id,
+            attempt.request_id,
+            "execute",
+            launch["call"],
+            deadline=deadline,
+        )
+        self._unstarted_attempt_id = None
+        return attempt
+
+    async def _start_executor(
+        self,
+        attempt: StageAttempt,
+        attempt_id: str,
+        directory: Path,
+        launch: JsonObject,
+        deadline: float | None,
+    ) -> StageAttempt:
         launch_path = directory / "launch.json"
         write_json(launch_path, launch)
         library_root = Path(__file__).resolve().parents[2]
@@ -440,6 +477,42 @@ class StageRunner:
         response: JsonObject,
         outcome: str,
     ) -> JsonObject:
+        response, outcome = self._normalize_accepted_response(
+            state, attempt, response, outcome
+        )
+        state.used_request_ids.add(attempt.request_id)
+        self._journal.client.record_command_result(
+            attempt.request_id,
+            response,
+            author="runner",
+            outcome=outcome,
+            context=self._context(state, attempt),
+        )
+        attempt.result_request_id = attempt.request_id
+        attempt.outcome = outcome
+        execution = response.get("execution", {})
+        if execution:
+            attempt.executor_status = execution
+            attempt.process_identity = execution.get("process")
+            attempt.started_at = execution.get("started_at")
+        attempt.executor_status = {
+            **(attempt.executor_status or {}),
+            "finished": True,
+            "current": None,
+            "pending": [],
+        }
+        self._save_state(state)
+        if self._notify_resources is not None:
+            self._notify_resources()
+        return response
+
+    def _normalize_accepted_response(
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        response: JsonObject,
+        outcome: str,
+    ) -> tuple[JsonObject, str]:
         definition = state.template["stages"][state.stage_position - 1]
         if "returns_data" in definition and response["result"] == "success":
             decision = response["data"]
@@ -477,31 +550,7 @@ class StageRunner:
                         error_code="conditional_unexpected_data",
                         context=self._context(state, attempt),
                     )
-        state.used_request_ids.add(attempt.request_id)
-        self._journal.client.record_command_result(
-            attempt.request_id,
-            response,
-            author="runner",
-            outcome=outcome,
-            context=self._context(state, attempt),
-        )
-        attempt.result_request_id = attempt.request_id
-        attempt.outcome = outcome
-        execution = response.get("execution", {})
-        if execution:
-            attempt.executor_status = execution
-            attempt.process_identity = execution.get("process")
-            attempt.started_at = execution.get("started_at")
-        attempt.executor_status = {
-            **(attempt.executor_status or {}),
-            "finished": True,
-            "current": None,
-            "pending": [],
-        }
-        self._save_state(state)
-        if self._notify_resources is not None:
-            self._notify_resources()
-        return response
+        return response, outcome
 
     async def _collect_result(
         self, state: RunnerState, attempt: StageAttempt
@@ -604,55 +653,8 @@ class StageRunner:
                                 "failed",
                             )
                 else:
-                    if self._call_future is not None and self._call_future.done():
-                        if not self._call_future.cancelled():
-                            self._call_future.exception()
-                        self._call_future = None
-                    timeout = state.template["unknown_state"]["timeout_seconds"]
-                    if deadline is not None:
-                        timeout = min(timeout, max(0.001, deadline - time.monotonic()))
-                    try:
-                        if self._connection is None:
-                            await self._connect(attempt, timeout)
-                        request_id = str(uuid4())
-                        state.used_request_ids.add(request_id)
-                        reply = await self._connection.query_command_state(
-                            request_id, timeout_seconds=timeout
-                        )
-                        first_observation = (
-                            attempt.process_identity is None
-                            and reply["data"].get("process") is not None
-                        )
-                        attempt.executor_status = reply["data"]
-                        attempt.process_identity = reply["data"].get("process")
-                        attempt.started_at = reply["data"].get("started_at")
-                        self._save_state(state, checkpoint=first_observation)
-                        if first_observation and self._notify_resources is not None:
-                            self._notify_resources()
-                    except (OSError, EOFError):
-                        if (
-                            self._journal.client.read_command_result(attempt.request_id)
-                            is not None
-                        ):
-                            continue
-                        if deadline is not None and time.monotonic() >= deadline:
-                            continue
-                        try:
-                            await self._connect(attempt, timeout)
-                        except (OSError, EOFError):
-                            # Completion can commit and remove the endpoint while
-                            # reconnecting. Reenter normal result validation and
-                            # deadline handling before declaring the attempt unknown.
-                            if (
-                                self._journal.client.read_command_result(
-                                    attempt.request_id
-                                )
-                                is not None
-                            ):
-                                continue
-                            if deadline is not None and time.monotonic() >= deadline:
-                                continue
-                            raise
+                    if await self._observe_executor(state, attempt, deadline):
+                        continue
                 await asyncio.sleep(0.05)
         finally:
             if self._call_future is not None:
@@ -663,6 +665,61 @@ class StageRunner:
             if self._connection is not None:
                 await self._connection.close()
                 self._connection = None
+
+    async def _observe_executor(
+        self, state: RunnerState, attempt: StageAttempt, deadline: float | None
+    ) -> bool:
+        """Return True when the result loop must recheck its journal and deadline."""
+        if self._call_future is not None and self._call_future.done():
+            if not self._call_future.cancelled():
+                self._call_future.exception()
+            self._call_future = None
+        timeout = state.template["unknown_state"]["timeout_seconds"]
+        if deadline is not None:
+            timeout = min(timeout, max(0.001, deadline - time.monotonic()))
+        try:
+            if self._connection is None:
+                await self._connect(attempt, timeout)
+            request_id = str(uuid4())
+            state.used_request_ids.add(request_id)
+            reply = await self._connection.query_command_state(
+                request_id, timeout_seconds=timeout
+            )
+            first_observation = (
+                attempt.process_identity is None
+                and reply["data"].get("process") is not None
+            )
+            attempt.executor_status = reply["data"]
+            attempt.process_identity = reply["data"].get("process")
+            attempt.started_at = reply["data"].get("started_at")
+            self._save_state(state, checkpoint=first_observation)
+            if first_observation and self._notify_resources is not None:
+                self._notify_resources()
+        except (OSError, EOFError):
+            if (
+                self._journal.client.read_command_result(attempt.request_id)
+                is not None
+            ):
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return True
+            try:
+                await self._connect(attempt, timeout)
+            except (OSError, EOFError):
+                # Completion can commit and remove the endpoint while
+                # reconnecting. Reenter normal result validation and
+                # deadline handling before declaring the attempt unknown.
+                if (
+                    self._journal.client.read_command_result(
+                        attempt.request_id
+                    )
+                    is not None
+                ):
+                    return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    return True
+                raise
+        return False
 
     async def interrupt(self, state: RunnerState, reason: str) -> bool:
         attempt = state.active_attempt
@@ -685,8 +742,7 @@ class StageRunner:
             if instance is None:
                 return False
             if (
-                instance is None
-                or instance.stopped
+                instance.stopped
                 or instance.service_instance_id
                 != attempt.participant["participant_instance_id"]
             ):
@@ -821,40 +877,53 @@ class StageRunner:
                 state, wait_services=wait_services, recovered=attempt
             )
         except (OSError, EOFError, ValueError, RuntimeError) as error:
-            state.unknown_state_recovery_count += 1
-            policy = state.template["unknown_state"]
-            action = (
-                policy["on_recovery_limit"]
-                if state.unknown_state_recovery_count >= policy["recovery_limit"]
-                else policy["on_timeout"]
+            return await self._recover_unknown_attempt(
+                state, attempt, error, wait_services
             )
-            self._journal.client.record_event(
-                "stage.recovery_failed",
-                {
-                    "action": action,
-                    "error": str(error),
-                    "count": state.unknown_state_recovery_count,
-                },
-                context=self._context(state, attempt),
+
+    async def _recover_unknown_attempt(
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        error: Exception,
+        wait_services: Callable[
+            [RunnerState], Awaitable[Literal["ready", "pause", "stop"]]
+        ] | None,
+    ) -> StageOutcome:
+        state.unknown_state_recovery_count += 1
+        policy = state.template["unknown_state"]
+        action = (
+            policy["on_recovery_limit"]
+            if state.unknown_state_recovery_count >= policy["recovery_limit"]
+            else policy["on_timeout"]
+        )
+        self._journal.client.record_event(
+            "stage.recovery_failed",
+            {
+                "action": action,
+                "error": str(error),
+                "count": state.unknown_state_recovery_count,
+            },
+            context=self._context(state, attempt),
+        )
+        if action == "pause":
+            attempt.outcome = "unknown"
+            self._save_state(state)
+            return StageOutcome(attempt, None, "pause")
+        if not await self.interrupt(state, "unknown_state"):
+            attempt.outcome = "unknown"
+            self._save_state(state)
+            return StageOutcome(attempt, None, "stop")
+        attempt.outcome = "unknown_stopped"
+        if action == "rerun":
+            return await self.execute(
+                state, wait_services=wait_services, recovered=attempt
             )
-            if action == "pause":
-                attempt.outcome = "unknown"
-                self._save_state(state)
-                return StageOutcome(attempt, None, "pause")
-            if not await self.interrupt(state, "unknown_state"):
-                attempt.outcome = "unknown"
-                self._save_state(state)
-                return StageOutcome(attempt, None, "stop")
-            attempt.outcome = "unknown_stopped"
-            if action == "rerun":
-                return await self.execute(
-                    state, wait_services=wait_services, recovered=attempt
-                )
-            return StageOutcome(
-                attempt,
-                {"result": "fail", "data": {"reason": "unknown_state"}},
-                "advance" if action == "skip" else "stop",
-            )
+        return StageOutcome(
+            attempt,
+            {"result": "fail", "data": {"reason": "unknown_state"}},
+            "advance" if action == "skip" else "stop",
+        )
 
     def _prune_artifacts(self, state: RunnerState, attempt: StageAttempt) -> None:
         import shutil
@@ -920,11 +989,7 @@ class StageRunner:
         # copy, including a crash between acceptance and the DAG transition.
         if checkpoint:
             state.checkpoint_id = str(uuid4())
-            self._journal.client.record_event(
-                "runner.checkpoint",
-                state_to_document(state),
-                context={"experiment_id": state.experiment_id, "run_id": state.run_id},
-            )
+            _record_runner_checkpoint(self._journal.client, state)
         try:
             self._state_store.save(state)
         except OSError as error:
@@ -956,46 +1021,49 @@ class StageRunner:
                 )
         self._executor_processes = remaining
         if state is not None:
-            request_ids = set(state.stage_result_ids.values())
-            for transfer in (state.pending_input, state.last_dag_decision):
-                if transfer is not None:
-                    request_ids.add(transfer["request_id"])
-            for request_id in request_ids:
-                record = self._journal.client.read_command_result(request_id)
-                if record is None:
-                    raise ValueError("An accepted result is missing from the journal.")
-                context = record["event"]["context"]
-                if context.get("participant_id") != context.get("stage_id"):
-                    continue
-                # The result context identifies its writer without a per-call result file.
-                module_name = context.get("module_name")
-                if module_name is None:
-                    continue
-                directory = (
-                    state.experiment_directory
-                    / "shared_artifacts"
-                    / f"epoch_{context['cycle_number']}"
-                    / module_name
-                    / context["stage_id"]
-                    / f"attempt_{context['attempt_number']}"
-                )
-                process_path = directory / "process.json"
-                if process_path.is_file():
-                    process_record = read_json(process_path)
-                    if process_record.get("experiment_id") == state.experiment_id:
-                        self._executor_identities[request_id] = process_record[
-                            "executor"
-                        ]
-            for request_id, identity in list(self._executor_identities.items()):
-                try:
-                    if process_identity(identity["pid"]) == identity:
-                        await asyncio.to_thread(
-                            psutil.Process(identity["pid"]).wait,
-                            state.template["start_timeout"],
-                        )
-                except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
-                    pass
-                except OSError as error:
-                    if getattr(error, "winerror", None) not in (87, 1168):
-                        raise
-                self._executor_identities.pop(request_id, None)
+            await self._wait_accepted_executors(state)
+
+    async def _wait_accepted_executors(self, state: RunnerState) -> None:
+        request_ids = set(state.stage_result_ids.values())
+        for transfer in (state.pending_input, state.last_dag_decision):
+            if transfer is not None:
+                request_ids.add(transfer["request_id"])
+        for request_id in request_ids:
+            record = self._journal.client.read_command_result(request_id)
+            if record is None:
+                raise ValueError("An accepted result is missing from the journal.")
+            context = record["event"]["context"]
+            if context.get("participant_id") != context.get("stage_id"):
+                continue
+            # The result context identifies its writer without a per-call result file.
+            module_name = context.get("module_name")
+            if module_name is None:
+                continue
+            directory = (
+                state.experiment_directory
+                / "shared_artifacts"
+                / f"epoch_{context['cycle_number']}"
+                / module_name
+                / context["stage_id"]
+                / f"attempt_{context['attempt_number']}"
+            )
+            process_path = directory / "process.json"
+            if process_path.is_file():
+                process_record = read_json(process_path)
+                if process_record.get("experiment_id") == state.experiment_id:
+                    self._executor_identities[request_id] = process_record[
+                        "executor"
+                    ]
+        for request_id, identity in list(self._executor_identities.items()):
+            try:
+                if process_identity(identity["pid"]) == identity:
+                    await asyncio.to_thread(
+                        psutil.Process(identity["pid"]).wait,
+                        state.template["start_timeout"],
+                    )
+            except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+                pass
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (87, 1168):
+                    raise
+            self._executor_identities.pop(request_id, None)
