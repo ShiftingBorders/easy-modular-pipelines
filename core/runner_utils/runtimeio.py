@@ -12,7 +12,7 @@ import struct
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 
 from core.logger_utils.events import copy_json_object
 
@@ -62,38 +62,7 @@ def read_json(path: Path, *, max_bytes: int | None = None) -> JsonObject:
     while True:
         try:
             if os.name == "nt":
-                import msvcrt
-                from ctypes import wintypes
-
-                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel.CreateFileW.argtypes = [
-                    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-                ]
-                kernel.CreateFileW.restype = wintypes.HANDLE
-                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel.CloseHandle.restype = wintypes.BOOL
-                # Share read/write/delete so the native rename fallback can
-                # replace the path while this handle keeps the old contents.
-                handle = kernel.CreateFileW(
-                    str(path), 0x80000000, 7, None, 3, 0x80, None
-                )
-                if handle == wintypes.HANDLE(-1).value:
-                    error = ctypes.WinError(ctypes.get_last_error())
-                    error.filename = str(path)
-                    raise error
-                try:
-                    descriptor = msvcrt.open_osfhandle(
-                        handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT
-                    )
-                except BaseException:
-                    kernel.CloseHandle(handle)
-                    raise
-                try:
-                    stream = os.fdopen(descriptor, "rb")
-                except BaseException:
-                    os.close(descriptor)
-                    raise
+                stream = _open_shared_reader(path)
             else:
                 stream = path.open("rb")
             with stream:
@@ -121,6 +90,42 @@ def read_json(path: Path, *, max_bytes: int | None = None) -> JsonObject:
     if max_bytes is not None and len(encoded) > max_bytes:
         raise ValueError(f"Metadata exceeds its size limit: {path.name}")
     return copy_json_object(json.loads(encoded.decode("utf-8")), str(path))
+
+
+def _open_shared_reader(path: Path) -> BinaryIO:
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    # Share read/write/delete so the native rename fallback can
+    # replace the path while this handle keeps the old contents.
+    handle = kernel.CreateFileW(
+        str(path), 0x80000000, 7, None, 3, 0x80, None
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        error = ctypes.WinError(ctypes.get_last_error())
+        error.filename = str(path)
+        raise error
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT
+        )
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return stream
 
 
 def write_json(path: Path, data: JsonObject) -> None:
@@ -155,42 +160,9 @@ def write_json(path: Path, data: JsonObject) -> None:
                     or getattr(error, "winerror", None) not in (5, 32, 33)
                 ):
                     raise
-                from ctypes import wintypes
-
-                # MoveFileEx (os.replace) rejects even delete-sharing readers.
-                # FileRenameInfoEx with POSIX semantics performs one atomic
-                # rename while those readers finish reading the old file.
-                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel.CreateFileW.argtypes = [
-                    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-                ]
-                kernel.CreateFileW.restype = wintypes.HANDLE
-                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel.CloseHandle.restype = wintypes.BOOL
-                kernel.SetFileInformationByHandle.argtypes = [
-                    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
-                ]
-                kernel.SetFileInformationByHandle.restype = wintypes.BOOL
-                handle = kernel.CreateFileW(
-                    str(temporary), 0x10000, 7, None, 3, 0x80, None
-                )
-                native_error = ctypes.get_last_error()
-                if handle != wintypes.HANDLE(-1).value:
-                    try:
-                        name = str(path.absolute()).encode("utf-16-le")
-                        # Native DWORD flags, HANDLE root, DWORD byte length,
-                        # then a terminated WCHAR filename (length excludes
-                        # the terminator). Flags: REPLACE_IF_EXISTS | POSIX.
-                        record = struct.pack("@IPI", 3, 0, len(name)) + name
-                        buffer = ctypes.create_string_buffer(record + b"\0\0")
-                        if kernel.SetFileInformationByHandle(
-                            handle, 22, buffer, len(record) + 2
-                        ):
-                            break
-                        native_error = ctypes.get_last_error()
-                    finally:
-                        kernel.CloseHandle(handle)
+                native_error = _replace_shared_file(temporary, path)
+                if native_error is None:
+                    break
                 # Older filesystems may not support FileRenameInfoEx. Retain
                 # the bounded MoveFileEx retry there and for external locks.
                 if native_error not in (1, 5, 32, 33, 50, 87):
@@ -211,6 +183,47 @@ def write_json(path: Path, data: JsonObject) -> None:
                 if failure is None:
                     raise
                 failure.add_note(f"Temporary JSON cleanup failed: {cleanup_error}")
+
+
+def _replace_shared_file(temporary: Path, path: Path) -> int | None:
+    """Return None on success, otherwise the native code for the caller's retry."""
+    from ctypes import wintypes
+
+    # MoveFileEx (os.replace) rejects even delete-sharing readers.
+    # FileRenameInfoEx with POSIX semantics performs one atomic
+    # rename while those readers finish reading the old file.
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(
+        str(temporary), 0x10000, 7, None, 3, 0x80, None
+    )
+    native_error = ctypes.get_last_error()
+    if handle != wintypes.HANDLE(-1).value:
+        try:
+            name = str(path.absolute()).encode("utf-16-le")
+            # Native DWORD flags, HANDLE root, DWORD byte length,
+            # then a terminated WCHAR filename (length excludes
+            # the terminator). Flags: REPLACE_IF_EXISTS | POSIX.
+            record = struct.pack("@IPI", 3, 0, len(name)) + name
+            buffer = ctypes.create_string_buffer(record + b"\0\0")
+            if kernel.SetFileInformationByHandle(
+                handle, 22, buffer, len(record) + 2
+            ):
+                return None
+            native_error = ctypes.get_last_error()
+        finally:
+            kernel.CloseHandle(handle)
+    return native_error
 
 
 def process_running(pid: int) -> bool:
@@ -246,49 +259,59 @@ def process_running(pid: int) -> bool:
 def process_identity(pid: int) -> JsonObject:
     """Use the OS creation value without rounding; PID alone is insufficient."""
     if os.name == "nt":
-        from ctypes import wintypes
-
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel.OpenProcess.restype = wintypes.HANDLE
-        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
-            ctypes.POINTER(wintypes.FILETIME)
-        ] * 4
-        handle = kernel.OpenProcess(0x1000, False, pid)
-        if not handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            times = [wintypes.FILETIME() for _ in range(4)]
-            if not kernel.GetProcessTimes(
-                handle, *(ctypes.byref(item) for item in times)
-            ):
-                raise ctypes.WinError(ctypes.get_last_error())
-            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
-        finally:
-            kernel.CloseHandle(handle)
-        query = ctypes.WinDLL("ntdll").NtQuerySystemInformation
-        query.argtypes = [
-            wintypes.ULONG,
-            ctypes.c_void_p,
-            wintypes.ULONG,
-            ctypes.POINTER(wintypes.ULONG),
-        ]
-        query.restype = ctypes.c_long
-        buffer = ctypes.create_string_buffer(48)
-        length = wintypes.ULONG()
-        if query(3, buffer, len(buffer), ctypes.byref(length)) != 0:
-            raise OSError("Cannot determine OS boot identity.")
-        boot_id = str(int.from_bytes(buffer.raw[:8], "little"))
-        host_id = socket.gethostname()
+        created, host_id, boot_id = _windows_process_identity(pid)
     else:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        created = int(fields[19])
-        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        host_id = Path("/etc/machine-id").read_text().strip()
+        created, host_id, boot_id = _linux_process_identity(pid)
     return {
         "pid": pid,
         "created_at_os": created,
         "host_id": host_id,
         "boot_id": boot_id,
     }
+
+
+def _windows_process_identity(pid: int) -> tuple[int, str, str]:
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+        ctypes.POINTER(wintypes.FILETIME)
+    ] * 4
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(
+            handle, *(ctypes.byref(item) for item in times)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
+    query = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+    query.argtypes = [
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    query.restype = ctypes.c_long
+    buffer = ctypes.create_string_buffer(48)
+    length = wintypes.ULONG()
+    if query(3, buffer, len(buffer), ctypes.byref(length)) != 0:
+        raise OSError("Cannot determine OS boot identity.")
+    boot_id = str(int.from_bytes(buffer.raw[:8], "little"))
+    host_id = socket.gethostname()
+    return created, host_id, boot_id
+
+
+def _linux_process_identity(pid: int) -> tuple[int, str, str]:
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    created = int(fields[19])
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    host_id = Path("/etc/machine-id").read_text().strip()
+    return created, host_id, boot_id
