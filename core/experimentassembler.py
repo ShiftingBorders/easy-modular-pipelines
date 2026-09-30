@@ -103,6 +103,12 @@ class ExperimentAssembler:
         services = template["services"]
         if type(services) is not list:
             raise TypeError("services must be an array.")
+        self._validate_template_policies(template)
+        self._validate_template_definitions(template, services)
+        self._validate_template_resources(template, path)
+        return text, template
+
+    def _validate_template_policies(self, template: JsonObject) -> None:
         snapshots = copy_json_object(template["snapshots"], "snapshots")
         if snapshots.keys() != {"mode", "keep"}:
             raise ValueError("snapshots requires mode and keep.")
@@ -157,6 +163,10 @@ class ExperimentAssembler:
             raise ValueError("unknown_state.recovery_limit must be nonnegative.")
         if unknown["on_recovery_limit"] not in ("stop", "pause"):
             raise ValueError("Invalid unknown_state.on_recovery_limit.")
+
+    def _validate_template_definitions(
+        self, template: JsonObject, services: list[JsonObject]
+    ) -> None:
         stages = template["stages"]
         if type(stages) is not list or not stages:
             raise ValueError("stages must be a nonempty array.")
@@ -240,6 +250,10 @@ class ExperimentAssembler:
                 raise ValueError(
                     "A DAG service reference requires an explicit service_id in services."
                 )
+
+    def _validate_template_resources(
+        self, template: JsonObject, path: Path
+    ) -> None:
         if type(template["resources"]) is not list:
             raise TypeError("resources must be an array.")
         resource_names = set()
@@ -272,7 +286,6 @@ class ExperimentAssembler:
                 or any(c not in "0123456789abcdefABCDEF" for c in digest)
             ):
                 raise ValueError("resource.hash must be SHA-256 or null.")
-        return text, template
 
     async def validate_template(self, template_path: Path) -> JsonObject:
         """Check structure and registered module references without assembling a run."""
@@ -421,27 +434,9 @@ class ExperimentAssembler:
             for role, item in definitions:
                 if role == "stage" and "service_id" in item:
                     continue
-                module = copy_json_object(item["module"], "module")
-                key = (
-                    require_text(module["name"], "module.name"),
-                    require_text(module["version"], "module.version"),
+                key, source, target, definition = self._module_copy_inputs(
+                    item, role, directory, copied
                 )
-                source = self._project_root / "modules" / key[0] / key[1]
-                target = directory / "modules" / key[0] / key[1]
-                if (
-                    source.is_symlink()
-                    or source.is_junction()
-                    or any(
-                        item.is_symlink() or item.is_junction()
-                        for item in source.rglob("*")
-                    )
-                ):
-                    raise ValueError("Module code must not contain filesystem links.")
-                definition = copied.get(key) or self.read_module(source)
-                if (definition["name"], definition["version"]) != key:
-                    raise ValueError("module.yaml identity differs from template.")
-                if definition["role"] != role:
-                    raise ValueError(f"Module {key} does not have role={role}.")
                 if key not in copied:
                     copy_task = asyncio.create_task(
                         asyncio.to_thread(shutil.copytree, source, target)
@@ -492,6 +487,36 @@ class ExperimentAssembler:
                 error.add_note(f"Build cleanup also failed: {cleanup_error}")
             raise
         return state
+
+    def _module_copy_inputs(
+        self,
+        item: JsonObject,
+        role: str,
+        directory: Path,
+        copied: dict[tuple[str, str], JsonObject],
+    ) -> tuple[tuple[str, str], Path, Path, JsonObject]:
+        module = copy_json_object(item["module"], "module")
+        key = (
+            require_text(module["name"], "module.name"),
+            require_text(module["version"], "module.version"),
+        )
+        source = self._project_root / "modules" / key[0] / key[1]
+        target = directory / "modules" / key[0] / key[1]
+        if (
+            source.is_symlink()
+            or source.is_junction()
+            or any(
+                item.is_symlink() or item.is_junction()
+                for item in source.rglob("*")
+            )
+        ):
+            raise ValueError("Module code must not contain filesystem links.")
+        definition = copied.get(key) or self.read_module(source)
+        if (definition["name"], definition["version"]) != key:
+            raise ValueError("module.yaml identity differs from template.")
+        if definition["role"] != role:
+            raise ValueError(f"Module {key} does not have role={role}.")
+        return key, source, target, definition
 
     async def rebuild(
         self,
@@ -546,32 +571,7 @@ class ExperimentAssembler:
                 target = root / "modules" / key[0] / key[1]
                 prepared = workspace / "modules" / key[0] / key[1]
                 if prepare_only:
-                    source = (
-                        target
-                        if target.exists()
-                        else (self._project_root / "modules" / key[0] / key[1])
-                    )
-                    if (
-                        not source.resolve().is_relative_to(
-                            root if target.exists() else self._project_root
-                        )
-                        or source.is_symlink()
-                        or source.is_junction()
-                        or any(
-                            p.is_symlink() or p.is_junction() for p in source.rglob("*")
-                        )
-                    ):
-                        raise ValueError(
-                            "Module code must not contain filesystem links."
-                        )
-                    manifest = self.read_module(source)
-                    if (manifest["name"], manifest["version"], manifest["role"]) != (
-                        *key,
-                        role,
-                    ):
-                        raise ValueError(
-                            f"Module identity/role differs from template: {key}."
-                        )
+                    source = self._rebuild_module_source(root, target, key, role)
                     if not target.exists() and key not in seen:
                         prepared.parent.mkdir(parents=True, exist_ok=True)
                         copying = asyncio.create_task(
@@ -585,15 +585,9 @@ class ExperimentAssembler:
                         candidate if target.exists() else staged, definition
                     )
                 else:
-                    if not target.exists():
-                        self.check_module(staged, definition)
-                        if not target.parent.resolve().is_relative_to(root):
-                            raise ValueError(
-                                "Module destination escapes the experiment."
-                            )
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        prepared.replace(target)
-                    self.check_module(candidate, definition)
+                    self._publish_rebuild_module(
+                        root, target, prepared, candidate, staged, definition
+                    )
                 seen.add(key)
         checking_resources = asyncio.create_task(
             asyncio.to_thread(self.check_resources, candidate)
@@ -608,6 +602,56 @@ class ExperimentAssembler:
         else:
             # The durable pending_rebuild record covers the multi-file publication.
             (workspace / "experiment.yaml").replace(state.template_path)
+
+    def _rebuild_module_source(
+        self, root: Path, target: Path, key: tuple[str, str], role: str
+    ) -> Path:
+        source = (
+            target
+            if target.exists()
+            else (self._project_root / "modules" / key[0] / key[1])
+        )
+        if (
+            not source.resolve().is_relative_to(
+                root if target.exists() else self._project_root
+            )
+            or source.is_symlink()
+            or source.is_junction()
+            or any(
+                p.is_symlink() or p.is_junction() for p in source.rglob("*")
+            )
+        ):
+            raise ValueError(
+                "Module code must not contain filesystem links."
+            )
+        manifest = self.read_module(source)
+        if (manifest["name"], manifest["version"], manifest["role"]) != (
+            *key,
+            role,
+        ):
+            raise ValueError(
+                f"Module identity/role differs from template: {key}."
+            )
+        return source
+
+    def _publish_rebuild_module(
+        self,
+        root: Path,
+        target: Path,
+        prepared: Path,
+        candidate: RunnerState,
+        staged: RunnerState,
+        definition: JsonObject,
+    ) -> None:
+        if not target.exists():
+            self.check_module(staged, definition)
+            if not target.parent.resolve().is_relative_to(root):
+                raise ValueError(
+                    "Module destination escapes the experiment."
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            prepared.replace(target)
+        self.check_module(candidate, definition)
 
     def check_modules(self, state: RunnerState) -> None:
         for role in ("stage", "service"):
