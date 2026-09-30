@@ -473,40 +473,7 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         require_text(origin, "result experiment ID")
     state.stage_result_origins = origins
     stage_ids = {item["stage_id"] for item in state.template["stages"]}
-    for key in ("pending_input", "last_dag_decision"):
-        value = document[key]
-        if value is None:
-            continue
-        value = copy_json_object(value, key)
-        expected = {"request_id", "source_stage_id", "experiment_id"}
-        expected.add("stage_id" if key == "pending_input" else "decision")
-        if value.keys() != expected:
-            raise ValueError(f"Invalid {key} fields.")
-        UUID(require_text(value["request_id"], "transition request_id"))
-        UUID(require_text(value["source_stage_id"], "transition source_stage_id"))
-        require_text(value["experiment_id"], "transition experiment_id")
-        if value["source_stage_id"] not in stage_ids:
-            raise ValueError("Saved transition refers to an unknown source stage.")
-        if key == "pending_input":
-            if value["stage_id"] not in stage_ids:
-                raise ValueError("Pending input targets an unknown stage.")
-            if (
-                state.stage_position > len(state.template["stages"])
-                or value["stage_id"]
-                != state.template["stages"][state.stage_position - 1]["stage_id"]
-            ):
-                raise ValueError("Pending input must belong to the current cursor.")
-        else:
-            decision = copy_json_object(value["decision"], "DAG decision")
-            command = decision.get("command")
-            if command not in (None, "pause", "stop", "move"):
-                raise ValueError("Invalid saved DAG command.")
-            fields = {"command", "stage_id"} if command == "move" else {"command"}
-            if decision.keys() != fields:
-                raise ValueError("Invalid saved DAG decision fields.")
-            if command == "move" and decision["stage_id"] not in stage_ids:
-                raise ValueError("Saved move targets an unknown stage.")
-        setattr(state, key, value)
+    _restore_transitions(state, document, stage_ids)
     retained = document["retained_artifacts"]
     if type(retained) is not list or len(retained) != len(set(retained)):
         raise ValueError("retained_artifacts must be a unique array of paths.")
@@ -566,44 +533,7 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         for key in ("freeze_id", "prepared_freeze_id"):
             if saved[key] is not None:
                 UUID(saved[key])
-        if type(saved["pending_requests"]) is not list:
-            raise TypeError("Service pending_requests must be an array.")
-        requests = [*saved["pending_requests"]]
-        if saved["active_request"] is not None:
-            requests.append(saved["active_request"])
-        for index, request in enumerate(requests):
-            request = copy_json_object(request, "service request")
-            if request.get("owner") not in ("caller", "service"):
-                raise ValueError("Saved request has an invalid policy owner.")
-            require_number(request["queued_monotonic"], "request queue time")
-            if request.get("deadline_monotonic") is not None:
-                require_number(request["deadline_monotonic"], "request deadline")
-            request_id = require_text(request["request_id"], "request_id")
-            UUID(request_id)
-            if (
-                request_id not in state.used_request_ids
-                or request_id in service_request_ids
-            ):
-                raise ValueError("Service request ID is missing or duplicated.")
-            service_request_ids.add(request_id)
-            require_text(request["command"], "service command")
-            copy_json_object(request["args"], "service command arguments")
-            if request["sent_monotonic"] is not None:
-                require_number(request["sent_monotonic"], "service send time")
-            if index < len(saved["pending_requests"]):
-                if request["sent_monotonic"] is not None or request["timed_out"]:
-                    raise ValueError(
-                        "A sent service request cannot re-enter the pending queue."
-                    )
-            elif (
-                request["sent_monotonic"] is None
-                or request["service_instance_id"] != instance.service_instance_id
-            ):
-                raise ValueError(
-                    "Active service request has no matching send identity/time."
-                )
-            if type(request["timed_out"]) is not bool:
-                raise TypeError("Service timed_out must be a boolean.")
+        _validate_service_requests(saved, state, instance, service_request_ids)
         for name in ("endpoint_path", "artifacts_directory"):
             if saved[name] is not None:
                 relative = Path(require_text(saved[name], name))
@@ -622,47 +552,138 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
         UUID(require_text(document["last_result_id"], "last result ID"))
         state.last_result_id = document["last_result_id"]
     if document["active_attempt"] is not None:
-        attempt = copy_json_object(document["active_attempt"], "active_attempt")
-        observed = {
-            key: attempt.pop(key)
-            for key in (
-                "process_identity",
-                "started_at",
-                "result_request_id",
-                "outcome",
-                "executor_status",
-                "request_id",
-                "participant",
-                "endpoint_path",
-                "service_id",
-                "queued_monotonic",
-                "queued_at",
-            )
-        }
-        relative = Path(attempt["artifacts_directory"])
-        attempt["artifacts_directory"] = (root / relative).resolve()
-        if relative.anchor or not attempt["artifacts_directory"].is_relative_to(root):
-            raise ValueError("Saved attempt directory escapes the experiment.")
-        state.active_attempt = StageAttempt(**attempt)
-        UUID(require_text(observed["request_id"], "request_id"))
-        if observed["result_request_id"] is not None:
-            UUID(require_text(observed["result_request_id"], "result request ID"))
-        if observed["participant"] is not None:
-            participant_identity(observed["participant"])
-        else:
-            raise ValueError("An active attempt requires a participant identity.")
-        if observed["service_id"] is not None:
-            UUID(require_text(observed["service_id"], "service ID"))
-            if observed["participant"]["participant_id"] != observed["service_id"]:
-                raise ValueError("Service attempt identity differs from its service.")
-        if observed["queued_monotonic"] is not None:
-            require_number(observed["queued_monotonic"], "queue time")
-        if observed["endpoint_path"] is not None:
-            relative = Path(observed["endpoint_path"])
-            resolved = (root / relative).resolve()
-            if relative.anchor or not resolved.is_relative_to(root):
-                raise ValueError("Saved participant endpoint escapes the experiment.")
-            observed["endpoint_path"] = resolved
-        for key, value in observed.items():
-            setattr(state.active_attempt, key, value)
+        _restore_active_attempt(root, document, state)
     return state
+
+
+def _restore_transitions(
+    state: RunnerState, document: JsonObject, stage_ids: set[str]
+) -> None:
+    for key in ("pending_input", "last_dag_decision"):
+        value = document[key]
+        if value is None:
+            continue
+        value = copy_json_object(value, key)
+        expected = {"request_id", "source_stage_id", "experiment_id"}
+        expected.add("stage_id" if key == "pending_input" else "decision")
+        if value.keys() != expected:
+            raise ValueError(f"Invalid {key} fields.")
+        UUID(require_text(value["request_id"], "transition request_id"))
+        UUID(require_text(value["source_stage_id"], "transition source_stage_id"))
+        require_text(value["experiment_id"], "transition experiment_id")
+        if value["source_stage_id"] not in stage_ids:
+            raise ValueError("Saved transition refers to an unknown source stage.")
+        if key == "pending_input":
+            if value["stage_id"] not in stage_ids:
+                raise ValueError("Pending input targets an unknown stage.")
+            if (
+                state.stage_position > len(state.template["stages"])
+                or value["stage_id"]
+                != state.template["stages"][state.stage_position - 1]["stage_id"]
+            ):
+                raise ValueError("Pending input must belong to the current cursor.")
+        else:
+            decision = copy_json_object(value["decision"], "DAG decision")
+            command = decision.get("command")
+            if command not in (None, "pause", "stop", "move"):
+                raise ValueError("Invalid saved DAG command.")
+            fields = {"command", "stage_id"} if command == "move" else {"command"}
+            if decision.keys() != fields:
+                raise ValueError("Invalid saved DAG decision fields.")
+            if command == "move" and decision["stage_id"] not in stage_ids:
+                raise ValueError("Saved move targets an unknown stage.")
+        setattr(state, key, value)
+
+
+def _validate_service_requests(
+    saved: JsonObject,
+    state: RunnerState,
+    instance: ServiceInstance,
+    service_request_ids: set[str],
+) -> None:
+    if type(saved["pending_requests"]) is not list:
+        raise TypeError("Service pending_requests must be an array.")
+    requests = [*saved["pending_requests"]]
+    if saved["active_request"] is not None:
+        requests.append(saved["active_request"])
+    for index, request in enumerate(requests):
+        request = copy_json_object(request, "service request")
+        if request.get("owner") not in ("caller", "service"):
+            raise ValueError("Saved request has an invalid policy owner.")
+        require_number(request["queued_monotonic"], "request queue time")
+        if request.get("deadline_monotonic") is not None:
+            require_number(request["deadline_monotonic"], "request deadline")
+        request_id = require_text(request["request_id"], "request_id")
+        UUID(request_id)
+        if (
+            request_id not in state.used_request_ids
+            or request_id in service_request_ids
+        ):
+            raise ValueError("Service request ID is missing or duplicated.")
+        service_request_ids.add(request_id)
+        require_text(request["command"], "service command")
+        copy_json_object(request["args"], "service command arguments")
+        if request["sent_monotonic"] is not None:
+            require_number(request["sent_monotonic"], "service send time")
+        if index < len(saved["pending_requests"]):
+            if request["sent_monotonic"] is not None or request["timed_out"]:
+                raise ValueError(
+                    "A sent service request cannot re-enter the pending queue."
+                )
+        elif (
+            request["sent_monotonic"] is None
+            or request["service_instance_id"] != instance.service_instance_id
+        ):
+            raise ValueError(
+                "Active service request has no matching send identity/time."
+            )
+        if type(request["timed_out"]) is not bool:
+            raise TypeError("Service timed_out must be a boolean.")
+
+
+def _restore_active_attempt(
+    root: Path, document: JsonObject, state: RunnerState
+) -> None:
+    attempt = copy_json_object(document["active_attempt"], "active_attempt")
+    observed = {
+        key: attempt.pop(key)
+        for key in (
+            "process_identity",
+            "started_at",
+            "result_request_id",
+            "outcome",
+            "executor_status",
+            "request_id",
+            "participant",
+            "endpoint_path",
+            "service_id",
+            "queued_monotonic",
+            "queued_at",
+        )
+    }
+    relative = Path(attempt["artifacts_directory"])
+    attempt["artifacts_directory"] = (root / relative).resolve()
+    if relative.anchor or not attempt["artifacts_directory"].is_relative_to(root):
+        raise ValueError("Saved attempt directory escapes the experiment.")
+    state.active_attempt = StageAttempt(**attempt)
+    UUID(require_text(observed["request_id"], "request_id"))
+    if observed["result_request_id"] is not None:
+        UUID(require_text(observed["result_request_id"], "result request ID"))
+    if observed["participant"] is not None:
+        participant_identity(observed["participant"])
+    else:
+        raise ValueError("An active attempt requires a participant identity.")
+    if observed["service_id"] is not None:
+        UUID(require_text(observed["service_id"], "service ID"))
+        if observed["participant"]["participant_id"] != observed["service_id"]:
+            raise ValueError("Service attempt identity differs from its service.")
+    if observed["queued_monotonic"] is not None:
+        require_number(observed["queued_monotonic"], "queue time")
+    if observed["endpoint_path"] is not None:
+        relative = Path(observed["endpoint_path"])
+        resolved = (root / relative).resolve()
+        if relative.anchor or not resolved.is_relative_to(root):
+            raise ValueError("Saved participant endpoint escapes the experiment.")
+        observed["endpoint_path"] = resolved
+    for key, value in observed.items():
+        setattr(state.active_attempt, key, value)
