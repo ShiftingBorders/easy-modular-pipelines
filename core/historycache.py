@@ -21,6 +21,7 @@ from typing import BinaryIO
 
 from core.logger import OperationLogger
 from core.logger_utils.events import LoggingStateError
+from core.runner_utils.runtimeio import _lock_open_stream
 
 
 class _ExactMean:
@@ -61,14 +62,7 @@ def acquire_cache_writer(path: Path) -> BinaryIO:
             stream.write(b"\0")
             stream.flush()
         stream.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_open_stream(stream)
         return stream
     except OSError as error:
         stream.close()
@@ -135,7 +129,7 @@ class JournalHistoryCache:
                 if row and json.loads(row[0]) == expected:
                     self._opened = True
                     return
-                if row and json.loads(row[0]) != expected:
+                if row:
                     for table in (
                         "facts",
                         "records",
@@ -267,29 +261,34 @@ class JournalHistoryCache:
             projected = self._project_pending(db, state, project, deadline)
             self._publish_template(db, source)
             if reader_context is not None:
-                encoded = json.dumps(
-                    {**reader_context, "state": state},
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-                revision = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-                with db:
-                    previous = db.execute(
-                        "SELECT value FROM metadata WHERE key='reader_revision'"
-                    ).fetchone()
-                    if previous is None or previous[0] != revision:
-                        db.execute(
-                            "INSERT OR REPLACE INTO metadata VALUES ('reader_context', ?)",
-                            (encoded,),
-                        )
-                        db.execute(
-                            "INSERT OR REPLACE INTO metadata VALUES ('reader_revision', ?)",
-                            (revision,),
-                        )
+                self._publish_reader_context(db, reader_context, state)
             if window:
                 self._refresh_window(source, changed)
             result = self._publication(db, page, bool(changed) or projected)
             return {**result, "target_boundary": target}
+
+    def _publish_reader_context(
+        self, db: sqlite3.Connection, reader_context: dict, state: dict
+    ) -> None:
+        encoded = json.dumps(
+            {**reader_context, "state": state},
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        revision = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        with db:
+            previous = db.execute(
+                "SELECT value FROM metadata WHERE key='reader_revision'"
+            ).fetchone()
+            if previous is None or previous[0] != revision:
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('reader_context', ?)",
+                    (encoded,),
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('reader_revision', ?)",
+                    (revision,),
+                )
 
     def _publish_template(
         self, db: sqlite3.Connection, source: OperationLogger
@@ -398,13 +397,10 @@ class JournalHistoryCache:
         if related != [entry["event"]["event_id"]]:
             entries = []
             missing = list(related)
-            while missing:
-                page = source.read_event_batch(missing)["events"]
-                if not page:
-                    raise LoggingStateError("A change refers to an unavailable event.")
+            for page in self._missing_event_pages(
+                source, missing, "A change refers to an unavailable event."
+            ):
                 entries.extend(page)
-                found = {item["event"]["event_id"] for item in page}
-                missing = [key for key in missing if key not in found]
         confirmation = "recorded"
         if change["effective_author"]:
             confirmation = "confirmed"
@@ -426,6 +422,17 @@ class JournalHistoryCache:
             metadata["ignored"] = superseded.get(event["event_id"], metadata["ignored"])
             self._store_event(db, item, metadata, compact)
         return entries
+
+    def _missing_event_pages(
+        self, source: OperationLogger, missing: list[str], missing_message: str
+    ) -> Iterator[list[dict]]:
+        while missing:
+            page = source.read_event_batch(missing)["events"]
+            if not page:
+                raise LoggingStateError(missing_message)
+            yield page
+            found = {item["event"]["event_id"] for item in page}
+            missing = [key for key in missing if key not in found]
 
     def _scope_context(self, db: sqlite3.Connection, context: dict) -> dict:
         coordinates = ("run_id", "template_revision_id", "cycle_number")
@@ -455,27 +462,7 @@ class JournalHistoryCache:
                 **scope_context,
                 "template_revision_id": event["data"]["template_revision_id"],
             }
-        scope = json.dumps(
-            [
-                scope_context.get("run_id"),
-                scope_context.get("template_revision_id"),
-                scope_context.get("cycle_number"),
-            ]
-        )
-        if event["event_type"] in {
-            "control.intent",
-            "control.result",
-            "control.reconciled",
-            "command.result",
-        }:
-            request_id = (
-                context.get("request_id")
-                or event["data"].get("request_id")
-                or event["data"].get("intent_event_id")
-                or event["event_id"]
-            )
-            # Runner and service observations can have different cycle contexts.
-            scope = json.dumps({"request_id": request_id})
+        scope = self._event_scope(event, scope_context, context)
         reduced = compact(event)
         reduced.update(cursor=item["cursor"], **metadata)
         db.execute(
@@ -533,6 +520,30 @@ class JournalHistoryCache:
                 (context.get("run_id"), event["occurred_at"], event["occurred_at"]),
             )
 
+    def _event_scope(self, event: dict, scope_context: dict, context: dict) -> str:
+        scope = json.dumps(
+            [
+                scope_context.get("run_id"),
+                scope_context.get("template_revision_id"),
+                scope_context.get("cycle_number"),
+            ]
+        )
+        if event["event_type"] in {
+            "control.intent",
+            "control.result",
+            "control.reconciled",
+            "command.result",
+        }:
+            request_id = (
+                context.get("request_id")
+                or event["data"].get("request_id")
+                or event["data"].get("intent_event_id")
+                or event["event_id"]
+            )
+            # Runner and service observations can have different cycle contexts.
+            scope = json.dumps({"request_id": request_id})
+        return scope
+
     def _update_run(self, db: sqlite3.Connection, item: dict) -> None:
         event = item["event"]
         run_id = event["context"].get("run_id")
@@ -577,6 +588,11 @@ class JournalHistoryCache:
                 self._remember(item)
             return
         before, remaining = None, self.window_events
+        self._load_window_tail(source, before, remaining)
+
+    def _load_window_tail(
+        self, source: OperationLogger, before: int | None, remaining: int
+    ) -> None:
         while remaining:
             tail = source.read_event_batch(limit=min(remaining, 1000), before=before)
             if not tail["events"]:
@@ -611,23 +627,7 @@ class JournalHistoryCache:
                 (str(int(complete)),),
             )
             if db.execute("SELECT 1 FROM dirty LIMIT 1").fetchone() is None:
-                checkpoint = db.execute(
-                    "SELECT value FROM metadata WHERE key='checkpoint'"
-                ).fetchone()
-                cursor = db.execute(
-                    "SELECT COALESCE(MAX(cursor),0) FROM facts"
-                ).fetchone()[0]
-                cached = {
-                    **self.identity,
-                    "cursor": cursor,
-                    "change_cursor": json.loads(checkpoint[0])["change_cursor"]
-                    if checkpoint
-                    else 0,
-                }
-                db.execute(
-                    "INSERT OR REPLACE INTO metadata VALUES ('cached_through', ?)",
-                    (json.dumps(cached),),
-                )
+                self._publish_cached_boundary(db)
         cached_row = db.execute(
             "SELECT value FROM metadata WHERE key='cached_through'"
         ).fetchone()
@@ -639,6 +639,23 @@ class JournalHistoryCache:
             "window_count": len(self.window),
             "cached_through": json.loads(cached_row[0]),
         }
+
+    def _publish_cached_boundary(self, db: sqlite3.Connection) -> None:
+        checkpoint = db.execute(
+            "SELECT value FROM metadata WHERE key='checkpoint'"
+        ).fetchone()
+        cursor = db.execute("SELECT COALESCE(MAX(cursor),0) FROM facts").fetchone()[0]
+        cached = {
+            **self.identity,
+            "cursor": cursor,
+            "change_cursor": json.loads(checkpoint[0])["change_cursor"]
+            if checkpoint
+            else 0,
+        }
+        db.execute(
+            "INSERT OR REPLACE INTO metadata VALUES ('cached_through', ?)",
+            (json.dumps(cached),),
+        )
 
     def observe(self, target: dict | None = None) -> dict:
         """Read worker-owned projections and reconstruct the latest source window."""
@@ -674,16 +691,7 @@ class JournalHistoryCache:
                 self.window.clear()
                 self._window_bytes = 0
                 before, remaining = boundary["cursor"] + 1, self.window_events
-                while remaining:
-                    page = source.read_event_batch(
-                        before=before, limit=min(remaining, 1000)
-                    )
-                    if not page["events"]:
-                        break
-                    for entry in page["events"]:
-                        self._remember(entry)
-                    before = min(entry["cursor"] for entry in page["events"])
-                    remaining -= len(page["events"])
+                self._load_window_tail(source, before, remaining)
             publication = self._observed_publication(boundary, target)
             cached = publication["cached_through"]
             if (
@@ -738,18 +746,9 @@ class JournalHistoryCache:
             ) as db:
                 db.execute("BEGIN")
                 metadata = dict(db.execute("SELECT key, value FROM metadata"))
-                recorded = json.loads(metadata.get("source", "{}"))
-                if (
-                    recorded.get("version") != self.SCHEMA_VERSION
-                    or recorded.get("identity") != self.identity
-                    or recorded.get("file_key") != list(self.file_key)
-                ):
+                valid, cached = self._decode_cached_boundary(metadata, empty)
+                if not valid:
                     return empty
-                if "checkpoint" not in metadata:
-                    return empty
-                cached = json.loads(
-                    metadata.get("cached_through", json.dumps(empty["cached_through"]))
-                )
                 latest = db.execute(
                     "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
                 ).fetchone()
@@ -770,6 +769,23 @@ class JournalHistoryCache:
             if "no such table" not in str(error):
                 raise
             return empty
+
+    def _decode_cached_boundary(
+        self, metadata: dict, empty: dict
+    ) -> tuple[bool, object]:
+        recorded = json.loads(metadata.get("source", "{}"))
+        if (
+            recorded.get("version") != self.SCHEMA_VERSION
+            or recorded.get("identity") != self.identity
+            or recorded.get("file_key") != list(self.file_key)
+        ):
+            return False, None
+        if "checkpoint" not in metadata:
+            return False, None
+        cached = json.loads(
+            metadata.get("cached_through", json.dumps(empty["cached_through"]))
+        )
+        return True, cached
 
     def read_view(self, version: int, reader: Callable, *args):
         """One SQLite read snapshot while an independent worker may publish."""
@@ -879,27 +895,8 @@ class JournalHistoryCache:
                 **event["context"],
             }
             entries.append(event)
-        template = None
-        if not command_scope:
-            template = db.execute(
-                "SELECT compact FROM facts WHERE kind='template.applied' AND run_id IS ? AND revision IS ? AND effective=1 ORDER BY cursor DESC LIMIT 1",
-                (run_id, revision),
-            ).fetchone()
-        if template:
-            event = json.loads(template[0])
-            if all(item["event_id"] != event["event_id"] for item in entries):
-                entries.insert(0, event)
-        observations = [
-            item for item in entries if item["event_type"] != "template.applied"
-        ]
-        if cycle is not None and observations:
-            first = min(item["occurred_at"] for item in observations)
-            last = max(item["occurred_at"] for item in entries)
-            for row in db.execute(
-                "SELECT compact FROM facts WHERE kind='runner.checkpoint' AND occurred_at>=? AND occurred_at<=? AND run_id IS ? AND scope!=? AND effective=1",
-                (first, last, run_id, scope),
-            ):
-                entries.append(json.loads(row[0]))
+        self._add_template_input(db, entries, command_scope, run_id, revision)
+        self._add_checkpoint_inputs(db, entries, cycle, run_id, scope)
         entries.sort(key=lambda item: item["cursor"])
         result = project(
             {
@@ -946,6 +943,45 @@ class JournalHistoryCache:
                 json.dumps(result["summary"], ensure_ascii=False),
             ),
         )
+
+    def _add_template_input(
+        self,
+        db: sqlite3.Connection,
+        entries: list[dict],
+        command_scope: bool,
+        run_id: str | None,
+        revision: str | None,
+    ) -> None:
+        template = None
+        if not command_scope:
+            template = db.execute(
+                "SELECT compact FROM facts WHERE kind='template.applied' AND run_id IS ? AND revision IS ? AND effective=1 ORDER BY cursor DESC LIMIT 1",
+                (run_id, revision),
+            ).fetchone()
+        if template:
+            event = json.loads(template[0])
+            if all(item["event_id"] != event["event_id"] for item in entries):
+                entries.insert(0, event)
+
+    def _add_checkpoint_inputs(
+        self,
+        db: sqlite3.Connection,
+        entries: list[dict],
+        cycle: int | None,
+        run_id: str | None,
+        scope: str,
+    ) -> None:
+        observations = [
+            item for item in entries if item["event_type"] != "template.applied"
+        ]
+        if cycle is not None and observations:
+            first = min(item["occurred_at"] for item in observations)
+            last = max(item["occurred_at"] for item in entries)
+            for row in db.execute(
+                "SELECT compact FROM facts WHERE kind='runner.checkpoint' AND occurred_at>=? AND occurred_at<=? AND run_id IS ? AND scope!=? AND effective=1",
+                (first, last, run_id, scope),
+            ):
+                entries.append(json.loads(row[0]))
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
         """Query the separate projection database, never the source tables."""
@@ -1009,21 +1045,12 @@ class JournalHistoryCache:
                         identifier for identifier in batch if identifier not in entries
                     )
                 )
-                while missing:
-                    page = source.read_event_batch(missing)["events"]
-                    if not page:
-                        raise LoggingStateError(
-                            "A referenced journal event is unavailable."
-                        )
+                for page in self._missing_event_pages(
+                    source, missing, "A referenced journal event is unavailable."
+                ):
                     entries.update(
                         (entry["event"]["event_id"], entry) for entry in page
                     )
-                    # The source byte budget can shorten an indexed batch.
-                    missing = [
-                        identifier
-                        for identifier in missing
-                        if identifier not in entries
-                    ]
                 for identifier in batch:
                     entry = entries[identifier]
                     yield {
