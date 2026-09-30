@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-import sys
 import threading
 import time
 import traceback
@@ -33,7 +32,7 @@ from core.logger_utils.events import (
     validate_command_result,
     validate_context,
 )
-from core.logger_utils.storage import SQLiteEventStore
+from core.logger_utils.storage import SQLiteEventStore, _write_stderr_best_effort
 
 
 class OperationLogger:
@@ -541,48 +540,35 @@ class OperationLogger:
                 persist=self._store.append_command_result,
             )
 
-    def read_command_result(self, request_id: str) -> JsonObject | None:
-        """Read the authoritative result and all recorded participant observations."""
+    def _read_store[Result](self, call: Callable[[SQLiteEventStore], Result]) -> Result:
         self._check_process()
         with self._lock:
             if self._store is None:
                 raise LoggingStateError("Logger is closed.")
             try:
-                return self._store.read_command_result(request_id)
+                return call(self._store)
             except BaseException as error:
                 if getattr(error, "journal_failed", False):
                     self._failed = True
                 raise
 
+    def read_command_result(self, request_id: str) -> JsonObject | None:
+        """Read the authoritative result and all recorded participant observations."""
+        return self._read_store(lambda store: store.read_command_result(request_id))
+
     def get_journal_info(self) -> JsonObject:
         """Return the open journal's schema, logical identity and generation."""
-        self._check_process()
-        with self._lock:
-            if self._store is None:
-                raise LoggingStateError("Logger is closed.")
-            try:
-                return self._store.get_journal_info()
-            except BaseException as error:
-                if getattr(error, "journal_failed", False):
-                    self._failed = True
-                raise
+        return self._read_store(lambda store: store.get_journal_info())
 
     def export_snapshot(
         self, destination: str | Path, *, min_free_bytes: int
     ) -> JsonObject:
         """Export a journal boundary, not a full experiment or a destructive rollback."""
-        self._check_process()
-        with self._lock:
-            if self._store is None:
-                raise LoggingStateError("Logger is closed.")
-            try:
-                return self._store.export_snapshot(
-                    destination, min_free_bytes=min_free_bytes
-                )
-            except BaseException as error:
-                if getattr(error, "journal_failed", False):
-                    self._failed = True
-                raise
+        return self._read_store(
+            lambda store: store.export_snapshot(
+                destination, min_free_bytes=min_free_bytes
+            )
+        )
 
     def record_error(
         self,
@@ -640,45 +626,48 @@ class OperationLogger:
         if not measurements:
             raise ValueError("resources must contain at least one measurement.")
         for name, measurement in measurements.items():
-            require_text(name, "resource name")
-            if not isinstance(measurement, dict):
-                raise TypeError("Each resource must be a JSON measurement object.")
-            if measurement.keys() - {
-                "value",
-                "unit",
-                "kind",
-                "scope",
-                "estimated",
-                "attributes",
-            }:
-                raise ValueError("Unknown resource measurement fields.")
-            if measurement.get("value") is not None:
-                require_number(measurement.get("value"), f"{name}.value")
-            else:
-                measurement["value"] = None
-            require_text(measurement.get("unit"), f"{name}.unit")
-            measurement.setdefault("kind", "delta")
-            measurement.setdefault("scope", "operation")
-            measurement.setdefault("estimated", False)
-            if measurement["kind"] not in ("delta", "total", "gauge", "peak"):
-                raise ValueError("Resource kind must be delta, total, gauge, or peak.")
-            scopes = ("operation", "process", "service", "host")
-            if measurement["scope"] not in scopes:
-                raise ValueError(f"Resource scope must be one of: {', '.join(scopes)}.")
-            if measurement["scope"] == "operation" and operation is None:
-                raise ValueError(
-                    "Operation-scoped resources require an operation handle."
-                )
-            if type(measurement["estimated"]) is not bool:
-                raise TypeError("Resource estimated must be a boolean.")
-            if "attributes" in measurement:
-                copy_json_object(measurement["attributes"], "resource attributes")
+            self._validate_measurement(name, measurement, operation)
         return self._record(
             "resources.recorded",
             {"resources": measurements},
             operation,
             context,
         )
+
+    def _validate_measurement(
+        self, name: str, measurement: JsonObject, operation: Operation | None
+    ) -> None:
+        require_text(name, "resource name")
+        if not isinstance(measurement, dict):
+            raise TypeError("Each resource must be a JSON measurement object.")
+        if measurement.keys() - {
+            "value",
+            "unit",
+            "kind",
+            "scope",
+            "estimated",
+            "attributes",
+        }:
+            raise ValueError("Unknown resource measurement fields.")
+        if measurement.get("value") is not None:
+            require_number(measurement.get("value"), f"{name}.value")
+        else:
+            measurement["value"] = None
+        require_text(measurement.get("unit"), f"{name}.unit")
+        measurement.setdefault("kind", "delta")
+        measurement.setdefault("scope", "operation")
+        measurement.setdefault("estimated", False)
+        if measurement["kind"] not in ("delta", "total", "gauge", "peak"):
+            raise ValueError("Resource kind must be delta, total, gauge, or peak.")
+        scopes = ("operation", "process", "service", "host")
+        if measurement["scope"] not in scopes:
+            raise ValueError(f"Resource scope must be one of: {', '.join(scopes)}.")
+        if measurement["scope"] == "operation" and operation is None:
+            raise ValueError("Operation-scoped resources require an operation handle.")
+        if type(measurement["estimated"]) is not bool:
+            raise TypeError("Resource estimated must be a boolean.")
+        if "attributes" in measurement:
+            copy_json_object(measurement["attributes"], "resource attributes")
 
     def record_progress(
         self,
@@ -764,16 +753,9 @@ class OperationLogger:
         view: str = "raw",
     ) -> JsonObject:
         """Read local committed events, including after a write failure, for reconciliation."""
-        self._check_process()
-        with self._lock:
-            if self._store is None:
-                raise LoggingStateError("Logger is closed.")
-            try:
-                return self._store.read_events(checkpoint, limit=limit, view=view)
-            except BaseException as error:
-                if getattr(error, "journal_failed", False):
-                    self._failed = True
-                raise
+        return self._read_store(
+            lambda store: store.read_events(checkpoint, limit=limit, view=view)
+        )
 
     def read_event_batch(
         self,
@@ -783,46 +765,25 @@ class OperationLogger:
         before: int | None = None,
     ) -> JsonObject:
         """Read selected original events or a tail page using existing indexes."""
-        self._check_process()
-        with self._lock:
-            if self._store is None:
-                raise LoggingStateError("Logger is closed.")
-            try:
-                return self._store.read_event_batch(event_ids, limit=limit, before=before)
-            except BaseException as error:
-                if getattr(error, "journal_failed", False):
-                    self._failed = True
-                raise
+        return self._read_store(
+            lambda store: store.read_event_batch(event_ids, limit=limit, before=before)
+        )
 
     def read_changes(
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
     ) -> JsonObject:
         """Read committed transitions, including confirmations without a new event."""
-        self._check_process()
-        with self._lock:
-            if self._store is None:
-                raise LoggingStateError("Logger is closed.")
-            try:
-                return self._store.read_changes(checkpoint, limit=limit)
-            except BaseException as error:
-                if getattr(error, "journal_failed", False):
-                    self._failed = True
-                raise
+        return self._read_store(
+            lambda store: store.read_changes(checkpoint, limit=limit)
+        )
 
     def export_diagnostics(
         self, operation_ids: list[str], destination: str | Path
     ) -> JsonObject:
         """Preserve selected operations outside files that runner will restore."""
-        self._check_process()
-        with self._lock:
-            if self._store is None:
-                raise LoggingStateError("Logger is closed.")
-            try:
-                return self._store.export_diagnostics(operation_ids, destination)
-            except BaseException as error:
-                if getattr(error, "journal_failed", False):
-                    self._failed = True
-                raise
+        return self._read_store(
+            lambda store: store.export_diagnostics(operation_ids, destination)
+        )
 
     def _report_secondary_failure(
         self,
@@ -843,12 +804,7 @@ class OperationLogger:
             original.add_note(message)
         except BaseException:  # noqa: BLE001, S110 - Preserve the original exception.
             pass
-        try:
-            if sys.stderr is not None:
-                sys.stderr.write(message + "\n")
-                sys.stderr.flush()
-        except BaseException:  # noqa: BLE001, S110 - This is the last-resort error sink.
-            pass
+        _write_stderr_best_effort(message)
 
 
 class Operation:
