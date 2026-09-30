@@ -21,7 +21,7 @@ import yaml
 from core.experimentassembler import ExperimentAssembler, find_experiment
 from core.logger import OperationLogger
 from core.logger_utils.events import copy_json_object, require_text
-from core.modulemanager import ModuleManager
+from core.modulemanager import ModuleManager, _await_outcome
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.state import JsonObject, RunnerState
 from core.storage_errors import StorageCapacityError, StorageConflict
@@ -106,14 +106,7 @@ class ExperimentArchiver:
         self._busy = True
         task = asyncio.create_task(self._logged_operation(operation, name))
         try:
-            while True:
-                try:
-                    return await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    if task.cancelled():
-                        raise
-                    # A cancelled worker await cannot undo publication or upload.
-                    continue
+            return await _await_outcome(task)
         finally:
             self._busy = False
 
@@ -152,22 +145,7 @@ class ExperimentArchiver:
             logger = OperationLogger(config)
             await asyncio.to_thread(logger.open)
             identity = logger.get_journal_info()
-            settings.update(
-                {
-                    "open_mode": "existing",
-                    "expected_journal": {
-                        key: identity[key] for key in ("journal_id", "generation")
-                    },
-                }
-            )
-            reader_config = folder / "reader.json"
-            write_json(
-                reader_config,
-                {
-                    "logging": settings,
-                    "operation_context": {"source": "experiment_archiver"},
-                },
-            )
+            reader_config = self._reader_config(settings, identity, folder)
             config = reader_config
             await asyncio.to_thread(
                 logger.record_event,
@@ -220,6 +198,27 @@ class ExperimentArchiver:
                     failure.add_note(
                         f"Closing the archive logger also failed: {close_error}"
                     )
+
+    def _reader_config(
+        self, settings: JsonObject, identity: JsonObject, folder: Path
+    ) -> Path:
+        settings.update(
+            {
+                "open_mode": "existing",
+                "expected_journal": {
+                    key: identity[key] for key in ("journal_id", "generation")
+                },
+            }
+        )
+        reader_config = folder / "reader.json"
+        write_json(
+            reader_config,
+            {
+                "logging": settings,
+                "operation_context": {"source": "experiment_archiver"},
+            },
+        )
+        return reader_config
 
     def _objects(self, value: object, field: str) -> list[JsonObject]:
         if not isinstance(value, list):
@@ -376,53 +375,62 @@ class ExperimentArchiver:
                     directories.append(name)
                     pending.append(entry)
                 elif entry.is_file():
-                    size = entry.stat().st_size
-                    total += size
-                    if total > self._settings["max_unpacked_bytes"]:
-                        raise StorageCapacityError(
-                            "Unpacked archive size exceeds its limit."
-                        )
-                    with entry.open("rb") as stream:
-                        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                        if os.fstat(stream.fileno()).st_size != size:
-                            raise ValueError("A source file changed during archiving.")
-                    files[name] = {"size": size, "sha256": digest}
+                    total, files[name] = self._file_inventory(entry, total)
                 else:
                     raise ValueError(f"Archive source is not a regular file: {entry}")
         return sorted(directories), files
+
+    def _file_inventory(self, entry: Path, total: int) -> tuple[int, JsonObject]:
+        size = entry.stat().st_size
+        total += size
+        if total > self._settings["max_unpacked_bytes"]:
+            raise StorageCapacityError(
+                "Unpacked archive size exceeds its limit."
+            )
+        with entry.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            if os.fstat(stream.fileno()).st_size != size:
+                raise ValueError("A source file changed during archiving.")
+        return total, {"size": size, "sha256": digest}
 
     def _copy(self, source: Path, target: Path) -> None:
         source = self._path(source)
         target = self._path(target)
         if source.is_dir():
-            directories, files = self._inventory(source)
-            target.mkdir(parents=True, exist_ok=False)
-            for name in directories:
-                (target / name).mkdir(parents=True, exist_ok=True)
-            for name in files:
-                self._space(target, (source / name).stat().st_size)
-                shutil.copy2(self._path(source / name), target / name)
-            if self._inventory(target) != (directories, files):
-                raise ValueError(
-                    "Source files changed while copying the archive payload."
-                )
+            self._copy_directory(source, target)
         elif source.is_file():
-            if source.stat().st_size > self._settings["max_unpacked_bytes"]:
-                raise StorageCapacityError(
-                    "Source file exceeds the unpacked size limit."
-                )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            self._space(target.parent, source.stat().st_size)
-            with source.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            shutil.copy2(source, target)
-            with target.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
-                    raise ValueError(
-                        "Source file changed while copying the archive payload."
-                    )
+            self._copy_file(source, target)
         else:
             raise FileNotFoundError(source)
+
+    def _copy_directory(self, source: Path, target: Path) -> None:
+        directories, files = self._inventory(source)
+        target.mkdir(parents=True, exist_ok=False)
+        for name in directories:
+            (target / name).mkdir(parents=True, exist_ok=True)
+        for name in files:
+            self._space(target, (source / name).stat().st_size)
+            shutil.copy2(self._path(source / name), target / name)
+        if self._inventory(target) != (directories, files):
+            raise ValueError(
+                "Source files changed while copying the archive payload."
+            )
+
+    def _copy_file(self, source: Path, target: Path) -> None:
+        if source.stat().st_size > self._settings["max_unpacked_bytes"]:
+            raise StorageCapacityError(
+                "Source file exceeds the unpacked size limit."
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._space(target.parent, source.stat().st_size)
+        with source.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        shutil.copy2(source, target)
+        with target.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                raise ValueError(
+                    "Source file changed while copying the archive payload."
+                )
 
     def _modules(self, template: JsonObject) -> list[dict[str, str]]:
         modules: dict[tuple[str, str], dict[str, str]] = {}
@@ -480,48 +488,9 @@ class ExperimentArchiver:
         work = Path(temporary.name)
         failure = None
         try:
-            payload = work / "payload"
-            payload.mkdir()
-            for module in modules:
-                relative = Path("modules") / module["name"] / module["version"]
-                await asyncio.to_thread(self._copy, root / relative, payload / relative)
-            resources = self._objects(template["resources"], "resources")
-            for resource in resources:
-                name = self._member(resource["name"])
-                await asyncio.to_thread(
-                    self._copy,
-                    root / "shared_data/resources" / name,
-                    payload / "resources" / name,
-                )
-                resource["path"] = f"resources/{name}"
-            template["resources"] = copy_json_object({"items": resources}, "resources")[
-                "items"
-            ]
-            (payload / "experiment.yaml").write_text(
-                yaml.safe_dump(template, allow_unicode=True, sort_keys=False),
-                encoding="utf-8",
+            payload, manifest = await self._prepare_payload(
+                state, root, work, template, modules
             )
-            directories, files = await asyncio.to_thread(self._inventory, payload)
-            manifest = copy_json_object(
-                {
-                    "schema_version": 2,
-                    "archive_id": str(uuid4()),
-                    "created_at": datetime.now(UTC).isoformat(),
-                    "source_experiment_id": state.experiment_id,
-                    "template": "experiment.yaml",
-                    "modules": modules,
-                    "directories": directories,
-                    "files": files,
-                },
-                "archive manifest",
-            )
-            await asyncio.to_thread(self._validate_payload, payload, manifest)
-            encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False).encode(
-                "utf-8"
-            )
-            if len(encoded) > self._settings["max_manifest_bytes"]:
-                raise StorageCapacityError("Archive manifest exceeds its size limit.")
-            (payload / "manifest.json").write_bytes(encoded)
             packed = work / "archive.tar.xz"
             await asyncio.to_thread(self._pack, payload, packed)
             await asyncio.to_thread(self._assert_stopped, state)
@@ -534,6 +503,58 @@ class ExperimentArchiver:
             raise
         finally:
             await asyncio.to_thread(self._cleanup, temporary, archive.parent, failure)
+
+    async def _prepare_payload(
+        self,
+        state: RunnerState,
+        root: Path,
+        work: Path,
+        template: JsonObject,
+        modules: list[dict[str, str]],
+    ) -> tuple[Path, JsonObject]:
+        payload = work / "payload"
+        payload.mkdir()
+        for module in modules:
+            relative = Path("modules") / module["name"] / module["version"]
+            await asyncio.to_thread(self._copy, root / relative, payload / relative)
+        resources = self._objects(template["resources"], "resources")
+        for resource in resources:
+            name = self._member(resource["name"])
+            await asyncio.to_thread(
+                self._copy,
+                root / "shared_data/resources" / name,
+                payload / "resources" / name,
+            )
+            resource["path"] = f"resources/{name}"
+        template["resources"] = copy_json_object({"items": resources}, "resources")[
+            "items"
+        ]
+        (payload / "experiment.yaml").write_text(
+            yaml.safe_dump(template, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        directories, files = await asyncio.to_thread(self._inventory, payload)
+        manifest = copy_json_object(
+            {
+                "schema_version": 2,
+                "archive_id": str(uuid4()),
+                "created_at": datetime.now(UTC).isoformat(),
+                "source_experiment_id": state.experiment_id,
+                "template": "experiment.yaml",
+                "modules": modules,
+                "directories": directories,
+                "files": files,
+            },
+            "archive manifest",
+        )
+        await asyncio.to_thread(self._validate_payload, payload, manifest)
+        encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
+        if len(encoded) > self._settings["max_manifest_bytes"]:
+            raise StorageCapacityError("Archive manifest exceeds its size limit.")
+        (payload / "manifest.json").write_bytes(encoded)
+        return payload, manifest
 
     def _pack(self, payload: Path, archive: Path) -> None:
         directories, files = self._inventory(payload)
@@ -642,16 +663,7 @@ class ExperimentArchiver:
                 names.add(name.casefold())
                 if len(names) > self._settings["max_members"]:
                     raise StorageCapacityError("Too many archive members.")
-                if header[257:265] != b"ustar\x0000" or member.type not in (
-                    tarfile.REGTYPE,
-                    tarfile.AREGTYPE,
-                    tarfile.DIRTYPE,
-                ):
-                    raise ValueError(
-                        "Archive links, sparse and special files are forbidden."
-                    )
-                if member.size < 0 or (member.isdir() and member.size != 0):
-                    raise ValueError("Invalid archive member size.")
+                self._validate_member_header(header, member)
                 total += member.size
                 if total > self._settings["max_unpacked_bytes"]:
                     raise StorageCapacityError(
@@ -691,6 +703,18 @@ class ExperimentArchiver:
             raise ValueError("Archive entries differ from its manifest inventory.")
         unpacked_tar.unlink()
         return manifest
+
+    def _validate_member_header(self, header: bytes, member: tarfile.TarInfo) -> None:
+        if header[257:265] != b"ustar\x0000" or member.type not in (
+            tarfile.REGTYPE,
+            tarfile.AREGTYPE,
+            tarfile.DIRTYPE,
+        ):
+            raise ValueError(
+                "Archive links, sparse and special files are forbidden."
+            )
+        if member.size < 0 or (member.isdir() and member.size != 0):
+            raise ValueError("Invalid archive member size.")
 
     def _validate_payload(self, payload: Path, manifest: JsonObject) -> set[str]:
         if (
@@ -754,6 +778,23 @@ class ExperimentArchiver:
             raise ValueError("Archive modules differ from the applied template.")
         allowed_files = {"experiment.yaml"}
         roots: list[str] = []
+        self._validate_payload_modules(payload, modules, roots)
+        self._validate_payload_resources(payload, raw_template, roots)
+        for name in names:
+            if name in allowed_files:
+                continue
+            if not any(
+                name == root
+                or name.startswith(root + "/")
+                or (name in directories and root.startswith(name + "/"))
+                for root in roots
+            ):
+                raise ValueError(f"Unexpected archive payload: {name}")
+        return set(names)
+
+    def _validate_payload_modules(
+        self, payload: Path, modules: list[dict[str, str]], roots: list[str]
+    ) -> None:
         for module in modules:
             relative = f"modules/{module['name']}/{module['version']}"
             folder = payload / relative
@@ -767,6 +808,10 @@ class ExperimentArchiver:
             if self._manager.module_hash(module["name"], folder) != module["hash"]:
                 raise ValueError("Module content differs from its expected hash.")
             roots.append(relative)
+
+    def _validate_payload_resources(
+        self, payload: Path, raw_template: JsonObject, roots: list[str]
+    ) -> None:
         for resource in self._objects(raw_template["resources"], "resources"):
             name = self._member(resource["name"])
             relative = f"resources/{name}"
@@ -786,17 +831,6 @@ class ExperimentArchiver:
                 if digest != require_text(resource["hash"], "resource hash").lower():
                     raise ValueError("Static resource differs from its expected hash.")
             roots.append(relative)
-        for name in names:
-            if name in allowed_files:
-                continue
-            if not any(
-                name == root
-                or name.startswith(root + "/")
-                or (name in directories and root.startswith(name + "/"))
-                for root in roots
-            ):
-                raise ValueError(f"Unexpected archive payload: {name}")
-        return set(names)
 
     async def _inspect(self, archive_path: Path) -> JsonObject:
         parent = self._path(self._project_root / "controller/archive_work")
@@ -873,48 +907,7 @@ class ExperimentArchiver:
                             f"Local module conflicts with archive: {name}/{version}"
                         )
             for module in modules:
-                name, version = module["name"], module["version"]
-                source = payload / "modules" / name / version
-                registered = await self._manager.register_module_async(
-                    name, version, source
-                )
-                entry: JsonObject = {
-                    "name": name,
-                    "version": version,
-                    "registered": registered,
-                    "installed": False,
-                }
-                completed.append(entry)
-                target = self._path(modules_root / name / version)
-                if not target.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    local = self._workspace(target.parent)
-                    local_failure = None
-                    try:
-                        staged = Path(local.name) / "module"
-                        await asyncio.to_thread(self._copy, source, staged)
-                        if (
-                            await asyncio.to_thread(
-                                self._manager.module_hash, name, staged
-                            )
-                            != module["hash"]
-                        ):
-                            raise ValueError(
-                                "Installed module hash differs after copying."
-                            )
-                        if self._path(target).exists():
-                            raise StorageConflict(
-                                f"Module destination appeared during installation: {target}"
-                            )
-                        staged.rename(target)
-                        entry["installed"] = True
-                    except BaseException as error:
-                        local_failure = error
-                        raise
-                    finally:
-                        await asyncio.to_thread(
-                            self._cleanup, local, target.parent, local_failure
-                        )
+                await self._install_module(module, payload, modules_root, completed)
             bundle = work / "installation"
             bundle.mkdir()
             await asyncio.to_thread(
@@ -950,3 +943,53 @@ class ExperimentArchiver:
             await asyncio.to_thread(
                 self._cleanup, temporary, destination.parent, failure
             )
+
+    async def _install_module(
+        self,
+        module: dict[str, str],
+        payload: Path,
+        modules_root: Path,
+        completed: list[JsonObject],
+    ) -> None:
+        name, version = module["name"], module["version"]
+        source = payload / "modules" / name / version
+        registered = await self._manager.register_module_async(
+            name, version, source
+        )
+        entry: JsonObject = {
+            "name": name,
+            "version": version,
+            "registered": registered,
+            "installed": False,
+        }
+        completed.append(entry)
+        target = self._path(modules_root / name / version)
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            local = self._workspace(target.parent)
+            local_failure = None
+            try:
+                staged = Path(local.name) / "module"
+                await asyncio.to_thread(self._copy, source, staged)
+                if (
+                    await asyncio.to_thread(
+                        self._manager.module_hash, name, staged
+                    )
+                    != module["hash"]
+                ):
+                    raise ValueError(
+                        "Installed module hash differs after copying."
+                    )
+                if self._path(target).exists():
+                    raise StorageConflict(
+                        f"Module destination appeared during installation: {target}"
+                    )
+                staged.rename(target)
+                entry["installed"] = True
+            except BaseException as error:
+                local_failure = error
+                raise
+            finally:
+                await asyncio.to_thread(
+                    self._cleanup, local, target.parent, local_failure
+                )
