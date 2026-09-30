@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import cli
-from core.runner_utils.runtimeio import write_json
+from core.primitives.json_files import write_json
 from tests.helpers.dag import wait_until
 from tests.helpers.http_runtime import ServerTestCase
 

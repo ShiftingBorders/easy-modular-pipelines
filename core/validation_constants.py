@@ -1,11 +1,23 @@
-"""Character sets used by module and storage input validation."""
+"""Compatibility imports; use the responsibility packages for new code."""
 
-from string import ascii_letters, digits, hexdigits
+from core.storage.hash_validation import (
+    SQL_COLUMN_NAME_CHARACTERS,
+    SQL_COLUMN_TYPE_CHARACTERS,
+)
+from core.storage.module_identity import (
+    CONTROL_CHARACTERS,
+    HEX_DIGITS,
+    INVALID_MODULE_NAME_CHARACTERS,
+    INVALID_MODULE_VERSION_CHARACTERS,
+    MODULE_IDENTITY_CHARACTERS,
+)
 
-HEX_DIGITS = frozenset(hexdigits)
-MODULE_IDENTITY_CHARACTERS = ascii_letters + digits + "_-."
-SQL_COLUMN_NAME_CHARACTERS = frozenset(ascii_letters + digits + "_")
-SQL_COLUMN_TYPE_CHARACTERS = frozenset(ascii_letters + digits + "_ (),")
-CONTROL_CHARACTERS = frozenset(chr(code) for code in range(32))
-INVALID_MODULE_NAME_CHARACTERS = frozenset('<>:"/\\|?*') | CONTROL_CHARACTERS
-INVALID_MODULE_VERSION_CHARACTERS = frozenset("/\\") | CONTROL_CHARACTERS
+__all__ = [
+    "CONTROL_CHARACTERS",
+    "HEX_DIGITS",
+    "INVALID_MODULE_NAME_CHARACTERS",
+    "INVALID_MODULE_VERSION_CHARACTERS",
+    "MODULE_IDENTITY_CHARACTERS",
+    "SQL_COLUMN_NAME_CHARACTERS",
+    "SQL_COLUMN_TYPE_CHARACTERS",
+]

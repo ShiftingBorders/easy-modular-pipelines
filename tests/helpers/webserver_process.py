@@ -13,9 +13,10 @@ from unittest.mock import patch
 import uvicorn
 
 import webserver
-from core import serverruntime
-from core.runner_utils.runtimeio import process_identity, write_json
-from core.serverruntime import load_server_settings
+from core.primitives.json_files import write_json
+from core.primitives.processes import process_identity
+from core.server import runtime as serverruntime
+from core.server.settings import load_server_settings
 from tests.helpers.server_faults import BlockedMessage, fault_controller, write_frame
 
 

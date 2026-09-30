@@ -34,7 +34,7 @@ owns DAG retries; the service manager owns restarts.
 ## StageClient
 
 ```python
-from core.runner_utils.stage_client import StageClient
+from core.participants.stage_client import StageClient
 
 # context_path is the absolute Path supplied by --emp-context.
 with StageClient(context_path) as client:

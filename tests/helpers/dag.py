@@ -21,12 +21,13 @@ from uuid import uuid4
 import httpx
 import yaml
 
-from core.experimentcontroller import ExperimentController
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import process_identity, read_json
-from core.seaweed import SeaweedDB
+from core.experiments.runner import ExperimentRunner
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json
+from core.primitives.processes import process_identity
+from core.server.experiment_controller import ExperimentController
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 TEMP_ROOT = REPOSITORY / ".artifacts" / "tmp" / "dag-tests"
@@ -127,7 +128,7 @@ class DagWorkspace:
         client = httpx.Client(
             base_url="http://filer.test", transport=httpx.MockTransport(self._filer)
         )
-        with patch("core.seaweed.httpx.Client", return_value=client):
+        with patch("core.storage.seaweed_client.httpx.Client", return_value=client):
             self.archives = SeaweedDB("http://filer.test")
         self.manager = ModuleManager(
             self.root / "modules", self.hashes, self.archives, self.root / "work"

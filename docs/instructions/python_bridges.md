@@ -44,7 +44,7 @@ takes:
 ```python
 from pathlib import Path
 
-from core.runner_utils.participant_server import ParticipantServer
+from core.participants.server import ParticipantServer
 
 # context, logger, and handle_request belong to your service implementation.
 server = ParticipantServer(

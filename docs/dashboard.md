@@ -242,7 +242,6 @@ the runtime machine. Monitoring is opt-in; the initial target is
 Windows uses `IcmpSendEcho`; Linux uses `iputils ping`.
 
 Resource metrics come from the runtime collector.
-GPU/VRAM monitoring is unfinished and disabled.
 
 Alerts can use sustained thresholds, free disk space, error counts in a time
 window, and ICMP failures. Repeated observations do not create duplicate

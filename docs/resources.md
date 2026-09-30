@@ -4,9 +4,6 @@ The resource collector observes host CPU/RAM, disk capacity, selected network
 interface I/O, and CPU/RAM of known experiment processes. The execution
 controller owns its lifecycle. The dashboard reads these observations.
 
-GPU/VRAM collection is not ready and is disabled. The reserved
-`gpu_interval_seconds` setting currently has no effect.
-
 ## Read measurements
 
 With a ready run-mode server:
@@ -67,7 +64,6 @@ Pass a different file to `webserver.py --resource-config <path>` or set
 | `disk_path` | `".."`, relative to the configuration file |
 | `network_interface` | `null`: select by route |
 | `network_reference_address` | `"1.1.1.1"` |
-| `gpu_interval_seconds` | 5, reserved and unused |
 
 Automatic network selection uses the IPv4 route to the reference address;
 it does not send a probe packet. The RAM buffer limits its stored history,

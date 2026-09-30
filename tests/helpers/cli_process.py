@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 
 import cli
-from core.runner_utils.runtimeio import process_identity, write_json
+from core.primitives.json_files import write_json
+from core.primitives.processes import process_identity
 
 
 def main():

@@ -281,8 +281,7 @@ operator=above|below, threshold and duration_seconds. Metrics: cpu, ram, disk
 (percent), disk_free_gib, internet_receive and internet_transmit (Mbps).
 An error rule uses kind=errors, threshold (positive event count), window_seconds,
 duration_seconds and optional experiment_id. An unavailable source cannot
-resolve an active incident. GPU/VRAM are unfinished and unused in sampling,
-views and rules; their prototype code is retained.
+resolve an active incident.
 
 Cache construction runs in independent spawned processes (`cache_workers`,
 default 2), with one writer per experiment and consistent SQLite read snapshots

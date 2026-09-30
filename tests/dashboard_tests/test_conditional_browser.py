@@ -11,7 +11,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from core.runner_utils.runtimeio import process_identity
+from core.primitives.processes import process_identity
 from dashboard.projections import experiment_views
 from tests.dashboard_tests.conditional_helpers import ConditionalHistory
 from tests.dashboard_tests.helpers import (

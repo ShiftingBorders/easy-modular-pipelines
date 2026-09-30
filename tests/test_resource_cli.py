@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from core.runner_utils.runtimeio import read_json, write_json
+from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import process_running
 from tests.helpers.http_runtime import HTTPServer, ServerTestCase
 from tests.helpers.resources import write_settings

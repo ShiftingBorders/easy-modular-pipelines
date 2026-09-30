@@ -247,6 +247,5 @@ snapshots are described in the [template reference](experiment_template.md).
   parallel stage execution and dependency-based fan-out/fan-in are unsupported.
 - `replace` is not supported yet.
 - StageClient currently has a synchronous public API.
-- GPU/VRAM monitoring is unfinished and disabled.
 - Old incompatible experiment, journal, and archive formats are rejected;
   automatic migration is not provided.

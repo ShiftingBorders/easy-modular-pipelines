@@ -16,7 +16,7 @@ import httpx
 import psutil
 import uvicorn
 
-from core.runner_utils.runtimeio import process_identity
+from core.primitives.processes import process_identity
 from dashboard.application import create_app
 from tests.dashboard_tests.helpers import (
     FIXTURES,

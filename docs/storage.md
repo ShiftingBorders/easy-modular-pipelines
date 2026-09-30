@@ -23,8 +23,8 @@ the server uses a different address.
 
 By default the server creates missing HashDB configuration and schema, initializes
 the database, and owns a local SeaweedFS process with data under the project's
-`seaweedfs/`. The executable is `core/seaweedfs/weed.exe` on Windows or
-`core/seaweedfs/weed` on Linux. Install it from the repository root before
+`seaweedfs/`. The executable is `core/storage/seaweedfs/weed.exe` on Windows or
+`core/storage/seaweedfs/weed` on Linux. Install it from the repository root before
 starting the server:
 
 ```text
@@ -140,7 +140,7 @@ calling application. Use absolute paths for library configuration and filesystem
 arguments. Serialize mutations of the same name/version across callers and
 keep the source stable during hashing and packaging.
 
-Expected storage failures derive from `core.storage_errors.StorageError`:
+Expected storage failures derive from `core.storage.errors.StorageError`:
 
 | Exception | Meaning |
 | --- | --- |

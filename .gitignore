@@ -10,8 +10,8 @@ wheels/
 .venv
 
 # SeaweedFS binaries installed by scripts/download_seaweedfs.py
-/core/seaweedfs/weed
-/core/seaweedfs/weed.exe
+/core/storage/seaweedfs/weed
+/core/storage/seaweedfs/weed.exe
 
 # Disposable local and agent-generated artifacts
 .artifacts/

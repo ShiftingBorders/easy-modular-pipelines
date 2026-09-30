@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from core.runner_utils.stage_client import StageClient
+from core.participants.stage_client import StageClient
 
 
 def main() -> None:

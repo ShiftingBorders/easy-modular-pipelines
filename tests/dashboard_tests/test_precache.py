@@ -9,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
-from core.historycache import acquire_cache_writer
+from core.journal.history_cache import acquire_cache_writer
 from dashboard.__main__ import precache
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals, cache_experiment

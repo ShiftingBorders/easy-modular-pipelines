@@ -1,1 +1,1 @@
-"""One event contract, durable SQLite storage and an explicitly scheduled projection."""
+"""Legacy journal import paths; new code uses core.journal."""

@@ -74,7 +74,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_running_and_paused_are_automatic(self):
         """T052/T053: metadata classification never opens a stopped journal."""
         with patch(
-            "core.logger.OperationLogger.open",
+            "core.journal.logger.OperationLogger.open",
             side_effect=AssertionError("Unexpected source read"),
         ):
             await self.views._refresh_cache_selection()

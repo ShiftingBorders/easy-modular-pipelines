@@ -1,8 +1,8 @@
-﻿# Repository Guidelines
+# Repository Guidelines
 
 ## Project Structure & Module Organization
 
-This is a Python 3.12 library-first project managed with `uv`. Core pipeline code lives in `core/`; when the maintainer defines or authorizes new structure, keep reusable classes and services there, with one focused module per concern (for example, `core/modulemanager.py` and `core/hashdb.py`). `webserver.py` owns the HTTP runtime and `cli.py` is its client; the separate dashboard starts with `uv run python -m dashboard`. Default, version-controlled configuration belongs in `default_settings/`, while tests belong in `tests/` and should mirror the source layout. Do not commit generated databases, caches, virtual environments, or build output.
+This is a Python 3.12 library-first project managed with `uv`. Core pipeline code lives in `core/`; when the maintainer defines or authorizes new structure, keep reusable classes and services there, with one focused module per concern (for example, `core/modules/manager.py` and `core/storage/hash_db.py`). `webserver.py` owns the HTTP runtime and `cli.py` is its client; the separate dashboard starts with `uv run python -m dashboard`. Default, version-controlled configuration belongs in `default_settings/`, while tests belong in `tests/` and should mirror the source layout. Do not commit generated databases, caches, virtual environments, or build output.
 
 Library behavior must not depend on the caller's current working directory.
 Resolve relative paths stored in configuration files against the directory of

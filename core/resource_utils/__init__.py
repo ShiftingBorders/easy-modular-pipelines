@@ -1,1 +1,1 @@
-"""Process sampling and plain data for the controller-owned resource collector."""
+"""Legacy resource-monitoring import paths; new code uses core.resources."""

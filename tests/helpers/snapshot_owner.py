@@ -7,16 +7,17 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from core.experimentassembler import ExperimentAssembler
-from core.hashdb import HashDB
-from core.logger import OperationLogger
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.journal import RunnerJournal
-from core.runner_utils.runtimeio import process_identity, read_json, write_json
-from core.runner_utils.services import ServiceManager
-from core.runner_utils.state import RunnerStateStore
-from core.seaweed import SeaweedDB
+from core.experiments.assembler import ExperimentAssembler
+from core.experiments.journal import RunnerJournal
+from core.experiments.runner import ExperimentRunner
+from core.experiments.services import ServiceManager
+from core.experiments.state import RunnerStateStore
+from core.journal.logger import OperationLogger
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.primitives.processes import process_identity
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 
 
 async def run_owner(options):
@@ -189,7 +190,7 @@ async def run_owner(options):
     try:
         if options.operation == "recover":
             with (
-                patch("core.runner_utils.experimentrunner.write_json", publish),
+                patch("core.experiments.runner.write_json", publish),
                 patch.object(RunnerStateStore, "save", save),
             ):
                 await runner.recover(options.experiment)
@@ -212,7 +213,7 @@ async def run_owner(options):
         )
         initial_revision = runner._state.template_revision_id
         with (
-            patch("core.runner_utils.snapshots.write_json", publish),
+            patch("core.experiments.snapshots.write_json", publish),
             patch.object(Path, "replace", move),
             patch.object(RunnerJournal, "complete_restore", complete),
             patch.object(ServiceManager, "load_states", load),
@@ -222,7 +223,7 @@ async def run_owner(options):
             patch.object(OperationLogger, "record_template_applied", applied),
             patch.object(ExperimentAssembler, "rebuild", rebuild),
             patch.object(ServiceManager, "prepare_rebuild", prepare),
-            patch("core.runner_utils.services.read_json", read_endpoint),
+            patch("core.experiments.services.read_json", read_endpoint),
         ):
             if options.operation == "rollback":
                 await runner.rollback(options.snapshot)

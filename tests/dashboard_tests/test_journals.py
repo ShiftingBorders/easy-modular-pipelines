@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from core.runner_utils.runtimeio import write_json
+from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals, read_object

@@ -15,16 +15,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from core.historycache import (
+from core.journal.events import LoggingError
+from core.journal.history_cache import (
     HistoryCacheBusy,
     HistoryCacheChanged,
     HistoryCacheLimit,
     JournalHistoryCache,
     acquire_cache_writer,
 )
-from core.logger import OperationLogger
-from core.logger_utils.events import LoggingError
-from core.runner_utils.runtimeio import read_json, write_json
+from core.journal.logger import OperationLogger
+from core.primitives.json_files import read_json, write_json
 from dashboard.api_client import SystemAPIError
 from dashboard.projections import (
     compact_event,

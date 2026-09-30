@@ -12,8 +12,8 @@ from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from core.logger_utils.events import LoggingError
-from core.runner_utils.runtimeio import write_json
+from core.journal.events import LoggingError
+from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import (
     LocalJournals,

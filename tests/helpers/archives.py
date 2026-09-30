@@ -21,12 +21,12 @@ from uuid import uuid4
 
 import yaml
 
-from core.experimentarchiver import ExperimentArchiver
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import read_json, write_json
-from core.seaweed import SeaweedDB
+from core.experiments.archiver import ExperimentArchiver
+from core.experiments.runner import ExperimentRunner
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned, wait_until
 
 TEMP_ROOT = REPOSITORY / ".artifacts/tmp/archive-tests"

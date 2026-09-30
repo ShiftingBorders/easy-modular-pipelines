@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals, cache_experiment

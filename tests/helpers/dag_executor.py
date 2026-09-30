@@ -8,9 +8,9 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from core.logger import OperationLogger
-from core.logger_utils.events import LoggingStorageError
-from core.runner_utils import executor
+from core.journal.events import LoggingStorageError
+from core.journal.logger import OperationLogger
+from core.participants import executor
 
 
 def main() -> None:

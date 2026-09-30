@@ -1,9 +1,9 @@
-"""Legacy import aliases; use core.storage_errors for semantic handling.
+"""Legacy import aliases; use core.storage.errors for semantic handling.
 
 Aliases preserve imports, not the former distinctions between operation names.
 """
 
-from core import storage_errors
+from core.storage import errors as storage_errors
 
 FailedOpenHashDB = storage_errors.StorageUnavailable
 UnexpectedSchemaValErr = storage_errors.StorageError

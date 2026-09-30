@@ -11,15 +11,15 @@ from uuid import uuid4
 
 import yaml
 
-from core.experimentassembler import ExperimentAssembler
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.journal import RunnerJournal
-from core.runner_utils.launch import ModuleLauncher
-from core.runner_utils.runtimeio import read_json, write_json
-from core.runner_utils.services import ServiceManager
-from core.runner_utils.state import RunnerState, RunnerStateStore
-from core.seaweed import SeaweedDB
+from core.experiments.assembler import ExperimentAssembler
+from core.experiments.journal import RunnerJournal
+from core.experiments.launch import ModuleLauncher
+from core.experiments.services import ServiceManager
+from core.experiments.state import RunnerState, RunnerStateStore
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 
 TEMP_ROOT = REPOSITORY / ".artifacts/tmp/service-tests"

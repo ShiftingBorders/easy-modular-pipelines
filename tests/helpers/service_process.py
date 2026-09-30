@@ -13,8 +13,9 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from core.logger import OperationLogger
-from core.runner_utils.runtimeio import process_identity, read_json, write_json
+from core.journal.logger import OperationLogger
+from core.primitives.json_files import read_json, write_json
+from core.primitives.processes import process_identity
 
 
 class PythonService:

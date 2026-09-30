@@ -14,19 +14,21 @@ from uuid import uuid4
 
 import yaml
 
-from core.experimentassembler import ExperimentAssembler
-from core.experimentcontroller import ExperimentController
-from core.logger_utils.events import LoggingStorageError
-from core.maintenancecontroller import MaintenanceController
-from core.storage_errors import (
+from core.experiments.assembler import ExperimentAssembler
+from core.journal.events import LoggingStorageError
+from core.server.experiment_controller import ExperimentController
+from core.server.maintenance_controller import MaintenanceController
+from core.storage.errors import (
     StorageClosedError,
     StorageError,
     StorageUnavailable,
     StoredObjectNotFound,
 )
-from tests import test_hashdb, test_modulemanager, test_server_results
 from tests.helpers.dag import DagWorkspace, wait_until
 from tests.helpers.services import ServiceWorkspace
+from tests.modules import test_manager as test_modulemanager
+from tests.server import test_results as test_server_results
+from tests.storage import test_hash_db as test_hashdb
 
 
 class ModuleListingTests(test_hashdb.HashDBTestCase):
@@ -425,7 +427,7 @@ class ReceiptListingTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.settings.result_ttl = 0
         # Completion has already occurred; advance the pruning clock deterministically.
         with (
-            patch("core.serverruntime.time.monotonic", return_value=10**12),
+            patch("core.server.runtime.time.monotonic", return_value=10**12),
             self.assertRaises(test_server_results.ServerError),
         ):
             self.runtime.list_commands(after=identifier)

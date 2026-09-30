@@ -8,7 +8,8 @@ from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from unittest.mock import patch
 
-from core.runner_utils.runtimeio import process_identity, write_json
+from core.primitives.json_files import write_json
+from core.primitives.processes import process_identity
 
 
 def blocked_receive(directory):
@@ -37,9 +38,9 @@ def write_frame(queue, data):
 
 
 def fault_controller(settings, requests, responses, instance_id):
-    from core import serverruntime
-    from core.experimentcontroller import ExperimentController
-    from core.runner_utils.snapshots import ExperimentSnapshots
+    from core.experiments.snapshots import ExperimentSnapshots
+    from core.server import runtime as serverruntime
+    from core.server.experiment_controller import ExperimentController
 
     control = Path(settings.fixture_control)
     write_json(

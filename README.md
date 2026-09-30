@@ -61,6 +61,9 @@ boundary and examples.
 
 ## Installation
 
+For library code organization and supported import paths, see the
+[core source layout](docs/architecture.md).
+
 ### From source
 
 Use Python 3.12 and `uv`. Clone the repository and install the locked environment:
@@ -73,10 +76,9 @@ uv run python scripts/download_seaweedfs.py
 ```
 
 Run project commands through `uv run` from this checkout. The managed module
-store also needs the SeaweedFS executable: `core/seaweedfs/weed.exe` on Windows
-or `core/seaweedfs/weed` on Linux. The download command installs the pinned
-SeaweedFS 4.45 build for your Windows/Linux amd64 host and verifies its SHA-256.
-The binaries are not stored in Git. Alternatively, configure an existing Filer
+store also needs the SeaweedFS executable: `core/storage/seaweedfs/weed.exe` on Windows
+or `core/storage/seaweedfs/weed` on Linux. The download command installs the pinned
+SeaweedFS 4.45 build for your Windows/Linux amd64 host and verifies its SHA-256. Alternatively, configure an existing Filer
 with `--filer-url`; see [module storage](docs/storage.md).
 
 Follow the [quickstart](docs/quickstart.md) to register the example modules,

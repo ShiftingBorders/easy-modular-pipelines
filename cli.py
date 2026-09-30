@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from core.logger_utils.events import (
+from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
     require_number,
@@ -1087,7 +1087,7 @@ async def run_command(
     interactive: bool = False,
 ) -> int:
     if options.action == "template" and options.template_action == "create":
-        from core.experimenttemplate import create_template
+        from core.experiments.template import create_template
 
         path = create_template(options.destination.absolute(), options.name)
         display(

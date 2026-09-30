@@ -1,22 +1,9 @@
-import json
-from pathlib import Path
-from typing import Any
+"""Compatibility imports; use the responsibility packages for new code."""
 
+from core.primitives.json_files import load_json
+from core.primitives.json_values import type_match_nonempty
 
-def load_json(path: Path | str) -> Any:
-    """Load and return a value from a UTF-8 JSON file."""
-    if isinstance(path, str):
-        path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(f"JSON file does not exist: {path}")
-    with path.open("r", encoding="utf-8") as file:
-        try:
-            return json.load(file)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"JSON file cannot be parsed: {path}") from error
-
-
-def type_match_nonempty(val: Any, targer_type: Any) -> bool:
-    if not isinstance(val, targer_type):
-        return False
-    return not isinstance(val, str) or bool(val.strip())
+__all__ = [
+    "load_json",
+    "type_match_nonempty",
+]

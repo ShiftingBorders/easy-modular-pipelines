@@ -18,8 +18,9 @@ from uuid import uuid4
 import psutil
 import yaml
 
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import process_identity, read_json
+from core.experiments.runner import ExperimentRunner
+from core.primitives.json_files import read_json
+from core.primitives.processes import process_identity
 from tests.helpers.archives import ArchiveWorkspace, inventory
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned, wait_until
 

@@ -33,7 +33,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         if os.name == "nt":
             failure = PermissionError("MoveFileEx denied replacement")
             failure.winerror = 32
-            with patch("core.runner_utils.runtimeio.os.replace", side_effect=failure):
+            with patch("core.primitives.json_files.os.replace", side_effect=failure):
                 self.views._write_commands()
         else:
             with path.open("r", encoding="utf-8") as previous:

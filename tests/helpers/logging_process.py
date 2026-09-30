@@ -36,7 +36,7 @@ def journal_identity(path: Path) -> dict:
 
 
 def make_store(path: Path, **options):
-    from core.logger_utils.storage import SQLiteEventStore
+    from core.journal.storage import SQLiteEventStore
 
     settings = {**STORE_OPTIONS, **options}
     if settings["open_mode"] == "existing" and "expected_journal" not in options:
@@ -277,15 +277,15 @@ def main() -> None:
                 sqlite3, "connect", side_effect=AssertionError("Unexpected DB open")
             ),
         ):
-            from core.logger import OperationLogger
-            from core.logger_utils.storage import SQLiteEventStore
+            from core.journal.logger import OperationLogger
+            from core.journal.storage import SQLiteEventStore
 
             OperationLogger(config)
             SQLiteEventStore(config.parent / "not-created.db", **STORE_OPTIONS)
         announce({"imported": True})
         return
 
-    from core.logger import OperationLogger
+    from core.journal.logger import OperationLogger
 
     if mode == "read":
         with OperationLogger(config) as logger:
@@ -323,7 +323,7 @@ def main() -> None:
 
     with OperationLogger(config) as logger:
         if mode == "lock":
-            from core.logger_utils.events import LoggingStateError, LoggingStorageError
+            from core.journal.events import LoggingStateError, LoggingStorageError
 
             confirmed = logger.record_event("test.before")
             result = {"confirmed_id": confirmed}
@@ -391,7 +391,7 @@ def main() -> None:
             checkpoint({"confirmed_last": event_id})
             return
         if mode == "fork":
-            from core.logger_utils.events import LoggingStateError
+            from core.journal.events import LoggingStateError
 
             child = os.fork()
             if child == 0:
