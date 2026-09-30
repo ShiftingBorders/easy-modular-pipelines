@@ -22,6 +22,7 @@ from core.logger_utils.events import (
     load_logging_settings,
     validate_checkpoint,
 )
+from core.logger_utils.storage import _matches_table_definition
 
 _APPLICATION_ID = 0x454D5046
 _CREATE_INFO = """CREATE TABLE filtered_info (
@@ -100,15 +101,7 @@ class FilteredJournal:
                     self._report_refresh_failure(error)
             except BaseException:
                 primary = sys.exc_info()[1]
-                try:
-                    self.close()
-                except BaseException as cleanup_error:  # noqa: BLE001 - Preserve open failure.
-                    try:
-                        primary.add_note(
-                            f"Filtered open cleanup failed: {type(cleanup_error).__name__}."
-                        )
-                    except BaseException:  # noqa: BLE001, S110
-                        pass
+                self._close_preserving_primary(primary, "Filtered open cleanup failed")
                 raise
 
     def _open_view(self) -> None:
@@ -168,12 +161,7 @@ class FilteredJournal:
                 "Unrecognized derived database; no file was replaced."
             )
         for kind, name, sql in actual:
-            if (
-                kind != "table"
-                or name not in expected
-                or not isinstance(sql, str)
-                or " ".join(sql.split()) != " ".join(expected[name].split())
-            ):
+            if not _matches_table_definition(kind, name, sql, expected):
                 raise LoggingStorageError("Unrecognized derived database schema.")
 
     def _check_view(self) -> None:
@@ -324,13 +312,7 @@ class FilteredJournal:
                             break
                         change = store._decode_change(row, source)
                         phase = "view"
-                        for event_id in change["related_event_ids"]:
-                            if event_id != change["effective_event_id"]:
-                                self._connection.execute(
-                                    "DELETE FROM filtered_events WHERE event_id=?",
-                                    (event_id,),
-                                )
-                        self._write_entry(change["entry"])
+                        self._apply_view_change(change)
                     rows.close()
                     rows = None
                 phase = "source"
@@ -388,6 +370,15 @@ class FilteredJournal:
                 )
                 self._last_error = None
             return publication
+
+    def _apply_view_change(self, change: JsonObject) -> None:
+        for event_id in change["related_event_ids"]:
+            if event_id != change["effective_event_id"]:
+                self._connection.execute(
+                    "DELETE FROM filtered_events WHERE event_id=?",
+                    (event_id,),
+                )
+        self._write_entry(change["entry"])
 
     def _fallback(self, checkpoint: JsonObject | None, limit: int) -> JsonObject:
         base = (
@@ -482,43 +473,7 @@ class FilteredJournal:
                 after = 0 if checkpoint is None else checkpoint["cursor"]
                 if after > metadata["cursor"]:
                     raise LoggingStateError("Checkpoint is beyond this publication.")
-                entries, size = [], 0
-                more = False
-                for (
-                    cursor,
-                    event_id,
-                    encoded,
-                    author,
-                    provisional,
-                ) in self._connection.execute(
-                    "SELECT * FROM filtered_events WHERE cursor > ? ORDER BY cursor LIMIT ?",
-                    (after, limit + 1),
-                ):
-                    item_size = len(encoded.encode("utf-8"))
-                    if len(entries) == limit or (
-                        entries and size + item_size > _PAGE_BYTES
-                    ):
-                        more = True
-                        break
-                    event = json.loads(encode_event(json.loads(encoded), None))
-                    if event["event_id"] != event_id or provisional not in (0, 1):
-                        raise ValueError("Invalid derived event identity.")
-                    if author not in (None, "runner", "participant") or bool(
-                        provisional
-                    ) != (author == "participant"):
-                        raise ValueError("Invalid derived result state.")
-                    entries.append(
-                        {
-                            "cursor": cursor,
-                            "event": event,
-                            "effective_author": author,
-                            "provisional": bool(provisional),
-                        }
-                    )
-                    size += item_size
-                    after = cursor
-                if not more:
-                    after = metadata["cursor"]
+                entries, after, more = self._read_derived_page(after, limit, metadata)
                 self._connection.execute("COMMIT")
                 self._check_view()
             except LookupError:
@@ -556,6 +511,46 @@ class FilteredJournal:
                 "refresh_error": None,
             }
 
+    def _read_derived_page(
+        self, after: int, limit: int, metadata: JsonObject
+    ) -> tuple[list[JsonObject], int, bool]:
+        entries, size = [], 0
+        more = False
+        for (
+            cursor,
+            event_id,
+            encoded,
+            author,
+            provisional,
+        ) in self._connection.execute(
+            "SELECT * FROM filtered_events WHERE cursor > ? ORDER BY cursor LIMIT ?",
+            (after, limit + 1),
+        ):
+            item_size = len(encoded.encode("utf-8"))
+            if len(entries) == limit or (entries and size + item_size > _PAGE_BYTES):
+                more = True
+                break
+            event = json.loads(encode_event(json.loads(encoded), None))
+            if event["event_id"] != event_id or provisional not in (0, 1):
+                raise ValueError("Invalid derived event identity.")
+            if author not in (None, "runner", "participant") or bool(provisional) != (
+                author == "participant"
+            ):
+                raise ValueError("Invalid derived result state.")
+            entries.append(
+                {
+                    "cursor": cursor,
+                    "event": event,
+                    "effective_author": author,
+                    "provisional": bool(provisional),
+                }
+            )
+            size += item_size
+            after = cursor
+        if not more:
+            after = metadata["cursor"]
+        return entries, after, more
+
     def run(self, stop_event: threading.Event) -> None:
         """Block in a caller-owned thread; primary failures propagate to that caller."""
         self._check_process()
@@ -577,17 +572,20 @@ class FilteredJournal:
                     stop_event.wait(min(remaining, 60))
         finally:
             primary = sys.exc_info()[1]
+            self._close_preserving_primary(primary, "Filtered journal cleanup failed")
+
+    def _close_preserving_primary(
+        self, primary: BaseException | None, prefix: str
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as error:
+            if primary is None:
+                raise
             try:
-                self.close()
-            except BaseException as error:
-                if primary is None:
-                    raise
-                try:
-                    primary.add_note(
-                        f"Filtered journal cleanup failed: {type(error).__name__}."
-                    )
-                except BaseException:  # noqa: BLE001, S110
-                    pass
+                primary.add_note(f"{prefix}: {type(error).__name__}.")
+            except BaseException:  # noqa: BLE001, S110
+                pass
 
     def close(self) -> None:
         self._check_process()
