@@ -30,7 +30,7 @@ from core.runner_utils.launch import ModuleLauncher
 from core.runner_utils.runtimeio import process_identity, read_json, write_json
 from core.runner_utils.services import ServiceManager
 from core.runner_utils.snapshots import ExperimentSnapshots
-from core.runner_utils.stages import StageRunner
+from core.runner_utils.stages import StageRunner, _record_runner_checkpoint
 from core.runner_utils.state import (
     JsonObject,
     JsonValue,
@@ -41,7 +41,6 @@ from core.runner_utils.state import (
     StageAttempt,
     StageOutcome,
     state_from_document,
-    state_to_document,
 )
 
 
@@ -153,17 +152,7 @@ class ExperimentRunner:
                 "continue requires a source experiment_id and no replacement template."
             )
         if self._task is not None and not self._task.done():
-            if continue_run:
-                raise RuntimeError(
-                    "Stop the selected experiment before continuing another instance."
-                )
-            if experiment_id != self._requested_id:
-                raise RuntimeError(
-                    "Stop the active experiment before creating another."
-                )
-            if self._state is not None and self._state.mode == "paused":
-                await self.resume()
-            return {"experiment_id": self._requested_id, "signaled": True}
+            return await self._signal_existing_run(continue_run, experiment_id)
         source = (
             find_experiment(self._project_root, experiment_id) if continue_run else None
         )
@@ -224,6 +213,19 @@ class ExperimentRunner:
         )
         return {"experiment_id": experiment_id, "signaled": True}
 
+    async def _signal_existing_run(
+        self, continue_run: bool, experiment_id: str | None
+    ) -> JsonObject:
+        if continue_run:
+            raise RuntimeError(
+                "Stop the selected experiment before continuing another instance."
+            )
+        if experiment_id != self._requested_id:
+            raise RuntimeError("Stop the active experiment before creating another.")
+        if self._state is not None and self._state.mode == "paused":
+            await self.resume()
+        return {"experiment_id": self._requested_id, "signaled": True}
+
     async def _advance_dag(self) -> None:
         wake_task = None
         readiness_task = None
@@ -236,98 +238,11 @@ class ExperimentRunner:
                 await self._stop_from_stage(recovering=True)
                 return
             if self._state is None and self._continue_source is not None:
-                manifest = await asyncio.to_thread(
-                    self._snapshots.latest_valid, self._continue_source
-                )
-                saved = manifest["state"]
-                if manifest["experiment_id"] != self._requested_id.split(":", 1)[1]:
-                    raise ValueError(
-                        "Continuation snapshot belongs to another experiment."
-                    )
-                if saved["phase"] == "completed" or (
-                    saved["pending_advance"]
-                    and saved["cycle_number"] == saved["template"]["cycles"]
-                    and saved["stage_position"] == len(saved["template"]["stages"])
-                    and not (
-                        saved.get("last_dag_decision") is not None
-                        and saved["last_dag_decision"]["decision"]["command"] == "pause"
-                    )
-                ):
-                    raise RuntimeError(
-                        "The snapshot has no remaining cycles; use experiment rerun."
-                    )
-                folder = str(uuid4())
-                directory = self._project_root / "experiments" / folder
-                directory.mkdir(parents=True, exist_ok=False)
-                state = RunnerState(
-                    self._requested_id,
-                    directory,
-                    f"{uuid4()}:{saved['run_id']}",
-                    directory / "experiment.yaml",
-                    saved["template_revision_id"],
-                    saved["template_yaml"],
-                    saved["template"],
-                    "paused",
-                )
-                state.phase = "restoring"
-                self._state = state
-                self._state_store.save(state)
-                registry = read_json(self._project_root / "experiments.json")
-                if self._requested_id in registry:
-                    raise FileExistsError("Continuation experiment ID already exists.")
-                registry[self._requested_id] = folder
-                write_json(self._project_root / "experiments.json", registry)
-                self._maintenance = True
-                try:
-                    if (
-                        self._resource_observer is not None
-                        and self._suspend_resources is None
-                    ):
-                        raise RuntimeError(
-                            "Resource observer must provide a restoration barrier."
-                        )
-                    await self._snapshots.restore(
-                        state,
-                        manifest["snapshot_id"],
-                        source_directory=self._continue_source,
-                        suspend_resources=self._suspend_resources,
-                    )
-                finally:
-                    self._maintenance = False
-                    self._publish_resources()
-                    if self._resume_resources is not None:
-                        self._resume_resources()
-                self._pending_advance = state.pending_advance
-                action = "ready"
+                state, action = await self._prepare_continuation()
             elif self._state is None:
-                state = await self._assembler.assemble(
-                    self._template_path, self._requested_id
-                )
-                self._state = state
-                self._journal.open(state, create=True)
-                self._journal.record_template(
-                    state, state.template_yaml, state.template, "initial"
-                )
-                self._assembler.check_modules(state)
-                self._assembler.check_resources(state)
-                state.mode = self._desired_mode
-                state.phase = "starting"
-                self._save_state()
-                action = await self._services.start_all(state)
+                state, action = await self._prepare_initial_run()
             else:
-                state = self._state
-                self._pending_advance = state.pending_advance
-                self._assembler.check_modules(state)
-                action = "ready"
-                if self._recover_live:
-                    action = await self._services.recover(state)
-                    barriers = {
-                        item.prepared_freeze_id or item.freeze_id
-                        for item in state.services.values()
-                    } - {None}
-                    if barriers and action != "stop":
-                        await self._services.unfreeze(state, barriers.pop())
-                    self._recover_live = False
+                state, action = await self._prepare_live_run()
             if action == "stop":
                 raise RuntimeError(
                     "Service startup or recovery requires experiment stop."
@@ -591,6 +506,98 @@ class ExperimentRunner:
             self._ready.set()
             self._idle.set()
 
+    async def _prepare_continuation(self) -> tuple[RunnerState, str]:
+        manifest = await asyncio.to_thread(
+            self._snapshots.latest_valid, self._continue_source
+        )
+        saved = manifest["state"]
+        if manifest["experiment_id"] != self._requested_id.split(":", 1)[1]:
+            raise ValueError("Continuation snapshot belongs to another experiment.")
+        if saved["phase"] == "completed" or (
+            saved["pending_advance"]
+            and saved["cycle_number"] == saved["template"]["cycles"]
+            and saved["stage_position"] == len(saved["template"]["stages"])
+            and not (
+                saved.get("last_dag_decision") is not None
+                and saved["last_dag_decision"]["decision"]["command"] == "pause"
+            )
+        ):
+            raise RuntimeError(
+                "The snapshot has no remaining cycles; use experiment rerun."
+            )
+        folder = str(uuid4())
+        directory = self._project_root / "experiments" / folder
+        directory.mkdir(parents=True, exist_ok=False)
+        state = RunnerState(
+            self._requested_id,
+            directory,
+            f"{uuid4()}:{saved['run_id']}",
+            directory / "experiment.yaml",
+            saved["template_revision_id"],
+            saved["template_yaml"],
+            saved["template"],
+            "paused",
+        )
+        state.phase = "restoring"
+        self._state = state
+        self._state_store.save(state)
+        registry = read_json(self._project_root / "experiments.json")
+        if self._requested_id in registry:
+            raise FileExistsError("Continuation experiment ID already exists.")
+        registry[self._requested_id] = folder
+        write_json(self._project_root / "experiments.json", registry)
+        self._maintenance = True
+        try:
+            if self._resource_observer is not None and self._suspend_resources is None:
+                raise RuntimeError(
+                    "Resource observer must provide a restoration barrier."
+                )
+            await self._snapshots.restore(
+                state,
+                manifest["snapshot_id"],
+                source_directory=self._continue_source,
+                suspend_resources=self._suspend_resources,
+            )
+        finally:
+            self._maintenance = False
+            self._publish_resources()
+            if self._resume_resources is not None:
+                self._resume_resources()
+        self._pending_advance = state.pending_advance
+        action = "ready"
+        return state, action
+
+    async def _prepare_initial_run(self) -> tuple[RunnerState, str]:
+        state = await self._assembler.assemble(self._template_path, self._requested_id)
+        self._state = state
+        self._journal.open(state, create=True)
+        self._journal.record_template(
+            state, state.template_yaml, state.template, "initial"
+        )
+        self._assembler.check_modules(state)
+        self._assembler.check_resources(state)
+        state.mode = self._desired_mode
+        state.phase = "starting"
+        self._save_state()
+        action = await self._services.start_all(state)
+        return state, action
+
+    async def _prepare_live_run(self) -> tuple[RunnerState, str]:
+        state = self._state
+        self._pending_advance = state.pending_advance
+        self._assembler.check_modules(state)
+        action = "ready"
+        if self._recover_live:
+            action = await self._services.recover(state)
+            barriers = {
+                item.prepared_freeze_id or item.freeze_id
+                for item in state.services.values()
+            } - {None}
+            if barriers and action != "stop":
+                await self._services.unfreeze(state, barriers.pop())
+            self._recover_live = False
+        return state, action
+
     def _at_dag_end(self) -> bool:
         state = self._state
         conditional_pause = (
@@ -642,20 +649,25 @@ class ExperimentRunner:
             state.pause_requested = True
         elif command == "move":
             target = decision["stage_id"]
-            position = next(
-                index
-                for index, item in enumerate(state.template["stages"], 1)
-                if item["stage_id"] == target
-            )
-            # The source remains in the journal even when a backwards jump
-            # invalidates its current result reference.
-            state.pending_input = {**source, "stage_id": target}
-            for item in state.template["stages"][position - 1 :]:
-                state.stage_result_ids.pop(item["stage_id"], None)
-                state.stage_result_origins.pop(item["stage_id"], None)
-                state.stage_retry_counts.pop(item["stage_id"], None)
-            state.stage_position = position
-            self._pending_advance = False
+            self._apply_conditional_move(state, source, target)
+
+    def _apply_conditional_move(
+        self, state: RunnerState, source: JsonObject, target: str
+    ) -> None:
+        position = next(
+            index
+            for index, item in enumerate(state.template["stages"], 1)
+            if item["stage_id"] == target
+        )
+        # The source remains in the journal even when a backwards jump
+        # invalidates its current result reference.
+        state.pending_input = {**source, "stage_id": target}
+        for item in state.template["stages"][position - 1 :]:
+            state.stage_result_ids.pop(item["stage_id"], None)
+            state.stage_result_origins.pop(item["stage_id"], None)
+            state.stage_retry_counts.pop(item["stage_id"], None)
+        state.stage_position = position
+        self._pending_advance = False
 
     def _retain_input_artifacts(self, data: JsonValue) -> None:
         """Protect experiment-relative artifact references carried through a jump."""
@@ -689,22 +701,7 @@ class ExperimentRunner:
         future, self._step_future = self._step_future, None
         try:
             if recovering:
-                # A crash may leave completed snapshot calls in saved queues.
-                # Preserve their accepted outcomes before stopping unresolved work.
-                for instance in self._state.services.values():
-                    requests = list(instance.pending_requests)
-                    if instance.active_request is not None:
-                        requests.append(instance.active_request)
-                    for request in requests:
-                        record = self._journal.client.read_command_result(
-                            request["request_id"]
-                        )
-                        if record is None or record["author"] != "runner":
-                            continue
-                        if request is instance.active_request:
-                            instance.active_request = None
-                        else:
-                            instance.pending_requests.remove(request)
+                self._retire_accepted_service_requests(self._state)
                 self._save_state()
             await self._stop(finalize_snapshot=not recovering)
         except BaseException as error:
@@ -721,6 +718,22 @@ class ExperimentRunner:
                     "phase": self._state.phase,
                 }
             )
+
+    def _retire_accepted_service_requests(self, state: RunnerState) -> None:
+        # A crash may leave completed snapshot calls in saved queues.
+        # Preserve their accepted outcomes before stopping unresolved work.
+        for instance in state.services.values():
+            requests = list(instance.pending_requests)
+            if instance.active_request is not None:
+                requests.append(instance.active_request)
+            for request in requests:
+                record = self._journal.client.read_command_result(request["request_id"])
+                if record is None or record["author"] != "runner":
+                    continue
+                if request is instance.active_request:
+                    instance.active_request = None
+                else:
+                    instance.pending_requests.remove(request)
 
     async def pause(self) -> None:
         if self._task is None or self._task.done():
@@ -764,7 +777,6 @@ class ExperimentRunner:
                 for instance in state.services.values()
             )
             or self._service_retrying
-            or self._maintenance
         ):
             raise RuntimeError(
                 "Resolve the blocked service before resuming the experiment."
@@ -833,27 +845,7 @@ class ExperimentRunner:
 
     async def _stop(self, *, finalize_snapshot: bool) -> JsonObject:
         self._stop_requested = True
-        if (
-            self._service_control_task is not None
-            and self._service_control_task is not asyncio.current_task()
-            and not self._service_control_task.done()
-        ):
-            self._service_control_task.cancel()
-            await asyncio.gather(self._service_control_task, return_exceptions=True)
-        if (
-            self._maintenance_task is not None
-            and self._maintenance_task is not asyncio.current_task()
-            and not self._maintenance_task.done()
-        ):
-            self._maintenance_task.cancel()
-            await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        if (
-            self._task is not None
-            and self._task is not asyncio.current_task()
-            and not self._task.done()
-        ):
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+        await self._cancel_control_tasks()
         if self._state is not None:
             failure = None
             try:
@@ -942,6 +934,29 @@ class ExperimentRunner:
         self._idle.set()
         return self.get_state()
 
+    async def _cancel_control_tasks(self) -> None:
+        if (
+            self._service_control_task is not None
+            and self._service_control_task is not asyncio.current_task()
+            and not self._service_control_task.done()
+        ):
+            self._service_control_task.cancel()
+            await asyncio.gather(self._service_control_task, return_exceptions=True)
+        if (
+            self._maintenance_task is not None
+            and self._maintenance_task is not asyncio.current_task()
+            and not self._maintenance_task.done()
+        ):
+            self._maintenance_task.cancel()
+            await asyncio.gather(self._maintenance_task, return_exceptions=True)
+        if (
+            self._task is not None
+            and self._task is not asyncio.current_task()
+            and not self._task.done()
+        ):
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
     async def rerun(
         self,
         scope: Literal["stage", "experiment"],
@@ -974,8 +989,7 @@ class ExperimentRunner:
         self._manual = True
         return await self.step()
 
-    async def start_service(self, position: int) -> JsonObject:
-        state = self._require_active()
+    def _require_idle_service_control(self, state: RunnerState, message: str) -> None:
         if (
             self._maintenance
             or self._service_retrying
@@ -988,14 +1002,22 @@ class ExperimentRunner:
             or state.active_attempt is not None
             or self._step_future is not None
         ):
-            raise RuntimeError(
-                "service start requires an idle pause without another service or maintenance operation."
-            )
+            raise RuntimeError(message)
+
+    def _service_definition(self, state: RunnerState, position: int) -> JsonObject:
         if type(position) is not int or not 1 <= position <= len(
             state.template["services"]
         ):
             raise ValueError("Service position is outside the template.")
-        service_id = state.template["services"][position - 1]["service_id"]
+        return state.template["services"][position - 1]
+
+    async def start_service(self, position: int) -> JsonObject:
+        state = self._require_active()
+        self._require_idle_service_control(
+            state,
+            "service start requires an idle pause without another service or maintenance operation.",
+        )
+        service_id = self._service_definition(state, position)["service_id"]
         self._service_retrying = True
         self._service_control_task = asyncio.current_task()
         try:
@@ -1014,26 +1036,11 @@ class ExperimentRunner:
 
     async def stop_service(self, position: int) -> JsonObject:
         state = self._require_active()
-        if (
-            self._maintenance
-            or self._service_retrying
-            or self._stop_requested
-            or self._task is None
-            or self._task.done()
-            or state.mode != "paused"
-            or state.phase != "waiting"
-            or not self._idle.is_set()
-            or state.active_attempt is not None
-            or self._step_future is not None
-        ):
-            raise RuntimeError(
-                "service stop requires an idle pause without another service or maintenance operation."
-            )
-        if type(position) is not int or not 1 <= position <= len(
-            state.template["services"]
-        ):
-            raise ValueError("Service position is outside the template.")
-        definition = state.template["services"][position - 1]
+        self._require_idle_service_control(
+            state,
+            "service stop requires an idle pause without another service or maintenance operation.",
+        )
+        definition = self._service_definition(state, position)
         service_id = definition["service_id"]
         instance = state.services.get(service_id)
         if instance is None:
@@ -1078,11 +1085,7 @@ class ExperimentRunner:
             raise RuntimeError(
                 "retry requires a paused experiment without another service retry."
             )
-        if type(position) is not int or not 1 <= position <= len(
-            state.template["services"]
-        ):
-            raise ValueError("Service position is outside the template.")
-        definition = state.template["services"][position - 1]
+        definition = self._service_definition(state, position)
         service_id = definition["service_id"]
         instance = state.services.get(service_id)
         if instance is None:
@@ -1159,17 +1162,18 @@ class ExperimentRunner:
                 raise ValueError("A started socket service is required.")
             old = instance.restart_count
             instance.restart_count = 0
-            self._save_state()
-            return {"service_id": service_id, "previous": old, "current": 0}
-        if type(position) is not int or not 1 <= position <= len(
-            state.template["stages"]
-        ):
-            raise ValueError("Position is outside the DAG.")
-        stage_id = state.template["stages"][position - 1]["stage_id"]
-        old = state.stage_retry_counts.get(stage_id, 0)
-        state.stage_retry_counts[stage_id] = 0
+            result_key, identifier = "service_id", service_id
+        else:
+            if type(position) is not int or not 1 <= position <= len(
+                state.template["stages"]
+            ):
+                raise ValueError("Position is outside the DAG.")
+            stage_id = state.template["stages"][position - 1]["stage_id"]
+            old = state.stage_retry_counts.get(stage_id, 0)
+            state.stage_retry_counts[stage_id] = 0
+            result_key, identifier = "stage_id", stage_id
         self._save_state()
-        return {"stage_id": stage_id, "previous": old, "current": 0}
+        return {result_key: identifier, "previous": old, "current": 0}
 
     async def replace(
         self, kind: ModuleRole, position: int, module: JsonObject, settings: JsonObject
@@ -1244,36 +1248,7 @@ class ExperimentRunner:
                 )
             except yaml.YAMLError as error:
                 raise ValueError(f"Invalid template YAML: {error}") from error
-            # Equivalent file-relative spellings are not a resource change. Keep
-            # the applied spelling, including configured absolute paths.
-            if len(template["resources"]) == len(state.template["resources"]) and all(
-                before["name"] == after["name"]
-                and before["hash"] == after["hash"]
-                and Path(before["path"]).resolve() == Path(after["path"]).resolve()
-                for before, after in zip(
-                    state.template["resources"], template["resources"]
-                )
-            ):
-                template["resources"] = [
-                    dict(item) for item in state.template["resources"]
-                ]
-            for key in state.template.keys() - {"stages", "services"}:
-                if json.dumps(template[key], sort_keys=True) != json.dumps(
-                    state.template[key], sort_keys=True
-                ):
-                    raise ValueError(f"reload_template cannot change {key}.")
-            old_roles = {
-                item[f"{role}_id"]: role
-                for role in ("stage", "service")
-                for item in state.template[f"{role}s"]
-            }
-            for role in ("stage", "service"):
-                for item in template[f"{role}s"]:
-                    item.setdefault(f"{role}_id", str(uuid4()))
-                    if old_roles.get(item[f"{role}_id"], role) != role:
-                        raise ValueError(
-                            "A stable definition ID cannot change its role."
-                        )
+            self._prepare_reload_candidate(state, template)
             text = yaml.safe_dump(template, allow_unicode=True, sort_keys=False)
             result = await self._apply_template(text, template)
             if self._reload_operation is not None:
@@ -1301,6 +1276,34 @@ class ExperimentRunner:
         finally:
             self._maintenance = False
             self._maintenance_task = None
+
+    def _prepare_reload_candidate(
+        self, state: RunnerState, template: JsonObject
+    ) -> None:
+        # Equivalent file-relative spellings are not a resource change. Keep
+        # the applied spelling, including configured absolute paths.
+        if len(template["resources"]) == len(state.template["resources"]) and all(
+            before["name"] == after["name"]
+            and before["hash"] == after["hash"]
+            and Path(before["path"]).resolve() == Path(after["path"]).resolve()
+            for before, after in zip(state.template["resources"], template["resources"])
+        ):
+            template["resources"] = [dict(item) for item in state.template["resources"]]
+        for key in state.template.keys() - {"stages", "services"}:
+            if json.dumps(template[key], sort_keys=True) != json.dumps(
+                state.template[key], sort_keys=True
+            ):
+                raise ValueError(f"reload_template cannot change {key}.")
+        old_roles = {
+            item[f"{role}_id"]: role
+            for role in ("stage", "service")
+            for item in state.template[f"{role}s"]
+        }
+        for role in ("stage", "service"):
+            for item in template[f"{role}s"]:
+                item.setdefault(f"{role}_id", str(uuid4()))
+                if old_roles.get(item[f"{role}_id"], role) != role:
+                    raise ValueError("A stable definition ID cannot change its role.")
 
     async def _apply_template(
         self, template_yaml: str, template: JsonObject
@@ -1414,60 +1417,7 @@ class ExperimentRunner:
                     after.get(identity), sort_keys=True
                 ):
                     continue
-                change = {
-                    "kind": role,
-                    "id": identity,
-                    "before": None if identity not in before else before[identity][1],
-                    "after": None if identity not in after else after[identity][1],
-                    "old_position": None
-                    if identity not in before
-                    else before[identity][0],
-                    "new_position": None
-                    if identity not in after
-                    else after[identity][0],
-                }
-                fields = []
-                pending_fields = [
-                    (
-                        [],
-                        change["before"],
-                        change["after"],
-                        identity in before,
-                        identity in after,
-                    )
-                ]
-                while pending_fields:
-                    path, old_value, new_value, old_present, new_present = (
-                        pending_fields.pop()
-                    )
-                    if old_present == new_present and json.dumps(
-                        old_value, sort_keys=True
-                    ) == json.dumps(new_value, sort_keys=True):
-                        continue
-                    if isinstance(old_value, dict) and isinstance(new_value, dict):
-                        for field in sorted(
-                            old_value.keys() | new_value.keys(), reverse=True
-                        ):
-                            pending_fields.append(
-                                (
-                                    [*path, field],
-                                    old_value.get(field),
-                                    new_value.get(field),
-                                    field in old_value,
-                                    field in new_value,
-                                )
-                            )
-                    else:
-                        fields.append(
-                            {
-                                "path": path,
-                                "before_present": old_present,
-                                "after_present": new_present,
-                                "before": old_value,
-                                "after": new_value,
-                            }
-                        )
-                change["fields"] = fields
+                change = self._definition_change(role, identity, before, after)
                 logger.record_event(
                     "reload.definition_changed", change, operation=operation
                 )
@@ -1909,6 +1859,61 @@ class ExperimentRunner:
                         },
                     )
 
+    def _definition_change(
+        self,
+        role: str,
+        identity: str,
+        before: dict[str, tuple[int, JsonObject]],
+        after: dict[str, tuple[int, JsonObject]],
+    ) -> JsonObject:
+        change = {
+            "kind": role,
+            "id": identity,
+            "before": None if identity not in before else before[identity][1],
+            "after": None if identity not in after else after[identity][1],
+            "old_position": None if identity not in before else before[identity][0],
+            "new_position": None if identity not in after else after[identity][0],
+        }
+        fields = []
+        pending_fields = [
+            (
+                [],
+                change["before"],
+                change["after"],
+                identity in before,
+                identity in after,
+            )
+        ]
+        while pending_fields:
+            path, old_value, new_value, old_present, new_present = pending_fields.pop()
+            if old_present == new_present and json.dumps(
+                old_value, sort_keys=True
+            ) == json.dumps(new_value, sort_keys=True):
+                continue
+            if isinstance(old_value, dict) and isinstance(new_value, dict):
+                for field in sorted(old_value.keys() | new_value.keys(), reverse=True):
+                    pending_fields.append(
+                        (
+                            [*path, field],
+                            old_value.get(field),
+                            new_value.get(field),
+                            field in old_value,
+                            field in new_value,
+                        )
+                    )
+            else:
+                fields.append(
+                    {
+                        "path": path,
+                        "before_present": old_present,
+                        "after_present": new_present,
+                        "before": old_value,
+                        "after": new_value,
+                    }
+                )
+        change["fields"] = fields
+        return change
+
     async def snapshot(self, label: str | None = None) -> JsonObject:
         if label is not None:
             require_text(label, "snapshot label")
@@ -2053,23 +2058,7 @@ class ExperimentRunner:
             await self._snapshots.restore(
                 state, snapshot_id, suspend_resources=self._suspend_resources
             )
-            if self._task is not None and not self._task.done():
-                self._task.cancel()
-                await asyncio.gather(self._task, return_exceptions=True)
-            self._error = None
-            self._stop_requested = False
-            self._termination_confirmed = True
-            self._pending_advance = state.pending_advance
-            self._last_attempt = self._last_response = None
-            self._desired_mode = "paused"
-            self._continue_source = None
-            self._recover_live = False
-            self._wake.clear()
-            self._ready.clear()
-            self._save_state()
-            self._task = asyncio.create_task(
-                self._advance_dag(), name=f"dag:{state.experiment_id}"
-            )
+            await self._activate_restored_state(state)
             return {
                 "experiment_id": state.experiment_id,
                 "snapshot_id": snapshot_id,
@@ -2101,6 +2090,25 @@ class ExperimentRunner:
             self._publish_resources()
             if self._resume_resources is not None:
                 self._resume_resources()
+
+    async def _activate_restored_state(self, state: RunnerState) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        self._error = None
+        self._stop_requested = False
+        self._termination_confirmed = True
+        self._pending_advance = state.pending_advance
+        self._last_attempt = self._last_response = None
+        self._desired_mode = "paused"
+        self._continue_source = None
+        self._recover_live = False
+        self._wake.clear()
+        self._ready.clear()
+        self._save_state()
+        self._task = asyncio.create_task(
+            self._advance_dag(), name=f"dag:{state.experiment_id}"
+        )
 
     async def recover(self, experiment_id: str) -> None:
         if self._closed or self._maintenance:
@@ -2148,58 +2156,9 @@ class ExperimentRunner:
             try:
                 state = self._state_store.load(root)
             except (FileNotFoundError, ValueError, TypeError, KeyError) as state_error:
-                # state.json is optional. A committed checkpoint can bootstrap
-                # recovery without accepting edits to the on-disk template.
-                identity = read_json(root / "runner/journal.json")
-                state = None
-                for config_path in (root / "runner/logging").glob("*.json"):
-                    try:
-                        config = read_json(config_path)["logging"]
-                    except (OSError, ValueError, TypeError, KeyError):
-                        continue
-                    if (
-                        config.get("open_mode") != "existing"
-                        or config.get("expected_journal") != identity
-                        or Path(config.get("db_path", "")).resolve()
-                        != root / "journals/events.sqlite"
-                    ):
-                        continue
-                    reader = OperationLogger(config_path)
-                    try:
-                        reader.open()
-                        checkpoint = boundary = None
-                        while True:
-                            page = await asyncio.to_thread(
-                                reader.read_events, checkpoint, limit=1000
-                            )
-                            if boundary is None:
-                                boundary = page["boundary"]["cursor"]
-                            for entry in page["events"]:
-                                if entry["cursor"] > boundary:
-                                    break
-                                event = entry["event"]
-                                if (
-                                    event["context"].get("experiment_id")
-                                    != experiment_id
-                                ):
-                                    continue
-                                if event["event_type"] in (
-                                    "runner.checkpoint",
-                                    "rebuild.checkpoint",
-                                ):
-                                    state = state_from_document(root, event["data"])
-                                elif event["event_type"] == "experiment.restored":
-                                    state = None
-                            checkpoint = page["checkpoint"]
-                            if checkpoint["cursor"] >= boundary or not page["has_more"]:
-                                break
-                    finally:
-                        reader.close()
-                    break
-                if state is None:
-                    raise RuntimeError(
-                        "Recovery requires a valid saved state or committed journal checkpoint."
-                    ) from state_error
+                state = await self._read_recovery_checkpoint(
+                    root, experiment_id, state_error
+                )
         if state.experiment_id != experiment_id:
             raise ValueError("Saved state belongs to a different experiment.")
         if state.template_path != root / "experiment.yaml":
@@ -2386,167 +2345,7 @@ class ExperimentRunner:
                             )
                         if instance.stopped:
                             continue
-                        process_file = (
-                            state.experiment_directory
-                            / "shared_artifacts/services"
-                            / sid
-                            / instance.service_instance_id
-                            / "process.json"
-                        )
-                        endpoint = instance.endpoint_path
-                        announced = (
-                            read_json(endpoint)
-                            if endpoint is not None and endpoint.is_file()
-                            else None
-                        )
-                        record = (
-                            read_json(process_file)
-                            if process_file.is_file()
-                            else announced
-                            if instance.process_identity is None
-                            else None
-                        )
-                        if record is not None:
-                            if (
-                                record.get("experiment_id") != state.experiment_id
-                                or record.get("participant_id") != sid
-                                or record.get("participant_instance_id")
-                                != instance.service_instance_id
-                            ):
-                                raise RuntimeError(
-                                    "Rebuild participant ownership cannot be verified."
-                                )
-                            instance.process_identity = record["process"]
-                        if (
-                            announced is not None
-                            and announced.get("participant_instance_id")
-                            == instance.service_instance_id
-                            and announced.get("process") != instance.process_identity
-                        ):
-                            # Before readiness, process.json still names the
-                            # launcher; the endpoint may name its child service.
-                            launched = instance.process_identity
-                            declared = announced.get("process")
-                            if (
-                                announced.get("experiment_id") != state.experiment_id
-                                or announced.get("participant_id") != sid
-                                or launched is None
-                                or not isinstance(declared, dict)
-                            ):
-                                raise RuntimeError(
-                                    "Rebuild endpoint and saved process ownership disagree."
-                                )
-                            child_alive = False
-                            try:
-                                if process_identity(declared["pid"]) != declared:
-                                    raise RuntimeError(
-                                        "Rebuild endpoint process identity has changed."
-                                    )
-                                child = psutil.Process(declared["pid"])
-                                if child.status() != psutil.STATUS_ZOMBIE:
-                                    try:
-                                        child.wait(timeout=0)
-                                    except psutil.TimeoutExpired:
-                                        child_alive = True
-                                if child_alive:
-                                    try:
-                                        ancestors = await asyncio.to_thread(
-                                            child.parents
-                                        )
-                                    except psutil.NoSuchProcess as error:
-                                        if error.pid != declared["pid"]:
-                                            raise RuntimeError(
-                                                "Rebuild endpoint ancestry cannot be verified."
-                                            ) from error
-                                        raise
-                                    except OSError as error:
-                                        raise RuntimeError(
-                                            "Rebuild endpoint ancestry cannot be verified."
-                                        ) from error
-                                    if process_identity(declared["pid"]) != declared:
-                                        raise RuntimeError(
-                                            "Rebuild endpoint process identity has changed."
-                                        )
-                            except (
-                                FileNotFoundError,
-                                ProcessLookupError,
-                                psutil.NoSuchProcess,
-                            ):
-                                child_alive = False
-                            except OSError as error:
-                                if getattr(error, "winerror", None) not in (87, 1168):
-                                    raise
-                                child_alive = False
-                            # A departed child needs no ancestry proof. Keep the
-                            # launcher identity so its shutdown is still required.
-                            if child_alive:
-                                if (
-                                    launched["pid"] not in {p.pid for p in ancestors}
-                                    or process_identity(launched["pid"]) != launched
-                                ):
-                                    raise RuntimeError(
-                                        "Rebuild endpoint is not owned by the launched process."
-                                    )
-                                # Persist both identities before shutdown: a
-                                # second recovery must still wait for launcher
-                                # cleanup without needing live ancestry again.
-                                write_json(
-                                    process_file,
-                                    {
-                                        **(record or announced),
-                                        "process": declared,
-                                        "launcher_process": (record or {}).get(
-                                            "launcher_process", launched
-                                        ),
-                                    },
-                                )
-                                instance.process_identity = declared
-                                self._journal.client.record_event(
-                                    "control.reconciled",
-                                    {
-                                        "action": "rebuild_service_process",
-                                        "launched_process": launched,
-                                        "participant_process": declared,
-                                    },
-                                    context={
-                                        "experiment_id": state.experiment_id,
-                                        "run_id": state.run_id,
-                                        "participant_id": sid,
-                                        "participant_instance_id": instance.service_instance_id,
-                                        "parent_operation_id": state.pending_rebuild[
-                                            "operation_id"
-                                        ],
-                                    },
-                                )
-                        if instance.process_identity is not None:
-                            try:
-                                instance.stopped = (
-                                    process_identity(instance.process_identity["pid"])
-                                    != instance.process_identity
-                                )
-                                if not instance.stopped:
-                                    process = psutil.Process(
-                                        instance.process_identity["pid"]
-                                    )
-                                    instance.stopped = (
-                                        process.status() == psutil.STATUS_ZOMBIE
-                                    )
-                                    if not instance.stopped:
-                                        try:
-                                            process.wait(timeout=0)
-                                            instance.stopped = True
-                                        except psutil.TimeoutExpired:
-                                            pass
-                            except (
-                                FileNotFoundError,
-                                ProcessLookupError,
-                                psutil.NoSuchProcess,
-                            ):
-                                instance.stopped = True
-                            except OSError as error:
-                                if getattr(error, "winerror", None) not in (87, 1168):
-                                    raise
-                                instance.stopped = True
+                        await self._recover_service_process(state, sid, instance)
                     operation_id = state.pending_rebuild["operation_id"]
                     self._journal.client.record_event(
                         "control.reconciled",
@@ -2706,30 +2505,222 @@ class ExperimentRunner:
             if self._resume_resources is not None:
                 self._resume_resources()
 
+    async def _read_recovery_checkpoint(
+        self, root: Path, experiment_id: str, state_error: Exception
+    ) -> RunnerState:
+        # state.json is optional. A committed checkpoint can bootstrap
+        # recovery without accepting edits to the on-disk template.
+        identity = read_json(root / "runner/journal.json")
+        state = None
+        for config_path in (root / "runner/logging").glob("*.json"):
+            try:
+                config = read_json(config_path)["logging"]
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            if (
+                config.get("open_mode") != "existing"
+                or config.get("expected_journal") != identity
+                or Path(config.get("db_path", "")).resolve()
+                != root / "journals/events.sqlite"
+            ):
+                continue
+            reader = OperationLogger(config_path)
+            try:
+                reader.open()
+                checkpoint = boundary = None
+                while True:
+                    page = await asyncio.to_thread(
+                        reader.read_events, checkpoint, limit=1000
+                    )
+                    if boundary is None:
+                        boundary = page["boundary"]["cursor"]
+                    for entry in page["events"]:
+                        if entry["cursor"] > boundary:
+                            break
+                        event = entry["event"]
+                        if event["context"].get("experiment_id") != experiment_id:
+                            continue
+                        if event["event_type"] in (
+                            "runner.checkpoint",
+                            "rebuild.checkpoint",
+                        ):
+                            state = state_from_document(root, event["data"])
+                        elif event["event_type"] == "experiment.restored":
+                            state = None
+                    checkpoint = page["checkpoint"]
+                    if checkpoint["cursor"] >= boundary or not page["has_more"]:
+                        break
+            finally:
+                reader.close()
+            break
+        if state is None:
+            raise RuntimeError(
+                "Recovery requires a valid saved state or committed journal checkpoint."
+            ) from state_error
+        return state
+
+    async def _recover_service_process(
+        self, state: RunnerState, sid: str, instance: ServiceInstance
+    ) -> None:
+        process_file = (
+            state.experiment_directory
+            / "shared_artifacts/services"
+            / sid
+            / instance.service_instance_id
+            / "process.json"
+        )
+        endpoint = instance.endpoint_path
+        announced = (
+            read_json(endpoint) if endpoint is not None and endpoint.is_file() else None
+        )
+        record = (
+            read_json(process_file)
+            if process_file.is_file()
+            else announced
+            if instance.process_identity is None
+            else None
+        )
+        if record is not None:
+            if (
+                record.get("experiment_id") != state.experiment_id
+                or record.get("participant_id") != sid
+                or record.get("participant_instance_id") != instance.service_instance_id
+            ):
+                raise RuntimeError("Rebuild participant ownership cannot be verified.")
+            instance.process_identity = record["process"]
+        if (
+            announced is not None
+            and announced.get("participant_instance_id") == instance.service_instance_id
+            and announced.get("process") != instance.process_identity
+        ):
+            await self._recover_service_child(
+                state, sid, instance, process_file, announced, record
+            )
+        if instance.process_identity is not None:
+            try:
+                instance.stopped = (
+                    process_identity(instance.process_identity["pid"])
+                    != instance.process_identity
+                )
+                if not instance.stopped:
+                    process = psutil.Process(instance.process_identity["pid"])
+                    instance.stopped = process.status() == psutil.STATUS_ZOMBIE
+                    if not instance.stopped:
+                        try:
+                            process.wait(timeout=0)
+                            instance.stopped = True
+                        except psutil.TimeoutExpired:
+                            pass
+            except (
+                FileNotFoundError,
+                ProcessLookupError,
+                psutil.NoSuchProcess,
+            ):
+                instance.stopped = True
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (87, 1168):
+                    raise
+                instance.stopped = True
+
+    async def _recover_service_child(
+        self,
+        state: RunnerState,
+        sid: str,
+        instance: ServiceInstance,
+        process_file: Path,
+        announced: JsonObject,
+        record: JsonObject | None,
+    ) -> None:
+        # Before readiness, process.json still names the
+        # launcher; the endpoint may name its child service.
+        launched = instance.process_identity
+        declared = announced.get("process")
+        if (
+            announced.get("experiment_id") != state.experiment_id
+            or announced.get("participant_id") != sid
+            or launched is None
+            or not isinstance(declared, dict)
+        ):
+            raise RuntimeError("Rebuild endpoint and saved process ownership disagree.")
+        child_alive = False
+        try:
+            if process_identity(declared["pid"]) != declared:
+                raise RuntimeError("Rebuild endpoint process identity has changed.")
+            child = psutil.Process(declared["pid"])
+            if child.status() != psutil.STATUS_ZOMBIE:
+                try:
+                    child.wait(timeout=0)
+                except psutil.TimeoutExpired:
+                    child_alive = True
+            if child_alive:
+                try:
+                    ancestors = await asyncio.to_thread(child.parents)
+                except psutil.NoSuchProcess as error:
+                    if error.pid != declared["pid"]:
+                        raise RuntimeError(
+                            "Rebuild endpoint ancestry cannot be verified."
+                        ) from error
+                    raise
+                except OSError as error:
+                    raise RuntimeError(
+                        "Rebuild endpoint ancestry cannot be verified."
+                    ) from error
+                if process_identity(declared["pid"]) != declared:
+                    raise RuntimeError("Rebuild endpoint process identity has changed.")
+        except (
+            FileNotFoundError,
+            ProcessLookupError,
+            psutil.NoSuchProcess,
+        ):
+            child_alive = False
+        except OSError as error:
+            if getattr(error, "winerror", None) not in (87, 1168):
+                raise
+            child_alive = False
+        # A departed child needs no ancestry proof. Keep the
+        # launcher identity so its shutdown is still required.
+        if child_alive:
+            if (
+                launched["pid"] not in {p.pid for p in ancestors}
+                or process_identity(launched["pid"]) != launched
+            ):
+                raise RuntimeError(
+                    "Rebuild endpoint is not owned by the launched process."
+                )
+            # Persist both identities before shutdown: a
+            # second recovery must still wait for launcher
+            # cleanup without needing live ancestry again.
+            write_json(
+                process_file,
+                {
+                    **(record or announced),
+                    "process": declared,
+                    "launcher_process": (record or {}).get(
+                        "launcher_process", launched
+                    ),
+                },
+            )
+            instance.process_identity = declared
+            self._journal.client.record_event(
+                "control.reconciled",
+                {
+                    "action": "rebuild_service_process",
+                    "launched_process": launched,
+                    "participant_process": declared,
+                },
+                context={
+                    "experiment_id": state.experiment_id,
+                    "run_id": state.run_id,
+                    "participant_id": sid,
+                    "participant_instance_id": instance.service_instance_id,
+                    "parent_operation_id": state.pending_rebuild["operation_id"],
+                },
+            )
+
     async def _fail(self, error: Exception, context: JsonObject) -> None:
         self._error = {"type": type(error).__name__, "message": str(error)}
         self._stop_requested = True
-        if (
-            self._service_control_task is not None
-            and self._service_control_task is not asyncio.current_task()
-            and not self._service_control_task.done()
-        ):
-            self._service_control_task.cancel()
-            await asyncio.gather(self._service_control_task, return_exceptions=True)
-        if (
-            self._maintenance_task is not None
-            and self._maintenance_task is not asyncio.current_task()
-            and not self._maintenance_task.done()
-        ):
-            self._maintenance_task.cancel()
-            await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        if (
-            self._task is not None
-            and self._task is not asyncio.current_task()
-            and not self._task.done()
-        ):
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+        await self._cancel_control_tasks()
         if self._state is not None:
             if self._stage_task is not None and not self._stage_task.done():
                 self._stage_task.cancel()
@@ -2810,14 +2801,7 @@ class ExperimentRunner:
         self._state.pending_advance = self._pending_advance
         self._state.checkpoint_id = str(uuid4())
         self._state.owner_identity = process_identity(os.getpid())
-        self._journal.client.record_event(
-            "runner.checkpoint",
-            state_to_document(self._state),
-            context={
-                "experiment_id": self._state.experiment_id,
-                "run_id": self._state.run_id,
-            },
-        )
+        _record_runner_checkpoint(self._journal.client, self._state)
         self._publish_resources()
         try:
             self._state_store.save(self._state)
@@ -2958,47 +2942,7 @@ class ExperimentRunner:
         if state is not None:
             for position, definition in enumerate(state.template["services"], 1):
                 instance = state.services.get(definition["service_id"])
-                active = None if instance is None else instance.active_request
-                services.append(
-                    {
-                        "position": position,
-                        "service_id": definition["service_id"],
-                        "module": definition["module"],
-                        "service_instance_id": None
-                        if instance is None
-                        else instance.service_instance_id,
-                        "implementation": None
-                        if instance is None
-                        else instance.implementation,
-                        "ready": instance is not None and instance.ready,
-                        "stopping": instance is not None and instance.stopping,
-                        "stopped": instance is None or instance.stopped,
-                        "manually_stopped": instance is not None
-                        and instance.manually_stopped,
-                        "restart_count": 0
-                        if instance is None
-                        else instance.restart_count,
-                        "blocked_action": None
-                        if instance is None
-                        else instance.blocked_action,
-                        "failure": None if instance is None else instance.failure,
-                        "process": None
-                        if instance is None
-                        else instance.process_identity,
-                        "last_status": None
-                        if instance is None
-                        else instance.last_status,
-                        "active_request": None
-                        if active is None
-                        else {
-                            key: active[key]
-                            for key in ("request_id", "command", "timed_out")
-                        },
-                        "pending_requests": 0
-                        if instance is None
-                        else len(instance.pending_requests),
-                    }
-                )
+                services.append(self._service_state(position, definition, instance))
         return {
             "experiment_id": self._requested_id,
             "phase": phase,
@@ -3031,6 +2975,35 @@ class ExperimentRunner:
             else state.template_revision_id,
             "run_id": None if state is None else state.run_id,
             "snapshot": self._last_snapshot,
+        }
+
+    def _service_state(
+        self, position: int, definition: JsonObject, instance: ServiceInstance | None
+    ) -> JsonObject:
+        active = None if instance is None else instance.active_request
+        return {
+            "position": position,
+            "service_id": definition["service_id"],
+            "module": definition["module"],
+            "service_instance_id": None
+            if instance is None
+            else instance.service_instance_id,
+            "implementation": None if instance is None else instance.implementation,
+            "ready": instance is not None and instance.ready,
+            "stopping": instance is not None and instance.stopping,
+            "stopped": instance is None or instance.stopped,
+            "manually_stopped": instance is not None and instance.manually_stopped,
+            "restart_count": 0 if instance is None else instance.restart_count,
+            "blocked_action": None if instance is None else instance.blocked_action,
+            "failure": None if instance is None else instance.failure,
+            "process": None if instance is None else instance.process_identity,
+            "last_status": None if instance is None else instance.last_status,
+            "active_request": None
+            if active is None
+            else {key: active[key] for key in ("request_id", "command", "timed_out")},
+            "pending_requests": 0
+            if instance is None
+            else len(instance.pending_requests),
         }
 
     async def read_events(
@@ -3076,14 +3049,7 @@ class ExperimentRunner:
                 self._state.owner_identity = None
                 self._state.checkpoint_id = str(uuid4())
                 try:
-                    self._journal.client.record_event(
-                        "runner.checkpoint",
-                        state_to_document(self._state),
-                        context={
-                            "experiment_id": self._state.experiment_id,
-                            "run_id": self._state.run_id,
-                        },
-                    )
+                    _record_runner_checkpoint(self._journal.client, self._state)
                     self._state_store.save(self._state)
                 except (LoggingError, OSError) as error:
                     write_json(
