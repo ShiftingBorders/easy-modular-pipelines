@@ -169,19 +169,7 @@ class HashDB:
             return SchemaValidationStatus.mismatch
 
         actual_schema = db.execute('PRAGMA table_info("MAIN")').fetchall()
-        actual_unique_constraints = []
-        for index in db.execute('PRAGMA index_list("MAIN")').fetchall():
-            is_unique = bool(index[2])
-            is_partial = bool(index[4])
-            if not is_unique or is_partial:
-                continue
-            escaped_index_name = index[1].replace('"', '""')
-            index_columns = db.execute(
-                f'PRAGMA index_info("{escaped_index_name}")'
-            ).fetchall()
-            actual_unique_constraints.append(
-                tuple(column[2] for column in index_columns)
-            )
+        actual_unique_constraints = self._unique_indexes(db)
 
         expected_db = sqlite3.connect(":memory:")
         try:
@@ -189,19 +177,7 @@ class HashDB:
             expected_schema = expected_db.execute(
                 'PRAGMA table_info("MAIN")'
             ).fetchall()
-            expected_unique_constraints = []
-            for index in expected_db.execute('PRAGMA index_list("MAIN")').fetchall():
-                is_unique = bool(index[2])
-                is_partial = bool(index[4])
-                if not is_unique or is_partial:
-                    continue
-                escaped_index_name = index[1].replace('"', '""')
-                index_columns = expected_db.execute(
-                    f'PRAGMA index_info("{escaped_index_name}")'
-                ).fetchall()
-                expected_unique_constraints.append(
-                    tuple(column[2] for column in index_columns)
-                )
+            expected_unique_constraints = self._unique_indexes(expected_db)
         finally:
             expected_db.close()
 
@@ -212,6 +188,21 @@ class HashDB:
         if schemas_match and unique_constraints_match:
             return SchemaValidationStatus.correct
         return SchemaValidationStatus.mismatch
+
+    def _unique_indexes(self, db: sqlite3.Connection) -> list[tuple[str | None, ...]]:
+        """Read column tuples of non-partial unique indexes, retaining duplicates."""
+        unique_constraints = []
+        for index in db.execute('PRAGMA index_list("MAIN")').fetchall():
+            is_unique = bool(index[2])
+            is_partial = bool(index[4])
+            if not is_unique or is_partial:
+                continue
+            escaped_index_name = index[1].replace('"', '""')
+            index_columns = db.execute(
+                f'PRAGMA index_info("{escaped_index_name}")'
+            ).fetchall()
+            unique_constraints.append(tuple(column[2] for column in index_columns))
+        return unique_constraints
 
     def _create_table(self, db: sqlite3.Connection, db_schema: dict[str, str]):
         """Create table `MAIN` using the configured database schema.
@@ -424,22 +415,19 @@ class HashDB:
         if isinstance(error, (sqlite3.ProgrammingError, sqlite3.InterfaceError)):
             raise error
         code = getattr(error, "sqlite_errorcode", 0) & 0xFF
-        if code in {
-            sqlite3.SQLITE_BUSY,
-            sqlite3.SQLITE_LOCKED,
-            sqlite3.SQLITE_CANTOPEN,
-        }:
-            failure = StorageUnavailable
-        elif code == sqlite3.SQLITE_FULL:
-            failure = StorageCapacityError
-        elif code in {
-            sqlite3.SQLITE_AUTH,
-            sqlite3.SQLITE_PERM,
-            sqlite3.SQLITE_READONLY,
-        }:
-            failure = StorageAccessError
-        elif isinstance(error, sqlite3.IntegrityError):
-            failure = StorageConflict
-        else:
-            failure = StorageError
+        failures_by_code = {
+            sqlite3.SQLITE_BUSY: StorageUnavailable,
+            sqlite3.SQLITE_LOCKED: StorageUnavailable,
+            sqlite3.SQLITE_CANTOPEN: StorageUnavailable,
+            sqlite3.SQLITE_FULL: StorageCapacityError,
+            sqlite3.SQLITE_AUTH: StorageAccessError,
+            sqlite3.SQLITE_PERM: StorageAccessError,
+            sqlite3.SQLITE_READONLY: StorageAccessError,
+        }
+        failure = failures_by_code.get(code)
+        if failure is None:
+            if isinstance(error, sqlite3.IntegrityError):
+                failure = StorageConflict
+            else:
+                failure = StorageError
         raise failure(f"Failed to {operation}.") from error
