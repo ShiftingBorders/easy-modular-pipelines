@@ -159,19 +159,7 @@ class SeaweedProcess:
             )
 
         master_port, volume_port, filer_port = selected_ports
-        command = [
-            str(weed_executable),
-            "server",
-            f"-dir={self.volume_path}",
-            f"-master.port={master_port}",
-            f"-volume.port={volume_port}",
-            f"-filer.port={filer_port}",
-        ]
-        for argument, value in config.start_args.model_dump(by_alias=True).items():
-            if argument not in {"master.port", "volume.port", "filer.port"}:
-                if isinstance(value, bool):
-                    value = str(value).lower()
-                command.append(f"-{argument}={value}")
+        command = self._start_command(config, weed_executable, selected_ports)
 
         # The handle must remain open for the complete child-process lifetime.
         try:
@@ -201,15 +189,38 @@ class SeaweedProcess:
                 master_port, volume_port, config.start_args.ip_bind, filer_port
             )
         except BaseException as error:
-            try:
-                self.stop()
-            except StorageError as cleanup_error:
-                error.add_note(
-                    f"SeaweedFS startup cleanup also failed: {cleanup_error}"
-                )
+            self._cleanup_failed_start(error)
             raise
         if not start_result:
             self._emergency_stop_debug(err)
+
+    def _start_command(
+        self,
+        config: SeaWeedConfig,
+        weed_executable: Path,
+        selected_ports: tuple[int, int, int],
+    ) -> list[str]:
+        master_port, volume_port, filer_port = selected_ports
+        command = [
+            str(weed_executable),
+            "server",
+            f"-dir={self.volume_path}",
+            f"-master.port={master_port}",
+            f"-volume.port={volume_port}",
+            f"-filer.port={filer_port}",
+        ]
+        for argument, value in config.start_args.model_dump(by_alias=True).items():
+            if argument not in {"master.port", "volume.port", "filer.port"}:
+                if isinstance(value, bool):
+                    value = str(value).lower()
+                command.append(f"-{argument}={value}")
+        return command
+
+    def _cleanup_failed_start(self, error: BaseException) -> None:
+        try:
+            self.stop()
+        except StorageError as cleanup_error:
+            error.add_note(f"SeaweedFS startup cleanup also failed: {cleanup_error}")
 
     def _emergency_stop_debug(self, err: Exception | None) -> None:
         failure = StorageUnavailable(
@@ -225,10 +236,7 @@ class SeaweedProcess:
                 failure.add_note(f"SeaweedFS output:\n{diagnostic_output.strip()}")
         except OSError as output_error:
             failure.add_note(f"Cannot read process output: {output_error}")
-        try:
-            self.stop()
-        except StorageError as cleanup_error:
-            failure.add_note(f"SeaweedFS startup cleanup also failed: {cleanup_error}")
+        self._cleanup_failed_start(failure)
         raise failure from err
 
     def _post_start_check(
@@ -277,12 +285,7 @@ class SeaweedProcess:
 
         if self._process is not None and self._process.poll() is None:
             try:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=self.start_stop_timeout)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    self._process.wait(timeout=5)
+                self._terminate_owned_process()
             except (OSError, subprocess.SubprocessError) as error:
                 failure = StorageError("Failed to stop the owned SeaweedFS process.")
                 if cleanup_error is not None:
@@ -310,6 +313,14 @@ class SeaweedProcess:
                 "Failed to close SeaweedFS resources."
             ) from cleanup_error
 
+    def _terminate_owned_process(self) -> None:
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=self.start_stop_timeout)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=5)
+
     def _volume_path_exists(self, volume_path: Path) -> None:
         """Ensure that the configured volume path is an existing directory."""
         try:
@@ -325,10 +336,11 @@ class SeaweedProcess:
 
     def _check_availability(self) -> bool:
         """Return whether this instance's process and Filer are available."""
-        if self._process is None or self._process.poll() is not None:
-            self.state = SeaweedState.STOPPED
-            return False
-        if self._client is None:
+        if (
+            self._process is None
+            or self._process.poll() is not None
+            or self._client is None
+        ):
             self.state = SeaweedState.STOPPED
             return False
 
@@ -338,11 +350,9 @@ class SeaweedProcess:
             self.state = SeaweedState.STOPPED
             return False
 
-        if response.status_code != httpx.codes.OK:
-            self.state = SeaweedState.STOPPED
-            return False
-        self.state = SeaweedState.RUNNING
-        return True
+        available = response.status_code == httpx.codes.OK
+        self.state = SeaweedState.RUNNING if available else SeaweedState.STOPPED
+        return available
 
     def is_available(self) -> bool:
         """Return whether this instance's Filer is currently available."""
