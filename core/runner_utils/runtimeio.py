@@ -21,6 +21,18 @@ if TYPE_CHECKING:
     from core.runner_utils.state import JsonObject
 
 
+def _lock_open_stream(stream: BinaryIO) -> None:
+    """Lock an initialized stream; the caller positions it and owns its closure."""
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 async def capture_stream(
     stream: asyncio.StreamReader,
     name: str,
