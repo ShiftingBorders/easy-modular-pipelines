@@ -58,17 +58,8 @@ class ModuleLauncher:
         )
         module_data = state.experiment_directory / "module_data" / owner_id
         module_data.mkdir(parents=True, exist_ok=True)
-        logging_config = (
-            None
-            if service_call
-            else self._journal.write_client_config(
-                state, {**context, "source": "module"}
-            )
-        )
-        executor_config = (
-            self._journal.write_client_config(state, {**context, "source": "executor"})
-            if module["role"] == "stage"
-            else None
+        logging_config, executor_config = self._prepare_logging_configs(
+            state, context, module, service_call
         )
         endpoint_path = (
             state.experiment_directory / "runner/endpoints" / f"{owner_id}.json"
@@ -132,6 +123,27 @@ class ModuleLauncher:
                 "runner_timeout_margin_seconds"
             ],
         }
+
+    def _prepare_logging_configs(
+        self,
+        state: RunnerState,
+        context: JsonObject,
+        module: JsonObject,
+        service_call: bool,
+    ) -> tuple[Path | None, Path | None]:
+        logging_config = (
+            None
+            if service_call
+            else self._journal.write_client_config(
+                state, {**context, "source": "module"}
+            )
+        )
+        executor_config = (
+            self._journal.write_client_config(state, {**context, "source": "executor"})
+            if module["role"] == "stage"
+            else None
+        )
+        return logging_config, executor_config
 
     def _merge_settings(
         self, defaults: JsonObject, overrides: JsonObject
