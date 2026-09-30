@@ -20,6 +20,17 @@ from core.validation_constants import (
 from utils.modulemanager_utils.modulemanager_errors import HashMismatch
 
 
+async def _await_outcome[T](operation: asyncio.Task[T]) -> T:
+    """Wait for the actual outcome, even if the caller is cancelled."""
+    while True:
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            if operation.cancelled():
+                raise
+            # Storage may have committed; finish before the owner closes it.
+
+
 class _ModuleWorkspace:
     """Clean a preparation workspace without replacing the operation's error."""
 
@@ -617,17 +628,7 @@ class ModuleManager:
         operation = asyncio.create_task(
             self._register_module_async(module_name, module_version, module_folder)
         )
-        return await self._await_outcome(operation)
-
-    async def _await_outcome[T](self, operation: asyncio.Task[T]) -> T:
-        """Wait for the actual outcome, even if the caller is cancelled."""
-        while True:
-            try:
-                return await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                if operation.cancelled():
-                    raise
-                # Storage may have committed; finish before the owner closes it.
+        return await _await_outcome(operation)
 
     async def _register_module_async(
         self, module_name: str, module_version: str, module_folder: str | Path | None
@@ -853,7 +854,7 @@ class ModuleManager:
             asyncio.to_thread(self._verify_stored_module, name, version, digest.lower())
         )
         # Never release the databases while a worker still uses their clients.
-        return await self._await_outcome(operation)
+        return await _await_outcome(operation)
 
     def _copy_module_source(self, source: Path, destination: Path) -> None:
         destination.mkdir()
@@ -876,7 +877,7 @@ class ModuleManager:
         operation = asyncio.create_task(
             self._register_and_install_module(module_folder)
         )
-        return await self._await_outcome(operation)
+        return await _await_outcome(operation)
 
     async def _register_and_install_module(self, module_folder: Path) -> JsonObject:
         manifest = await asyncio.to_thread(read_module_manifest, Path(module_folder))
@@ -984,7 +985,7 @@ class ModuleManager:
         operation = asyncio.create_task(
             asyncio.to_thread(self._remove_archive_if_present, name, version)
         )
-        removed = await self._await_outcome(operation)
+        removed = await _await_outcome(operation)
         try:
             hash_removed = self.hash_db.remove_module_hash(name, version)
         except StorageError as error:
