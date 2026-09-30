@@ -51,12 +51,7 @@ class CollectorSettings:
             )
         for name, value in document.items():
             if name == "disk_path":
-                configured = Path(require_text(value, name))
-                document[name] = str(
-                    configured
-                    if configured.is_absolute()
-                    else (path.parent / configured).resolve()
-                )
+                document[name] = _resolve_disk_path(value, name, path)
                 continue
             if name == "network_interface":
                 if value is not None:
@@ -66,13 +61,7 @@ class CollectorSettings:
                 ipaddress.IPv4Address(require_text(value, name))
                 continue
             if name == "restart_delays_seconds":
-                if type(value) is not list or not value:
-                    raise ValueError("restart_delays_seconds must be a nonempty array.")
-                for delay in value:
-                    if require_number(delay, name) <= 0:
-                        raise ValueError("Restart delays must be positive.")
-                if value != sorted(value):
-                    raise ValueError("Restart delays must be nondecreasing.")
+                _validate_restart_delays(value, name)
                 continue
             if require_number(value, name) <= 0:
                 raise ValueError(f"{name} must be positive.")
@@ -88,6 +77,23 @@ class CollectorSettings:
         if document["logging_busy_timeout_seconds"] > 60:
             raise ValueError("logging_busy_timeout_seconds must not exceed 60.")
         return cls(**document)
+
+
+def _resolve_disk_path(value: object, name: str, path: Path) -> str:
+    configured = Path(require_text(value, name))
+    return str(
+        configured if configured.is_absolute() else (path.parent / configured).resolve()
+    )
+
+
+def _validate_restart_delays(value: object, name: str) -> None:
+    if type(value) is not list or not value:
+        raise ValueError("restart_delays_seconds must be a nonempty array.")
+    for delay in value:
+        if require_number(delay, name) <= 0:
+            raise ValueError("Restart delays must be positive.")
+    if value != sorted(value):
+        raise ValueError("Restart delays must be nondecreasing.")
 
 
 @dataclass(frozen=True)
