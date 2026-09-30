@@ -219,19 +219,11 @@ class ResourceCollector:
         self._stop_worker = True
         self._wake.set()
         timeout = self._settings.shutdown_timeout_seconds
-        if process.pid is not None:
-            await asyncio.to_thread(process.join, timeout)
-            if process.is_alive():
-                process.terminate()
-                await asyncio.to_thread(process.join, timeout)
-            if process.is_alive():
-                process.kill()
-                await asyncio.to_thread(process.join, timeout)
-            if process.is_alive():
-                self._error = (
-                    "Collector termination is unconfirmed; restart is withheld."
-                )
-                return
+        if process.pid is not None and not await self._confirm_worker_exit(
+            process, timeout
+        ):
+            self._error = "Collector termination is unconfirmed; restart is withheld."
+            return
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -241,6 +233,18 @@ class ResourceCollector:
         process.close()
         self._process = None
         self._observed.set()
+
+    async def _confirm_worker_exit(
+        self, process: multiprocessing.Process, timeout: float
+    ) -> bool:
+        await asyncio.to_thread(process.join, timeout)
+        if process.is_alive():
+            process.terminate()
+            await asyncio.to_thread(process.join, timeout)
+        if process.is_alive():
+            process.kill()
+            await asyncio.to_thread(process.join, timeout)
+        return not process.is_alive()
 
     async def suspend_experiment(self) -> None:
         """Confirm writer closure before a caller replaces an experiment journal."""
