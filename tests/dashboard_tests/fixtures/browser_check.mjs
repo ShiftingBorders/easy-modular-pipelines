@@ -69,7 +69,14 @@ try {
         const form=document.getElementById('alert-rule-form');form.elements.name.value='Browser CPU rule';form.elements.threshold.value='0';form.elements.duration_seconds.value='0';form.requestSubmit();
         await wait(()=>!document.getElementById('details-dialog').open && document.getElementById('main').innerText.includes('Browser CPU rule'));
         await wait(()=>document.getElementById('alert-count').textContent==='1');output.bell=document.getElementById('alert-count').textContent;
-        document.querySelector('[data-delete-rule]').click();await wait(()=>!document.getElementById('main').innerText.includes('Browser CPU rule'));
+        const deleteRule=document.querySelector('[data-delete-rule]'), deletedRuleId=deleteRule.dataset.deleteRule;
+        deleteRule.click();
+        // Closed incidents retain the name; only the loaded rules table proves deletion.
+        await wait(()=>{
+            const rules=document.querySelector('[data-key="panel:Alert rules"]');
+            return rules && !document.querySelector('#main .loading') &&
+                ![...rules.querySelectorAll('[data-delete-rule]')].some(button=>button.dataset.deleteRule===deletedRuleId);
+        });
         output.ruleDeleted=true;
         const search=document.getElementById('global-search');search.value='Compute';search.dispatchEvent(new Event('input',{bubbles:true}));
         output.searchMatches=document.getElementById('search-results').innerText;
