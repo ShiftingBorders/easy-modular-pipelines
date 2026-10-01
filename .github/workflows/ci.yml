@@ -12,8 +12,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    name: Python 3.12 checks (${{ matrix.os }})
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Run Ruff
+        run: uv run --with ruff ruff check core tests scripts dashboard cli.py webserver.py
+
+      - name: Compile Python sources
+        run: uv run python -m compileall core scripts dashboard cli.py webserver.py
+
+  tests:
+    name: Tests / ${{ matrix.group }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -21,6 +44,16 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
+        group:
+          - storage
+          - modules
+          - experiments
+          - journal
+          - participants
+          - resources
+          - server
+          - dashboard_tests
+          - root
 
     steps:
       - name: Check out repository
@@ -38,20 +71,33 @@ jobs:
       - name: Install pinned SeaweedFS
         run: uv run python scripts/download_seaweedfs.py
 
-      - name: Run Ruff
-        run: uv run --with ruff ruff check core tests scripts
+      - name: Run group tests
+        if: matrix.group != 'root'
+        run: >-
+          uv run python -m unittest discover
+          -s tests/${{ matrix.group }} -t . -p "test_*.py" -v
 
-      - name: Compile Python sources
-        run: uv run python -m compileall core scripts
-
-      - name: Run unit tests
-        run: uv run python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Run root tests
+        if: matrix.group == 'root'
+        run: >-
+          uv run python -m unittest
+          tests.test_cli
+          tests.test_cli_discovery
+          tests.test_cli_library_reads
+          tests.test_cli_protocol
+          tests.test_resource_cli
+          tests.test_service_cli
+          tests.test_system_dag
+          tests.test_template_reload_cli
+          tests.test_weather_dag
+          tests.test_webserver
+          -v
 
       - name: Upload failed-test diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: test-diagnostics-${{ matrix.os }}
+          name: test-diagnostics-${{ matrix.group }}-${{ matrix.os }}
           path: .artifacts/ci-failures/
           include-hidden-files: true
           if-no-files-found: ignore

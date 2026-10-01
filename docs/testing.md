@@ -20,6 +20,30 @@ Temporary outputs belong under `.artifacts/`.
 The repository's VS Code configuration uses `unittest`, the `tests` directory,
 and the `test_*.py` discovery pattern.
 
+## Continuous integration
+
+GitHub Actions runs Ruff and Python compilation in a separate `Static checks`
+job. Test jobs run independently using a matrix of Ubuntu and Windows with
+nine groups: `storage`, `modules`, `experiments`, `journal`, `participants`,
+`resources`, `server`, `dashboard_tests`, and `root`.
+
+Each test job installs the locked environment and pinned SeaweedFS binary.
+Directory groups use discovery with the repository as the import root:
+
+```text
+uv run python -m unittest discover -s tests/experiments -t . -p "test_*.py" -v
+```
+
+The `root` group explicitly lists the test modules directly under `tests/`.
+When adding a root test module or a new test directory, update the workflow
+to keep all tests included. The matrix uses `fail-fast: false`, so a failed
+group does not cancel other groups. Failure diagnostics are uploaded from
+`.artifacts/ci-failures/` with the group and OS in the artifact name.
+
+Browser tests still require the prerequisites described below and skip when
+they are unavailable. Splitting the suite does not change platform-specific
+or opt-in test behavior.
+
 ## Selected suites
 
 | Area | Command |
