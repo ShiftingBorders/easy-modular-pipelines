@@ -33,9 +33,10 @@ an entire manager or runner merely to access its private fields.
 
 ## Import migration
 
-Older public imports remain explicit compatibility re-exports of the same
-objects. They contain no independent implementation. This allows existing
-immutable module versions to run without changing their source or hashes.
+Legacy compatibility modules have been removed. Import directly from the
+owning modules below. Existing module versions that use legacy imports must
+be migrated and registered as new versions; update their template hashes.
+Do not edit already installed module contents in place.
 
 | Legacy import | Preferred import |
 | --- | --- |
@@ -48,9 +49,10 @@ immutable module versions to run without changing their source or hashes.
 | `core.hashdb.HashDB` | `core.storage.hash_db.HashDB` |
 | `core.serverruntime.ServerRuntime` | `core.server.runtime.ServerRuntime` |
 
-The old executor module entry point delegates to `core.participants.executor`.
-Legacy `utils` imports also remain aliases; new implementation code does not
-import that package. Exception aliases refer to the same exception classes.
+Use `core.participants.executor` as the executor module entry point. The old
+`core.runner_utils`, `core.logger_utils`, `core.resource_utils`, and external
+`utils` compatibility packages have also been removed. Import shared operations
+from `core.primitives`, and storage exceptions from `core.storage.errors`.
 
 The migration does not change journal schemas, experiment formats, configuration
 fields, or module identity. Configuration-relative paths still resolve from
@@ -61,6 +63,5 @@ Core test modules are grouped under `tests/storage`, `tests/modules`,
 `tests/journal`, `tests/participants`, `tests/experiments`, `tests/resources`,
 and `tests/server`. Shared fixtures remain under `tests/helpers`; application
 and dashboard suites keep their existing locations. Test imports and mock
-destinations follow the defining implementation module; patching a compatibility
-facade does not replace a dependency inside its owner.
+destinations follow the defining implementation module.
 See [testing](testing.md) for the commands and approval policy.

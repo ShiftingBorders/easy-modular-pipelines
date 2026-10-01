@@ -1,6 +1,6 @@
 """Backend-independent storage operations used by ModuleManager.
 
-Implementations raise categories from core.storage_errors for expected
+Implementations raise categories from core.storage.errors for expected
 failures. They must not report a service failure as an absent object.
 Resource creation and shutdown belong to the application, not these protocols.
 Existing return values are preserved pending a separate result-type review."""
