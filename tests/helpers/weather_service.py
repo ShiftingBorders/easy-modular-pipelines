@@ -39,7 +39,10 @@ class WeatherService:
 
     async def tick(self):
         while True:
-            await asyncio.sleep(30)
+            deadline = time.monotonic() + 30
+            # Asyncio timers can wake up one clock-resolution step early.
+            while (remaining := deadline - time.monotonic()) > 0:
+                await asyncio.sleep(remaining)
             if not self.frozen:
                 self.generate()
 
