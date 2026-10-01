@@ -10,6 +10,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from core.journal.events import LoggingError
+from core.journal.storage import SQLiteEventStore
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
 
@@ -37,6 +38,46 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
         write_json(directory / "manifest.json", manifest)
+
+    async def test_validation_copy_never_enters_wal_mode(self):
+        """Validation reads and restores its copy without mapped SHM sidecars."""
+        original_open = SQLiteEventStore.open
+        original_restore = SQLiteEventStore.complete_restore
+        scratch = self.w.root / "controller/snapshot_validation"
+        before = file_inventory(self.archive)
+        opened, restored = [], []
+
+        def observe_open(store):
+            original_open(store)
+            if store.db_path.parent.parent == scratch:
+                opened.append(store.db_path)
+                self.assertEqual(
+                    store._connection.execute("PRAGMA journal_mode").fetchone(),
+                    ("delete",),
+                )
+                self.assertEqual(
+                    {path.name for path in store.db_path.parent.iterdir()},
+                    {"journal.sqlite"},
+                )
+
+        def observe_restore(store, *args, **kwargs):
+            result = original_restore(store, *args, **kwargs)
+            if store.db_path.parent.parent == scratch:
+                restored.append(result)
+                self.assertFalse(store.db_path.with_name("journal.sqlite-shm").exists())
+                self.assertFalse(store.db_path.with_name("journal.sqlite-wal").exists())
+            return result
+
+        with (
+            patch.object(SQLiteEventStore, "open", observe_open),
+            patch.object(SQLiteEventStore, "complete_restore", observe_restore),
+        ):
+            manifest = self.runner._snapshots._validate_snapshot(self.archive)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0]["snapshot_id"], manifest["journal"]["snapshot_id"])
+        self.assertFalse(opened[0].parent.exists())
+        self.assertEqual(file_inventory(self.archive), before)
 
     async def test_manifest_schema_identity_cursor_and_applied_template_are_checked(
         self,

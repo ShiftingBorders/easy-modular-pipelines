@@ -19,10 +19,10 @@ from tests.dashboard_tests.helpers import (
     FIXTURES,
     PROJECT_ROOT,
     cleanup_directory,
+    close_browser,
     temporary_directory,
 )
 from tests.dashboard_tests.test_browser import BROWSER
-from tests.helpers.dag import terminate_owned
 
 
 class ConditionalBrowserTests(unittest.TestCase):
@@ -105,6 +105,8 @@ class ConditionalBrowserTests(unittest.TestCase):
                         "--headless=new",
                         "--disable-gpu",
                         "--no-first-run",
+                        "--disable-component-update",
+                        "--disable-background-networking",
                         *(
                             ["--no-sandbox", "--disable-dev-shm-usage"]
                             if os.name != "nt" and os.geteuid() == 0
@@ -182,10 +184,14 @@ class ConditionalBrowserTests(unittest.TestCase):
                 self.assertGreater(result["loopWidth"], 80)
                 self.assertGreater(result["loopHeight"], 30)
         finally:
-            if identity is not None:
-                terminate_owned(identity)
-            if browser is not None:
-                browser.wait(timeout=15)
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
+            try:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            finally:
+                if identity is not None:
+                    close_browser(identity, profile)
+                elif browser is not None and browser.poll() is None:
+                    browser.terminate()
+                if browser is not None:
+                    browser.wait(timeout=15)

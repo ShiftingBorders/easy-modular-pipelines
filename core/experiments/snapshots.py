@@ -560,23 +560,27 @@ class ExperimentSnapshots:
             database = Path(temporary.name) / "journal.sqlite"
             shutil.copyfile(directory / "journal/journal.sqlite", database)
             settings = state.template["logging"]
-            store = SQLiteEventStore(
-                database,
-                busy_timeout_seconds=settings["busy_timeout_seconds"],
-                max_event_bytes=settings["max_event_bytes"],
-                min_free_bytes=0,
-                open_mode="existing",
-                expected_journal={
+            store_options = {
+                "busy_timeout_seconds": settings["busy_timeout_seconds"],
+                "max_event_bytes": settings["max_event_bytes"],
+                "min_free_bytes": 0,
+                "open_mode": "existing",
+                "expected_journal": {
                     key: document["journal"][key]
                     for key in ("journal_id", "generation")
                 },
-            )
+            }
+            # Snapshot exports use DELETE mode. Reading them must not enable WAL:
+            # its mapped SHM file can remain delete-pending after close on Windows.
+            store = SQLiteEventStore(database, **store_options, read_only=True)
             try:
                 store.open()
-                try:
-                    _validate_journal_results(state, store)
-                finally:
-                    store.close()
+                _validate_journal_results(state, store)
+            finally:
+                store.close()
+            # Restore through a separate writer without opening a live WAL client.
+            store = SQLiteEventStore(database, **store_options)
+            try:
                 store.complete_restore(
                     document["journal"],
                     restoration_id=str(uuid4()),

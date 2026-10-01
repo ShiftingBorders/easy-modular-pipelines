@@ -22,6 +22,7 @@ from tests.dashboard_tests.helpers import (
     FIXTURES,
     PROJECT_ROOT,
     cleanup_directory,
+    close_browser,
     temporary_directory,
     write_settings,
 )
@@ -30,7 +31,6 @@ from tests.dashboard_tests.integration_helpers import (
     history,
     resource_status,
 )
-from tests.helpers.dag import terminate_owned
 
 EDGE = (
     Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
@@ -157,8 +157,9 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 browser = await asyncio.create_subprocess_exec(
                     str(BROWSER),
                     "--headless=new",
-                    "--disable-gpu",
                     "--no-first-run",
+                    "--disable-component-update",
+                    "--disable-background-networking",
                     *(
                         ["--no-sandbox", "--disable-dev-shm-usage"]
                         if os.name != "nt" and os.geteuid() == 0
@@ -267,6 +268,8 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["historyEvents"], 500)
                 self.assertEqual(result["summaryRequests"], 0)
                 self.assertEqual(result["coldHistoryEvents"], 500)
+                self.assertTrue(result["coldRefreshPending"])
+                self.assertEqual(result["coldRowsWhileRefreshing"], 200)
                 self.assertLessEqual(result["coldOpenMs"], 200)
                 for page, timings in result["pageTimings"].items():
                     with self.subTest(page=page):
@@ -338,12 +341,14 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await asyncio.wait_for(task, 15)
                 finally:
-                    if browser is not None and browser.returncode is None:
-                        if os.name == "nt" and identity:
-                            terminate_owned(identity)
-                        else:
+                    try:
+                        if identity is not None:
+                            await asyncio.to_thread(close_browser, identity, profile)
+                        elif browser is not None and browser.returncode is None:
                             browser.terminate()
-                        await browser.wait()
-                    if browser_output is not None:
-                        browser_output.close()
-                    server_thread.shutdown(wait=True)
+                        if browser is not None:
+                            await asyncio.wait_for(browser.wait(), 15)
+                    finally:
+                        if browser_output is not None:
+                            browser_output.close()
+                        server_thread.shutdown(wait=True)

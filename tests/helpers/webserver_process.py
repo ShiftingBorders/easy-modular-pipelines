@@ -5,6 +5,7 @@ import asyncio
 import os
 import signal
 import socket
+import time
 from functools import partial
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -60,6 +61,18 @@ async def serve(config, control, fault_mode):
                 if (control / "interrupt").exists():
                     (control / "interrupt").unlink()
                     signal.raise_signal(signal.SIGINT)
+                if published and (control / "expire-results").exists():
+                    runtime = webserver.app.state.runtime
+                    expired_at = time.monotonic() - runtime.settings.result_ttl
+                    identifiers = []
+                    for identifier, record in runtime._records.items():
+                        if record.finished_at is not None:
+                            record.finished_at = expired_at
+                            identifiers.append(identifier)
+                    (control / "expire-results").unlink()
+                    write_json(
+                        control / "results-expired.json", {"command_ids": identifiers}
+                    )
                 if published and (control / "truncate-request").exists():
                     write_frame(webserver.app.state.runtime._requests, b"\x80\x05\x95")
                     (control / "request-corrupted").touch()

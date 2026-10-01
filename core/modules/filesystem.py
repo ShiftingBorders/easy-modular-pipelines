@@ -94,7 +94,16 @@ class _ModuleWorkspace:
         traceback: TracebackType | None,
     ) -> None:
         try:
-            self._temporary.cleanup()
+            for attempt in range(3):
+                try:
+                    self._temporary.cleanup()
+                    break
+                except OSError as cleanup_error:
+                    # Windows may still report a directory as nonempty while
+                    # its last deleted entry is disappearing from the filesystem.
+                    if getattr(cleanup_error, "winerror", None) != 145 or attempt == 2:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
         except OSError as cleanup_error:
             note = f"Temporary cleanup failed at {self._work}: {cleanup_error}"
             if failure is not None:

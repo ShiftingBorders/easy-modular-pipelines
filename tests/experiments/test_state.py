@@ -11,7 +11,15 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from core.experiments.state import RunnerState, RunnerStateStore, StageAttempt
+from core.experiments.state import (
+    RunnerState,
+    RunnerStateStore,
+    ServiceInstance,
+    StageAttempt,
+    _relative_state_path,
+    state_from_document,
+    state_to_document,
+)
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
 from tests.helpers.dag import DagWorkspace
@@ -34,6 +42,126 @@ class RunnerStateTests(unittest.TestCase):
             "paused",
         )
         self.store = RunnerStateStore()
+
+    def _add_path_participants(self):
+        stage_id = str(uuid4())
+        attempt = StageAttempt(
+            str(uuid4()),
+            stage_id,
+            str(uuid4()),
+            1,
+            1,
+            self.root / "attempt",
+            None,
+            {},
+            None,
+        )
+        attempt.participant = {
+            "experiment_id": self.state.experiment_id,
+            "participant_id": stage_id,
+            "participant_instance_id": attempt.attempt_id,
+        }
+        attempt.endpoint_path = self.root / "stage-endpoint.json"
+        self.state.active_attempt = attempt
+        self.state.used_request_ids.add(attempt.request_id)
+        service_id = str(uuid4())
+        service = ServiceInstance(service_id, str(uuid4()), {"service_id": service_id})
+        service.endpoint_path = self.root / "service-endpoint.json"
+        self.state.services[service_id] = service
+        return attempt, service
+
+    @unittest.skipUnless(os.name == "nt", "Windows realpath namespace race")
+    def test_disappearing_stage_and_service_endpoints_survive_state_round_trip(self):
+        """Delete the real file between realpath's two native calls."""
+        import ntpath
+
+        participants = self._add_path_participants()
+        native = ntpath._getfinalpathname
+        for participant in participants:
+            endpoint = participant.endpoint_path
+            for operation in ("save", "load"):
+                with self.subTest(participant=endpoint.name, operation=operation):
+                    endpoint.write_text("{}", encoding="utf-8")
+                    document = state_to_document(self.state)
+                    removed = []
+
+                    def resolve_and_remove(path, endpoint=endpoint, removed=removed):
+                        result = native(path)
+                        if not removed and Path(path) == endpoint:
+                            endpoint.unlink()
+                            removed.append(path)
+                        return result
+
+                    with patch.object(ntpath, "_getfinalpathname", resolve_and_remove):
+                        if operation == "save":
+                            saved = state_to_document(self.state)
+                            restored = state_from_document(self.root, saved)
+                        else:
+                            restored = state_from_document(self.root, document)
+                    self.assertEqual(removed, [str(endpoint)])
+                    self.assertFalse(endpoint.exists())
+                    self.assertEqual(state_to_document(restored), document)
+
+    def test_saved_participant_paths_still_reject_absolute_and_parent_paths(self):
+        """Both stage and service paths retain their experiment boundary."""
+        self._add_path_participants()
+        original = state_to_document(self.state)
+        service_id = next(iter(self.state.services))
+        for owner in ("stage", "service"):
+            for path in (str(self.root / "endpoint.json"), "../outside.json"):
+                with self.subTest(owner=owner, path=path):
+                    document = copy.deepcopy(original)
+                    participant = (
+                        document["active_attempt"]
+                        if owner == "stage"
+                        else document["services"][service_id]
+                    )
+                    participant["endpoint_path"] = path
+                    with self.assertRaisesRegex(ValueError, "escapes the experiment"):
+                        state_from_document(self.root, document)
+
+    def test_participant_endpoint_links_cannot_escape_the_experiment(self):
+        participants = self._add_path_participants()
+        document = state_to_document(self.state)
+        outside = self.workspace.root / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        for participant in participants:
+            endpoint = participant.endpoint_path
+            try:
+                endpoint.symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"File symlinks unavailable: {error}")
+            try:
+                with self.subTest(participant=endpoint.name):
+                    with self.assertRaises(ValueError):
+                        state_to_document(self.state)
+                    with self.assertRaisesRegex(ValueError, "escapes the experiment"):
+                        state_from_document(self.root, document)
+            finally:
+                endpoint.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "Windows local and UNC namespace spelling")
+    def test_windows_namespace_comparison_keeps_drive_and_share_boundaries(self):
+        for root, extended in (
+            (Path("C:/experiment"), Path("//?/C:/experiment")),
+            (
+                Path("//server/share/experiment"),
+                Path("//?/UNC/server/share/experiment"),
+            ),
+        ):
+            for parent in (root, extended):
+                for child in (root / "endpoint.json", extended / "endpoint.json"):
+                    with self.subTest(parent=parent, child=child):
+                        self.assertEqual(
+                            _relative_state_path(child, parent), Path("endpoint.json")
+                        )
+            with self.assertRaises(ValueError):
+                _relative_state_path(extended.parent / "outside.json", root)
+        with self.assertRaises(ValueError):
+            _relative_state_path(
+                Path("//?/UNC/server/other/experiment/endpoint.json"),
+                Path("//server/share/experiment"),
+            )
 
     def test_round_trip_preserves_position_counts_inputs_and_attempt_paths(self):
         """D1: portable internal references and scalar execution state survive reload."""
@@ -284,7 +412,9 @@ class RunnerStateTests(unittest.TestCase):
         write_json(path, {"value": "old"})
         denied = PermissionError(errno.EACCES, "access denied", str(path))
         with (
-            patch("core.primitives.json_files.os.replace", side_effect=denied) as replace,
+            patch(
+                "core.primitives.json_files.os.replace", side_effect=denied
+            ) as replace,
             patch("core.primitives.json_files.time.sleep") as sleep,
             self.assertRaises(PermissionError) as raised,
         ):
@@ -301,7 +431,10 @@ class RunnerStateTests(unittest.TestCase):
         denied = PermissionError(errno.EACCES, "access denied", str(path))
         target = "os.fdopen" if os.name == "nt" else "pathlib.Path.open"
         started = time.monotonic()
-        with patch(target, side_effect=denied), self.assertRaises(PermissionError) as error:
+        with (
+            patch(target, side_effect=denied),
+            self.assertRaises(PermissionError) as error,
+        ):
             read_json(path)
         self.assertIs(error.exception, denied)
         self.assertLess(time.monotonic() - started, 5)

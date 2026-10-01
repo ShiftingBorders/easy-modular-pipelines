@@ -142,9 +142,9 @@ class RuntimeJournalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_keep_attempts_retains_other_stages_epochs_and_journal_history(self):
         """D6: only old attempts of the pointer stage/current cycle are removed."""
-        async with asyncio.timeout(30):
-            for keep in (1, 2):
-                with self.subTest(keep=keep):
+        for keep in (1, 2):
+            with self.subTest(keep=keep):
+                async with asyncio.timeout(30):
                     module = self.workspace.module(f"worker-{keep}")
                     stages = [self.workspace.stage(module) for _ in range(3)]
                     await self.session.launch(

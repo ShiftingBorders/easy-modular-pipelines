@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from email import policy
 from email.parser import BytesParser
@@ -1084,6 +1085,73 @@ class RegistrationRepeatTests(ModuleManagerTestCase):
 
 
 class ReplacementAndCleanupTests(ModuleManagerTestCase):
+    def test_rejected_package_retries_transient_directory_cleanup(self):
+        """A delete-pending entry must not leave the rejected package workspace."""
+        self._seed_hash()
+        self.objects["/modules/demo/1"] = self._archive_bytes([])
+        original = tempfile.TemporaryDirectory.cleanup
+        attempts = []
+
+        def cleanup(temporary):
+            if Path(temporary.name).name.startswith("extract-module-"):
+                attempts.append(temporary.name)
+                if len(attempts) == 1:
+                    error = OSError("Directory entry is still being deleted")
+                    error.winerror = 145
+                    raise error
+            return original(temporary)
+
+        with (
+            patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup),
+            self.assertRaises(ValueError),
+        ):
+            self.manager.extract_module("demo", "1")
+        self.assertEqual(len(attempts), 2)
+        self._assert_work_clean()
+
+    def test_rejected_package_preserves_persistent_cleanup_error(self):
+        """Bound retries and preserve the package error with cleanup diagnostics."""
+        self._seed_hash()
+        self.objects["/modules/demo/1"] = self._archive_bytes([])
+        original = tempfile.TemporaryDirectory.cleanup
+        for code, expected_attempts in ((145, 3), (5, 1)):
+            retained = []
+
+            def cleanup(temporary, retained=retained, code=code):
+                if Path(temporary.name).name.startswith("extract-module-"):
+                    retained.append(temporary)
+                    error = OSError("Persistent cleanup failure")
+                    error.winerror = code
+                    raise error
+                return original(temporary)
+
+            with self.subTest(winerror=code):
+                try:
+                    with (
+                        patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup),
+                        self.assertRaises(ValueError) as raised,
+                    ):
+                        self.manager.extract_module("demo", "1")
+                    self.assertEqual(len(retained), expected_attempts)
+                    self.assertIn("Package", str(raised.exception))
+                    notes = " ".join(raised.exception.__notes__)
+                    self.assertIn("Persistent cleanup failure", notes)
+                    self.assertIn(retained[0].name, notes)
+                finally:
+                    for temporary in set(retained):
+                        for attempt in range(10):
+                            try:
+                                original(temporary)
+                                break
+                            except OSError as error:
+                                if (
+                                    getattr(error, "winerror", None) != 145
+                                    or attempt == 9
+                                ):
+                                    raise
+                                time.sleep(0.02)
+                self._assert_work_clean()
+
     def _old_target(self):
         target = self.root / "target"
         target.mkdir()

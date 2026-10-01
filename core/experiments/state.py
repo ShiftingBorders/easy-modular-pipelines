@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -287,6 +288,26 @@ class RunnerStateStore:
         write_json(destination, document)
 
 
+def _relative_state_path(path: Path, root: Path) -> Path:
+    """Compare resolved paths using the same Windows namespace spelling."""
+    if os.name == "nt":
+        # Python 3.12 can retain this prefix when a file disappears between
+        # realpath's native calls. Add it to both comparison paths; never strip
+        # it from a resolved target or skip resolution of filesystem links.
+        paths = []
+        for value in (path, root):
+            text = str(value)
+            if not text.startswith("\\\\?\\"):
+                text = (
+                    "\\\\?\\UNC\\" + text[2:]
+                    if text.startswith("\\\\")
+                    else "\\\\?\\" + text
+                )
+            paths.append(Path(text))
+        path, root = paths
+    return path.relative_to(root)
+
+
 def state_to_document(state: RunnerState) -> JsonObject:
     """Serialize known public records, never live tasks or control queues."""
     root = state.experiment_directory.resolve()
@@ -308,21 +329,21 @@ def state_to_document(state: RunnerState) -> JsonObject:
         for name in ("endpoint_path", "artifacts_directory"):
             path = saved[name]
             saved[name] = (
-                None if path is None else path.resolve().relative_to(root).as_posix()
+                None
+                if path is None
+                else _relative_state_path(path.resolve(), root).as_posix()
             )
         document["services"][service_id] = saved
     if state.active_attempt is not None:
         attempt = dict(vars(state.active_attempt))
-        attempt["artifacts_directory"] = (
-            state.active_attempt.artifacts_directory.resolve()
-            .relative_to(root)
-            .as_posix()
-        )
+        attempt["artifacts_directory"] = _relative_state_path(
+            state.active_attempt.artifacts_directory.resolve(), root
+        ).as_posix()
         endpoint = state.active_attempt.endpoint_path
         attempt["endpoint_path"] = (
             None
             if endpoint is None
-            else endpoint.resolve().relative_to(root).as_posix()
+            else _relative_state_path(endpoint.resolve(), root).as_posix()
         )
         document["active_attempt"] = attempt
     return copy_json_object(document, "runner state")
@@ -540,8 +561,14 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
             if saved[name] is not None:
                 relative = Path(require_text(saved[name], name))
                 resolved = (root / relative).resolve()
-                if relative.anchor or not resolved.is_relative_to(root):
+                if relative.anchor:
                     raise ValueError("Saved service path escapes the experiment.")
+                try:
+                    _relative_state_path(resolved, root)
+                except ValueError:
+                    raise ValueError(
+                        "Saved service path escapes the experiment."
+                    ) from None
                 saved[name] = resolved
         for name, value in saved.items():
             setattr(instance, name, value)
@@ -665,8 +692,12 @@ def _restore_active_attempt(
     }
     relative = Path(attempt["artifacts_directory"])
     attempt["artifacts_directory"] = (root / relative).resolve()
-    if relative.anchor or not attempt["artifacts_directory"].is_relative_to(root):
+    if relative.anchor:
         raise ValueError("Saved attempt directory escapes the experiment.")
+    try:
+        _relative_state_path(attempt["artifacts_directory"], root)
+    except ValueError:
+        raise ValueError("Saved attempt directory escapes the experiment.") from None
     state.active_attempt = StageAttempt(**attempt)
     UUID(require_text(observed["request_id"], "request_id"))
     if observed["result_request_id"] is not None:
@@ -684,8 +715,14 @@ def _restore_active_attempt(
     if observed["endpoint_path"] is not None:
         relative = Path(observed["endpoint_path"])
         resolved = (root / relative).resolve()
-        if relative.anchor or not resolved.is_relative_to(root):
+        if relative.anchor:
             raise ValueError("Saved participant endpoint escapes the experiment.")
+        try:
+            _relative_state_path(resolved, root)
+        except ValueError:
+            raise ValueError(
+                "Saved participant endpoint escapes the experiment."
+            ) from None
         observed["endpoint_path"] = resolved
     for key, value in observed.items():
         setattr(state.active_attempt, key, value)

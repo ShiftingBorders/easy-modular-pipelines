@@ -1,11 +1,14 @@
 """Approved exactness regressions for partitioned journal projections."""
 
 import copy
+import sqlite3
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+from core.journal.logger import OperationLogger
 from dashboard.api_client import SystemAPIClient
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
@@ -106,6 +109,69 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
         reader.window_events = 500
         reader.max_bytes = 1
         self.assertIsNone(reader.preview("exp-test"))
+
+    async def test_preview_at_500_events_preserves_order_and_source(self):
+        """The complete small-history shortcut stops at the 500-event boundary."""
+        data = history()
+        workspace, reader, _ = self.cache(data)
+        reader.window_events = 1000
+        identifiers = [event["event_id"] for event in data["entries"]]
+        for number in range(500 - len(identifiers)):
+            identifiers.append(
+                workspace.logger.record_event("preview.sample", {"number": number})
+            )
+        database_path = workspace.directory / "journals/events.sqlite"
+        with closing(
+            sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        ) as db:
+            before = tuple(db.iterdump())
+            preview = reader.preview("exp-test")
+            self.assertTrue(preview["complete"])
+            self.assertEqual(preview["window_count"], 500)
+            self.assertEqual(
+                [event["event_id"] for event in preview["entries"]], identifiers
+            )
+            self.assertEqual(
+                [event["cursor"] for event in preview["entries"]],
+                list(range(1, 501)),
+            )
+            self.assertEqual(tuple(db.iterdump()), before)
+            workspace.logger.record_event("preview.limit", {"number": 501})
+            before = tuple(db.iterdump())
+            self.assertIsNone(reader.preview("exp-test"))
+            self.assertEqual(tuple(db.iterdump()), before)
+
+    async def test_byte_limited_batch_cannot_become_a_complete_preview(self):
+        """An event-count fit is insufficient when the reader returns only a tail."""
+        _, reader, _ = self.cache(history())
+        reader.window_events = 500
+        with patch("core.journal.storage._PAGE_BYTES", 1):
+            self.assertIsNone(reader.preview("exp-test"))
+        preview = reader.preview("exp-test")
+        self.assertTrue(preview["complete"])
+        self.assertEqual(len(preview["entries"]), preview["boundary"]["event_count"])
+
+    async def test_append_during_preview_rejects_the_changed_boundary(self):
+        """A completed batch cannot hide an append before the boundary recheck."""
+        workspace, reader, _ = self.cache(history())
+        reader.window_events = 500
+        original = OperationLogger.read_events
+        appended = []
+
+        def read_page(source, *args, **kwargs):
+            result = original(source, *args, **kwargs)
+            if not appended:
+                appended.append(
+                    workspace.logger.record_event("preview.concurrent", {"new": True})
+                )
+            return result
+
+        with patch.object(OperationLogger, "read_events", read_page):
+            self.assertIsNone(reader.preview("exp-test"))
+        self.assertEqual(len(appended), 1)
+        preview = reader.preview("exp-test")
+        self.assertTrue(preview["complete"])
+        self.assertEqual(preview["entries"][-1]["event_id"], appended[0])
 
     async def test_historical_revision_is_not_replaced_by_latest_template(self):
         """T036/T059: each cycle retains the template revision recorded for it."""

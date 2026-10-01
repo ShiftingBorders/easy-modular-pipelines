@@ -76,7 +76,9 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
 
             async def finish_before_connect(attempt, timeout):
                 self.assertEqual(attempt.request_id, request_id)
-                self.assertIsNone(runner._journal.client.read_command_result(request_id))
+                self.assertIsNone(
+                    runner._journal.client.read_command_result(request_id)
+                )
                 gate.touch()
                 record = await wait_until(
                     lambda: runner._journal.client.read_command_result(request_id),
@@ -85,7 +87,9 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(record["author"], "participant")
                 self.assertEqual(record["outcome"], "succeeded")
                 published_responses.append(record["response"])
-                await wait_until(lambda: not attempt.endpoint_path.exists(), timeout=timeout)
+                await wait_until(
+                    lambda: not attempt.endpoint_path.exists(), timeout=timeout
+                )
                 try:
                     await connect(attempt, timeout)
                 except FileNotFoundError as error:
@@ -97,7 +101,9 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                 await runner._stages._connection.close()
                 reply = await step
 
-            self.assertTrue(connection_errors, "The real endpoint connection must fail.")
+            self.assertTrue(
+                connection_errors, "The real endpoint connection must fail."
+            )
             self.assertEqual(reply["result"], "success", reply)
             state = runner._state
             self.assertIsNone(state.active_attempt, runner.get_state())
@@ -111,7 +117,8 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state.stage_attempt_numbers[stage["stage_id"]], 1)
             trace = state.experiment_directory / "shared_data/trace.jsonl"
             entries = [
-                json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
+                json.loads(line)
+                for line in trace.read_text(encoding="utf-8").splitlines()
             ]
             starts = [entry for entry in entries if entry["event"] == "start"]
             self.assertEqual(len(starts), 1)
@@ -469,7 +476,8 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
 
     async def _probe(self, fault: str):
         module = self.workspace.module(f"probe-{fault}")
-        stage = self.workspace.stage(module)
+        settings = {"gate": str(self.workspace.gate())} if fault == "timeout" else {}
+        stage = self.workspace.stage(module, settings=settings)
         assembler = ExperimentAssembler(self.workspace.root, self.workspace.manager)
         state = await assembler.assemble(
             self.workspace.write_template(self.workspace.template([stage])), fault
@@ -592,23 +600,18 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
     ):
         """B10: the independent executor enforces its deadline."""
         async with asyncio.timeout(30):
-            gate = self.workspace.gate()
-            await self.session.launch(
-                self.workspace.template(
-                    [self.workspace.stage(settings={"gate": str(gate)}, timeout=1)]
-                )
-            )
-            step = self.session.post("step")
-            directory, ready = await self.session.ready_attempt()
-            reply = await step
-            self.assertEqual(reply["result"], "fail")
+            state, directory, process, output = await self._probe("timeout")
+            ready = read_json(directory / "ready.json")
             self.assertFalse(process_running(ready["pid"]))
+            result = journal_result(state, directory)["response"]
+            self.assertEqual(result["result"], "fail")
             self.assertEqual(
-                journal_result(self.session.runner._state, directory)["response"][
-                    "execution"
-                ]["interruption_reason"],
+                result["execution"]["interruption_reason"],
                 "timeout",
             )
+            (directory / "release-executor").touch()
+            await asyncio.wait_for(asyncio.shield(output), 5)
+            self.assertEqual(process.returncode, 0)
 
     async def test_runner_deadline_ignores_a_late_success(self):
         """B10: runner T+margin remains effective when executor timeout is suppressed."""
