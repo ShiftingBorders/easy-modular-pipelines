@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from core.journal.events import validate_context
+from core.models.resource_settings import CollectorConfiguration
 from core.primitives.json_files import read_json
 from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
-    require_number,
     require_text,
 )
 
@@ -44,57 +43,13 @@ class CollectorSettings:
     def load(cls, path: Path) -> CollectorSettings:
         if not path.is_absolute():
             raise ValueError("Collector settings path must be absolute.")
-        document = read_json(path)
-        document.setdefault("gpu_interval_seconds", 5)
-        if document.keys() != {field.name for field in fields(cls)}:
-            raise ValueError(
-                "Collector settings require exactly the documented fields."
-            )
-        for name, value in document.items():
-            if name == "disk_path":
-                document[name] = _resolve_disk_path(value, name, path)
-                continue
-            if name == "network_interface":
-                if value is not None:
-                    require_text(value, name)
-                continue
-            if name == "network_reference_address":
-                ipaddress.IPv4Address(require_text(value, name))
-                continue
-            if name == "restart_delays_seconds":
-                _validate_restart_delays(value, name)
-                continue
-            if require_number(value, name) <= 0:
-                raise ValueError(f"{name} must be positive.")
-        for name in ("max_buffer_bytes", "stale_after_intervals"):
-            if type(document[name]) is not int:
-                raise TypeError(f"{name} must be an integer.")
-        if document["max_buffer_bytes"] < 4096:
-            raise ValueError("max_buffer_bytes must allow at least 4096 bytes.")
-        if document["sample_interval_seconds"] < 0.1:
-            raise ValueError("sample_interval_seconds must be at least 0.1.")
-        if document["heartbeat_timeout_seconds"] <= document["status_interval_seconds"]:
-            raise ValueError("Heartbeat timeout must exceed the status interval.")
-        if document["logging_busy_timeout_seconds"] > 60:
-            raise ValueError("logging_busy_timeout_seconds must not exceed 60.")
+        document = CollectorConfiguration.model_validate(read_json(path)).model_dump()
+        configured = Path(document["disk_path"])
+        document["disk_path"] = str(
+            configured if configured.is_absolute() else (path.parent / configured).resolve()
+        )
+        # Preserve the public dataclass/asdict contract used by collector IPC clients.
         return cls(**document)
-
-
-def _resolve_disk_path(value: object, name: str, path: Path) -> str:
-    configured = Path(require_text(value, name))
-    return str(
-        configured if configured.is_absolute() else (path.parent / configured).resolve()
-    )
-
-
-def _validate_restart_delays(value: object, name: str) -> None:
-    if type(value) is not list or not value:
-        raise ValueError("restart_delays_seconds must be a nonempty array.")
-    for delay in value:
-        if require_number(delay, name) <= 0:
-            raise ValueError("Restart delays must be positive.")
-    if value != sorted(value):
-        raise ValueError("Restart delays must be nondecreasing.")
 
 
 @dataclass(frozen=True)

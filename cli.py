@@ -13,11 +13,15 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Self
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import httpx
 
+from core.models.client_settings import (
+    ClientConfiguration,
+    ClientConnectionConfiguration,
+)
 from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
@@ -109,6 +113,10 @@ def command_receipt(value: object) -> JsonObject:
 
 
 def load_settings(config_path: Path | None, overrides: JsonObject) -> JsonObject:
+    return _load_settings(config_path, overrides).model_dump()
+
+
+def _load_settings(config_path: Path | None, overrides: JsonObject) -> ClientConfiguration:
     if config_path is not None and not config_path.is_absolute():
         raise ValueError("config_path must be absolute.")
     settings = copy_json_object(
@@ -123,60 +131,30 @@ def load_settings(config_path: Path | None, overrides: JsonObject) -> JsonObject
             raise ValueError(f"Unknown CLI settings: {sorted(custom.keys() - fields)}")
         settings.update(custom)
     settings.update(overrides)
-    if type(settings["schema_version"]) is not int or settings["schema_version"] != 1:
-        raise ValueError("Only CLI settings schema_version 1 is supported.")
-    url = urlsplit(require_text(settings["server_url"], "server_url"))
-    if (
-        url.scheme not in ("http", "https")
-        or not url.hostname
-        or url.username is not None
-        or url.password is not None
-        or url.query
-        or url.fragment
-    ):
-        raise ValueError(
-            "server_url must be an HTTP(S) base URL without credentials, query or fragment."
-        )
-    if url.port is not None and not 1 <= url.port <= 65535:
-        raise ValueError("Invalid server_url port.")
-    if settings["token_env"] is not None:
-        require_text(settings["token_env"], "token_env")
-    for name in (
-        "request_timeout_seconds",
-        "wait_timeout_seconds",
-        "poll_interval_seconds",
-    ):
-        if require_number(settings[name], name) <= 0:
-            raise ValueError(f"{name} must be positive.")
-    value = settings["max_response_bytes"]
-    if type(value) is not int or value < 1:
-        raise ValueError("max_response_bytes must be a positive integer.")
-    return settings
+    return ClientConfiguration.model_validate(settings)
 
 
 class APIClient:
     """Own only an HTTP connection; closing it never sends a runtime stop."""
 
-    def __init__(self, settings: JsonObject) -> None:
-        self.url = require_text(settings["server_url"], "server_url").rstrip("/")
-        self.timeout = require_number(
-            settings["request_timeout_seconds"], "request_timeout_seconds"
+    def __init__(self, settings: JsonObject | ClientConnectionConfiguration) -> None:
+        validated = (
+            settings if isinstance(settings, ClientConnectionConfiguration)
+            else ClientConnectionConfiguration.model_validate(settings)
         )
-        self.wait_timeout = require_number(
-            settings["wait_timeout_seconds"], "wait_timeout_seconds"
-        )
-        self.interval = require_number(
-            settings["poll_interval_seconds"], "poll_interval_seconds"
-        )
-        value = settings["max_response_bytes"]
-        if type(value) is not int or value < 1:
-            raise ValueError("max_response_bytes must be positive.")
-        self.max_bytes = value
-        token_env = settings["token_env"]
+        self._configure(validated)
+
+    def _configure(self, settings: ClientConnectionConfiguration) -> None:
+        self.url = settings.server_url.rstrip("/")
+        self.timeout = settings.request_timeout_seconds
+        self.wait_timeout = settings.wait_timeout_seconds
+        self.interval = settings.poll_interval_seconds
+        self.max_bytes = settings.max_response_bytes
+        token_env = settings.token_env
         self.token = (
             None
             if token_env is None
-            else os.environ.get(require_text(token_env, "token_env"))
+            else os.environ.get(token_env)
         )
         if token_env is not None and not self.token:
             raise ValueError(f"CLI token environment variable is empty: {token_env}")
@@ -1081,7 +1059,7 @@ async def execute(
 
 async def run_command(
     options: argparse.Namespace,
-    settings: JsonObject,
+    settings: JsonObject | ClientConfiguration,
     *,
     as_json: bool,
     interactive: bool = False,
@@ -1127,7 +1105,7 @@ def report_error(error: Exception, *, as_json: bool) -> int:
 
 
 def shell(
-    parser: argparse.ArgumentParser, settings: JsonObject, *, as_json: bool
+    parser: argparse.ArgumentParser, settings: JsonObject | ClientConfiguration, *, as_json: bool
 ) -> int:
     print(
         "Connected client shell. Commands run asynchronously by default; use result ID or --wait. quit/EOF disconnect only.",
@@ -1204,7 +1182,7 @@ def main() -> None:
         if value is not None:
             overrides[name] = value
     try:
-        settings = load_settings(
+        settings = _load_settings(
             None if options.config is None else options.config.resolve(), overrides
         )
         code = (

@@ -5,11 +5,34 @@ from __future__ import annotations
 import ctypes
 import os
 import socket
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from core.primitives.paths import repository_root
+
 if TYPE_CHECKING:
     from core.primitives.json_values import JsonObject
+
+
+def module_process_arguments(argv: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Prepare SDK imports and the current uv interpreter without a PID wrapper.
+
+    Explicit executables keep their selection. The bare `python` command uses
+    this environment. On Windows, replicate CPython's venv redirector environment
+    while starting its base executable directly, so Popen.pid is the stage PID.
+    """
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(repository_root()), environment.get("PYTHONPATH")))
+    )
+    arguments = list(argv)
+    if arguments[0] == "python":
+        arguments[0] = sys.executable
+        if os.name == "nt" and sys.prefix != sys.base_prefix:
+            arguments[0] = sys._base_executable
+            environment["__PYVENV_LAUNCHER__"] = sys.executable
+    return arguments, environment
 
 
 def process_running(pid: int) -> bool:

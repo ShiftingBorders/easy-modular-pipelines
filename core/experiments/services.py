@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -33,8 +32,7 @@ from core.participants.connection import ParticipantConnection
 from core.participants.protocol import PROTOCOL_VERSION, error_details
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
-from core.primitives.paths import repository_root
-from core.primitives.processes import process_identity
+from core.primitives.processes import module_process_arguments, process_identity
 
 type ServiceAction = Literal["ready", "pause", "stop"]
 
@@ -265,15 +263,11 @@ class ServiceManager:
                 (directory / "stdout.log").open("ab") as stdout,
                 (directory / "stderr.log").open("ab") as stderr,
             ):
-                environment = dict(os.environ)
-                library = str(repository_root())
-                environment["PYTHONPATH"] = os.pathsep.join(
-                    filter(None, (library, environment.get("PYTHONPATH")))
-                )
+                argv, environment = module_process_arguments(launch["argv"])
                 spawn = asyncio.create_task(
                     asyncio.to_thread(
                         subprocess.Popen,
-                        launch["argv"],
+                        argv,
                         cwd=launch["code_directory"],
                         env=environment,
                         stdin=subprocess.DEVNULL,

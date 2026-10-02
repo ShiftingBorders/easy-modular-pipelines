@@ -1,6 +1,5 @@
 """Archive storage through SeaweedFS Filer, independent of server lifecycle."""
 
-import math
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -8,6 +7,7 @@ from urllib.parse import quote
 
 import httpx
 
+from core.models.storage_settings import FilerConfiguration
 from core.storage.errors import (
     StorageAccessError,
     StorageCapacityError,
@@ -41,29 +41,17 @@ class SeaweedDB:
         timeout: float = 60,
         before_upload: Callable[[int], None] | None = None,
     ) -> None:
-        if not isinstance(filer_url, str):
-            raise StorageConfigurationError("filer_url must be an HTTP(S) URL.")
         try:
-            url = httpx.URL(filer_url)
-        except httpx.InvalidURL as error:
-            raise StorageConfigurationError("Invalid Filer URL.") from error
-        if url.scheme not in {"http", "https"} or not url.host:
-            raise StorageConfigurationError("filer_url must be an HTTP(S) URL.")
-        for name, value in (("max_archive_gb", max_archive_gb), ("timeout", timeout)):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise StorageConfigurationError(
-                    f"{name} must be a finite positive number."
-                )
+            settings = FilerConfiguration(
+                filer_url=filer_url, max_archive_gb=max_archive_gb, timeout=timeout,
+            )
+        except (ValueError, TypeError) as error:
+            raise StorageConfigurationError(str(error)) from error
         if before_upload is not None and not callable(before_upload):
             raise StorageConfigurationError("before_upload must be callable.")
-        self.max_archive_gb = max_archive_gb
+        self.max_archive_gb = settings.max_archive_gb
         self._before_upload = before_upload
-        self._client = httpx.Client(base_url=url, timeout=timeout)
+        self._client = httpx.Client(base_url=settings.filer_url, timeout=settings.timeout)
 
     def close(self) -> None:
         """Close this client's connections without stopping the Filer server."""

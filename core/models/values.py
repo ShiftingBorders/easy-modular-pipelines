@@ -1,0 +1,34 @@
+"""Shared scalar constraints without changing established input conversions."""
+
+from pathlib import Path
+from typing import Annotated
+
+from pydantic import BeforeValidator, Field, ValidationInfo
+
+from core.primitives.json_values import require_number, require_text
+
+
+def _text(value: object, info: ValidationInfo) -> str:
+    return require_text(value, info.field_name or "value")
+
+
+def _number(value: object, info: ValidationInfo) -> int | float:
+    return require_number(value, info.field_name or "value")
+
+
+def _absolute_path(value: object, info: ValidationInfo) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise TypeError(f"{info.field_name} must be a string or Path.")
+    path = Path(value)
+    if not path.is_absolute() or "\x00" in str(path):
+        raise ValueError(f"{info.field_name} must be an absolute filesystem path.")
+    return path
+
+
+Text = Annotated[str, BeforeValidator(_text)]
+Number = Annotated[int | float, BeforeValidator(_number)]
+PositiveNumber = Annotated[Number, Field(gt=0)]
+PositiveInteger = Annotated[int, Field(strict=True, gt=0)]
+NonnegativeInteger = Annotated[int, Field(strict=True, ge=0)]
+SchemaVersionOne = Annotated[int, Field(strict=True, ge=1, le=1)]
+AbsolutePath = Annotated[Path, BeforeValidator(_absolute_path)]

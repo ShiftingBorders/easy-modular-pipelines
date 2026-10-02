@@ -27,7 +27,7 @@ from core.journal.events import (
     validate_context,
 )
 from core.journal.measurements import _validate_measurement
-from core.journal.settings import load_logging_settings
+from core.journal.settings import _load_logging_settings
 from core.journal.storage import SQLiteEventStore
 from core.journal.streams import _write_stderr_best_effort
 from core.primitives.json_values import (
@@ -77,34 +77,31 @@ class OperationLogger:
                 raise LoggingStateError(
                     "Logger is already open; close it before reopening."
                 )
-            settings, context = load_logging_settings(self._config_path)
-            if self._read_only and settings["open_mode"] != "existing":
+            settings, context = _load_logging_settings(self._config_path)
+            if self._read_only and settings.open_mode != "existing":
                 raise LoggingStateError(
                     "A read-only client requires an existing journal."
                 )
-            db_path = Path(settings["db_path"])
+            db_path = settings.db_path
             context.setdefault("source", "library")
             # A context exported by a parent process must not identify this writer as it.
             context["host_name"] = socket.gethostname()
             context["process_id"] = self._process_id
             context = validate_context(context)
             reopening = db_path == self._journal_path
-            expected = settings["expected_journal"]
             if reopening and self._journal_info is not None:
-                expected = {
-                    name: self._journal_info[name]
-                    for name in ("journal_id", "generation")
-                }
-            store = SQLiteEventStore(
-                db_path,
-                busy_timeout_seconds=settings["busy_timeout_seconds"],
-                max_event_bytes=settings["max_event_bytes"],
-                open_mode="existing" if reopening else settings["open_mode"],
-                min_free_bytes=settings["min_free_bytes"],
-                expected_journal=expected,
-                diagnostic_context=context,
-                read_only=self._read_only,
-            )
+                from core.models.journal_settings import JournalConfiguration
+
+                # Reopening intentionally replaces the file's original create identity.
+                settings = JournalConfiguration.model_validate({
+                    **settings.model_dump(exclude={"filtered_refresh_interval_seconds"}),
+                    "open_mode": "existing",
+                    "expected_journal": {
+                        name: self._journal_info[name]
+                        for name in ("journal_id", "generation")
+                    },
+                })
+            store = SQLiteEventStore._from_settings(settings, context, self._read_only)
             producer_instance_id = uuid4().hex
             expected_identity = (
                 self._journal_identity if db_path == self._journal_path else None

@@ -61,11 +61,24 @@ def _validate_config(config: object) -> HashDBConfig:
             is invalid.
     """
     try:
-        return HashDBConfig.model_validate(config)
+        settings = HashDBConfig.model_validate(config)
     except ValidationError as error:
         raise StorageConfigurationError(
             f"Invalid database configuration: {error}"
         ) from error
+
+    # Filesystem state is checked at use time, outside Pydantic data validators.
+    try:
+        if not settings.schema_path.is_file():
+            raise ValueError("schema_path must reference an existing JSON file")
+        if settings.db_path.exists() and not settings.db_path.is_file():
+            raise ValueError("db_path must not reference a directory")
+        for parent in settings.db_path.parents:
+            if parent.exists() and not parent.is_dir():
+                raise ValueError("a parent path is not a directory")
+    except (OSError, ValueError) as error:
+        raise StorageConfigurationError(f"Invalid database configuration: {error}") from error
+    return settings
 
 
 def _validate_schema_file(schema_path: Path) -> dict:

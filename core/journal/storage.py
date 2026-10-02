@@ -1,5 +1,7 @@
 """One durable journal format, command reconciliation and identified recovery."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -9,6 +11,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from core.journal.diagnostics import (
@@ -50,14 +53,17 @@ from core.journal.schema import (
     _matches_table_definition,
 )
 from core.journal.streams import _write_stderr_best_effort
+from core.models.journal_options import JournalOptions, validate_journal_options
 from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
-    require_number,
     require_text,
 )
 
 _PAGE_BYTES = 16777216
+
+if TYPE_CHECKING:
+    from core.models.journal_settings import JournalConfiguration
 
 
 class SQLiteEventStore:
@@ -79,35 +85,36 @@ class SQLiteEventStore:
             raise TypeError("read_only must be a boolean.")
         if read_only and open_mode != "existing":
             raise ValueError("Read-only access requires an existing journal.")
+        settings = validate_journal_options(
+            db_path=db_path, busy_timeout_seconds=busy_timeout_seconds,
+            max_event_bytes=max_event_bytes, open_mode=open_mode,
+            min_free_bytes=min_free_bytes, expected_journal=expected_journal,
+        )
+        context = validate_context(
+            {} if diagnostic_context is None else diagnostic_context,
+        )
+        self._configure(settings, context, read_only)
+
+    @classmethod
+    def _from_settings(
+        cls, settings: JournalConfiguration, context: JsonObject, read_only: bool,
+    ) -> SQLiteEventStore:
+        """Use settings already validated at the configuration-file boundary."""
+        store = cls.__new__(cls)
+        store._configure(settings, context, read_only)
+        return store
+
+    def _configure(
+        self, settings: JournalConfiguration | JournalOptions,
+        diagnostic_context: JsonObject, read_only: bool,
+    ) -> None:
         self._read_only = read_only
-        if not isinstance(db_path, (str, Path)):
-            raise TypeError("db_path must be a string or Path.")
-        path = Path(db_path)
-        if not path.is_absolute() or "\x00" in str(path):
-            raise ValueError("db_path must be an absolute filesystem path.")
-        timeout = require_number(busy_timeout_seconds, "busy_timeout_seconds")
-        if not 0 < timeout <= 60:
-            raise ValueError(
-                "busy_timeout_seconds must be greater than 0 and at most 60."
-            )
-        if max_event_bytes is not None and (
-            type(max_event_bytes) is not int or max_event_bytes < 1
-        ):
-            raise ValueError("max_event_bytes must be a positive integer or None.")
-        if open_mode not in ("create", "existing"):
-            raise ValueError("open_mode must be create or existing.")
-        if type(min_free_bytes) is not int or min_free_bytes < 0:
-            raise ValueError("min_free_bytes must be a nonnegative integer.")
-        if open_mode == "existing":
-            expected_journal = validate_journal_identity(expected_journal)
-        elif expected_journal is not None:
-            raise ValueError("create requires expected_journal=None.")
-        self.db_path = path
-        self._timeout = float(timeout)
-        self._max_event_bytes = max_event_bytes
-        self._expected_journal = expected_journal
-        self._open_mode = open_mode
-        self._min_free_bytes = min_free_bytes
+        self.db_path = settings.db_path
+        self._timeout = float(settings.busy_timeout_seconds)
+        self._max_event_bytes = settings.max_event_bytes
+        self._expected_journal = settings.expected_journal
+        self._open_mode = settings.open_mode
+        self._min_free_bytes = settings.min_free_bytes
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.RLock()
         self._process_id = os.getpid()
@@ -115,9 +122,7 @@ class SQLiteEventStore:
         self._file_identity: tuple[int, int] | None = None
         self._journal_id: str | None = None
         self._generation: str | None = None
-        self._diagnostic_context = validate_context(
-            {} if diagnostic_context is None else diagnostic_context,
-        )
+        self._diagnostic_context = dict(diagnostic_context)
 
     def _check_process(self) -> None:
         if os.getpid() != self._process_id:

@@ -7,6 +7,7 @@ the API.
 | Package | Responsibility and entry points |
 | --- | --- |
 | `core.primitives` | JSON values and files, native file locks, process identity, task completion, and locations shipped with the framework. |
+| `core.models` | Pydantic configuration and boundary models, grouped by contract. Validators describe data; file access and runtime effects remain with their owners. |
 | `core.storage` | `hash_db.HashDB`, `seaweed_client.SeaweedDB`, `seaweed_process.SeaweedProcess`, storage contracts, configuration, and errors. |
 | `core.modules` | `manager.ModuleManager`, module manifests, package validation, and installation filesystem operations. |
 | `core.journal` | `logger.OperationLogger`, events and settings, SQLite storage, filtered views, captured streams, and derived history caches. |
@@ -25,6 +26,16 @@ use modules, participants, and journals. Storage, journals, participants, and
 resources do not import the DAG runner. Primitives have no dependencies on
 those higher-level packages. JSON types have one definition in
 `core.primitives.json_values`.
+
+All Pydantic model definitions live in `core/models/`. Existing imports from
+`core.storage.hash_config` and `core.storage.seaweed_config` remain supported.
+Configuration consumers receive validated models where compatible with their
+public contracts. `CollectorSettings` retains its public dataclass form.
+
+The low-level `SQLiteEventStore` constructor validates scalar arguments with
+standard-library rules and performs no file I/O. File-based journal settings
+use Pydantic after their explicit read, reusing those same opening rules.
+Journal imports therefore do not trigger Pydantic plugin metadata discovery.
 
 Private operations that validate or prepare explicit inputs live beside their
 owner in focused modules. The owning classes retain state changes, transactions,

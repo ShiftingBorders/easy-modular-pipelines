@@ -17,8 +17,7 @@ from core.participants.protocol import participant_identity
 from core.participants.server import ParticipantServer
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_number
-from core.primitives.paths import repository_root
-from core.primitives.processes import process_identity
+from core.primitives.processes import module_process_arguments, process_identity
 
 
 class StageExecutor:
@@ -227,14 +226,10 @@ class StageExecutor:
         return {**response, "execution": execution}
 
     async def _start_process(self) -> None:
-        environment = dict(os.environ)
-        library_root = str(repository_root())
-        environment["PYTHONPATH"] = os.pathsep.join(
-            filter(None, (library_root, environment.get("PYTHONPATH")))
-        )
+        argv, environment = module_process_arguments(self._launch["argv"])
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(
-                *self._launch["argv"],
+                *argv,
                 cwd=self._launch["code_directory"],
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,

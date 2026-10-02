@@ -97,6 +97,9 @@ if __name__ == "__main__":
 The executor appends `--emp-context <absolute-json-path>` and supplies the core
 SDK through `PYTHONPATH`. Python examples use the project's `uv` environment;
 `-B` prevents bytecode writes into the immutable module directory.
+The bare command `python` uses the runner's interpreter from that environment.
+An explicit executable path selects your own interpreter; provide the framework's
+dependencies in that environment.
 
 Do not run this entry point without a runner-created context. StageClient
 connects to its assigned executor; an arbitrary JSON file is not a standalone

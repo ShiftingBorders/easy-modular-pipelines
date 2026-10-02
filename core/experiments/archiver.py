@@ -30,6 +30,7 @@ from core.experiments.archive_inputs import (
 from core.experiments.assembler import ExperimentAssembler, find_experiment
 from core.experiments.state import RunnerState
 from core.journal.logger import OperationLogger
+from core.models.archive_settings import ArchiveConfiguration
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
@@ -63,32 +64,7 @@ class ExperimentArchiver:
             if config_path is None
             else config_path
         )
-        settings = read_json(config)
-        if settings.keys() != {
-            "schema_version",
-            "max_archive_bytes",
-            "max_unpacked_bytes",
-            "max_members",
-            "max_manifest_bytes",
-            "max_decompression_memory_bytes",
-            "min_free_bytes",
-            "compression_preset",
-        }:
-            raise ValueError("Invalid experiment archiver settings fields.")
-        for name, value in settings.items():
-            minimum = 0 if name in ("min_free_bytes", "compression_preset") else 1
-            if type(value) is not int or value < minimum:
-                raise ValueError(f"Invalid archiver setting: {name}")
-        self._settings: dict[str, int] = {
-            key: value for key, value in settings.items() if isinstance(value, int)
-        }
-        if (
-            self._settings["schema_version"] != 1
-            or self._settings["compression_preset"] > 9
-        ):
-            raise ValueError(
-                "Unsupported archiver settings version or compression preset."
-            )
+        self._settings = ArchiveConfiguration.model_validate(read_json(config))
         self._busy = False
 
     async def create(self, state: RunnerState, archive_path: Path) -> JsonObject:
@@ -207,7 +183,7 @@ class ExperimentArchiver:
                     )
 
     def _space(self, folder: Path, required: int = 0) -> None:
-        if shutil.disk_usage(folder).free < required + self._settings["min_free_bytes"]:
+        if shutil.disk_usage(folder).free < required + self._settings.min_free_bytes:
             raise StorageCapacityError(f"Insufficient free space at {folder}.")
 
     def _workspace(self, parent: Path) -> tempfile.TemporaryDirectory:
@@ -305,7 +281,7 @@ class ExperimentArchiver:
                 if name.casefold() in names:
                     raise ValueError("Archive member names collide ignoring case.")
                 names.add(name.casefold())
-                if len(names) > self._settings["max_members"]:
+                if len(names) > self._settings.max_members:
                     raise StorageCapacityError("Too many archive members.")
                 if entry.is_dir():
                     directories.append(name)
@@ -319,7 +295,7 @@ class ExperimentArchiver:
     def _file_inventory(self, entry: Path, total: int) -> tuple[int, JsonObject]:
         size = entry.stat().st_size
         total += size
-        if total > self._settings["max_unpacked_bytes"]:
+        if total > self._settings.max_unpacked_bytes:
             raise StorageCapacityError("Unpacked archive size exceeds its limit.")
         with entry.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -349,7 +325,7 @@ class ExperimentArchiver:
             raise ValueError("Source files changed while copying the archive payload.")
 
     def _copy_file(self, source: Path, target: Path) -> None:
-        if source.stat().st_size > self._settings["max_unpacked_bytes"]:
+        if source.stat().st_size > self._settings.max_unpacked_bytes:
             raise StorageCapacityError("Source file exceeds the unpacked size limit.")
         target.parent.mkdir(parents=True, exist_ok=True)
         self._space(target.parent, source.stat().st_size)
@@ -454,14 +430,14 @@ class ExperimentArchiver:
         encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
-        if len(encoded) > self._settings["max_manifest_bytes"]:
+        if len(encoded) > self._settings.max_manifest_bytes:
             raise StorageCapacityError("Archive manifest exceeds its size limit.")
         (payload / "manifest.json").write_bytes(encoded)
         return payload, manifest
 
     def _pack(self, payload: Path, archive: Path) -> None:
         directories, files = self._inventory(payload)
-        if len(directories) + len(files) > self._settings["max_members"]:
+        if len(directories) + len(files) > self._settings.max_members:
             raise StorageCapacityError("Too many archive members including manifest.")
         unpacked = archive.with_name("uncompressed.tar")
         with tarfile.open(
@@ -480,14 +456,14 @@ class ExperimentArchiver:
                     (source.stat().st_size if source.is_file() else 0) + 10240,
                 )
                 stream.add(source, arcname=name, recursive=False)
-        compressor = lzma.LZMACompressor(preset=self._settings["compression_preset"])
+        compressor = lzma.LZMACompressor(preset=self._settings.compression_preset)
         written = 0
         with unpacked.open("rb") as source, archive.open("xb") as destination:
             while True:
                 block = source.read(1024 * 1024)
                 data = compressor.compress(block) if block else compressor.flush()
                 written += len(data)
-                if written > self._settings["max_archive_bytes"]:
+                if written > self._settings.max_archive_bytes:
                     raise StorageCapacityError(
                         "Compressed archive size exceeds its limit."
                     )
@@ -501,11 +477,11 @@ class ExperimentArchiver:
         """Bound both decoder memory and disk use before parsing any tar metadata."""
         decoder = lzma.LZMADecompressor(
             format=lzma.FORMAT_XZ,
-            memlimit=self._settings["max_decompression_memory_bytes"],
+            memlimit=self._settings.max_decompression_memory_bytes,
         )
         limit = (
-            self._settings["max_unpacked_bytes"]
-            + self._settings["max_members"] * 1024
+            self._settings.max_unpacked_bytes
+            + self._settings.max_members * 1024
             + 10240
         )
         compressed = unpacked = 0
@@ -515,7 +491,7 @@ class ExperimentArchiver:
                 if decoder.needs_input and not block:
                     raise ValueError("Truncated XZ stream.")
                 compressed += len(block)
-                if compressed > self._settings["max_archive_bytes"]:
+                if compressed > self._settings.max_archive_bytes:
                     raise StorageCapacityError(
                         "Compressed archive size exceeds its limit."
                     )
@@ -534,7 +510,7 @@ class ExperimentArchiver:
         archive = _path(archive_path)
         if not archive.is_file():
             raise FileNotFoundError(archive)
-        if archive.stat().st_size > self._settings["max_archive_bytes"]:
+        if archive.stat().st_size > self._settings.max_archive_bytes:
             raise StorageCapacityError("Compressed archive size exceeds its limit.")
         target.mkdir()
         unpacked_tar = target.parent / "archive.tar"
@@ -564,17 +540,17 @@ class ExperimentArchiver:
                 if name.casefold() in names:
                     raise ValueError("Duplicate or case-colliding archive member.")
                 names.add(name.casefold())
-                if len(names) > self._settings["max_members"]:
+                if len(names) > self._settings.max_members:
                     raise StorageCapacityError("Too many archive members.")
                 _validate_member_header(header, member)
                 total += member.size
-                if total > self._settings["max_unpacked_bytes"]:
+                if total > self._settings.max_unpacked_bytes:
                     raise StorageCapacityError(
                         "Unpacked archive size exceeds its limit."
                     )
                 if (
                     name == "manifest.json"
-                    and member.size > self._settings["max_manifest_bytes"]
+                    and member.size > self._settings.max_manifest_bytes
                 ):
                     raise StorageCapacityError(
                         "Archive manifest exceeds its size limit."
