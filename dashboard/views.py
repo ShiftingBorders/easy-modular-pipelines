@@ -19,6 +19,7 @@ from core.models.dashboard_resources import (
     CollectorSamples,
     CollectorStatus,
 )
+from core.models.dashboard_upstream import LiveState
 from core.models.server_receipts import CommandReceipt
 from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
@@ -441,7 +442,8 @@ class DashboardViews:
             if time.monotonic() - self._live_at < 0.5:
                 return dict(self._live)
             try:
-                self._live = await self.system.read("state")
+                observed = await self._read_live_state()
+                self._live = observed.model_dump(exclude_unset=True)
                 self._live["available"] = True
             except SystemAPIError as error:
                 self._live = {
@@ -452,6 +454,14 @@ class DashboardViews:
                 }
             self._live_at = time.monotonic()
             return dict(self._live)
+
+    async def _read_live_state(self) -> LiveState:
+        try:
+            return LiveState.model_validate(await self.system.read("state"))
+        except (TypeError, ValueError) as error:
+            raise SystemAPIError(
+                "invalid_response", "System API returned an invalid live state.", 502
+            ) from error
 
     async def _poll_source(self, source: str) -> None:
         while True:

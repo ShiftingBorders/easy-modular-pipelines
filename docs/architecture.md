@@ -203,6 +203,13 @@ separate model that preserves minimal legacy history. The owner persists a
 submission before POST, validates complete upstream receipts before consuming
 their state, and keeps unknown outcomes reconcilable without resubmission.
 
+Dashboard connection settings share the same URL, timeout, response-budget and
+token-environment rules with file configuration. The API client consumes that
+checked subset; environment lookup and HTTP stream ownership remain explicit.
+Live state/services are checked before publishing availability, with partial
+legacy read metadata preserved. Failed-HTTP diagnostic decoding uses separate
+models and retains existing fallback messages/status mappings.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
