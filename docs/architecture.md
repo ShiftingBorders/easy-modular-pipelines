@@ -109,6 +109,12 @@ take boundary snapshots, finish a step or DAG, and launch the next stage.
 Unknown ownership, conditional stop and final completion keep distinct loop
 control paths.
 
+Recovery keeps selection, ownership and checkpoint-acceptance policy with the
+runner. The journal module reads bounded checkpoint/launch evidence, while the
+state module reconstructs attempt data without I/O. Minimal attempt ownership
+is bound before optional files are read, so failure handling still confirms
+termination before repeating unresolved work.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

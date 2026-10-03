@@ -245,3 +245,48 @@ async def _read_reload_progress(
         if checkpoint["cursor"] >= boundary or not page["has_more"]:
             break
     return completed
+
+
+async def _read_recovery_evidence(
+    logger: OperationLogger, experiment_id: str
+) -> tuple[JsonObject | None, list[JsonObject]]:
+    checkpoint = None
+    latest = None
+    launches = []
+    boundary = None
+    while True:
+        page = await asyncio.to_thread(
+            logger.read_events, checkpoint, limit=1000
+        )
+        if boundary is None:
+            boundary = page["boundary"]["cursor"]
+        for entry in page["events"]:
+            if entry["cursor"] > boundary:
+                break
+            event = entry["event"]
+            if event["context"].get("experiment_id") != experiment_id:
+                continue
+            if event["event_type"] == "experiment.restored":
+                latest, launches = None, []
+            elif event["event_type"] in (
+                "runner.checkpoint",
+                "rebuild.checkpoint",
+            ):
+                latest, launches = event["data"], []
+            elif (
+                event["event_type"] == "control.intent"
+                and event["data"].get("action") == "start_stage"
+            ):
+                launches.append(
+                    {
+                        **event["context"],
+                        "queued_monotonic": event["data"][
+                            "queued_monotonic"
+                        ],
+                        "queued_at": event["data"]["queued_at"],
+                    }
+                )
+        checkpoint = page["checkpoint"]
+        if checkpoint["cursor"] >= boundary or not page["has_more"]:
+            break
+    return latest, launches

@@ -20,6 +20,7 @@ from core.experiments.assembler import ExperimentAssembler, find_experiment
 from core.experiments.journal import (
     RunnerJournal,
     _read_recovery_checkpoint,
+    _read_recovery_evidence,
     _read_reload_progress,
 )
 from core.experiments.launch import ModuleLauncher
@@ -39,8 +40,9 @@ from core.experiments.state import (
     RunnerState,
     RunnerStateStore,
     ServiceInstance,
-    StageAttempt,
     StageOutcome,
+    _apply_recovered_attempt_context,
+    _attempt_from_launch,
     state_from_document,
 )
 from core.journal.events import LoggingError, encode_event
@@ -2015,6 +2017,85 @@ class ExperimentRunner:
         )
 
     async def recover(self, experiment_id: str) -> None:
+        await self._prepare_recovery_selection(experiment_id)
+        registry = read_json(self._project_root / "experiments.json")
+        try:
+            folder = RegistryEntry.model_validate(
+                {"folder": registry.get(experiment_id)}
+            ).folder
+        except (ValueError, TypeError) as error:
+            raise FileNotFoundError(f"Unknown experiment: {experiment_id}") from error
+        root = (self._project_root / "experiments" / folder).resolve()
+        if not root.is_relative_to((self._project_root / "experiments").resolve()):
+            raise ValueError("Experiment registry path escapes the project.")
+        marker = (
+            self._project_root / "controller/restore_transactions" / f"{folder}.json"
+        )
+        transaction = read_json(marker) if marker.is_file() else None
+        state = await self._load_recovery_state(root, experiment_id, transaction)
+        await self._services.close()
+        await self._stages.close()
+        self._journal.close()
+        self._state = state
+        self._requested_id = experiment_id
+        self._desired_mode = "paused"
+        self._continue_source = None
+        self._last_attempt = self._last_response = None
+        self._error = None
+        self._maintenance = True
+        self._maintenance_task = asyncio.current_task()
+        try:
+            if transaction is not None and transaction["phase"] != "complete":
+                if (
+                    self._resource_observer is not None
+                    and self._suspend_resources is None
+                ):
+                    raise RuntimeError(
+                        "Resource observer must provide a restoration barrier."
+                    )
+                source = (
+                    self._project_root / "experiments" / transaction["source_folder"]
+                    if transaction["clone"]
+                    else None
+                )
+                await self._snapshots.restore(
+                    state,
+                    transaction["snapshot_id"],
+                    source_directory=source,
+                    suspend_resources=self._suspend_resources,
+                    resume_transaction=True,
+                )
+                self._recover_live = False
+            else:
+                self._journal.open(state, create=False)
+                latest, launches = await _read_recovery_evidence(
+                    self._journal.client, experiment_id
+                )
+                self._adopt_recovery_checkpoint(state, root, latest)
+                rebuilding = state.pending_rebuild is not None
+                if rebuilding:
+                    await self._recover_interrupted_rebuild(state)
+                    launches = []
+                if launches:
+                    self._recover_launched_attempt(state, root, launches[-1])
+                self._journal.close()
+                self._journal.open(state, create=False)
+                self._recover_live = not rebuilding
+            await self._start_recovered_dag(state, experiment_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if self._error is None:
+                await self._fail(error, {})
+            raise
+        finally:
+            self._maintenance = False
+            self._maintenance_task = None
+            self._publish_resources()
+            if self._resume_resources is not None:
+                self._resume_resources()
+
+    async def _prepare_recovery_selection(self, experiment_id: str) -> None:
         if self._closed or self._maintenance:
             raise RuntimeError("Runner is closed or already restoring an experiment.")
         if (
@@ -2039,20 +2120,10 @@ class ExperimentRunner:
                 )
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
-        registry = read_json(self._project_root / "experiments.json")
-        try:
-            folder = RegistryEntry.model_validate(
-                {"folder": registry.get(experiment_id)}
-            ).folder
-        except (ValueError, TypeError) as error:
-            raise FileNotFoundError(f"Unknown experiment: {experiment_id}") from error
-        root = (self._project_root / "experiments" / folder).resolve()
-        if not root.is_relative_to((self._project_root / "experiments").resolve()):
-            raise ValueError("Experiment registry path escapes the project.")
-        marker = (
-            self._project_root / "controller/restore_transactions" / f"{folder}.json"
-        )
-        transaction = read_json(marker) if marker.is_file() else None
+
+    async def _load_recovery_state(
+        self, root: Path, experiment_id: str, transaction: JsonObject | None
+    ) -> RunnerState:
         if transaction is not None and transaction.get("phase") != "complete":
             state = state_from_document(root, transaction["stopped_state"])
         else:
@@ -2097,316 +2168,195 @@ class ExperimentRunner:
                     error, (FileNotFoundError, ProcessLookupError)
                 ) and getattr(error, "winerror", None) not in (87, 1168):
                     raise
-        await self._services.close()
-        await self._stages.close()
-        self._journal.close()
-        self._state = state
-        self._requested_id = experiment_id
-        self._desired_mode = "paused"
-        self._continue_source = None
-        self._last_attempt = self._last_response = None
-        self._error = None
-        self._maintenance = True
-        self._maintenance_task = asyncio.current_task()
-        try:
-            if transaction is not None and transaction["phase"] != "complete":
-                if (
-                    self._resource_observer is not None
-                    and self._suspend_resources is None
-                ):
-                    raise RuntimeError(
-                        "Resource observer must provide a restoration barrier."
-                    )
-                source = (
-                    self._project_root / "experiments" / transaction["source_folder"]
-                    if transaction["clone"]
-                    else None
-                )
-                await self._snapshots.restore(
-                    state,
-                    transaction["snapshot_id"],
-                    source_directory=source,
-                    suspend_resources=self._suspend_resources,
-                    resume_transaction=True,
-                )
-                self._recover_live = False
-            else:
-                self._journal.open(state, create=False)
-                checkpoint = None
-                latest = None
-                launches = []
-                boundary = None
-                while True:
-                    page = await asyncio.to_thread(
-                        self._journal.client.read_events, checkpoint, limit=1000
-                    )
-                    if boundary is None:
-                        boundary = page["boundary"]["cursor"]
-                    for entry in page["events"]:
-                        if entry["cursor"] > boundary:
-                            break
-                        event = entry["event"]
-                        if event["context"].get("experiment_id") != experiment_id:
-                            continue
-                        if event["event_type"] == "experiment.restored":
-                            latest, launches = None, []
-                        elif event["event_type"] in (
-                            "runner.checkpoint",
-                            "rebuild.checkpoint",
-                        ):
-                            latest, launches = event["data"], []
-                        elif (
-                            event["event_type"] == "control.intent"
-                            and event["data"].get("action") == "start_stage"
-                        ):
-                            launches.append(
-                                {
-                                    **event["context"],
-                                    "queued_monotonic": event["data"][
-                                        "queued_monotonic"
-                                    ],
-                                    "queued_at": event["data"]["queued_at"],
-                                }
-                            )
-                    checkpoint = page["checkpoint"]
-                    if checkpoint["cursor"] >= boundary or not page["has_more"]:
-                        break
-                if latest is not None and (
-                    latest["checkpoint_id"] != state.checkpoint_id
-                    or latest["pending_rebuild"] != state.pending_rebuild
-                    or latest["pending_rebuild"] is not None
-                ):
-                    # The mandatory journal is authoritative for DAG progress; the
-                    # file may contain later participant observations with that cursor.
-                    committed = state_from_document(root, latest)
-                    if (
-                        state.run_id == committed.run_id
-                        and state.pending_rebuild is None
-                        and committed.pending_rebuild is None
-                    ):
-                        # A file saved during rebuild may still own the replaced
-                        # instances even when it already has the committed run ID.
-                        committed.services = state.services
-                    vars(state).update(vars(committed))
-                rebuilding = state.pending_rebuild is not None
-                if rebuilding:
-                    if (
-                        self._resource_observer is not None
-                        and self._suspend_resources is None
-                    ):
-                        raise RuntimeError(
-                            "Reload recovery requires a resource restoration barrier."
-                        )
-                    # Startup may have published ownership after the last checkpoint.
-                    # Never assume that a missing PID proves no process was launched.
-                    for sid, instance in state.services.items():
-                        # The accepted result can be newer than the queue checkpoint.
-                        # Retire it without issuing a conflicting cancellation outcome.
-                        requests = [*instance.pending_requests]
-                        if instance.active_request is not None:
-                            requests.append(instance.active_request)
-                        for request in requests:
-                            accepted = self._journal.client.read_command_result(
-                                request["request_id"]
-                            )
-                            if accepted is None or accepted["author"] != "runner":
-                                continue
-                            context = accepted["event"]["context"]
-                            expected_instance = (
-                                request["service_instance_id"]
-                                or request.get("expected_instance")
-                                or instance.service_instance_id
-                            )
-                            if (
-                                context.get("experiment_id") != state.experiment_id
-                                or context.get("participant_id") != sid
-                                or context.get("participant_instance_id")
-                                != expected_instance
-                            ):
-                                raise ValueError(
-                                    "Rebuild request result belongs to another participant."
-                                )
-                            if instance.active_request is request:
-                                instance.active_request = None
-                            else:
-                                instance.pending_requests.remove(request)
-                            self._journal.client.record_event(
-                                "control.reconciled",
-                                {
-                                    "action": "retire_rebuild_request",
-                                    "request_id": request["request_id"],
-                                    "result_event_id": accepted["event_id"],
-                                    "outcome": accepted["outcome"],
-                                },
-                                context={
-                                    "experiment_id": state.experiment_id,
-                                    "run_id": state.run_id,
-                                    "parent_operation_id": state.pending_rebuild[
-                                        "operation_id"
-                                    ],
-                                },
-                            )
-                        if instance.stopped:
-                            continue
-                        await self._recover_service_process(state, sid, instance)
-                    operation_id = state.pending_rebuild["operation_id"]
-                    self._journal.client.record_event(
-                        "control.reconciled",
-                        {
-                            "action": "reload_template",
-                            "state": "interrupted",
-                        },
-                        context={
-                            "experiment_id": state.experiment_id,
-                            "run_id": state.run_id,
-                            "parent_operation_id": operation_id,
-                        },
-                    )
-                    await self._snapshots.restore(
-                        state,
-                        state.pending_rebuild["snapshot_id"],
-                        preserve_rebuild_diagnostics=True,
-                        suspend_resources=self._suspend_resources,
-                    )
-                    self._journal.client.record_event(
-                        "control.reconciled",
-                        {
-                            "action": "reload_template",
-                            "state": "rolled_back",
-                        },
-                        context={
-                            "experiment_id": state.experiment_id,
-                            "run_id": state.run_id,
-                            "parent_operation_id": operation_id,
-                        },
-                    )
-                    self._pending_advance = state.pending_advance
-                    self._save_state()
-                    launches = []
-                if launches:
-                    launched = launches[-1]
-                    if (
-                        state.active_attempt is None
-                        or state.active_attempt.attempt_id != launched["attempt_id"]
-                    ):
-                        definition = next(
-                            item
-                            for item in state.template["stages"]
-                            if item["stage_id"] == launched["stage_id"]
-                        )
-                        directory = (
-                            root
-                            / "shared_artifacts"
-                            / f"epoch_{launched['cycle_number']}"
-                            / self._assembler.module_reference(
-                                state.template, definition
-                            )["name"]
-                            / launched["stage_id"]
-                            / f"attempt_{launched['attempt_number']}"
-                        )
-                        attempt = StageAttempt(
-                            launched["attempt_id"],
-                            launched["stage_id"],
-                            launched["stage_execution_id"],
-                            launched["cycle_number"],
-                            launched["attempt_number"],
-                            directory,
-                            {},
-                            {},
-                            definition["timeout_seconds"],
-                        )
-                        # Bind ownership before optional files are read so failure
-                        # handling still has to confirm this attempt's termination.
-                        attempt.request_id = launched["request_id"]
-                        attempt.participant = {
-                            key: launched[key]
-                            for key in (
-                                "experiment_id",
-                                "participant_id",
-                                "participant_instance_id",
-                            )
-                        }
-                        attempt.service_id = definition.get("service_id")
-                        attempt.endpoint_path = (
-                            root / "runner/endpoints" / f"{attempt.service_id}.json"
-                            if attempt.service_id is not None
-                            else directory / "executor.lock.json"
-                        )
-                        attempt.queued_monotonic = launched["queued_monotonic"]
-                        attempt.queued_at = launched["queued_at"]
-                        state.active_attempt = attempt
-                        context = read_json(directory / "context.json")
-                        if context["context"]["attempt_id"] != launched["attempt_id"]:
-                            raise ValueError(
-                                "Saved launch context has a different attempt identity."
-                            )
-                        attempt.input_data = context["input_data"]
-                        attempt.effective_settings = context["settings"]
-                        attempt.request_id = context["context"]["request_id"]
-                        attempt.participant = {
-                            key: context["context"][key]
-                            for key in (
-                                "experiment_id",
-                                "participant_id",
-                                "participant_instance_id",
-                            )
-                        }
-                        attempt.endpoint_path = Path(context["endpoint_path"])
-                        attempt.service_id = context["service_id"]
-                        attempt.queued_at = context["queued_at"]
-                        attempt.queued_monotonic = context["queued_monotonic"]
-                        record_path = directory / "process.json"
-                        if record_path.exists():
-                            record = read_json(record_path)
-                            if record.get("attempt_id") != attempt.attempt_id:
-                                raise ValueError(
-                                    "Saved process record has a different attempt identity."
-                                )
-                            attempt.process_identity = record["stage"]
-                            attempt.started_at = record["started_at"]
-                        state.active_attempt = attempt
-                        state.stage_attempt_numbers[attempt.stage_id] = (
-                            attempt.attempt_number
-                        )
-                self._journal.close()
-                self._journal.open(state, create=False)
-                self._recover_live = not rebuilding
-            self._pending_advance = state.pending_advance
-            self._stop_requested = False
-            self._termination_confirmed = True
-            state.mode = "paused"
-            state.pause_requested = True
-            self._wake.clear()
-            self._ready.clear()
+        return state
+
+    def _adopt_recovery_checkpoint(
+        self, state: RunnerState, root: Path, latest: JsonObject | None
+    ) -> None:
+        if latest is not None and (
+            latest["checkpoint_id"] != state.checkpoint_id
+            or latest["pending_rebuild"] != state.pending_rebuild
+            or latest["pending_rebuild"] is not None
+        ):
+            # The mandatory journal is authoritative for DAG progress; the
+            # file may contain later participant observations with that cursor.
+            committed = state_from_document(root, latest)
             if (
-                state.phase in ("completed", "stopped", "failed")
-                and state.active_attempt is None
-                and all(item.stopped for item in state.services.values())
+                state.run_id == committed.run_id
+                and state.pending_rebuild is None
+                and committed.pending_rebuild is None
             ):
-                self._ready.set()
-                self._idle.set()
-                return
-            # The DAG now owns startup failure handling. It must not cancel the
-            # recovery caller that is waiting for its readiness notification.
-            self._maintenance_task = None
-            self._task = asyncio.create_task(
-                self._advance_dag(), name=f"dag:{experiment_id}"
+                # A file saved during rebuild may still own the replaced
+                # instances even when it already has the committed run ID.
+                committed.services = state.services
+            vars(state).update(vars(committed))
+
+    async def _recover_interrupted_rebuild(self, state: RunnerState) -> None:
+        if (
+            self._resource_observer is not None
+            and self._suspend_resources is None
+        ):
+            raise RuntimeError(
+                "Reload recovery requires a resource restoration barrier."
             )
-            await self._ready.wait()
-            if self._error is not None:
-                raise RuntimeError(self._error["message"])
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            if self._error is None:
-                await self._fail(error, {})
-            raise
-        finally:
-            self._maintenance = False
-            self._maintenance_task = None
-            self._publish_resources()
-            if self._resume_resources is not None:
-                self._resume_resources()
+        # Startup may have published ownership after the last checkpoint.
+        # Never assume that a missing PID proves no process was launched.
+        for sid, instance in state.services.items():
+            self._retire_rebuild_requests(state, sid, instance)
+            if instance.stopped:
+                continue
+            await self._recover_service_process(state, sid, instance)
+        operation_id = state.pending_rebuild["operation_id"]
+        self._journal.client.record_event(
+            "control.reconciled",
+            {
+                "action": "reload_template",
+                "state": "interrupted",
+            },
+            context={
+                "experiment_id": state.experiment_id,
+                "run_id": state.run_id,
+                "parent_operation_id": operation_id,
+            },
+        )
+        await self._snapshots.restore(
+            state,
+            state.pending_rebuild["snapshot_id"],
+            preserve_rebuild_diagnostics=True,
+            suspend_resources=self._suspend_resources,
+        )
+        self._journal.client.record_event(
+            "control.reconciled",
+            {
+                "action": "reload_template",
+                "state": "rolled_back",
+            },
+            context={
+                "experiment_id": state.experiment_id,
+                "run_id": state.run_id,
+                "parent_operation_id": operation_id,
+            },
+        )
+        self._pending_advance = state.pending_advance
+        self._save_state()
+
+    def _retire_rebuild_requests(
+        self, state: RunnerState, sid: str, instance: ServiceInstance
+    ) -> None:
+        # The accepted result can be newer than the queue checkpoint.
+        # Retire it without issuing a conflicting cancellation outcome.
+        requests = [*instance.pending_requests]
+        if instance.active_request is not None:
+            requests.append(instance.active_request)
+        for request in requests:
+            accepted = self._journal.client.read_command_result(
+                request["request_id"]
+            )
+            if accepted is None or accepted["author"] != "runner":
+                continue
+            context = accepted["event"]["context"]
+            expected_instance = (
+                request["service_instance_id"]
+                or request.get("expected_instance")
+                or instance.service_instance_id
+            )
+            if (
+                context.get("experiment_id") != state.experiment_id
+                or context.get("participant_id") != sid
+                or context.get("participant_instance_id")
+                != expected_instance
+            ):
+                raise ValueError(
+                    "Rebuild request result belongs to another participant."
+                )
+            if instance.active_request is request:
+                instance.active_request = None
+            else:
+                instance.pending_requests.remove(request)
+            self._journal.client.record_event(
+                "control.reconciled",
+                {
+                    "action": "retire_rebuild_request",
+                    "request_id": request["request_id"],
+                    "result_event_id": accepted["event_id"],
+                    "outcome": accepted["outcome"],
+                },
+                context={
+                    "experiment_id": state.experiment_id,
+                    "run_id": state.run_id,
+                    "parent_operation_id": state.pending_rebuild[
+                        "operation_id"
+                    ],
+                },
+            )
+
+    def _recover_launched_attempt(
+        self, state: RunnerState, root: Path, launched: JsonObject
+    ) -> None:
+        if state.active_attempt is not None and state.active_attempt.attempt_id == launched["attempt_id"]:
+            return
+        definition = next(
+            item
+            for item in state.template["stages"]
+            if item["stage_id"] == launched["stage_id"]
+        )
+        directory = (
+            root
+            / "shared_artifacts"
+            / f"epoch_{launched['cycle_number']}"
+            / self._assembler.module_reference(
+                state.template, definition
+            )["name"]
+            / launched["stage_id"]
+            / f"attempt_{launched['attempt_number']}"
+        )
+        attempt = _attempt_from_launch(definition, launched, directory, root)
+        state.active_attempt = attempt
+        context = read_json(directory / "context.json")
+        if context["context"]["attempt_id"] != launched["attempt_id"]:
+            raise ValueError(
+                "Saved launch context has a different attempt identity."
+            )
+        _apply_recovered_attempt_context(attempt, context)
+        record_path = directory / "process.json"
+        if record_path.exists():
+            record = read_json(record_path)
+            if record.get("attempt_id") != attempt.attempt_id:
+                raise ValueError(
+                    "Saved process record has a different attempt identity."
+                )
+            attempt.process_identity = record["stage"]
+            attempt.started_at = record["started_at"]
+        state.active_attempt = attempt
+        state.stage_attempt_numbers[attempt.stage_id] = (
+            attempt.attempt_number
+        )
+
+    async def _start_recovered_dag(self, state: RunnerState, experiment_id: str) -> None:
+        self._pending_advance = state.pending_advance
+        self._stop_requested = False
+        self._termination_confirmed = True
+        state.mode = "paused"
+        state.pause_requested = True
+        self._wake.clear()
+        self._ready.clear()
+        if (
+            state.phase in ("completed", "stopped", "failed")
+            and state.active_attempt is None
+            and all(item.stopped for item in state.services.values())
+        ):
+            self._ready.set()
+            self._idle.set()
+            return
+        # The DAG now owns startup failure handling. It must not cancel the
+        # recovery caller that is waiting for its readiness notification.
+        self._maintenance_task = None
+        self._task = asyncio.create_task(
+            self._advance_dag(), name=f"dag:{experiment_id}"
+        )
+        await self._ready.wait()
+        if self._error is not None:
+            raise RuntimeError(self._error["message"])
 
     async def _recover_service_process(
         self, state: RunnerState, sid: str, instance: ServiceInstance

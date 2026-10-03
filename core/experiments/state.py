@@ -425,3 +425,57 @@ def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
     for name, value in values.items():
         setattr(attempt, name, value)
     return attempt
+
+
+def _attempt_from_launch(
+    definition: JsonObject, launched: JsonObject, directory: Path, root: Path
+) -> StageAttempt:
+    attempt = StageAttempt(
+        launched["attempt_id"],
+        launched["stage_id"],
+        launched["stage_execution_id"],
+        launched["cycle_number"],
+        launched["attempt_number"],
+        directory,
+        {},
+        {},
+        definition["timeout_seconds"],
+    )
+    # Bind ownership before optional files are read so failure
+    # handling still has to confirm this attempt's termination.
+    attempt.request_id = launched["request_id"]
+    attempt.participant = {
+        key: launched[key]
+        for key in (
+            "experiment_id",
+            "participant_id",
+            "participant_instance_id",
+        )
+    }
+    attempt.service_id = definition.get("service_id")
+    attempt.endpoint_path = (
+        root / "runner/endpoints" / f"{attempt.service_id}.json"
+        if attempt.service_id is not None
+        else directory / "executor.lock.json"
+    )
+    attempt.queued_monotonic = launched["queued_monotonic"]
+    attempt.queued_at = launched["queued_at"]
+    return attempt
+
+
+def _apply_recovered_attempt_context(attempt: StageAttempt, context: JsonObject) -> None:
+    attempt.input_data = context["input_data"]
+    attempt.effective_settings = context["settings"]
+    attempt.request_id = context["context"]["request_id"]
+    attempt.participant = {
+        key: context["context"][key]
+        for key in (
+            "experiment_id",
+            "participant_id",
+            "participant_instance_id",
+        )
+    }
+    attempt.endpoint_path = Path(context["endpoint_path"])
+    attempt.service_id = context["service_id"]
+    attempt.queued_at = context["queued_at"]
+    attempt.queued_monotonic = context["queued_monotonic"]
