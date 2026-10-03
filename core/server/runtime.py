@@ -24,7 +24,13 @@ from queue import Empty, Full
 from typing import TYPE_CHECKING, BinaryIO, Self
 from uuid import UUID, uuid4
 
-from core.models.server_commands import ControllerOutcome, ServerChain, ServerCommand
+from core.models.server_commands import (
+    ControllerOutcome,
+    RuntimeReady,
+    RuntimeStopped,
+    ServerChain,
+    ServerCommand,
+)
 from core.primitives.file_lock import _lock_open_stream
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -1194,22 +1200,22 @@ class ServerRuntime:
         if kind == "ready":
             if self._closing or self._process is None or not self._process.is_alive():
                 return True
-            self._identity = copy_json_object(
-                response.get("process"), "process identity"
-            )
-            self._storage = copy_json_object(
-                response.get("storage", {}), "storage initialization"
-            )
-            self._state = "ready"
-            if self._ready is not None and not self._ready.done():
-                self._ready.set_result(None)
+            self._accept_runtime_ready(RuntimeReady.model_validate(response))
             return True
         if kind in ("stopped", "error"):
-            self._unavailable(str(response.get("message", "Controller stopped.")))
-            if kind == "stopped":
+            notice = RuntimeStopped.model_validate(response)
+            self._unavailable(str(notice.message))
+            if notice.kind == "stopped":
                 self._state = "stopped"
             return True
         return False
+
+    def _accept_runtime_ready(self, notice: RuntimeReady) -> None:
+        self._identity = notice.process
+        self._storage = notice.storage
+        self._state = "ready"
+        if self._ready is not None and not self._ready.done():
+            self._ready.set_result(None)
 
     def _accept_read_response(self, identifier: str, response: JsonObject) -> bool:
         waiter = self._reads.get(identifier)

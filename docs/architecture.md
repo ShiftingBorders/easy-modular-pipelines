@@ -69,6 +69,12 @@ filesystem checks. Resource-history and event reads validate query structure
 before invoking their owners. Maintenance separates request execution from
 failure mapping and retains serial module mutations and concurrent reads.
 
+Controller queues validate command and chain documents before admission, while
+runtime notifications preserve their metadata contract and live-process guards.
+Service response handling consumes typed observations and separates heartbeat
+from work completion. Participant request parsing passes a checked model to
+internal reply handling; application callbacks retain validated JSON dictionaries.
+
 Collector snapshots and IPC commands are validated before selecting a journal
 or replacing process targets. Incoming packets are validated before updating
 resource history and freshness. Supervision retains worker ownership, restart

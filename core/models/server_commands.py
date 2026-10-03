@@ -79,6 +79,61 @@ class ServerChain(_Document):
         return self
 
 
+class ControllerCommand(_Document):
+    api_version: SchemaVersionOne
+    command_id: UUIDText
+    command: Text
+    args: JsonObject = Field(default_factory=dict)
+    target: JsonObject = Field(default_factory=dict)
+    chain_id: UUIDText | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        document = copy_json_object(document, "controller command")
+        if "commands" in document:
+            raise ValueError("Nested chains are not supported.")
+        return document
+
+
+class ControllerChain(_Document):
+    api_version: SchemaVersionOne
+    chain_id: UUIDText
+    commands: Annotated[list[ControllerCommand], Field(min_length=1)]
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        document = copy_json_object(document, "controller chain")
+        if isinstance(document.get("commands"), list):
+            document["commands"] = [
+                {
+                    **copy_json_object(command, "chain command"),
+                    "api_version": 1,
+                    "chain_id": document.get("chain_id"),
+                }
+                for command in document["commands"]
+            ]
+        return document
+
+
+class RuntimeReady(_Document):
+    """Ready metadata is an object; actual ownership comes from the process handle."""
+
+    model_config = ConfigDict(extra="allow")
+
+    kind: Literal["ready"] = Field(alias="_runtime")
+    process: JsonObject
+    storage: JsonObject = Field(default_factory=dict)
+
+
+class RuntimeStopped(_Document):
+    model_config = ConfigDict(extra="allow")
+
+    kind: Literal["stopped", "error"] = Field(alias="_runtime")
+    message: JsonValue = "Controller stopped."
+
+
 class ControllerOutcome(_Document):
     """Optional payload fields retain the existing partial-outcome contract."""
 

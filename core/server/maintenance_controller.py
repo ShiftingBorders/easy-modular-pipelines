@@ -17,6 +17,7 @@ from core.models.server_arguments import (
     ModuleSource,
     StateQueryArguments,
 )
+from core.models.server_commands import ControllerChain, ControllerCommand
 from core.modules.manager import ModuleManager
 from core.modules.manifest import read_module_manifest
 from core.primitives.json_values import JsonObject, copy_json_object
@@ -96,23 +97,26 @@ class MaintenanceController:
             if isinstance(request, Exception):
                 raise RuntimeError("Maintenance command channel failed.") from request  # noqa: TRY004 - This is a transport failure, not a type error.
             request = copy_json_object(request, "request")
-            if request.get("command") == "server.shutdown":
-                self._shutdown_requested.set()
-                return
             if "commands" in request:
-                commands = [
-                    {**command, "chain_id": request["chain_id"]}
-                    for command in request["commands"]
-                ]
+                chain = ControllerChain.model_validate(request)
+                commands = [command.model_dump(exclude_unset=True) for command in chain.commands]
             else:
-                if request["command"].startswith(("stats.", "logs.")):
-                    if request["command"] == "stats.state":
-                        await self._publish(await self._execute(request))
-                    else:
-                        await self._admit_read(request)
+                command = ControllerCommand.model_validate(request)
+                if command.command == "server.shutdown":
+                    self._shutdown_requested.set()
+                    return
+                if command.command.startswith(("stats.", "logs.")):
+                    await self._admit_command_read(command)
                     continue
-                commands = [request]
+                commands = [command.model_dump(exclude_unset=True)]
             await self._commands.put(commands)
+
+    async def _admit_command_read(self, command: ControllerCommand) -> None:
+        document = command.model_dump(exclude_unset=True)
+        if command.command == "stats.state":
+            await self._publish(await self._execute(document))
+        else:
+            await self._admit_read(document)
 
     async def _admit_read(self, request: JsonObject) -> None:
         try:

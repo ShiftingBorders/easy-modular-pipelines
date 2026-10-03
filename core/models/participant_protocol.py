@@ -1,6 +1,6 @@
 """Participant wire documents; authentication and live ownership stay outside."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -38,6 +38,13 @@ class ParticipantRequest(ParticipantIdentity):
     request_id: RequestId
     command: Text
     args: JsonObject
+    deadline_monotonic: Number | None = None
+
+    @model_validator(mode="after")
+    def validate_execute_context(self) -> Self:
+        if self.command == "execute":
+            copy_json_object(self.args.get("context", {}), "call context")
+        return self
 
 
 class ParticipantResult(BaseModel):

@@ -5,18 +5,29 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.experiments.state import RunnerState
+from core.models.participant_observations import ServiceRestorationPaths
 from core.primitives.json_values import JsonObject
 
 
 def _load_state_paths(
     state: RunnerState, service_states: dict[str, Path], selected: set[str]
 ) -> dict[str, str]:
+    # Unused supplied entries retain the existing ignore behavior.
+    supplied_paths = ServiceRestorationPaths.model_validate(
+        {
+            "paths": {
+                service_id: service_states.get(service_id)
+                for service_id in state.services
+                if service_id in selected
+            }
+        }
+    )
     paths = {}
     root = state.experiment_directory.resolve()
     for service_id, instance in state.services.items():
         if service_id not in selected:
             continue
-        supplied = service_states.get(service_id)
+        supplied = supplied_paths.paths[service_id]
         if supplied is None:
             if instance.definition["state_required"]:
                 raise ValueError(f"Required service state is missing: {service_id}")

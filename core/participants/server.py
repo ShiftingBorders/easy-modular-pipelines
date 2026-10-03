@@ -13,13 +13,13 @@ from pathlib import Path
 
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
-from core.models.participant_protocol import ParticipantHello
+from core.models.participant_protocol import ParticipantHello, ParticipantRequest
 from core.participants.protocol import (
     PROTOCOL_VERSION,
+    _validated_request,
     encode_frame,
     participant_identity,
     read_frame,
-    validate_request,
     validate_response,
 )
 from core.primitives.json_files import read_json, write_json
@@ -171,14 +171,13 @@ class ParticipantServer:
                 },
             )
             while True:
-                request = await read_frame(reader)
-                validate_request(request, self.identity)
-                request_id = request["request_id"]
+                request = _validated_request(await read_frame(reader), self.identity)
+                request_id = request.request_id
                 if request_id in self._seen:
                     raise ValueError("A request ID cannot be reused.")
                 if (
                     role == "runner"
-                    and request["command"]
+                    and request.command
                     not in ("heartbeat", "command_state", "interrupt", "shutdown")
                     and self._logger.read_command_result(request_id) is not None
                 ):
@@ -188,7 +187,7 @@ class ParticipantServer:
                 self._seen.add(request_id)
                 reply = asyncio.create_task(self._reply(writer, role, request))
                 replies.add(reply)
-                self._reply_commands[reply] = request["command"]
+                self._reply_commands[reply] = request.command
                 reply.add_done_callback(replies.discard)
                 reply.add_done_callback(self._reply_commands.pop)
         except LoggingError as error:
@@ -203,11 +202,12 @@ class ParticipantServer:
             writer.transport.abort()
             self._client_tasks.discard(task)
 
-    async def _reply(self, writer, role: str, request: JsonObject) -> None:
+    async def _reply(self, writer, role: str, request: ParticipantRequest) -> None:
+        message = request.model_dump(exclude_unset=True)
         try:
-            command = request["command"]
+            command = request.command
             if role == "module":
-                response = await self._module_handler(request)
+                response = await self._module_handler(message)
             elif command == "command_state":
                 response = self._command_state()
             elif command == "heartbeat" and (
@@ -222,23 +222,23 @@ class ParticipantServer:
                     },
                 }
             elif command in ("heartbeat", "interrupt", "shutdown"):
-                response = await self._handle_control(request, command)
+                response = await self._handle_control(message, command)
             else:
-                request_id = request["request_id"]
+                request_id = request.request_id
                 self._requests[request_id] = {
                     "request_id": request_id,
                     "command": command,
                 }
-                job = asyncio.create_task(self._run_work(request))
+                job = asyncio.create_task(self._run_work(message))
                 self._work[request_id] = job
-                job.add_done_callback(partial(self._observe_work, request))
+                job.add_done_callback(partial(self._observe_work, message))
                 response = await asyncio.shield(job)
             await self._send(
                 writer,
                 {
                     "protocol_version": PROTOCOL_VERSION,
                     "message_type": "response",
-                    "request_id": request["request_id"],
+                    "request_id": request.request_id,
                     **validate_response(response),
                 },
             )
@@ -254,7 +254,7 @@ class ParticipantServer:
                     {
                         "protocol_version": PROTOCOL_VERSION,
                         "message_type": "response",
-                        "request_id": request["request_id"],
+                        "request_id": request.request_id,
                         "result": "fail",
                         "data": {"error": str(error), "code": "participant_failure"},
                     },
@@ -331,7 +331,7 @@ class ParticipantServer:
 
     def _call_context(self, request: JsonObject) -> JsonObject:
         call_context = (
-            copy_json_object(request["args"].get("context", {}), "call context")
+            request["args"].get("context", {})
             if request["command"] == "execute"
             else {}
         )
@@ -348,8 +348,6 @@ class ParticipantServer:
         try:
             context = self._call_context(request)
             deadline = request.get("deadline_monotonic")
-            if deadline is not None:
-                require_number(deadline, "request deadline")
             remaining = (
                 None if deadline is None else max(0, deadline - time.monotonic())
             )

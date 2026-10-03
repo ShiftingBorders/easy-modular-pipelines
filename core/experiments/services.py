@@ -31,6 +31,7 @@ from core.journal.events import LoggingError
 from core.models.participant_observations import (
     CommandState,
     CommandStateResponse,
+    ServiceObservation,
     ServiceStateExport,
 )
 from core.participants.connection import ParticipantConnection
@@ -872,8 +873,14 @@ class ServiceManager:
     async def _handle_message(
         self, state: RunnerState, service_id: str, message: JsonObject
     ) -> None:
+        observation = ServiceObservation.model_validate(message)
+        await self._handle_observation(state, service_id, observation)
+
+    async def _handle_observation(
+        self, state: RunnerState, service_id: str, observation: ServiceObservation
+    ) -> None:
         instance = state.services[service_id]
-        message = copy_json_object(message, "service message")
+        message = observation.model_dump(exclude_unset=True)
         context = {
             "experiment_id": state.experiment_id,
             "run_id": state.run_id,
@@ -882,13 +889,6 @@ class ServiceManager:
             "participant_id": service_id,
             "participant_instance_id": instance.service_instance_id,
         }
-        if (
-            type(message.get("protocol_version")) is not int
-            or message["protocol_version"] != PROTOCOL_VERSION
-        ):
-            raise ValueError(f"Service protocol_version must be {PROTOCOL_VERSION}.")
-        request_id = require_text(message.get("request_id"), "request_id")
-        UUID(request_id)
         for key in ("experiment_id", "service_id", "service_instance_id"):
             if message.get(key, context[key]) != context[key]:
                 self._journal.client.record_event(
@@ -897,72 +897,79 @@ class ServiceManager:
                     context=context,
                 )
                 return
-        if message.get("result") not in ("success", "fail") or "data" not in message:
-            raise ValueError("Service replies require result=success/fail and data.")
-        kind = "status" if message.get("command") == "heartbeat" else "command_result"
         self._journal.client.record_event("service.message", message, context=context)
-        if kind == "status":
+        if observation.command == "heartbeat":
             if not self._handle_heartbeat(
-                service_id, instance, message, request_id, context
+                service_id, instance, message, observation.request_id, context
             ):
                 return
-        elif kind == "command_result":
-            active = instance.active_request
-            if active is None or active["request_id"] != request_id:
-                self._journal.client.record_event(
-                    "service.message_ignored",
-                    {"ignored": "retired_or_unknown_request", "message": message},
-                    context=context,
-                )
-                return
-            response = {
-                key: value
-                for key, value in message.items()
-                if key
-                not in ("protocol_version", "message_type", "request_id", "command")
-            }
-            if (
-                active.get("owner") != "caller"
-                and not active["timed_out"]
-                and time.monotonic() - active["sent_monotonic"]
-                >= instance.definition["command_timeout_seconds"]
-            ):
-                await self._handle_timeout(state, service_id, request_id)
-            if active["timed_out"]:
-                self._journal.client.record_event(
-                    "service.message_ignored",
-                    {"ignored": "command_timeout", "message": message},
-                    context=context,
-                )
-                # A late result releases actual work, never changes its timed-out outcome.
-                if (
-                    active.get("owner") != "caller"
-                    and instance.definition["on_command_timeout"] == "restart"
-                ):
-                    instance.failure = error_details(
-                        "service_failure",
-                        "Timed-out command requires an explicit restart.",
-                    )
-                    self._restarts[service_id] = asyncio.create_task(
-                        self.restart(state, service_id, automatic=True)
-                    )
-                    return
-                if instance.blocked_action == "pause":
-                    instance.blocked_action = None
-            else:
-                self._finish_request(
-                    state,
-                    instance,
-                    active,
-                    response,
-                    "succeeded" if response["result"] == "success" else "failed",
-                )
-            instance.active_request = None
+        elif not await self._handle_work_observation(
+            state, service_id, instance, observation, context
+        ):
+            return
         try:
             self._state_store.save(state)
         except OSError as error:
             self._journal.client.record_error(error, context=context)
         self._changed.set()
+
+    async def _handle_work_observation(
+        self,
+        state: RunnerState,
+        service_id: str,
+        instance: ServiceInstance,
+        observation: ServiceObservation,
+        context: JsonObject,
+    ) -> bool:
+        """Return False when retired work or restart must skip the final state save."""
+        message = observation.model_dump(exclude_unset=True)
+        request_id = observation.request_id
+        active = instance.active_request
+        if active is None or active["request_id"] != request_id:
+            self._journal.client.record_event(
+                "service.message_ignored",
+                {"ignored": "retired_or_unknown_request", "message": message},
+                context=context,
+            )
+            return False
+        response = observation.model_dump(
+            exclude_unset=True,
+            exclude={"protocol_version", "message_type", "request_id", "command"},
+        )
+        if (
+            active.get("owner") != "caller"
+            and not active["timed_out"]
+            and time.monotonic() - active["sent_monotonic"]
+            >= instance.definition["command_timeout_seconds"]
+        ):
+            await self._handle_timeout(state, service_id, request_id)
+        if active["timed_out"]:
+            self._journal.client.record_event(
+                "service.message_ignored",
+                {"ignored": "command_timeout", "message": message},
+                context=context,
+            )
+            # A late result releases actual work, never changes its timed-out outcome.
+            if (
+                active.get("owner") != "caller"
+                and instance.definition["on_command_timeout"] == "restart"
+            ):
+                instance.failure = error_details(
+                    "service_failure", "Timed-out command requires an explicit restart.",
+                )
+                self._restarts[service_id] = asyncio.create_task(
+                    self.restart(state, service_id, automatic=True)
+                )
+                return False
+            if instance.blocked_action == "pause":
+                instance.blocked_action = None
+        else:
+            self._finish_request(
+                state, instance, active, response,
+                "succeeded" if observation.result == "success" else "failed",
+            )
+        instance.active_request = None
+        return True
 
     def _handle_heartbeat(
         self,

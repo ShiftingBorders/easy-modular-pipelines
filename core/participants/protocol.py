@@ -53,10 +53,17 @@ async def read_frame(reader: asyncio.StreamReader) -> JsonObject:
 
 
 def validate_request(message: JsonObject, identity: JsonObject) -> None:
-    request = ParticipantRequest.model_validate(message)
+    request = _validated_request(message, identity)
     message["request_id"] = request.request_id
+
+
+def _validated_request(
+    message: JsonObject, identity: JsonObject
+) -> ParticipantRequest:
+    request = ParticipantRequest.model_validate(message)
     actual_identity = {
         name: getattr(request, name) for name in IDENTITY_FIELDS
     }
     if actual_identity != identity:
         raise ValueError("Request belongs to a different participant.")
+    return request

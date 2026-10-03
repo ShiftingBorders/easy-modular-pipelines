@@ -1,14 +1,24 @@
 """Participant observations checked before recovery mutates runtime state."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    field_validator,
+    model_validator,
+)
 
-from core.models.participant_protocol import ModuleProgress, ParticipantResponse
+from core.models.participant_protocol import (
+    ModuleProgress,
+    ParticipantResponse,
+    ProtocolVersion,
+)
 from core.models.process_identity import ProcessIdentity
 from core.models.values import Boolean, Number, Text, UUIDText
-from core.primitives.json_values import JsonObject, copy_json_object
+from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
 
 
 class _Observation(BaseModel):
@@ -25,6 +35,15 @@ class _Observation(BaseModel):
 class CommandWork(_Observation):
     request_id: UUIDText
     command: Text
+
+
+class ServiceObservation(_Observation):
+    protocol_version: ProtocolVersion
+    request_id: UUIDText
+    result: Literal["success", "fail"]
+    data: JsonValue
+    message_type: Literal["response"] = "response"
+    command: Text | None = None
 
 
 class CommandState(_Observation):
@@ -60,3 +79,22 @@ class ServiceStateExport(_Observation):
         if value is not None and Path(value).anchor:
             raise ValueError("Service state_path must be experiment-relative.")
         return value
+
+
+def _restoration_path(value: object) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, (str, Path)):
+        raise TypeError("Service restoration path must be a string or Path.")
+    path = Path(value)
+    if "\x00" in str(path):
+        raise ValueError("Service restoration path contains a null character.")
+    return path
+
+
+class ServiceRestorationPaths(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
+    )
+
+    paths: dict[UUIDText, Annotated[Path | None, BeforeValidator(_restoration_path)]]

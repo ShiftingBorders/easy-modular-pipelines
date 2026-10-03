@@ -8,7 +8,6 @@ from collections.abc import Coroutine
 from multiprocessing.queues import Queue
 from pathlib import Path
 from queue import Empty, Full
-from uuid import UUID
 
 from core.experiments.assembler import ExperimentAssembler
 from core.experiments.reader import ExperimentReader
@@ -32,8 +31,9 @@ from core.models.server_arguments import (
     StateQueryArguments,
     TemplateArguments,
 )
+from core.models.server_commands import ControllerChain, ControllerCommand
 from core.modules.manager import ModuleManager
-from core.primitives.json_values import JsonObject, copy_json_object, require_text
+from core.primitives.json_values import JsonObject, copy_json_object
 from core.primitives.paths import repository_root
 from core.resources.collector import ResourceCollector
 from core.server.module_reads import _validate_module_read_args
@@ -143,31 +143,17 @@ class ExperimentController:
                 ) from self._intake_error
             try:
                 request = copy_json_object(request, "request")
-                if (
-                    type(request.get("api_version")) is not int
-                    or request["api_version"] != 1
-                ):
-                    raise ValueError("api_version must be 1.")
                 if "commands" in request:
                     batch = self._read_chain(request)
                 else:
-                    UUID(require_text(request.get("command_id"), "command_id"))
-                    name = require_text(request.get("command"), "command")
-                    if (
-                        name == "server.shutdown"
-                        and self._shutdown_requested is not None
-                    ):
+                    command = ControllerCommand.model_validate(request)
+                    if command.command == "server.shutdown" and self._shutdown_requested is not None:
                         # Only the server owner sends this private queue message.
                         self._shutdown_requested.set()
                         return
-                    if name.startswith(("stats.", "logs.")):
-                        task = asyncio.create_task(self._answer_read(request))
-                        self._reads.add(task)
-                        task.add_done_callback(self._reads.discard)
+                    batch = await self._admit_command(command)
+                    if batch is None:
                         continue
-                    batch = [request]
-                    if name == "stop":
-                        await self._cancel_queued_commands()
                 await self._control_queue.put(batch)
             except (TypeError, ValueError, KeyError) as error:
                 command = request if isinstance(request, dict) else {}
@@ -176,24 +162,21 @@ class ExperimentController:
                 )
 
     def _read_chain(self, request: JsonObject) -> list[JsonObject]:
-        UUID(require_text(request.get("chain_id"), "chain_id"))
-        commands = request["commands"]
-        if not isinstance(commands, list) or not commands:
-            raise ValueError("A command chain must be nonempty.")
-        batch = []
-        for command in commands:
-            command = copy_json_object(command, "chain command")
-            UUID(require_text(command.get("command_id"), "command_id"))
-            if "commands" in command:
-                raise ValueError("Nested chains are not supported.")
-            batch.append(
-                {
-                    **command,
-                    "api_version": 1,
-                    "chain_id": request["chain_id"],
-                }
-            )
-        return batch
+        chain = ControllerChain.model_validate(request)
+        return [command.model_dump(exclude_unset=True) for command in chain.commands]
+
+    async def _admit_command(
+        self, command: ControllerCommand
+    ) -> list[JsonObject] | None:
+        document = command.model_dump(exclude_unset=True)
+        if command.command.startswith(("stats.", "logs.")):
+            task = asyncio.create_task(self._answer_read(document))
+            self._reads.add(task)
+            task.add_done_callback(self._reads.discard)
+            return None
+        if command.command == "stop":
+            await self._cancel_queued_commands()
+        return [document]
 
     async def _cancel_queued_commands(self) -> None:
         cancelled = list(self._active_tail)
@@ -248,57 +231,9 @@ class ExperimentController:
     async def _execute_command(self, command: JsonObject) -> JsonObject:
         name = ""
         try:
-            if command.keys() - {
-                "api_version",
-                "command_id",
-                "chain_id",
-                "command",
-                "args",
-                "target",
-            }:
-                raise ValueError("Unknown command fields.")
-            name = require_text(command.get("command"), "command")
-            args = copy_json_object(command.get("args", {}), "args")
-            if name.startswith(("stats.", "logs.")):
-                data = await self._read_request(command)
-            else:
-                if self._recovery_required and name not in (
-                    "recover",
-                    "stop",
-                    "archive.inspect",
-                ):
-                    raise RuntimeError(
-                        f"Recover unfinished experiments before issuing control commands: {sorted(self._recovery_required)}"
-                    )
-                data = await self._execute_control_command(name, args, command)
-                if name == "recover":
-                    self._recovery_required.discard(
-                        require_text(args.get("experiment_id"), "experiment_id")
-                    )
-                if (
-                    name == "stop"
-                    and isinstance(data, dict)
-                    and data.get("termination_confirmed")
-                ):
-                    identifier = data.get("experiment_id")
-                    if isinstance(identifier, str):
-                        # Confirmed shutdown also permits explicit rollback after
-                        # recovery reported an incomplete restoration transaction.
-                        if data.get("pending_rebuild") is not None:
-                            self._recovery_required.add(identifier)
-                        else:
-                            self._recovery_required.discard(identifier)
-                if data is None:
-                    data = {}
-            return {
-                "command_id": command["command_id"],
-                "chain_id": command.get("chain_id"),
-                "state": "succeeded",
-                "result": "success",
-                "experiment_id": self._runner.get_state()["experiment_id"],
-                "data": data,
-                "error": None,
-            }
+            validated = ControllerCommand.model_validate(command)
+            name = validated.command
+            return await self._perform_command(validated)
         except LoggingError as error:
             if (
                 name not in ("stats.artifacts", "stats.artifact")
@@ -341,6 +276,40 @@ class ExperimentController:
             return self._failure(
                 command, "operation_failed", f"{type(error).__name__}: {error}", error
             )
+
+    async def _perform_command(self, command: ControllerCommand) -> JsonObject:
+        name = command.command
+        document = command.model_dump(exclude_unset=True)
+        if name.startswith(("stats.", "logs.")):
+            data = await self._read_request(document)
+        else:
+            if self._recovery_required and name not in ("recover", "stop", "archive.inspect"):
+                raise RuntimeError(
+                    "Recover unfinished experiments before issuing control commands: "
+                    f"{sorted(self._recovery_required)}"
+                )
+            data = await self._execute_control_command(name, command.args, document)
+            if name == "recover":
+                self._recovery_required.discard(command.args["experiment_id"])
+            if name == "stop" and isinstance(data, dict) and data.get("termination_confirmed"):
+                identifier = data.get("experiment_id")
+                if isinstance(identifier, str):
+                    # Confirmed shutdown permits rollback after an incomplete restoration.
+                    if data.get("pending_rebuild") is not None:
+                        self._recovery_required.add(identifier)
+                    else:
+                        self._recovery_required.discard(identifier)
+            if data is None:
+                data = {}
+        return {
+            "command_id": command.command_id,
+            "chain_id": command.chain_id,
+            "state": "succeeded",
+            "result": "success",
+            "experiment_id": self._runner.get_state()["experiment_id"],
+            "data": data,
+            "error": None,
+        }
 
     async def _execute_control_command(
         self, name: str, args: JsonObject, command: JsonObject
