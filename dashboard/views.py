@@ -13,6 +13,11 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from core.journal.events import LoggingError
+from core.models.dashboard_resources import (
+    CollectorHistoryPage,
+    CollectorSamples,
+    CollectorStatus,
+)
 from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import (
@@ -32,39 +37,13 @@ from dashboard.projections import (
 
 
 def validate_samples(samples: object) -> list[dict]:
-    if not isinstance(samples, list):
-        raise SystemAPIError(
-            "invalid_response", "Collector measurements must be a list."
-        )
-    for sample in samples:
-        if (
-            not isinstance(sample, dict)
-            or not isinstance(sample.get("series_id"), str)
-            or instant(sample.get("observed_at")) is None
-            or not isinstance(sample.get("resources"), dict)
-        ):
-            raise SystemAPIError(
-                "invalid_response", "Invalid collector measurement envelope."
-            )
-        for metric in sample["resources"].values():
-            if (
-                not isinstance(metric, dict)
-                or not isinstance(metric.get("attributes", {}), dict)
-                or (
-                    metric.get("value") is not None
-                    and type(metric["value"]) not in (int, float)
-                )
-            ):
-                raise SystemAPIError("invalid_response", "Invalid collector metric.")
-        freshness = sample.get("freshness", {})
-        if not isinstance(freshness, dict) or any(
-            not isinstance(item, dict) or type(item.get("fresh")) is not bool
-            for item in freshness.values()
-        ):
-            raise SystemAPIError(
-                "invalid_response", "Invalid collector freshness metadata."
-            )
-    return samples
+    try:
+        return [
+            sample.model_dump(exclude_unset=True)
+            for sample in CollectorSamples.validate_python(samples, strict=True)
+        ]
+    except (ValueError, TypeError) as error:
+        raise SystemAPIError("invalid_response", "Invalid collector measurements.") from error
 
 
 class DashboardViews:
@@ -1325,74 +1304,67 @@ class DashboardViews:
 
     async def _refresh_resources(self) -> None:
         async with self._resource_lock:
-            error = None
-            if time.monotonic() - self._resource_at >= 0.5:
-                try:
-                    status = await self.system.read("resources")
-                    if status.get("history_id") != self._history_id:
-                        self._history.clear()
-                        self._history_cursor = 0
-                        self._history_id = status.get("history_id")
-                        self._history_gap = False
-                    if not isinstance(status.get("latest"), list):
-                        raise SystemAPIError(
-                            "invalid_response",
-                            "Collector status has no measurements list.",
-                        )
-                    validate_samples(status["latest"])
-                    self._resource_status = status
-                    self._resource_observed_at = time.monotonic()
-                except SystemAPIError as failure:
-                    error = str(failure)
-                    self._resource_status = {
-                        **self._resource_status,
-                        "state": "unavailable",
-                        "error": error,
-                    }
-                if error is None:
-                    try:
-                        for _ in range(5):
-                            page = await self.system.read(
-                                "resources/history",
-                                {"after": self._history_cursor, "limit": 1000},
-                            )
-                            if (
-                                not isinstance(page.get("samples"), list)
-                                or type(page.get("cursor")) is not int
-                                or "history_id" not in page
-                                or "gap" not in page
-                            ):
-                                raise SystemAPIError(
-                                    "invalid_response", "Invalid resource history page."
-                                )
-                            if page["history_id"] != self._history_id:
-                                self._history.clear()
-                                self._history_id, self._history_cursor = (
-                                    page["history_id"],
-                                    0,
-                                )
-                                self._history_gap = False
-                                continue
-                            validate_samples(page["samples"])
-                            self._history_gap = (
-                                self._history_gap
-                                or page["gap"]
-                                or len(self._history) + len(page["samples"])
-                                > self._history.maxlen
-                            )
-                            self._history.extend(page["samples"])
-                            previous_cursor = self._history_cursor
-                            self._history_cursor = page["cursor"]
-                            if (
-                                not page["samples"]
-                                or self._history_cursor == previous_cursor
-                            ):
-                                break
-                        self._resource_status["history_error"] = None
-                    except SystemAPIError as failure:
-                        # History failure does not invalidate fresh instantaneous readings.
-                        self._resource_status["history_error"] = str(failure)
+            if time.monotonic() - self._resource_at < 0.5:
+                return
+            try:
+                status = CollectorStatus.model_validate(await self.system.read("resources"))
+            except (ValueError, TypeError):
+                error = "Invalid collector status."
+            except SystemAPIError as failure:
+                error = str(failure)
+            else:
+                self._accept_resource_status(status)
+                await self._refresh_resource_history()
                 self._resource_at = time.monotonic()
+                return
+            self._resource_status = {
+                **self._resource_status, "state": "unavailable", "error": error,
+            }
+            self._resource_at = time.monotonic()
+
+    def _accept_resource_status(self, status: CollectorStatus) -> None:
+        if status.history_id != self._history_id:
+            self._history.clear()
+            self._history_cursor = 0
+            self._history_id = status.history_id
+            self._history_gap = False
+        self._resource_status = status.model_dump(exclude_unset=True)
+        self._resource_observed_at = time.monotonic()
+
+    async def _refresh_resource_history(self) -> None:
+        try:
+            for _ in range(5):
+                document = await self.system.read(
+                    "resources/history", {"after": self._history_cursor, "limit": 1000}
+                )
+                try:
+                    page = CollectorHistoryPage.model_validate(document)
+                except (ValueError, TypeError) as error:
+                    raise SystemAPIError(
+                        "invalid_response", "Invalid resource history page."
+                    ) from error
+                if self._accept_resource_history_page(page):
+                    break
+            self._resource_status["history_error"] = None
+        except SystemAPIError as failure:
+            # History failure does not invalidate fresh instantaneous readings.
+            self._resource_status["history_error"] = str(failure)
+
+    def _accept_resource_history_page(self, page: CollectorHistoryPage) -> bool:
+        """Apply a checked page and report whether this bounded read can stop."""
+        if page.history_id != self._history_id:
+            self._history.clear()
+            self._history_id, self._history_cursor = page.history_id, 0
+            self._history_gap = False
+            return False
+        self._history_gap = (
+            self._history_gap or page.gap
+            or len(self._history) + len(page.samples) > self._history.maxlen
+        )
+        self._history.extend(sample.model_dump(exclude_unset=True) for sample in page.samples)
+        previous_cursor = self._history_cursor
+        self._history_cursor = page.cursor
+        return not page.samples or self._history_cursor == previous_cursor
 
     async def compute(self, params: dict) -> dict:
         status = dict(self._resource_status)

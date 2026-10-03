@@ -191,6 +191,12 @@ Probe execution, history/incident updates and persistence are separate stages.
 The standalone worker uses standard-library scalar timeout checks and does not
 import dashboard or pipeline code.
 
+Dashboard collector read models describe samples, metrics, freshness, status and
+history pages without requiring the full collector IPC metadata. Ingestion
+validates each incoming bounded batch before changing retained state. Typed
+status/history application retains epoch/cursor/gap checks and independent history
+failure handling; rendering does not revalidate the retained sample array.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
