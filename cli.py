@@ -878,79 +878,11 @@ async def execute(
     if action == "experiment" or (
         action == "snapshot" and options.snapshot_action is not None
     ):
-        params = {}
-        if action == "experiment":
-            path = "/experiments"
-            if options.experiment_action == "inspect":
-                path += "/inspect"
-                params["experiment_id"] = options.experiment_id
-        else:
-            if (
-                options.label is not None
-                or options.wait is not None
-                or options.wait_timeout is not None
-                or options.command_id is not None
-            ):
-                raise ValueError(
-                    "Snapshot reads do not accept creation or wait options."
-                )
-            path = "/snapshots"
-            if options.experiment_id is not None:
-                params["experiment_id"] = options.experiment_id
-            if options.snapshot_action == "inspect":
-                path += "/inspect"
-                params["snapshot_id"] = options.snapshot_id
-        document = await client.request("GET", path, params=params)
-        display(document, as_json=as_json)
-        return 0
+        return await _read_experiment_metadata(options, client, as_json=as_json)
     if action in ("health", "status", "state", "resources", "resource-history"):
-        path = {
-            "health": "/health",
-            "status": "/state",
-            "state": "/state",
-            "resources": "/resources",
-            "resource-history": "/resources/history",
-        }[action]
-        params = {}
-        if action in ("status", "state") and options.experiment_id is not None:
-            params["experiment_id"] = options.experiment_id
-        if action == "resource-history":
-            if options.after < 0 or options.limit > 1000:
-                raise ValueError("after must be nonnegative and limit must be 1..1000.")
-            params = {"after": options.after, "limit": options.limit}
-        watch = getattr(options, "watch", None)
-        while True:
-            document = await client.request("GET", path, params=params)
-            display(document, as_json=as_json, streaming=watch is not None)
-            if watch is None:
-                return 0
-            await asyncio.sleep(watch)
+        return await _read_runtime_state(options, client, as_json=as_json)
     if action == "logs":
-        identifier = options.experiment_id
-        if identifier is None:
-            current = await client.request("GET", "/state")
-            identifier = require_text(
-                current.get("experiment_id"),
-                "selected experiment_id; use --experiment-id",
-            )
-        cursor = None if options.cursor is None else json_argument(options.cursor)
-        if options.limit > 1000:
-            raise ValueError("limit must be 1..1000.")
-        while True:
-            params = {"limit": options.limit}
-            if cursor is not None:
-                params["cursor"] = json.dumps(cursor, separators=(",", ":"))
-            document = await client.request(
-                "GET",
-                "/experiments/" + quote(identifier, safe="") + "/events",
-                params=params,
-            )
-            display(document, as_json=as_json, streaming=options.follow)
-            if not options.follow:
-                return 0
-            cursor = copy_json_object(document.get("checkpoint"), "journal checkpoint")
-            if not document.get("has_more"):
-                await asyncio.sleep(client.interval)
+        return await _read_journal(options, client, as_json=as_json)
     timeout = (
         client.wait_timeout if options.wait_timeout is None else options.wait_timeout
     )
@@ -974,6 +906,88 @@ async def execute(
         client, options, timeout, as_json=as_json,
         wait=not interactive if options.wait is None else options.wait,
     )
+
+
+async def _read_experiment_metadata(
+    options: argparse.Namespace, client: APIClient, *, as_json: bool,
+) -> int:
+    params = {}
+    if options.action == "experiment":
+        path = "/experiments"
+        if options.experiment_action == "inspect":
+            path += "/inspect"
+            params["experiment_id"] = options.experiment_id
+    else:
+        if (
+            options.label is not None
+            or options.wait is not None
+            or options.wait_timeout is not None
+            or options.command_id is not None
+        ):
+            raise ValueError("Snapshot reads do not accept creation or wait options.")
+        path = "/snapshots"
+        if options.experiment_id is not None:
+            params["experiment_id"] = options.experiment_id
+        if options.snapshot_action == "inspect":
+            path += "/inspect"
+            params["snapshot_id"] = options.snapshot_id
+    document = await client.request("GET", path, params=params)
+    display(document, as_json=as_json)
+    return 0
+
+
+async def _read_runtime_state(
+    options: argparse.Namespace, client: APIClient, *, as_json: bool,
+) -> int:
+    action = options.action
+    path = {
+        "health": "/health",
+        "status": "/state",
+        "state": "/state",
+        "resources": "/resources",
+        "resource-history": "/resources/history",
+    }[action]
+    params = {}
+    if action in ("status", "state") and options.experiment_id is not None:
+        params["experiment_id"] = options.experiment_id
+    if action == "resource-history":
+        if options.after < 0 or options.limit > 1000:
+            raise ValueError("after must be nonnegative and limit must be 1..1000.")
+        params = {"after": options.after, "limit": options.limit}
+    watch = getattr(options, "watch", None)
+    while True:
+        document = await client.request("GET", path, params=params)
+        display(document, as_json=as_json, streaming=watch is not None)
+        if watch is None:
+            return 0
+        await asyncio.sleep(watch)
+
+
+async def _read_journal(
+    options: argparse.Namespace, client: APIClient, *, as_json: bool,
+) -> int:
+    identifier = options.experiment_id
+    if identifier is None:
+        current = await client.request("GET", "/state")
+        identifier = require_text(
+            current.get("experiment_id"), "selected experiment_id; use --experiment-id"
+        )
+    cursor = None if options.cursor is None else json_argument(options.cursor)
+    if options.limit > 1000:
+        raise ValueError("limit must be 1..1000.")
+    while True:
+        params = {"limit": options.limit}
+        if cursor is not None:
+            params["cursor"] = json.dumps(cursor, separators=(",", ":"))
+        document = await client.request(
+            "GET", "/experiments/" + quote(identifier, safe="") + "/events", params=params
+        )
+        display(document, as_json=as_json, streaming=options.follow)
+        if not options.follow:
+            return 0
+        cursor = copy_json_object(document.get("checkpoint"), "journal checkpoint")
+        if not document.get("has_more"):
+            await asyncio.sleep(client.interval)
 
 
 async def _send_submission(
