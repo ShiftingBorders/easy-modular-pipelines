@@ -5,16 +5,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Literal
-from uuid import UUID
 
-from core.participants.protocol import participant_identity
+from core.models.runner_state import (
+    AttemptParameters,
+    SavedAttempt,
+    SavedRunnerState,
+    SavedService,
+    ServiceParameters,
+    StateParameters,
+)
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
     JsonObject,
     JsonValue,
     copy_json_object,
-    require_number,
-    require_text,
 )
 
 type ModuleRole = Literal["stage", "service"]
@@ -62,46 +66,35 @@ class StageAttempt:
         effective_settings: JsonObject,
         timeout_seconds: float | None,
     ) -> None:
-        for name, value in (
-            ("attempt_id", attempt_id),
-            ("stage_id", stage_id),
-            ("stage_execution_id", stage_execution_id),
-        ):
-            UUID(require_text(value, name))
-        for name, value in (
-            ("cycle_number", cycle_number),
-            ("attempt_number", attempt_number),
-        ):
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{name} must be a positive integer.")
-        artifacts_directory = Path(artifacts_directory)
-        if not artifacts_directory.is_absolute():
-            raise ValueError("artifacts_directory must be absolute.")
-        if timeout_seconds is not None:
-            require_number(timeout_seconds, "timeout_seconds")
-            if timeout_seconds <= 0:
-                raise ValueError("timeout_seconds must be positive or null.")
-        payload = copy_json_object(
-            {"input_data": input_data, "effective_settings": effective_settings},
-            "attempt parameters",
+        parameters = AttemptParameters(
+            attempt_id=attempt_id,
+            stage_id=stage_id,
+            stage_execution_id=stage_execution_id,
+            cycle_number=cycle_number,
+            attempt_number=attempt_number,
+            artifacts_directory=artifacts_directory,
+            input_data=input_data,
+            effective_settings=effective_settings,
+            timeout_seconds=timeout_seconds,
         )
-        if type(effective_settings) is not dict:
-            raise TypeError("effective_settings must be a JSON object.")
-        self.attempt_id = attempt_id
-        self.stage_id = stage_id
-        self.stage_execution_id = stage_execution_id
-        self.cycle_number = cycle_number
-        self.attempt_number = attempt_number
-        self.artifacts_directory = artifacts_directory
-        self.input_data = payload["input_data"]
-        self.effective_settings = payload["effective_settings"]
-        self.timeout_seconds = timeout_seconds
+        self._configure(parameters)
+
+    def _configure(self, parameters: AttemptParameters) -> None:
+        self.attempt_id = parameters.attempt_id
+        self.stage_id = parameters.stage_id
+        self.stage_execution_id = parameters.stage_execution_id
+        self.cycle_number = parameters.cycle_number
+        self.attempt_number = parameters.attempt_number
+        self.artifacts_directory = parameters.artifacts_directory
+        self.input_data = parameters.input_data
+        self.effective_settings = parameters.effective_settings
+        self.timeout_seconds = parameters.timeout_seconds
         self.process_identity = None
         self.started_at = None
         self.result_request_id = None
         self.outcome = None
         self.executor_status: JsonObject | None = None
-        self.request_id = attempt_id
+        self.request_id = parameters.attempt_id
         self.participant: JsonObject | None = None
         self.endpoint_path: Path | None = None
         self.service_id: str | None = None
@@ -130,13 +123,18 @@ class ServiceInstance:
         service_instance_id: str,
         definition: JsonObject,
     ) -> None:
-        UUID(require_text(service_id, "service_id"))
-        UUID(require_text(service_instance_id, "service_instance_id"))
-        self.definition = copy_json_object(definition, "service definition")
-        if self.definition.get("service_id") != service_id:
-            raise ValueError("Service definition has a different service_id.")
-        self.service_id = service_id
-        self.service_instance_id = service_instance_id
+        self._configure(
+            ServiceParameters(
+                service_id=service_id,
+                service_instance_id=service_instance_id,
+                definition=definition,
+            )
+        )
+
+    def _configure(self, parameters: ServiceParameters) -> None:
+        self.service_id = parameters.service_id
+        self.service_instance_id = parameters.service_instance_id
+        self.definition = parameters.definition
         self.process_identity = None
         self.endpoint_path = None
         self.ready = False
@@ -196,24 +194,28 @@ class RunnerState:
         template: JsonObject,
         mode: RunnerMode,
     ) -> None:
-        require_text(experiment_id, "experiment_id")
-        require_text(run_id, "run_id")
-        UUID(require_text(template_revision_id, "template_revision_id"))
-        require_text(template_yaml, "template_yaml")
-        experiment_directory = Path(experiment_directory)
-        template_path = Path(template_path)
-        if not experiment_directory.is_absolute() or not template_path.is_absolute():
-            raise ValueError("Experiment and template paths must be absolute.")
-        if mode not in ("running", "paused"):
-            raise ValueError("mode must be running or paused.")
-        self.template = copy_json_object(template, "template")
-        self.experiment_id = experiment_id
-        self.experiment_directory = experiment_directory
-        self.run_id = run_id
-        self.template_path = template_path
-        self.template_revision_id = template_revision_id
-        self.template_yaml = template_yaml
-        self.mode = mode
+        self._configure(
+            StateParameters(
+                experiment_id=experiment_id,
+                experiment_directory=experiment_directory,
+                run_id=run_id,
+                template_path=template_path,
+                template_revision_id=template_revision_id,
+                template_yaml=template_yaml,
+                template=template,
+                mode=mode,
+            )
+        )
+
+    def _configure(self, parameters: StateParameters) -> None:
+        self.template = parameters.template
+        self.experiment_id = parameters.experiment_id
+        self.experiment_directory = parameters.experiment_directory
+        self.run_id = parameters.run_id
+        self.template_path = parameters.template_path
+        self.template_revision_id = parameters.template_revision_id
+        self.template_yaml = parameters.template_yaml
+        self.mode = parameters.mode
         self.phase = "idle"
         self.pause_requested = False
         self.cycle_number = 1
@@ -350,379 +352,76 @@ def state_to_document(state: RunnerState) -> JsonObject:
 
 
 def state_from_document(root: Path, document: JsonObject) -> RunnerState:
-    document = copy_json_object(document, "runner state")
-    if type(document.get("schema_version")) is int and document["schema_version"] == 3:
-        document.setdefault("pending_input", None)
-        document.setdefault("last_dag_decision", None)
-        document.setdefault("retained_artifacts", [])
-    fields = {
-        "schema_version",
-        "experiment_id",
-        "run_id",
-        "template_path",
-        "template_revision_id",
-        "template_yaml",
-        "template",
-        "mode",
-        "phase",
-        "pause_requested",
-        "cycle_number",
-        "stage_position",
-        "active_attempt",
-        "stage_retry_counts",
-        "stage_attempt_numbers",
-        "services",
-        "last_result",
-        "last_result_id",
-        "stage_result_ids",
-        "unknown_state_recovery_count",
-        "used_request_ids",
-        "stable_snapshot_id",
-        "pending_rebuild",
-        "pending_advance",
-        "stage_result_origins",
-        "checkpoint_id",
-        "owner_identity",
-        "pending_input",
-        "last_dag_decision",
-        "retained_artifacts",
-    }
-    if (
-        document.keys() != fields
-        or type(document["schema_version"]) is not int
-        or document["schema_version"] not in (3, 4)
-    ):
-        raise ValueError("Unsupported runner state schema.")
-    template_path = Path(document["template_path"])
-    if not template_path.is_absolute():
-        template_path = root / template_path
-    state = RunnerState(
-        document["experiment_id"],
-        root,
-        document["run_id"],
-        template_path,
-        document["template_revision_id"],
-        document["template_yaml"],
-        document["template"],
-        document["mode"],
+    """Validate the entire document before allocating any runtime records."""
+    if not root.is_absolute():
+        raise ValueError("Experiment and template paths must be absolute.")
+    return _restore_state(root, SavedRunnerState.model_validate(document))
+
+
+def _saved_path(root: Path, relative: str, label: str) -> Path:
+    path = Path(relative)
+    resolved = (root / path).resolve()
+    if path.anchor:
+        raise ValueError(f"Saved {label} escapes the experiment.")
+    try:
+        _relative_state_path(resolved, root)
+    except ValueError:
+        raise ValueError(f"Saved {label} escapes the experiment.") from None
+    return resolved
+
+
+def _restore_state(root: Path, document: SavedRunnerState) -> RunnerState:
+    values = document.model_dump(exclude_unset=True)
+    values.pop("schema_version")
+    template_path = Path(document.template_path)
+    values["template_path"] = (
+        template_path if template_path.is_absolute() else root / template_path
     )
-    if document["phase"] not in (
-        "idle",
-        "starting",
-        "stage_running",
-        "waiting",
-        "snapshotting",
-        "rebuilding",
-        "restoring",
-        "stopped",
-        "completed",
-        "failed",
-    ):
-        raise ValueError("Invalid saved phase.")
-    if (
-        type(document["pause_requested"]) is not bool
-        or type(document["services"]) is not dict
-    ):
-        raise ValueError("Invalid pause flag or service state.")
-    for key in ("cycle_number", "stage_position", "unknown_state_recovery_count"):
-        minimum = 0 if key == "unknown_state_recovery_count" else 1
-        if type(document[key]) is not int or document[key] < minimum:
-            raise ValueError(f"Invalid saved {key}.")
-    for key in ("stage_retry_counts", "stage_attempt_numbers"):
-        if type(document[key]) is not dict:
-            raise TypeError(f"{key} must be an object.")
-        for definition_id, count in document[key].items():
-            UUID(definition_id)
-            if type(count) is not int or count < 0:
-                raise ValueError("Saved counts must be nonnegative integers.")
-    for key in (
-        "phase",
-        "pause_requested",
-        "cycle_number",
-        "stage_position",
-        "stage_retry_counts",
-        "stage_attempt_numbers",
-        "last_result",
-        "unknown_state_recovery_count",
-        "stable_snapshot_id",
-        "pending_rebuild",
-    ):
-        setattr(state, key, document[key])
-    if state.pending_rebuild is not None:
-        pending = copy_json_object(state.pending_rebuild, "pending_rebuild")
-        if pending.keys() != {
-            "operation_id",
-            "snapshot_id",
-            "template_revision_id",
-            "run_id",
-        }:
-            raise ValueError("Invalid pending rebuild fields.")
-        for key in ("operation_id", "snapshot_id", "template_revision_id"):
-            UUID(require_text(pending[key], f"pending_rebuild.{key}"))
-        require_text(pending["run_id"], "pending_rebuild.run_id")
-        if state.stable_snapshot_id != pending["snapshot_id"]:
-            raise ValueError("Pending rebuild must retain its protective snapshot.")
-        state.pending_rebuild = pending
-    if type(document["used_request_ids"]) is not list:
-        raise TypeError("used_request_ids must be an array.")
-    for request_id in document["used_request_ids"]:
-        UUID(request_id)
-    state.used_request_ids = set(document["used_request_ids"])
-    if len(state.used_request_ids) != len(document["used_request_ids"]):
-        raise ValueError("Duplicate saved request ID.")
-    if type(document["pending_advance"]) is not bool:
-        raise TypeError("pending_advance must be a boolean.")
-    state.pending_advance = document["pending_advance"]
-    if document["checkpoint_id"] is not None:
-        UUID(require_text(document["checkpoint_id"], "checkpoint_id"))
-    state.checkpoint_id = document["checkpoint_id"]
-    if document["owner_identity"] is not None:
-        owner = copy_json_object(document["owner_identity"], "runner owner")
-        if owner.keys() != {"pid", "created_at_os", "host_id", "boot_id"}:
-            raise ValueError("Runner owner requires complete OS identity.")
-        for key in ("pid", "created_at_os"):
-            if type(owner[key]) is not int or owner[key] < (1 if key == "pid" else 0):
-                raise ValueError("Invalid runner owner identity.")
-        require_text(owner["host_id"], "owner host_id")
-        require_text(owner["boot_id"], "owner boot_id")
-        state.owner_identity = owner
-    origins = copy_json_object(document["stage_result_origins"], "stage result origins")
-    if type(document["stage_result_ids"]) is not dict:
-        raise TypeError("stage_result_ids must be an object.")
-    if origins.keys() - document["stage_result_ids"].keys():
-        raise ValueError("A result origin requires a saved stage result.")
-    for stage_id, origin in origins.items():
-        UUID(stage_id)
-        require_text(origin, "result experiment ID")
-    state.stage_result_origins = origins
-    stage_ids = {item["stage_id"] for item in state.template["stages"]}
-    _restore_transitions(state, document, stage_ids)
-    retained = document["retained_artifacts"]
-    if type(retained) is not list or len(retained) != len(set(retained)):
-        raise ValueError("retained_artifacts must be a unique array of paths.")
-    artifacts_root = (root / "shared_artifacts").resolve()
-    for relative in retained:
-        path = Path(require_text(relative, "retained artifact"))
-        if path.anchor or not (root / path).resolve().is_relative_to(artifacts_root):
+    values["used_request_ids"] = set(document.used_request_ids)
+    values["services"] = {
+        key: _restore_service(root, service)
+        for key, service in document.services.items()
+    }
+    values["active_attempt"] = (
+        None
+        if document.active_attempt is None
+        else _restore_attempt(root, document.active_attempt)
+    )
+    artifacts = (root / "shared_artifacts").resolve()
+    for relative in document.retained_artifacts:
+        path = Path(relative)
+        if path.anchor or not (root / path).resolve().is_relative_to(artifacts):
             raise ValueError("Retained artifact path escapes shared_artifacts.")
-    state.retained_artifacts = retained
-    service_request_ids = set()
-    for service_id, saved in document["services"].items():
-        saved = copy_json_object(saved, "service state")
-        # Earlier schema-3 states had no explicit manual-stop intent.
-        saved.setdefault("manually_stopped", False)
-        instance = ServiceInstance(
-            saved["service_id"],
-            saved["service_instance_id"],
-            saved["definition"],
-        )
-        if service_id != instance.service_id or saved.keys() != vars(instance).keys():
-            raise ValueError("Invalid saved service fields or identity.")
-        for key in ("ready", "ever_ready", "stopping", "stopped", "manually_stopped"):
-            if type(saved[key]) is not bool:
-                raise TypeError(f"service.{key} must be a boolean.")
-        if type(saved["restart_count"]) is not int or saved["restart_count"] < 0:
-            raise ValueError("Invalid service restart count.")
-        if saved["blocked_action"] not in (None, "pause", "stop") or saved[
-            "implementation"
-        ] not in ("full", "action"):
-            raise ValueError("Invalid saved service mode.")
-        if saved["start_deadline"] is not None:
-            require_number(saved["start_deadline"], "service start deadline")
-        if saved["process_identity"] is not None:
-            identity = copy_json_object(
-                saved["process_identity"], "service process identity"
-            )
-            if identity.keys() != {"pid", "created_at_os", "host_id", "boot_id"}:
-                raise ValueError("Service requires complete OS identity.")
-            for name in ("pid", "created_at_os"):
-                if type(identity[name]) is not int or identity[name] < (
-                    1 if name == "pid" else 0
-                ):
-                    raise ValueError("Invalid service OS identity value.")
-            for name in ("host_id", "boot_id"):
-                require_text(identity[name], name)
-        for name in ("started_at",):
-            if saved[name] is not None:
-                require_text(saved[name], name)
-        if saved["failure"] is not None:
-            failure = copy_json_object(saved["failure"], "service failure")
-            if failure.keys() != {"code", "message"}:
-                raise ValueError("Service failure requires code and message.")
-            require_text(failure["code"], "failure code")
-            require_text(failure["message"], "failure message")
-        if saved["last_status"] is not None:
-            copy_json_object(saved["last_status"], "service status")
-        for key in ("freeze_id", "prepared_freeze_id"):
-            if saved[key] is not None:
-                UUID(saved[key])
-        _validate_service_requests(saved, state, instance, service_request_ids)
-        for name in ("endpoint_path", "artifacts_directory"):
-            if saved[name] is not None:
-                relative = Path(require_text(saved[name], name))
-                resolved = (root / relative).resolve()
-                if relative.anchor:
-                    raise ValueError("Saved service path escapes the experiment.")
-                try:
-                    _relative_state_path(resolved, root)
-                except ValueError:
-                    raise ValueError(
-                        "Saved service path escapes the experiment."
-                    ) from None
-                saved[name] = resolved
-        for name, value in saved.items():
-            setattr(instance, name, value)
-        state.services[service_id] = instance
-    for stage_id, request_id in document["stage_result_ids"].items():
-        UUID(stage_id)
-        UUID(require_text(request_id, "result request ID"))
-        state.stage_result_ids[stage_id] = request_id
-    if document["last_result_id"] is not None:
-        UUID(require_text(document["last_result_id"], "last result ID"))
-        state.last_result_id = document["last_result_id"]
-    if document["active_attempt"] is not None:
-        _restore_active_attempt(root, document, state)
+    # Every field is guaranteed by the saved-document model. Avoid revalidating
+    # constructor inputs while restoring an already checked, complete record.
+    state = RunnerState.__new__(RunnerState)
+    state.experiment_directory = root
+    for name, value in values.items():
+        setattr(state, name, value)
     return state
 
 
-def _restore_transitions(
-    state: RunnerState, document: JsonObject, stage_ids: set[str]
-) -> None:
-    for key in ("pending_input", "last_dag_decision"):
-        value = document[key]
-        if value is None:
-            continue
-        value = copy_json_object(value, key)
-        expected = {"request_id", "source_stage_id", "experiment_id"}
-        expected.add("stage_id" if key == "pending_input" else "decision")
-        if value.keys() != expected:
-            raise ValueError(f"Invalid {key} fields.")
-        UUID(require_text(value["request_id"], "transition request_id"))
-        UUID(require_text(value["source_stage_id"], "transition source_stage_id"))
-        require_text(value["experiment_id"], "transition experiment_id")
-        if value["source_stage_id"] not in stage_ids:
-            raise ValueError("Saved transition refers to an unknown source stage.")
-        if key == "pending_input":
-            if value["stage_id"] not in stage_ids:
-                raise ValueError("Pending input targets an unknown stage.")
-            if (
-                state.stage_position > len(state.template["stages"])
-                or value["stage_id"]
-                != state.template["stages"][state.stage_position - 1]["stage_id"]
-            ):
-                raise ValueError("Pending input must belong to the current cursor.")
-        else:
-            decision = copy_json_object(value["decision"], "DAG decision")
-            command = decision.get("command")
-            if command not in (None, "pause", "stop", "move"):
-                raise ValueError("Invalid saved DAG command.")
-            fields = {"command", "stage_id"} if command == "move" else {"command"}
-            if decision.keys() != fields:
-                raise ValueError("Invalid saved DAG decision fields.")
-            if command == "move" and decision["stage_id"] not in stage_ids:
-                raise ValueError("Saved move targets an unknown stage.")
-        setattr(state, key, value)
+def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
+    values = document.model_dump(exclude_unset=True)
+    for name in ("endpoint_path", "artifacts_directory"):
+        if values[name] is not None:
+            values[name] = _saved_path(root, values[name], "service path")
+    instance = ServiceInstance.__new__(ServiceInstance)
+    for name, value in values.items():
+        setattr(instance, name, value)
+    return instance
 
 
-def _validate_service_requests(
-    saved: JsonObject,
-    state: RunnerState,
-    instance: ServiceInstance,
-    service_request_ids: set[str],
-) -> None:
-    if type(saved["pending_requests"]) is not list:
-        raise TypeError("Service pending_requests must be an array.")
-    requests = [*saved["pending_requests"]]
-    if saved["active_request"] is not None:
-        requests.append(saved["active_request"])
-    for index, request in enumerate(requests):
-        request = copy_json_object(request, "service request")
-        if request.get("owner") not in ("caller", "service"):
-            raise ValueError("Saved request has an invalid policy owner.")
-        require_number(request["queued_monotonic"], "request queue time")
-        if request.get("deadline_monotonic") is not None:
-            require_number(request["deadline_monotonic"], "request deadline")
-        request_id = require_text(request["request_id"], "request_id")
-        UUID(request_id)
-        if (
-            request_id not in state.used_request_ids
-            or request_id in service_request_ids
-        ):
-            raise ValueError("Service request ID is missing or duplicated.")
-        service_request_ids.add(request_id)
-        require_text(request["command"], "service command")
-        copy_json_object(request["args"], "service command arguments")
-        if request["sent_monotonic"] is not None:
-            require_number(request["sent_monotonic"], "service send time")
-        if index < len(saved["pending_requests"]):
-            if request["sent_monotonic"] is not None or request["timed_out"]:
-                raise ValueError(
-                    "A sent service request cannot re-enter the pending queue."
-                )
-        elif (
-            request["sent_monotonic"] is None
-            or request["service_instance_id"] != instance.service_instance_id
-        ):
-            raise ValueError(
-                "Active service request has no matching send identity/time."
-            )
-        if type(request["timed_out"]) is not bool:
-            raise TypeError("Service timed_out must be a boolean.")
-
-
-def _restore_active_attempt(
-    root: Path, document: JsonObject, state: RunnerState
-) -> None:
-    attempt = copy_json_object(document["active_attempt"], "active_attempt")
-    observed = {
-        key: attempt.pop(key)
-        for key in (
-            "process_identity",
-            "started_at",
-            "result_request_id",
-            "outcome",
-            "executor_status",
-            "request_id",
-            "participant",
-            "endpoint_path",
-            "service_id",
-            "queued_monotonic",
-            "queued_at",
+def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
+    values = document.model_dump(exclude_unset=True)
+    values["artifacts_directory"] = _saved_path(
+        root, document.artifacts_directory, "attempt directory"
+    )
+    if document.endpoint_path is not None:
+        values["endpoint_path"] = _saved_path(
+            root, document.endpoint_path, "participant endpoint"
         )
-    }
-    relative = Path(attempt["artifacts_directory"])
-    attempt["artifacts_directory"] = (root / relative).resolve()
-    if relative.anchor:
-        raise ValueError("Saved attempt directory escapes the experiment.")
-    try:
-        _relative_state_path(attempt["artifacts_directory"], root)
-    except ValueError:
-        raise ValueError("Saved attempt directory escapes the experiment.") from None
-    state.active_attempt = StageAttempt(**attempt)
-    UUID(require_text(observed["request_id"], "request_id"))
-    if observed["result_request_id"] is not None:
-        UUID(require_text(observed["result_request_id"], "result request ID"))
-    if observed["participant"] is not None:
-        participant_identity(observed["participant"])
-    else:
-        raise ValueError("An active attempt requires a participant identity.")
-    if observed["service_id"] is not None:
-        UUID(require_text(observed["service_id"], "service ID"))
-        if observed["participant"]["participant_id"] != observed["service_id"]:
-            raise ValueError("Service attempt identity differs from its service.")
-    if observed["queued_monotonic"] is not None:
-        require_number(observed["queued_monotonic"], "queue time")
-    if observed["endpoint_path"] is not None:
-        relative = Path(observed["endpoint_path"])
-        resolved = (root / relative).resolve()
-        if relative.anchor:
-            raise ValueError("Saved participant endpoint escapes the experiment.")
-        try:
-            _relative_state_path(resolved, root)
-        except ValueError:
-            raise ValueError(
-                "Saved participant endpoint escapes the experiment."
-            ) from None
-        observed["endpoint_path"] = resolved
-    for key, value in observed.items():
-        setattr(state.active_attempt, key, value)
+    attempt = StageAttempt.__new__(StageAttempt)
+    for name, value in values.items():
+        setattr(attempt, name, value)
+    return attempt

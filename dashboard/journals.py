@@ -24,6 +24,7 @@ from core.journal.history_cache import (
     acquire_cache_writer,
 )
 from core.journal.logger import OperationLogger
+from core.models.experiment_registry import RegistryEntry
 from core.primitives.json_files import read_json, write_json
 from dashboard.api_client import SystemAPIError
 from dashboard.projections import (
@@ -420,12 +421,10 @@ class LocalJournals:
             raise ValueError("Experiment directory escapes the configured project.")
         result = {}
         for identifier, folder in document.items():
-            if (
-                not isinstance(folder, str)
-                or Path(folder).name != folder
-                or folder in {".", ".."}
-            ):
-                raise ValueError("Invalid experiment registry entry.")
+            try:
+                folder = RegistryEntry.model_validate({"folder": folder}).folder
+            except (ValueError, TypeError) as error:
+                raise ValueError("Invalid experiment registry entry.") from error
             directory = (base / folder).resolve()
             if not directory.is_relative_to(base):
                 raise ValueError("Registered experiment escapes the project.")

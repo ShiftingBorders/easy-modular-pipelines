@@ -2,59 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from uuid import UUID
 
 from core.experiments.results import read_result
 from core.experiments.state import RunnerState
 from core.journal.storage import SQLiteEventStore
+from core.models.snapshot_documents import SnapshotManifest
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
 
 def _validate_snapshot_manifest(document: JsonObject) -> None:
-    required = {
-        "schema_version",
-        "snapshot_id",
-        "experiment_id",
-        "experiment_folder",
-        "created_at",
-        "sequence",
-        "kind",
-        "label",
-        "state",
-        "services",
-        "journal",
-        "directories",
-        "files",
-    }
-    if (
-        document.keys() != required
-        or type(document["schema_version"]) is not int
-        or document["schema_version"] != 2
-    ):
-        raise ValueError("Unsupported experiment snapshot manifest.")
-    UUID(require_text(document["snapshot_id"], "snapshot_id"))
-    require_text(document["experiment_id"], "experiment_id")
-    folder = require_text(document["experiment_folder"], "experiment folder")
-    if (
-        folder in (".", "..")
-        or Path(folder).name != folder
-        or any(character in folder for character in '/\\:*?"<>|')
-    ):
-        raise ValueError("Invalid experiment folder in snapshot.")
-    if (
-        type(document["sequence"]) is not int
-        or not 0 < document["sequence"] <= 9223372036854775807
-        or document["kind"] not in ("regular", "final")
-    ):
-        raise ValueError("Invalid snapshot sequence or kind.")
-    if datetime.fromisoformat(document["created_at"]).utcoffset() != UTC.utcoffset(
-        None
-    ):
-        raise ValueError("Snapshot time must be UTC.")
-    if document["label"] is not None:
-        require_text(document["label"], "snapshot label")
+    SnapshotManifest.model_validate(document)
 
 
 def _validate_snapshot_exports(

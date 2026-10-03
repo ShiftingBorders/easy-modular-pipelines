@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import psutil
@@ -34,6 +34,11 @@ from core.experiments.state import (
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
+from core.models.snapshot_documents import (
+    STAGE_CONTROL_FILES,
+    RestoreTransaction,
+    SnapshotInventory,
+)
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 from core.primitives.processes import process_identity
@@ -42,17 +47,7 @@ from core.primitives.processes import process_identity
 class ExperimentSnapshots:
     """Own snapshot publication and restoration; the runner owns DAG decisions."""
 
-    _STAGE_CONTROL_FILES = frozenset(
-        {
-            "launch.json",
-            "context.json",
-            "process.json",
-            "ready.json",
-            "executor.token",
-            "executor.lock.json",
-            "stop.emergency.json",
-        }
-    )
+    _STAGE_CONTROL_FILES = STAGE_CONTROL_FILES
 
     def __init__(
         self,
@@ -603,59 +598,21 @@ class ExperimentSnapshots:
         return document
 
     def _validate_snapshot_files(self, directory: Path, document: JsonObject) -> None:
-        files = copy_json_object(document["files"], "snapshot files")
-        directories = document["directories"]
-        if type(directories) is not list or any(
-            type(item) is not str for item in directories
-        ):
-            raise TypeError("Snapshot directories must be a string array.")
-        names = [*directories, *files]
-        if len({name.casefold() for name in names}) != len(names):
-            raise ValueError("Snapshot paths collide.")
-        for name in names:
-            relative = PurePosixPath(name)
-            if (
-                not name
-                or "\\" in name
-                or ":" in name
-                or PureWindowsPath(name).anchor
-                or relative.is_absolute()
-                or any(
-                    part in (".", "..") or part.rstrip(" .") != part
-                    for part in name.split("/")
-                )
-                or relative.parts[0] not in ("files", "journal")
-            ):
-                raise ValueError("Unsafe snapshot member path.")
-            parts = relative.parts
-            if (
-                parts[0] == "files"
-                and len(parts) > 1
-                and parts[1]
-                not in {
-                    "modules",
-                    "module_data",
-                    "shared_settings",
-                    "shared_data",
-                    "shared_artifacts",
-                    "experiment.yaml",
-                }
-            ):
-                raise ValueError("Snapshot contains a runtime control file.")
-            if parts[:3] == ("files", "shared_artifacts", "services"):
-                raise ValueError("Snapshot contains live service control artifacts.")
-            if (
-                len(parts) == 7
-                and parts[:2] == ("files", "shared_artifacts")
-                and parts[2].startswith("epoch_")
-                and parts[5].startswith("attempt_")
-                and (
-                    parts[6] in self._STAGE_CONTROL_FILES
-                    or parts[6].startswith("executor.lock.")
-                    and parts[6].endswith(".token")
-                )
-            ):
-                raise ValueError("Snapshot contains live stage control artifacts.")
+        inventory = SnapshotInventory.model_validate(
+            {
+                "files": document["files"],
+                "directories": document["directories"],
+            }
+        )
+        self._check_snapshot_inventory(directory, inventory)
+
+    def _check_snapshot_inventory(
+        self,
+        directory: Path,
+        inventory: SnapshotInventory,
+    ) -> None:
+        files, directories = inventory.files, inventory.directories
+        for name in (*directories, *files):
             path = directory / name
             if (
                 path.is_symlink()
@@ -681,18 +638,13 @@ class ExperimentSnapshots:
                     relative = path.relative_to(directory).as_posix()
                     observed_files.add(relative)
                     expected = files.get(relative)
-                    if (
-                        type(expected) is not dict
-                        or expected.keys() != {"size_bytes", "sha256"}
-                        or type(expected["size_bytes"]) is not int
-                        or expected["size_bytes"] < 0
-                    ):
+                    if expected is None:
                         raise ValueError("Invalid snapshot file inventory.")
                     with path.open("rb") as stream:
                         digest = hashlib.file_digest(stream, "sha256").hexdigest()
                     if (
-                        path.stat().st_size != expected["size_bytes"]
-                        or digest != expected["sha256"]
+                        path.stat().st_size != expected.size_bytes
+                        or digest != expected.sha256
                     ):
                         raise ValueError(f"Snapshot file checksum mismatch: {relative}")
         if observed_files != set(files) or observed_directories != set(directories):
@@ -933,40 +885,11 @@ class ExperimentSnapshots:
         validate_only: bool = False,
         retry_failed: bool = False,
     ) -> RunnerState:
-        transaction = copy_json_object(transaction, "restore transaction")
-        if (
-            transaction.keys()
-            != {
-                "schema_version",
-                "restoration_id",
-                "experiment_id",
-                "target_folder",
-                "source_folder",
-                "snapshot_id",
-                "run_id",
-                "clone",
-                "phase",
-                "preserve_diagnostics",
-                "stopped_state",
-                "owner",
-            }
-            or type(transaction["schema_version"]) is not int
-            or transaction["schema_version"] != 2
-        ):
-            raise ValueError("Invalid restore transaction marker.")
-        restoration_id = str(UUID(transaction["restoration_id"]))
-        snapshot_id = str(UUID(transaction["snapshot_id"]))
-        owner = copy_json_object(transaction["owner"], "restore owner")
-        if (
-            owner.keys() != {"pid", "created_at_os", "host_id", "boot_id"}
-            or type(owner["pid"]) is not int
-            or owner["pid"] < 1
-            or type(owner["created_at_os"]) is not int
-            or owner["created_at_os"] < 0
-        ):
-            raise ValueError("Invalid restoration owner identity.")
-        require_text(owner["host_id"], "restore owner host")
-        require_text(owner["boot_id"], "restore owner boot")
+        validated = RestoreTransaction.model_validate(transaction)
+        transaction = validated.model_dump(exclude_unset=True)
+        restoration_id = str(UUID(validated.restoration_id))
+        snapshot_id = str(UUID(validated.snapshot_id))
+        owner = validated.owner.model_dump()
         if owner.get("pid") != os.getpid():
             try:
                 if process_identity(owner["pid"]) == owner:
@@ -983,19 +906,6 @@ class ExperimentSnapshots:
                     error, (FileNotFoundError, ProcessLookupError)
                 ) and getattr(error, "winerror", None) not in (87, 1168):
                     raise
-        if (
-            type(transaction["clone"]) is not bool
-            or type(transaction["preserve_diagnostics"]) is not bool
-        ):
-            raise TypeError("Restore transaction flags must be booleans.")
-        for key in ("target_folder", "source_folder"):
-            name = require_text(transaction[key], key)
-            if (
-                name in (".", "..")
-                or Path(name).name != name
-                or any(character in name for character in '/\\:*?"<>|')
-            ):
-                raise ValueError("Unsafe transaction folder.")
         target = self._project_root / "experiments" / transaction["target_folder"]
         work = self._project_root / "controller/restores" / restoration_id
         if (
@@ -1004,16 +914,6 @@ class ExperimentSnapshots:
             or not work.resolve().is_relative_to(self._project_root)
         ):
             raise ValueError("Restore transaction belongs to another experiment.")
-        if transaction["phase"] not in (
-            "staging",
-            "prepared",
-            "files_installed",
-            "journal_restored",
-            "services_starting",
-            "complete",
-            "failed",
-        ):
-            raise ValueError("Unknown restoration phase.")
         for path in (
             marker,
             target,

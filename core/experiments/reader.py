@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID
 
 from core.journal.storage import SQLiteEventStore
+from core.models.experiment_registry import RegistryEntry
 from core.primitives.json_files import read_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
@@ -30,14 +31,12 @@ class ExperimentReader:
         require_text(experiment_id, "experiment_id")
         if experiment_id not in registry:
             raise FileNotFoundError(f"Unknown experiment: {experiment_id}")
-        folder = registry[experiment_id]
-        if (
-            not isinstance(folder, str)
-            or not folder
-            or Path(folder).name != folder
-            or folder in (".", "..")
-        ):
-            raise ValueError(f"Invalid registry entry: {experiment_id}")
+        try:
+            folder = RegistryEntry.model_validate(
+                {"folder": registry[experiment_id]}
+            ).folder
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"Invalid registry entry: {experiment_id}") from error
         base = self._path(self._root, "experiments")
         return self._path(base, folder)
 

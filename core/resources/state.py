@@ -8,15 +8,13 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
-from core.journal.events import validate_context
 from core.models.resource_settings import CollectorConfiguration
+from core.models.resource_target import ResourceTargetDocument
 from core.primitives.json_files import read_json
 from core.primitives.json_values import (
     JsonObject,
-    copy_json_object,
-    require_text,
 )
 
 
@@ -60,20 +58,8 @@ class ResourceTarget:
 
     @classmethod
     def from_document(cls, document: JsonObject) -> ResourceTarget:
-        document = copy_json_object(document, "resource target")
-        if document.keys() != {"series_id", "identity", "context"}:
-            raise ValueError("A target requires series_id, identity, and context.")
-        series_id = require_text(document["series_id"], "series_id")
-        UUID(series_id)
-        identity = copy_json_object(document["identity"], "process identity")
-        if identity.keys() != {"pid", "created_at_os", "host_id", "boot_id"}:
-            raise ValueError("A resource target requires the complete OS identity.")
-        for name in ("pid", "created_at_os"):
-            if type(identity[name]) is not int or identity[name] <= 0:
-                raise ValueError(f"identity.{name} must be a positive integer.")
-        for name in ("host_id", "boot_id"):
-            require_text(identity[name], name)
-        return cls(series_id, identity, validate_context(document["context"]))
+        target = ResourceTargetDocument.model_validate(document)
+        return cls(target.series_id, target.identity.model_dump(), target.context)
 
 
 class ResourceHistory:

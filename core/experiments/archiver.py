@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import psutil
 import yaml
@@ -30,6 +30,7 @@ from core.experiments.archive_inputs import (
 from core.experiments.assembler import ExperimentAssembler, find_experiment
 from core.experiments.state import RunnerState
 from core.journal.logger import OperationLogger
+from core.models.archive_documents import ArchiveManifest
 from core.models.archive_settings import ArchiveConfiguration
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
@@ -584,53 +585,13 @@ class ExperimentArchiver:
         return manifest
 
     def _validate_payload(self, payload: Path, manifest: JsonObject) -> set[str]:
-        if (
-            manifest.keys()
-            != {
-                "schema_version",
-                "archive_id",
-                "created_at",
-                "source_experiment_id",
-                "template",
-                "modules",
-                "directories",
-                "files",
-            }
-            or type(manifest["schema_version"]) is not int
-            or manifest["schema_version"] != 2
-        ):
-            raise ValueError("Unsupported experiment archive manifest.")
-        UUID(require_text(manifest["archive_id"], "archive_id"))
-        require_text(manifest["source_experiment_id"], "source_experiment_id")
-        if datetime.fromisoformat(
-            require_text(manifest["created_at"], "created_at")
-        ).utcoffset() != UTC.utcoffset(None):
-            raise ValueError("Archive creation time must use UTC.")
-        if manifest["template"] != "experiment.yaml":
-            raise ValueError("The archive template must be experiment.yaml.")
-        directories = manifest["directories"]
-        files = copy_json_object(manifest["files"], "archive files")
-        if not isinstance(directories, list) or any(
-            not isinstance(item, str) for item in directories
-        ):
-            raise ValueError("Archive directories must be an array of paths.")
-        directories = [require_text(item, "directory") for item in directories]
-        names = [_member(name) for name in [*directories, *files]]
-        if "manifest.json" in names or len({name.casefold() for name in names}) != len(
-            names
-        ):
-            raise ValueError("Archive manifest contains colliding or reserved paths.")
-        for info in files.values():
-            info = copy_json_object(info, "file integrity")
-            if (
-                info.keys() != {"size", "sha256"}
-                or type(info["size"]) is not int
-                or info["size"] < 0
-            ):
-                raise ValueError("Invalid file integrity record.")
-            digest = require_text(info["sha256"], "file sha256")
-            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-                raise ValueError("Invalid file SHA-256.")
+        return self._check_payload(payload, ArchiveManifest.model_validate(manifest))
+
+    def _check_payload(self, payload: Path, manifest: ArchiveManifest) -> set[str]:
+        directories = manifest.directories
+        files = {name: info.model_dump() for name, info in manifest.files.items()}
+        manifest = manifest.model_dump()
+        names = [*directories, *files]
         actual_dirs, actual_files = self._inventory(payload)
         actual_files.pop("manifest.json", None)
         if sorted(directories) != actual_dirs or files != actual_files:

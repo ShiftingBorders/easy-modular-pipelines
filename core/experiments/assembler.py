@@ -13,6 +13,7 @@ import yaml
 
 from core.experiments.state import RunnerState
 from core.experiments.template_validation import _template_document
+from core.models.experiment_registry import RegistryEntry
 from core.models.experiment_template import (
     ErrorPolicy,
     ExperimentTemplate,
@@ -44,13 +45,14 @@ def find_experiment(project_root: Path, experiment_id: str) -> Path:
     registry = copy_json_object(
         json.loads(registry_path.read_text(encoding="utf-8")), "registry"
     )
-    folder = registry.get(experiment_id)
-    if (
-        not isinstance(folder, str)
-        or Path(folder).name != folder
-        or folder in (".", "..")
-    ):
-        raise FileNotFoundError(f"Unknown or invalid experiment: {experiment_id}")
+    try:
+        folder = RegistryEntry.model_validate(
+            {"folder": registry.get(experiment_id)}
+        ).folder
+    except (ValueError, TypeError) as error:
+        raise FileNotFoundError(
+            f"Unknown or invalid experiment: {experiment_id}"
+        ) from error
     directory = (root / "experiments" / folder).resolve()
     if not directory.is_relative_to((root / "experiments").resolve()):
         raise ValueError("Experiment directory escapes the project.")

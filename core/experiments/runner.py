@@ -39,6 +39,7 @@ from core.experiments.state import (
 )
 from core.journal.events import LoggingError, encode_event
 from core.journal.logger import OperationLogger
+from core.models.experiment_registry import RegistryEntry
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -2052,13 +2053,12 @@ class ExperimentRunner:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         registry = read_json(self._project_root / "experiments.json")
-        folder = registry.get(experiment_id)
-        if (
-            not isinstance(folder, str)
-            or folder in (".", "..")
-            or Path(folder).name != folder
-        ):
-            raise FileNotFoundError(f"Unknown experiment: {experiment_id}")
+        try:
+            folder = RegistryEntry.model_validate(
+                {"folder": registry.get(experiment_id)}
+            ).folder
+        except (ValueError, TypeError) as error:
+            raise FileNotFoundError(f"Unknown experiment: {experiment_id}") from error
         root = (self._project_root / "experiments" / folder).resolve()
         if not root.is_relative_to((self._project_root / "experiments").resolve()):
             raise ValueError("Experiment registry path escapes the project.")
