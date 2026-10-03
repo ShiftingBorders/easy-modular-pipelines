@@ -130,6 +130,24 @@ class SnapshotManifest(BaseModel):
         return copy_json_object(document, "snapshot manifest")
 
 
+class SnapshotMetadata(BaseModel):
+    """The legacy inspection subset, without full restoration/inventory requirements."""
+
+    model_config = ConfigDict(
+        extra="allow", strict=True, frozen=True, hide_input_in_errors=True
+    )
+
+    schema_version: Annotated[int, Field(ge=2, le=2)]
+    snapshot_id: UUIDText
+    experiment_id: Text
+    state: JsonObject
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        return copy_json_object(document, "snapshot metadata")
+
+
 class SnapshotFile(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 

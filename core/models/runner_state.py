@@ -232,6 +232,15 @@ class SavedAttempt(_Document):
         return self
 
 
+class SavedStateMetadata(_Document):
+    """Inspection header only; opaque state is not reconstructed or integrity checked."""
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: Annotated[int, Field(ge=3, le=4)]
+    experiment_id: Text
+
+
 class SavedRunnerState(_Document):
     schema_version: Annotated[int, Field(ge=3, le=4)]
     experiment_id: Text

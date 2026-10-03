@@ -489,9 +489,15 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                 raise StorageUnavailable("mutation failed")
             return True
 
+        identifiers = {
+            name: str(uuid4())
+            for name in ("first", "fail", "cancelled", "next", "bad-read", "state")
+        }
+        chain_id = str(uuid4())
         commands = [
             {
-                "command_id": name,
+                "api_version": 1,
+                "command_id": identifiers[name],
                 "command": "module.remove",
                 "args": {"name": name, "version": "1"},
             }
@@ -500,21 +506,39 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(files.manager, "unregister_module_async", side_effect=remove):
             serving = asyncio.create_task(controller.serve())
             try:
-                requests.put({"chain_id": "chain", "commands": commands[:3]})
+                requests.put(
+                    {"api_version": 1, "chain_id": chain_id, "commands": commands[:3]}
+                )
                 requests.put(commands[3])
                 await asyncio.wait_for(entered.wait(), 2)
                 requests.put(
-                    {"command_id": "bad-read", "command": "stats.module", "args": {}}
+                    {
+                        "api_version": 1,
+                        "command_id": identifiers["bad-read"],
+                        "command": "stats.module",
+                        "args": {},
+                    }
                 )
-                requests.put({"command_id": "state", "command": "stats.state"})
+                requests.put(
+                    {
+                        "api_version": 1,
+                        "command_id": identifiers["state"],
+                        "command": "stats.state",
+                    }
+                )
                 await wait_until(lambda: responses.qsize() == 2)
                 reads = {
                     response["command_id"]: response
                     for response in (responses.get_nowait(), responses.get_nowait())
                 }
-                self.assertEqual(reads["bad-read"]["error"]["code"], "invalid_request")
                 self.assertEqual(
-                    reads["state"]["data"]["current_command"]["command_id"], "first"
+                    reads[identifiers["bad-read"]]["error"]["code"], "invalid_request"
+                )
+                self.assertEqual(
+                    reads[identifiers["state"]]["data"]["current_command"][
+                        "command_id"
+                    ],
+                    identifiers["first"],
                 )
                 self.assertEqual(calls, ["first"])
                 release.set()
@@ -522,7 +546,10 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                 results = [responses.get_nowait() for _ in range(4)]
                 self.assertEqual(
                     [row["command_id"] for row in results],
-                    ["first", "fail", "cancelled", "next"],
+                    [
+                        identifiers[name]
+                        for name in ("first", "fail", "cancelled", "next")
+                    ],
                 )
                 self.assertEqual(
                     [row["state"] for row in results],
@@ -530,7 +557,7 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     [row["chain_id"] for row in results],
-                    ["chain", "chain", "chain", None],
+                    [chain_id, chain_id, chain_id, None],
                 )
                 self.assertEqual(calls, ["first", "fail", "next"])
             finally:
@@ -564,25 +591,50 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(controller, "_execute", side_effect=execute):
             serving = asyncio.create_task(controller.serve())
+            overflow_id, state_id = str(uuid4()), str(uuid4())
             try:
                 for index in range(4):
-                    requests.put({"command_id": str(index), "command": "stats.modules"})
+                    requests.put(
+                        {
+                            "api_version": 1,
+                            "command_id": str(uuid4()),
+                            "command": "stats.modules",
+                        }
+                    )
                 await wait_until(lambda: len(started) == 4)
                 for index in range(64):
                     requests.put(
-                        {"command_id": f"queued-{index}", "command": "stats.modules"}
+                        {
+                            "api_version": 1,
+                            "command_id": str(uuid4()),
+                            "command": "stats.modules",
+                        }
                     )
                 await wait_until(controller._read_commands.full)
-                requests.put({"command_id": "overflow", "command": "stats.modules"})
-                requests.put({"command_id": "state", "command": "stats.state"})
+                requests.put(
+                    {
+                        "api_version": 1,
+                        "command_id": overflow_id,
+                        "command": "stats.modules",
+                    }
+                )
+                requests.put(
+                    {"api_version": 1, "command_id": state_id, "command": "stats.state"}
+                )
                 await wait_until(lambda: responses.qsize() == 2)
                 overflow, state = responses.get_nowait(), responses.get_nowait()
-                self.assertEqual(overflow["command_id"], "overflow")
+                self.assertEqual(overflow["command_id"], overflow_id)
                 self.assertEqual(overflow["error"]["code"], "too_many_reads")
-                self.assertEqual(state["command_id"], "state")
+                self.assertEqual(state["command_id"], state_id)
                 self.assertIsNone(state["data"]["current_command"])
                 self.assertEqual(len(started), 4)
-                requests.put({"command": "server.shutdown"})
+                requests.put(
+                    {
+                        "api_version": 1,
+                        "command_id": str(uuid4()),
+                        "command": "server.shutdown",
+                    }
+                )
                 await asyncio.wait_for(shutdown.wait(), 2)
             finally:
                 await asyncio.wait_for(controller.close(), 5)
@@ -642,33 +694,49 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                     return await asyncio.to_thread(blocking)
 
                 replacement = blocking if method == "read" else delayed
+                slow_id, state_id, after_id = str(uuid4()), str(uuid4()), str(uuid4())
                 with patch.object(target, method, side_effect=replacement):
                     serving = asyncio.create_task(controller.serve())
                     try:
                         requests.put(
-                            {"command_id": "slow", "command": name, "args": args}
+                            {
+                                "api_version": 1,
+                                "command_id": slow_id,
+                                "command": name,
+                                "args": args,
+                            }
                         )
                         await asyncio.wait_for(entered.wait(), 2)
-                        requests.put({"command_id": "state", "command": "stats.state"})
+                        requests.put(
+                            {
+                                "api_version": 1,
+                                "command_id": state_id,
+                                "command": "stats.state",
+                            }
+                        )
                         await wait_until(
                             lambda responses=responses: not responses.empty()
                         )
-                        self.assertEqual(responses.get_nowait()["command_id"], "state")
+                        self.assertEqual(responses.get_nowait()["command_id"], state_id)
                         release.set()
                         await wait_until(
                             lambda responses=responses: not responses.empty()
                         )
                         failed = responses.get_nowait()
-                        self.assertEqual(failed["command_id"], "slow")
+                        self.assertEqual(failed["command_id"], slow_id)
                         self.assertEqual(failed["error"]["code"], "storage_error")
                         requests.put(
-                            {"command_id": "after", "command": "stats.modules"}
+                            {
+                                "api_version": 1,
+                                "command_id": after_id,
+                                "command": "stats.modules",
+                            }
                         )
                         await wait_until(
                             lambda responses=responses: not responses.empty()
                         )
                         response = responses.get_nowait()
-                        self.assertEqual(response["command_id"], "after")
+                        self.assertEqual(response["command_id"], after_id)
                         self.assertEqual(response["result"], "success")
                     finally:
                         release.set()
@@ -708,6 +776,7 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
             await mutation_release.wait()
             return True
 
+        read_id, mutation_id, state_id = str(uuid4()), str(uuid4()), str(uuid4())
         with (
             patch.object(files.archives, "check_module_stored", side_effect=archive),
             patch.object(files.manager, "unregister_module_async", side_effect=mutate),
@@ -717,25 +786,29 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
             try:
                 requests.put(
                     {
-                        "command_id": "read",
+                        "api_version": 1,
+                        "command_id": read_id,
                         "command": "stats.module",
                         "args": {"name": "worker", "version": "1"},
                     }
                 )
                 requests.put(
                     {
-                        "command_id": "mutation",
+                        "api_version": 1,
+                        "command_id": mutation_id,
                         "command": "module.remove",
                         "args": {"name": "worker", "version": "1"},
                     }
                 )
                 await asyncio.wait_for(archive_started.wait(), 2)
                 await asyncio.wait_for(mutation_started.wait(), 2)
-                requests.put({"command_id": "state", "command": "stats.state"})
+                requests.put(
+                    {"api_version": 1, "command_id": state_id, "command": "stats.state"}
+                )
                 await wait_until(lambda responses=responses: not responses.empty())
                 self.assertEqual(
                     responses.get_nowait()["data"]["current_command"]["command_id"],
-                    "mutation",
+                    mutation_id,
                 )
                 closing = asyncio.create_task(controller.close())
                 await asyncio.sleep(0)
@@ -747,7 +820,7 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(closing.done())
                 mutation_release.set()
                 await asyncio.wait_for(closing, 5)
-                self.assertEqual(responses.get_nowait()["command_id"], "mutation")
+                self.assertEqual(responses.get_nowait()["command_id"], mutation_id)
                 self.assertTrue(all(task.done() for task in controller._tasks))
             finally:
                 archive_release.set()
@@ -770,6 +843,7 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
         for name in ("stats.artifacts", "stats.artifact"):
             response = await controller._execute_command(
                 {
+                    "api_version": 1,
                     "command_id": str(uuid4()),
                     "command": name,
                     "args": {"experiment_id": "old"},

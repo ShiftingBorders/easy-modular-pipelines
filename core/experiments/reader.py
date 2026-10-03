@@ -7,12 +7,14 @@ from uuid import UUID
 
 from core.journal.storage import SQLiteEventStore
 from core.models.experiment_registry import RegistryEntry
+from core.models.runner_state import SavedStateMetadata
 from core.models.server_arguments import (
     ArtifactReference,
     ExperimentReference,
     NoArguments,
     SnapshotMetadataReference,
 )
+from core.models.snapshot_documents import SnapshotMetadata
 from core.primitives.json_files import read_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
@@ -82,9 +84,7 @@ class ExperimentReader:
         state = read_json(self._path(directory, "runner/state.json"))
         if state.get("experiment_id") != experiment_id:
             raise ValueError("Saved state belongs to another experiment.")
-        if state.get("schema_version") not in (3, 4):
-            raise ValueError("Unsupported saved experiment state schema.")
-        return state
+        return SavedStateMetadata.model_validate(state).model_dump(exclude_unset=True)
 
     def inspect_snapshot(self, experiment_id: str, snapshot_id: str) -> JsonObject:
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
@@ -93,14 +93,13 @@ class ExperimentReader:
         base = self._path(base, directory.name)
         folder = self._path(base, snapshot_id)
         manifest = read_json(self._path(folder, "manifest.json"))
-        if manifest.get("schema_version") != 2:
-            raise ValueError("Unsupported snapshot manifest schema.")
+        metadata = SnapshotMetadata.model_validate(manifest)
         if (
-            manifest.get("experiment_id") != experiment_id
-            or manifest.get("snapshot_id") != snapshot_id
+            metadata.experiment_id != experiment_id
+            or metadata.snapshot_id != snapshot_id
         ):
             raise ValueError("Snapshot manifest identity does not match its location.")
-        state = copy_json_object(manifest.get("state"), "snapshot state")
+        state = metadata.state
         if state.get("experiment_id") != experiment_id:
             raise ValueError("Snapshot state belongs to another experiment.")
         return {

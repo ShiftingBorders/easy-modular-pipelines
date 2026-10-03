@@ -230,6 +230,11 @@ delivery has a partial-channel facade and consumes a checked channel object in
 its OS operation; complete saved notification configuration retains its required
 fields.
 
+Experiment metadata inspection uses dedicated saved-state and snapshot header
+models. These preserve sparse legacy documents and opaque fields while checking
+the inspection contract. Location/identity checks remain with the reader;
+inspection does not run restoration or traverse the snapshot inventory.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
