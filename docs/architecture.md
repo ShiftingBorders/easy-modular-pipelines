@@ -40,6 +40,12 @@ overrides keep working, then validates its JSON result before module inspection.
 Registered hashes, actual module roles, filesystem boundaries, and resource
 ownership are checked by the operations that use those resources.
 
+Participant identity, endpoint, hello, request, response, and notification models
+validate wire data at the receiving boundary. Connection operations use typed
+endpoints and replies; public protocol helpers and application handlers retain
+their JSON contracts. Authentication, live OS identity, request correlation,
+deadlines, and work ownership remain with the participant runtime.
+
 The low-level `SQLiteEventStore` constructor validates scalar arguments with
 standard-library rules and performs no file I/O. File-based journal settings
 use Pydantic after their explicit read, reusing those same opening rules.

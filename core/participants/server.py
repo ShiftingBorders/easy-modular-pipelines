@@ -13,6 +13,7 @@ from pathlib import Path
 
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
+from core.models.participant_protocol import ParticipantHello
 from core.participants.protocol import (
     PROTOCOL_VERSION,
     encode_frame,
@@ -150,19 +151,13 @@ class ParticipantServer:
         replies: set[asyncio.Task] = set()
         try:
             async with asyncio.timeout(self._timeout):
-                hello = await read_frame(reader)
-            role = hello.get("role")
-            token = hello.get("token")
+                hello = ParticipantHello.model_validate(await read_frame(reader))
+            role = hello.role
             if (
-                type(hello.get("protocol_version")) is not int
-                or hello["protocol_version"] != PROTOCOL_VERSION
-                or hello.get("message_type") != "hello"
-                or hello.get("identity") != self.identity
-                or role not in ("runner", "module")
+                hello.identity != self.identity
                 or role == "module"
                 and self._module_handler is None
-                or not isinstance(token, str)
-                or not hmac.compare_digest(token, self._token)
+                or not hmac.compare_digest(hello.token, self._token)
             ):
                 return
             self._clients[writer] = (role, asyncio.Lock())

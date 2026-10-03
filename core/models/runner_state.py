@@ -11,6 +11,7 @@ from pydantic import (
     model_validator,
 )
 
+from core.models.participant_identity import ParticipantIdentity
 from core.models.process_identity import ProcessIdentity
 from core.models.values import (
     AbsolutePath,
@@ -47,14 +48,6 @@ class _Document(_Input):
     @classmethod
     def detach(cls, value: object) -> JsonObject:
         return copy_json_object(value, "runner document")
-
-
-class ParticipantIdentity(_Document):
-    model_config = ConfigDict(extra="allow")
-
-    experiment_id: Text
-    participant_id: UUIDText
-    participant_instance_id: UUIDText
 
 
 class AttemptParameters(_Input):

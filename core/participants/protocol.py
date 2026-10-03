@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from uuid import UUID
 
+from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_protocol import (
+    ParticipantRequest,
+    ParticipantResult,
+    ResultEnvelope,
+)
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
 PROTOCOL_VERSION = 2
@@ -20,23 +25,12 @@ def error_details(code: str, message: object | None) -> JsonObject | None:
 
 def participant_identity(context: JsonObject) -> JsonObject:
     identity = {name: context[name] for name in IDENTITY_FIELDS}
-    for name, value in identity.items():
-        require_text(value, name)
-        if name != "experiment_id":
-            UUID(value)
-    return identity
+    return ParticipantIdentity.model_validate(identity).model_dump()
 
 
 def validate_response(response: JsonObject, *, envelope: bool = False) -> JsonObject:
-    response = copy_json_object(response, "participant result")
-    allowed = {"result", "data", "error", "execution"}
-    if envelope:
-        allowed.update({"protocol_version", "message_type", "request_id"})
-    if response.keys() - allowed:
-        raise ValueError("Unknown result fields; domain output belongs in data.")
-    if response.get("result") not in ("success", "fail") or "data" not in response:
-        raise ValueError("A result requires result=success/fail and data.")
-    return response
+    model = ResultEnvelope if envelope else ParticipantResult
+    return model.model_validate(response).model_dump(exclude_unset=True)
 
 
 def encode_frame(message: JsonObject) -> bytes:
@@ -59,15 +53,10 @@ async def read_frame(reader: asyncio.StreamReader) -> JsonObject:
 
 
 def validate_request(message: JsonObject, identity: JsonObject) -> None:
-    if (
-        type(message.get("protocol_version")) is not int
-        or message["protocol_version"] != PROTOCOL_VERSION
-        or message.get("message_type") != "request"
-    ):
-        raise ValueError("Unsupported participant request protocol.")
-    UUID(require_text(message.get("request_id"), "request_id"))
-    message["request_id"] = str(UUID(message["request_id"]))
-    if participant_identity(message) != identity:
+    request = ParticipantRequest.model_validate(message)
+    message["request_id"] = request.request_id
+    actual_identity = {
+        name: getattr(request, name) for name in IDENTITY_FIELDS
+    }
+    if actual_identity != identity:
         raise ValueError("Request belongs to a different participant.")
-    require_text(message.get("command"), "command")
-    copy_json_object(message.get("args"), "request arguments")

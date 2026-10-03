@@ -6,12 +6,17 @@ import asyncio
 from pathlib import Path
 from uuid import UUID
 
+from core.models.participant_protocol import (
+    ParticipantEndpoint,
+    ParticipantHelloReply,
+    ParticipantNotification,
+    ParticipantReply,
+)
 from core.participants.protocol import (
     PROTOCOL_VERSION,
     encode_frame,
     participant_identity,
     read_frame,
-    validate_response,
 )
 from core.primitives.json_files import read_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
@@ -45,31 +50,27 @@ class ParticipantConnection:
         await self.close()
         self._notifications = asyncio.Queue()
         async with asyncio.timeout(timeout_seconds):
-            endpoint = await asyncio.to_thread(read_json, self._endpoint_path)
-            if (
-                type(endpoint.get("protocol_version")) is not int
-                or endpoint["protocol_version"] != PROTOCOL_VERSION
+            endpoint = ParticipantEndpoint.model_validate(
+                await asyncio.to_thread(read_json, self._endpoint_path)
+            )
+            if any(
+                getattr(endpoint, name) != value
+                for name, value in self._identity.items()
             ):
-                raise ValueError(
-                    "Unsupported endpoint protocol; old experiments are not supported."
-                )
-            if participant_identity(endpoint) != self._identity:
                 raise ValueError("Participant endpoint identity mismatch.")
             actual = await asyncio.to_thread(
-                process_identity, endpoint["process"]["pid"]
+                process_identity, endpoint.process.pid
             )
-            if actual != endpoint["process"]:
+            if actual != endpoint.process.model_dump():
                 raise ValueError("Participant OS identity differs from its endpoint.")
-            address = endpoint["endpoint"]
-            if address["host"] != "127.0.0.1" or type(address["port"]) is not int:
-                raise ValueError("Participant must listen on loopback.")
-            token_path = Path(address["token_file"])
+            address = endpoint.endpoint
+            token_path = Path(address.token_file)
             if not token_path.is_absolute():
                 token_path = self._endpoint_path.parent / token_path
             token = await asyncio.to_thread(token_path.read_text, encoding="utf-8")
             try:
                 self._reader, self._writer = await asyncio.open_connection(
-                    address["host"], address["port"]
+                    address.host, address.port
                 )
                 await self.send_message(
                     {
@@ -80,14 +81,10 @@ class ParticipantConnection:
                         "token": token,
                     }
                 )
-                reply = await read_frame(self._reader)
-                if (
-                    type(reply.get("protocol_version")) is not int
-                    or reply["protocol_version"] != PROTOCOL_VERSION
-                    or reply.get("message_type") != "hello"
-                    or reply.get("result") != "success"
-                    or reply.get("data") != self._identity
-                ):
+                reply = ParticipantHelloReply.model_validate(
+                    await read_frame(self._reader)
+                )
+                if reply.data != self._identity:
                     raise ValueError("Participant handshake failed.")
                 self._receive_task = asyncio.create_task(self._receive_loop())
             except BaseException:
@@ -98,28 +95,20 @@ class ParticipantConnection:
         failure = ConnectionError("Participant connection closed.")
         try:
             while True:
-                message = await read_frame(self._reader)
-                if (
-                    type(message.get("protocol_version")) is not int
-                    or message["protocol_version"] != PROTOCOL_VERSION
-                ):
-                    raise ValueError("Unsupported response protocol.")
-                if message.get("message_type") == "notification":
+                message = ParticipantReply.validate_python(
+                    await read_frame(self._reader)
+                )
+                if isinstance(message, ParticipantNotification):
                     if self._role != "module":
                         raise ValueError(
                             "Unexpected notification on the runner channel."
                         )
-                    await self._notifications.put(message)
+                    await self._notifications.put(message.model_dump(exclude_unset=True))
                     continue
-                if message.get("message_type") != "response":
-                    raise ValueError("Expected a participant response.")
-                request_id = str(
-                    UUID(require_text(message.get("request_id"), "request_id"))
-                )
-                validate_response(message, envelope=True)
+                request_id = str(UUID(message.request_id))
                 future = self._pending.get(request_id)
                 if future is not None and not future.done():
-                    future.set_result(message)
+                    future.set_result(message.model_dump(exclude_unset=True))
                 # A late reply never becomes the result of another request.
         except asyncio.CancelledError:
             pass
