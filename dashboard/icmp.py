@@ -1,10 +1,8 @@
 """Server-owned ICMP scheduling, observations, and incident transitions."""
 
 import asyncio
-import ipaddress
 import json
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -14,7 +12,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from dashboard.config import number
+from core.models.dashboard_icmp import (
+    ICMPSettings,
+    ICMPWorkerResult,
+    SavedICMPState,
+)
 
 
 def timestamp() -> str:
@@ -22,55 +24,7 @@ def timestamp() -> str:
 
 
 def validate_icmp_settings(document: object) -> dict:
-    if not isinstance(document, dict) or document.keys() != {
-        "enabled",
-        "host",
-        "timeout_seconds",
-        "interval_seconds",
-    }:
-        raise ValueError(
-            "ICMP settings require enabled, host, timeout_seconds and interval_seconds."
-        )
-    if type(document["enabled"]) is not bool:
-        raise ValueError("enabled must be true or false.")
-    host = document["host"]
-    if not isinstance(host, str):
-        raise TypeError("host must be an IPv4 address or hostname.")
-    host = host.strip()
-    if host:
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            try:
-                host = host.encode("idna").decode("ascii").lower().rstrip(".")
-            except UnicodeError as error:
-                raise ValueError("Invalid hostname.") from error
-            if len(host) > 253 or any(
-                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part)
-                for part in host.split(".")
-            ):
-                raise ValueError(
-                    "Use a hostname without a URL, port, spaces or options."
-                )
-        else:
-            if (
-                address.version != 4
-                or address.is_multicast
-                or address.is_unspecified
-                or str(address) == "255.255.255.255"
-            ):
-                raise ValueError("Use a unicast IPv4 address or hostname.")
-            host = str(address)
-    if document["enabled"] and not host:
-        raise ValueError("A target host is required to enable ICMP monitoring.")
-    timeout = number(document["timeout_seconds"], "timeout_seconds", 0.1, 60)
-    interval = number(document["interval_seconds"], "interval_seconds", 1, 600)
-    return {
-        "enabled": document["enabled"],
-        "host": host,
-        "timeout_seconds": timeout,
-        "interval_seconds": interval,
-    }
+    return ICMPSettings.model_validate(document).model_dump()
 
 
 class ICMPMonitor:
@@ -119,63 +73,24 @@ class ICMPMonitor:
             if path.exists():
                 if path.stat().st_size > 4 * 1024 * 1024:
                     raise ValueError("ICMP state file is too large.")
-                document = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(document, dict) or document.keys() != {
-                    "settings",
-                    "history",
-                    "incidents",
-                }:
-                    raise ValueError("Invalid ICMP state file.")
-                self.settings = validate_icmp_settings(document["settings"])
-                for field in ("history", "incidents"):
-                    if not isinstance(document[field], list) or any(
-                        not isinstance(row, dict) for row in document[field]
-                    ):
-                        raise ValueError(f"Invalid ICMP {field}.")
-                for observation in document["history"]:
-                    if observation.get("status") not in {"reply", "no_reply", "error"}:
-                        raise ValueError("Invalid saved ICMP observation status.")
-                    for field in ("host", "probe_host", "observed_at", "session_id"):
-                        if not isinstance(observation.get(field), str):
-                            raise TypeError(
-                                f"Missing saved ICMP observation field: {field}."
-                            )
-                    observed_at = datetime.fromisoformat(observation["observed_at"])
-                    if observed_at.utcoffset() is None:
-                        raise ValueError(
-                            "Saved ICMP timestamps must include a timezone."
-                        )
-                    if observation.get("rtt_ms") is not None:
-                        number(observation["rtt_ms"], "saved RTT", 0, 3600000)
-                for incident in document["incidents"]:
-                    if incident.get("status") not in {"active", "resolved", "closed"}:
-                        raise ValueError("Invalid saved ICMP incident status.")
-                    for field in ("id", "host", "probe_host", "started_at"):
-                        if not isinstance(incident.get(field), str):
-                            raise TypeError(
-                                f"Missing saved ICMP incident field: {field}."
-                            )
-                    for field in ("started_at", "ended_at"):
-                        value = incident.get(field)
-                        if value is None and field == "ended_at":
-                            continue
-                        instant = datetime.fromisoformat(value)
-                        if instant.utcoffset() is None:
-                            raise ValueError(
-                                "Saved ICMP incident timestamps must include a timezone."
-                            )
-                if (
-                    sum(item["status"] == "active" for item in document["incidents"])
-                    > 1
-                ):
-                    raise ValueError("Multiple active incidents for one ICMP rule.")
-                self.history = document["history"][-720:]
-                self.incidents = document["incidents"][-200:]
+                document = SavedICMPState.model_validate(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+                self._restore_state(document)
         except BaseException:
             self._file.close()
             self._file = None
             raise
         self._task = asyncio.create_task(self._run(), name="dashboard-icmp")
+
+    def _restore_state(self, document: SavedICMPState) -> None:
+        self.settings = document.settings.model_dump()
+        self.history = [
+            item.model_dump(exclude_unset=True) for item in document.history[-720:]
+        ]
+        self.incidents = [
+            item.model_dump(exclude_unset=True) for item in document.incidents[-200:]
+        ]
 
     def _write(self, document: dict) -> None:
         temporary = self.directory / f".icmp-{uuid4()}.json"
@@ -189,7 +104,11 @@ class ICMPMonitor:
             temporary.unlink(missing_ok=True)
 
     async def configure(self, document: object) -> dict:
-        settings = validate_icmp_settings(document)
+        settings = ICMPSettings.model_validate(validate_icmp_settings(document))
+        return await self._configure(settings)
+
+    async def _configure(self, validated: ICMPSettings) -> dict:
+        settings = validated.model_dump()
         async with self._lock:
             if self._closing:
                 raise ValueError("ICMP monitor is closing.")
@@ -283,6 +202,16 @@ class ICMPMonitor:
         return self.snapshot()
 
     async def _measure(self, settings: dict, revision: int) -> None:
+        validated = ICMPSettings.model_validate(settings)
+        started = timestamp()
+        result = await self._probe_worker(validated)
+        async with self._lock:
+            if revision != self._revision:
+                return
+            self._record_probe_result(result, validated, revision, started)
+            await self._persist_observations()
+
+    async def _probe_worker(self, settings: ICMPSettings) -> ICMPWorkerResult:
         worker = Path(__file__).with_name("icmp_worker.py")
         options = (
             {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -290,39 +219,32 @@ class ICMPMonitor:
             else {"start_new_session": True}
         )
         process = None
-        started = timestamp()
         try:
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-B",
                 str(worker),
-                settings["host"],
-                str(settings["timeout_seconds"]),
+                settings.host,
+                str(settings.timeout_seconds),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **options,
             )
             output, _ = await asyncio.wait_for(
-                process.communicate(), settings["timeout_seconds"] + 4
+                process.communicate(), settings.timeout_seconds + 4
             )
             if process.returncode != 0 or len(output) > 16384:
                 raise ValueError("ICMP worker did not return a valid result.")
-            result = json.loads(output)
-            if not isinstance(result, dict) or result.get("status") not in {
-                "reply",
-                "no_reply",
-                "error",
-            }:
-                raise ValueError("Unexpected ICMP worker status.")
-            if result.get("rtt_ms") is not None:
-                number(result["rtt_ms"], "ICMP RTT", 0, 3600000)
+            return ICMPWorkerResult.model_validate(json.loads(output))
         except (TimeoutError, OSError, TypeError, ValueError) as error:
-            result = {
-                "status": "error",
-                "reason": str(error) or "Probe deadline exceeded (including DNS).",
-                "rtt_ms": None,
-                "address": None,
-            }
+            return ICMPWorkerResult.model_validate(
+                {
+                    "status": "error",
+                    "reason": str(error) or "Probe deadline exceeded (including DNS).",
+                    "rtt_ms": None,
+                    "address": None,
+                }
+            )
         finally:
             if process is not None and process.returncode is None:
                 with suppress(ProcessLookupError):
@@ -331,64 +253,72 @@ class ICMPMonitor:
                     else:
                         os.killpg(process.pid, signal.SIGKILL)
                 await process.wait()
-        async with self._lock:
-            if revision != self._revision:
-                return
-            result.update(
-                host=settings["host"],
-                probe_host=self.host_name,
-                source="dashboard_host",
-                started_at=started,
-                observed_at=timestamp(),
-                session_id=self.session_id,
-                revision=revision,
-                timeout_seconds=settings["timeout_seconds"],
+
+    def _record_probe_result(
+        self,
+        observed: ICMPWorkerResult,
+        settings: ICMPSettings,
+        revision: int,
+        started: str,
+    ) -> None:
+        result = observed.model_dump(exclude_unset=True)
+        result.update(
+            host=settings.host,
+            probe_host=self.host_name,
+            source="dashboard_host",
+            started_at=started,
+            observed_at=timestamp(),
+            session_id=self.session_id,
+            revision=revision,
+            timeout_seconds=settings.timeout_seconds,
+        )
+        self.history.append(result)
+        self.history = self.history[-720:]
+        active = next(
+            (item for item in self.incidents if item.get("status") == "active"),
+            None,
+        )
+        if result["status"] == "no_reply" and active is None:
+            self.incidents.append(
+                {
+                    "id": str(uuid4()),
+                    "type": "icmp_no_reply",
+                    "source": "dashboard_host",
+                    "host": settings.host,
+                    "probe_host": self.host_name,
+                    "status": "active",
+                    "started_at": result["observed_at"],
+                    "ended_at": None,
+                }
             )
-            self.history.append(result)
-            self.history = self.history[-720:]
-            active = next(
-                (item for item in self.incidents if item.get("status") == "active"),
-                None,
+            self.incidents = self.incidents[-200:]
+        elif result["status"] == "reply" and active:
+            active.update(
+                status="resolved",
+                ended_at=result["observed_at"],
+                resolution="echo_reply",
             )
-            if result["status"] == "no_reply" and active is None:
-                self.incidents.append(
+
+    async def _persist_observations(self) -> None:
+        try:
+            writing = asyncio.create_task(
+                asyncio.to_thread(
+                    self._write,
                     {
-                        "id": str(uuid4()),
-                        "type": "icmp_no_reply",
-                        "source": "dashboard_host",
-                        "host": settings["host"],
-                        "probe_host": self.host_name,
-                        "status": "active",
-                        "started_at": result["observed_at"],
-                        "ended_at": None,
-                    }
+                        "settings": self.settings,
+                        "history": self.history,
+                        "incidents": self.incidents,
+                    },
                 )
-                self.incidents = self.incidents[-200:]
-            elif result["status"] == "reply" and active:
-                active.update(
-                    status="resolved",
-                    ended_at=result["observed_at"],
-                    resolution="echo_reply",
-                )
+            )
             try:
-                writing = asyncio.create_task(
-                    asyncio.to_thread(
-                        self._write,
-                        {
-                            "settings": self.settings,
-                            "history": self.history,
-                            "incidents": self.incidents,
-                        },
-                    )
-                )
-                try:
-                    await asyncio.shield(writing)
-                except asyncio.CancelledError:
-                    await writing
-                    raise
-                self.storage_error = None
-            except OSError as error:
-                self.storage_error = f"Could not persist ICMP observations: {error}"
+                await asyncio.shield(writing)
+            except asyncio.CancelledError:
+                await writing
+                raise
+            self.storage_error = None
+        except OSError as error:
+            self.storage_error = f"Could not persist ICMP observations: {error}"
 
     async def _run(self) -> None:
         while not self._closing:

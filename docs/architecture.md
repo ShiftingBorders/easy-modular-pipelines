@@ -184,6 +184,13 @@ state; saved-state reading resets incident freshness. Public JSON validator
 wrappers remain available. Rule limits, incident transitions, atomic persistence,
 rollback and notification scheduling stay with the monitor.
 
+ICMP settings, saved observations/incidents and worker results have dedicated
+models. The parent validates stdout before publishing observations, while DNS,
+actual Echo Reply, worker kill/wait, revision and freshness stay with the monitor.
+Probe execution, history/incident updates and persistence are separate stages.
+The standalone worker uses standard-library scalar timeout checks and does not
+import dashboard or pipeline code.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
