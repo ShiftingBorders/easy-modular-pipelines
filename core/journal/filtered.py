@@ -27,7 +27,6 @@ from core.journal.view_schema import (
     _CREATE_INFO,
     _validate_view_schema,
 )
-from core.models.journal_cache import FilteredPublication
 from core.primitives.json_values import JsonObject, copy_json_object
 
 _PAGE_BYTES = 16777216
@@ -149,6 +148,8 @@ class FilteredJournal:
         _validate_view_schema(self._connection)
 
     def _metadata(self) -> JsonObject | None:
+        from core.models.journal_cache import FilteredPublication
+
         row = self._connection.execute(
             "SELECT metadata_json FROM filtered_info WHERE singleton=1"
         ).fetchone()
