@@ -25,6 +25,7 @@ from core.experiments.journal import (
 )
 from core.experiments.launch import ModuleLauncher
 from core.experiments.reload import (
+    ReloadApplication,
     _definition_change,
     _prepare_reload_candidate,
     _reload_cursor,
@@ -46,7 +47,7 @@ from core.experiments.state import (
     state_from_document,
 )
 from core.journal.events import LoggingError, encode_event
-from core.journal.logger import OperationLogger
+from core.journal.logger import Operation, OperationLogger
 from core.models.experiment_registry import RegistryEntry
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
@@ -1353,25 +1354,53 @@ class ExperimentRunner:
         if not result["changed"]:
             logger.record_event("reload.unchanged", result, operation=operation)
             return result
-        old = state.template
-        layout = _reload_layout(old, template, state.stage_position, self._pending_advance)
-        old_services, new_services = layout.old_services, layout.new_services
-        changed_services = layout.changed_services
-        new_stages, prefix = layout.new_stages, layout.prefix
+        application = await self._plan_reload_application(
+            state, template_yaml, template, operation, result
+        )
+        self._audit_reload_definitions(application)
+        self._audit_reload_candidate(state, application)
+        self._audit_reload_progress(state, application)
+        try:
+            await self._prepare_reload_snapshot(state, application)
+            self._isolate_reload_service_data(state, application)
+            await self._publish_reload_dag(state, application)
+            await self._transfer_reload_services(state, application)
+            self._commit_reload(state, application)
+            return result
+        except BaseException as error:
+            await self._handle_reload_failure(state, application, error)
+            raise
+        finally:
+            await self._cleanup_reload_application(state, application)
+
+    async def _plan_reload_application(
+        self, state: RunnerState, template_yaml: str, template: JsonObject,
+        operation: Operation, result: JsonObject,
+    ) -> ReloadApplication:
+        layout = _reload_layout(state.template, template, state.stage_position, self._pending_advance)
         completed = await _read_reload_progress(
-            logger, state.experiment_id, previous_revision, state.cycle_number,
-            set(state.stage_result_ids),
+            self._journal.client, state.experiment_id, state.template_revision_id,
+            state.cycle_number, set(state.stage_result_ids),
         )
         cursor = _reload_cursor(layout, completed)
-        next_position, new_position = cursor.next_position, cursor.stage_position
-        new_pending, rewind = cursor.pending_advance, cursor.rewind
-        preserved = cursor.preserved
+        return ReloadApplication(
+            template=template, template_yaml=template_yaml, previous=state.template,
+            layout=layout, cursor=cursor, completed=completed,
+            previous_revision=state.template_revision_id,
+            candidate_revision=str(uuid4()), candidate_run=f"{uuid4()}:{state.run_id}",
+            workspace=state.experiment_directory / "runner/rebuilds" / operation.get_operation_id(),
+            logger=self._journal.client, operation=operation, result=result,
+            prior_instances={sid: item.service_instance_id for sid, item in state.services.items()},
+            prior_service_retries={sid: item.restart_count for sid, item in state.services.items()},
+        )
+
+    def _audit_reload_definitions(self, application: ReloadApplication) -> None:
         for role in ("stage", "service"):
             before = {
-                s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(old[f"{role}s"])
+                s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(application.previous[f"{role}s"])
             }
             after = {
-                s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(template[f"{role}s"])
+                s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(application.template[f"{role}s"])
             }
             for identity in dict.fromkeys([*before, *after]):
                 if json.dumps(before.get(identity), sort_keys=True) == json.dumps(
@@ -1379,18 +1408,18 @@ class ExperimentRunner:
                 ):
                     continue
                 change = _definition_change(role, identity, before, after)
-                logger.record_event(
-                    "reload.definition_changed", change, operation=operation
+                application.logger.record_event(
+                    "reload.definition_changed", change, operation=application.operation
                 )
-                result["changes"].append(
+                application.result["changes"].append(
                     {
                         k: v
                         for k, v in change.items()
                         if k not in ("before", "after", "fields")
                     }
                 )
-        candidate_revision = str(uuid4())
-        candidate_run = f"{uuid4()}:{state.run_id}"
+
+    def _audit_reload_candidate(self, state: RunnerState, application: ReloadApplication) -> None:
         # Validate the dedicated full-template event before any filesystem/process effects.
         encode_event(
             {
@@ -1402,423 +1431,425 @@ class ExperimentRunner:
                 "event_type": "template.applied",
                 "operation_id": None,
                 "context": {
-                    **logger.get_context(),
-                    "run_id": candidate_run,
+                    **application.logger.get_context(),
+                    "run_id": application.candidate_run,
                     "previous_run_id": state.run_id,
                 },
                 "data": {
-                    "template": template,
-                    "template_yaml": template_yaml,
-                    "template_revision_id": candidate_revision,
-                    "previous_template_revision_id": previous_revision,
+                    "template": application.template,
+                    "template_yaml": application.template_yaml,
+                    "template_revision_id": application.candidate_revision,
+                    "previous_template_revision_id": application.previous_revision,
                     "reason": "reload_template",
                 },
             },
             state.template["logging"]["max_event_bytes"],
         )
-        logger.record_event(
+        application.logger.record_event(
             "reload.previous_template",
             {
-                "template": old,
+                "template": application.previous,
                 "template_yaml": state.template_yaml,
             },
-            operation=operation,
+            operation=application.operation,
         )
-        parameters = logger.record_event(
+        application.parameters = application.logger.record_event(
             "reload.candidate",
             {
-                "template": template,
-                "template_yaml": template_yaml,
-                "run_id": candidate_run,
-                "template_revision_id": candidate_revision,
+                "template": application.template,
+                "template_yaml": application.template_yaml,
+                "run_id": application.candidate_run,
+                "template_revision_id": application.candidate_revision,
             },
-            operation=operation,
+            operation=application.operation,
         )
-        logger.record_event(
+
+    def _audit_reload_progress(self, state: RunnerState, application: ReloadApplication) -> None:
+        application.logger.record_event(
             "reload.progress",
             {
-                "template_revision_id": candidate_revision,
-                "preserved_completed_stage_ids": sorted(completed & preserved),
+                "template_revision_id": application.candidate_revision,
+                "preserved_completed_stage_ids": sorted(application.completed & application.cursor.preserved),
                 "cycle_number": state.cycle_number,
                 "old_position": state.stage_position,
                 "old_pending_advance": self._pending_advance,
-                "new_position": new_position,
-                "new_pending_advance": new_pending,
-                "rewind": rewind,
-                "unchanged_prefix_length": prefix,
+                "new_position": application.cursor.stage_position,
+                "new_pending_advance": application.cursor.pending_advance,
+                "rewind": application.cursor.rewind,
+                "unchanged_prefix_length": application.layout.prefix,
                 "invalidated_results": {
                     k: v
                     for k, v in state.stage_result_ids.items()
-                    if k not in preserved
+                    if k not in application.cursor.preserved
                 },
                 "preserved_results": {
-                    k: v for k, v in state.stage_result_ids.items() if k in preserved
+                    k: v for k, v in state.stage_result_ids.items() if k in application.cursor.preserved
                 },
                 "result_origins": state.stage_result_origins,
                 "cleared_retries": {
                     k: v
                     for k, v in state.stage_retry_counts.items()
-                    if k not in preserved
+                    if k not in application.cursor.preserved
                 },
                 "preserved_attempt_numbers": state.stage_attempt_numbers,
             },
-            operation=operation,
+            operation=application.operation,
         )
-        workspace = (
-            state.experiment_directory
-            / "runner/rebuilds"
-            / operation.get_operation_id()
+
+    async def _prepare_reload_snapshot(self, state: RunnerState, application: ReloadApplication) -> None:
+        await self._services.prepare_rebuild(state, application.template, validate_only=True)
+        await self._assembler.rebuild(
+            state, application.template_yaml, application.template, workspace=application.workspace, prepare_only=True
         )
-        detached = False
-        committed = False
-        prior_instances = {
-            sid: s.service_instance_id for sid, s in state.services.items()
+        if self._resource_observer is not None and self._suspend_resources is None:
+            raise RuntimeError("Reload requires a resource restoration barrier.")
+        # Detach the paused scheduler, not the service manager. Its monitor must
+        # still answer freeze, shutdown and readiness work during maintenance.
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            application.detached = True
+            await asyncio.gather(self._task, return_exceptions=True)
+        self._last_snapshot = await self._snapshots.create(
+            state, "before reload_template"
+        )
+        application.snapshot_id = self._last_snapshot["snapshot_id"]
+        application.result["snapshot_id"] = application.snapshot_id
+        state.pending_rebuild = {
+            "operation_id": application.operation.get_operation_id(),
+            "snapshot_id": application.snapshot_id,
+            "template_revision_id": application.candidate_revision,
+            "run_id": application.candidate_run,
         }
-        prior_service_retries = {
-            sid: s.restart_count for sid, s in state.services.items()
-        }
-        try:
-            await self._services.prepare_rebuild(state, template, validate_only=True)
-            await self._assembler.rebuild(
-                state, template_yaml, template, workspace=workspace, prepare_only=True
-            )
-            if self._resource_observer is not None and self._suspend_resources is None:
-                raise RuntimeError("Reload requires a resource restoration barrier.")
-            # Detach the paused scheduler, not the service manager. Its monitor must
-            # still answer freeze, shutdown and readiness work during maintenance.
-            if self._task is not None and not self._task.done():
-                self._task.cancel()
-                detached = True
-                await asyncio.gather(self._task, return_exceptions=True)
-            self._last_snapshot = await self._snapshots.create(
-                state, "before reload_template"
-            )
-            snapshot_id = self._last_snapshot["snapshot_id"]
-            result["snapshot_id"] = snapshot_id
-            state.pending_rebuild = {
-                "operation_id": operation.get_operation_id(),
-                "snapshot_id": snapshot_id,
-                "template_revision_id": candidate_revision,
-                "run_id": candidate_run,
-            }
-            state.phase = "rebuilding"
-            self._save_state()
-            logger.record_event(
-                "control.intent",
+        state.phase = "rebuilding"
+        self._save_state()
+        application.logger.record_event(
+            "control.intent",
+            {
+                "action": "reload_template",
+                "parameters_event_id": application.parameters,
+                "snapshot_id": application.snapshot_id,
+            },
+            operation=application.operation,
+        )
+        await self._services.prepare_rebuild(state, application.template)
+        self._save_state()
+
+    def _isolate_reload_service_data(self, state: RunnerState, application: ReloadApplication) -> None:
+        for sid, definition in application.layout.new_services.items():
+            previous = application.layout.old_services.get(sid)
+            application.logger.record_event(
+                "reload.service_plan",
                 {
-                    "action": "reload_template",
-                    "parameters_event_id": parameters,
-                    "snapshot_id": snapshot_id,
+                    "service_id": sid,
+                    "old_definition": previous,
+                    "new_definition": definition,
+                    "previous_instance_id": application.prior_instances.get(sid),
+                    "transfer_state": previous is not None
+                    and sid in application.layout.changed_services
+                    and previous["module"]["name"] == definition["module"]["name"],
                 },
-                operation=operation,
+                operation=application.operation,
             )
-            await self._services.prepare_rebuild(state, template)
-            self._save_state()
-            for sid, definition in new_services.items():
-                previous = old_services.get(sid)
-                logger.record_event(
-                    "reload.service_plan",
-                    {
-                        "service_id": sid,
-                        "old_definition": previous,
-                        "new_definition": definition,
-                        "previous_instance_id": prior_instances.get(sid),
-                        "transfer_state": previous is not None
-                        and sid in changed_services
-                        and previous["module"]["name"] == definition["module"]["name"],
-                    },
-                    operation=operation,
-                )
-                # An absent definition cannot authorize reuse of files left by
-                # a removed service, even when its stable ID is added again.
-                if (
-                    previous is None
-                    or previous["module"]["name"] != definition["module"]["name"]
-                ):
-                    data = state.experiment_directory / "module_data" / sid
-                    if data.exists():
-                        if (
-                            data.is_symlink()
-                            or data.is_junction()
-                            or not data.resolve().is_relative_to(
-                                state.experiment_directory.resolve()
-                            )
-                        ):
-                            raise ValueError("Service data escapes the experiment.")
-                        displaced = workspace / "previous_data" / sid
-                        displaced.parent.mkdir(parents=True, exist_ok=True)
-                        data.replace(displaced)
-                        logger.record_event(
-                            "reload.service_data",
-                            {
-                                "service_id": sid,
-                                "action": "isolate_previous_module_data",
-                                "previous_module": None
-                                if previous is None
-                                else previous["module"],
-                                "new_module": definition["module"],
-                                "reason": "no_applied_service"
-                                if previous is None
-                                else "module_name_changed",
-                            },
-                            operation=operation,
+            # An absent definition cannot authorize reuse of files left by
+            # a removed service, even when its stable ID is added again.
+            if (
+                previous is None
+                or previous["module"]["name"] != definition["module"]["name"]
+            ):
+                data = state.experiment_directory / "module_data" / sid
+                if data.exists():
+                    if (
+                        data.is_symlink()
+                        or data.is_junction()
+                        or not data.resolve().is_relative_to(
+                            state.experiment_directory.resolve()
                         )
-            await self._assembler.rebuild(
-                state, template_yaml, template, workspace=workspace
+                    ):
+                        raise ValueError("Service data escapes the experiment.")
+                    displaced = application.workspace / "previous_data" / sid
+                    displaced.parent.mkdir(parents=True, exist_ok=True)
+                    data.replace(displaced)
+                    application.logger.record_event(
+                        "reload.service_data",
+                        {
+                            "service_id": sid,
+                            "action": "isolate_previous_module_data",
+                            "previous_module": None
+                            if previous is None
+                            else previous["module"],
+                            "new_module": definition["module"],
+                            "reason": "no_applied_service"
+                            if previous is None
+                            else "module_name_changed",
+                        },
+                        operation=application.operation,
+                    )
+
+    async def _publish_reload_dag(self, state: RunnerState, application: ReloadApplication) -> None:
+        await self._assembler.rebuild(
+            state, application.template_yaml, application.template, workspace=application.workspace
+        )
+        application.logger.record_event(
+            "control.observed",
+            {"action": "reload_template", "state": "files_published"},
+            operation=application.operation,
+        )
+        state.template = application.template
+        state.template_yaml = application.template_yaml
+        self._last_attempt = self._last_response = None
+        state.run_id = application.candidate_run
+        state.template_revision_id = application.candidate_revision
+        state.stage_result_ids = {
+            k: v for k, v in state.stage_result_ids.items() if k in application.cursor.preserved
+        }
+        state.stage_result_origins = {
+            k: v for k, v in state.stage_result_origins.items() if k in application.cursor.preserved
+        }
+        state.stage_retry_counts = {
+            k: v for k, v in state.stage_retry_counts.items() if k in application.cursor.preserved
+        }
+        state.stage_position = application.cursor.stage_position
+        self._pending_advance = state.pending_advance = application.cursor.pending_advance
+        if state.pending_input is not None and (
+            state.pending_input["source_stage_id"] not in application.cursor.preserved
+            or state.pending_input["stage_id"] not in application.cursor.preserved
+            or state.pending_input["stage_id"]
+            != application.layout.new_stages[application.cursor.stage_position - 1]["stage_id"]
+        ):
+            state.pending_input = None
+        if state.last_dag_decision is not None and (
+            state.last_dag_decision["source_stage_id"] not in application.cursor.preserved
+            or state.last_dag_decision["decision"].get("stage_id") is not None
+            and state.pending_input is None
+        ):
+            state.last_dag_decision = None
+        state.last_result = state.last_result_id = None
+        predecessor = application.cursor.next_position - 1
+        if predecessor >= 0:
+            request_id = state.stage_result_ids.get(
+                application.layout.new_stages[predecessor]["stage_id"]
             )
-            logger.record_event(
-                "control.observed",
-                {"action": "reload_template", "state": "files_published"},
-                operation=operation,
+            if request_id is not None:
+                record = application.logger.read_command_result(request_id)
+                if record is None or record["author"] != "runner":
+                    raise ValueError(
+                        "Retained predecessor has no accepted journal result."
+                    )
+                state.last_result_id = request_id
+                state.last_result = record["response"]["data"]
+        self._save_state()
+
+    async def _transfer_reload_services(self, state: RunnerState, application: ReloadApplication) -> None:
+        if await self._services.reconcile(state, application.template) != "ready":
+            raise RuntimeError("Reloaded services did not become ready.")
+        transfer = {
+            sid
+            for sid, definition in application.layout.new_services.items()
+            if sid in application.layout.old_services
+            and sid in application.layout.changed_services
+            and definition["module"]["name"] == application.layout.old_services[sid]["module"]["name"]
+        }
+        manifest = await asyncio.to_thread(
+            self._snapshots._validate_snapshot,
+            self._project_root
+            / "snapshots"
+            / state.experiment_directory.name
+            / application.snapshot_id,
+        )
+        exports = {
+            sid: Path(path)
+            for sid, path in manifest["services"].items()
+            if sid in transfer
+        }
+        await self._services.load_states(state, exports, service_ids=transfer)
+        if any(
+            state.services[sid].service_instance_id != application.prior_instances[sid]
+            for sid in application.layout.new_services.keys() & application.layout.old_services.keys()
+            if sid not in application.layout.changed_services
+        ):
+            raise RuntimeError("An unchanged service restarted during reload.")
+        for sid in dict.fromkeys([*application.layout.old_services, *application.layout.new_services]):
+            instance = state.services.get(sid)
+            application.logger.record_event(
+                "reload.service",
+                {
+                    "service_id": sid,
+                    "state_loaded": sid in exports,
+                    "state_path": None
+                    if sid not in exports
+                    else exports[sid].as_posix(),
+                    "service_instance_id": None
+                    if instance is None
+                    else instance.service_instance_id,
+                    "previous_instance_id": application.prior_instances.get(sid),
+                    "previous_restart_count": application.prior_service_retries.get(sid),
+                    "restart_count": None
+                    if instance is None
+                    else instance.restart_count,
+                    "ready": False if instance is None else instance.ready,
+                    "definition": application.layout.new_services.get(sid),
+                },
+                operation=application.operation,
             )
-            state.template = template
-            state.template_yaml = template_yaml
+
+    def _commit_reload(self, state: RunnerState, application: ReloadApplication) -> None:
+        application.logger.record_template_applied(
+            application.template,
+            template_yaml=application.template_yaml,
+            template_revision_id=application.candidate_revision,
+            previous_template_revision_id=application.previous_revision,
+            reason="reload_template",
+            context={
+                "experiment_id": state.experiment_id,
+                "run_id": application.candidate_run,
+                "previous_run_id": application.candidate_run.split(":", 1)[1],
+            },
+        )
+        state.phase, state.mode = "waiting", "paused"
+        state.pause_requested = False
+        pending = state.pending_rebuild
+        state.pending_rebuild = None
+        try:
+            self._save_state()
+        except BaseException:
+            state.pending_rebuild = pending
+            raise
+        application.committed = True
+        application.result.update(
+            template_revision_id=application.candidate_revision,
+            stage_position=application.cursor.stage_position,
+            pending_advance=application.cursor.pending_advance,
+        )
+
+    async def _handle_reload_failure(self, state: RunnerState, application: ReloadApplication, error: BaseException) -> None:
+        if state.pending_rebuild is None or application.committed:
+            await self._handle_detached_reload_failure(state, application, error)
+            return
+        failure_id = None
+        try:
+            failure_id = application.logger.record_error(
+                error, operation=application.operation, include_traceback=True
+            )
+            application.logger.finish_operation(
+                application.operation,
+                status="cancelled"
+                if isinstance(error, asyncio.CancelledError)
+                else "failed",
+            )
+            self._reload_operation = None
+            if isinstance(error, (asyncio.CancelledError, LoggingError)):
+                # A priority stop must retain the recovery point, never finalize
+                # the partially published tree as a valid experiment snapshot.
+                raise error
+            await self._snapshots.restore(
+                state,
+                state.pending_rebuild["snapshot_id"],
+                preserve_rebuild_diagnostics=True,
+                suspend_resources=self._suspend_resources,
+            )
             self._last_attempt = self._last_response = None
-            state.run_id = candidate_run
-            state.template_revision_id = candidate_revision
-            state.stage_result_ids = {
-                k: v for k, v in state.stage_result_ids.items() if k in preserved
-            }
-            state.stage_result_origins = {
-                k: v for k, v in state.stage_result_origins.items() if k in preserved
-            }
-            state.stage_retry_counts = {
-                k: v for k, v in state.stage_retry_counts.items() if k in preserved
-            }
-            state.stage_position = new_position
-            self._pending_advance = state.pending_advance = new_pending
-            if state.pending_input is not None and (
-                state.pending_input["source_stage_id"] not in preserved
-                or state.pending_input["stage_id"] not in preserved
-                or state.pending_input["stage_id"]
-                != new_stages[new_position - 1]["stage_id"]
-            ):
-                state.pending_input = None
-            if state.last_dag_decision is not None and (
-                state.last_dag_decision["source_stage_id"] not in preserved
-                or state.last_dag_decision["decision"].get("stage_id") is not None
-                and state.pending_input is None
-            ):
-                state.last_dag_decision = None
-            state.last_result = state.last_result_id = None
-            predecessor = next_position - 1
-            if predecessor >= 0:
-                request_id = state.stage_result_ids.get(
-                    new_stages[predecessor]["stage_id"]
-                )
-                if request_id is not None:
-                    record = logger.read_command_result(request_id)
-                    if record is None or record["author"] != "runner":
-                        raise ValueError(
-                            "Retained predecessor has no accepted journal result."
-                        )
-                    state.last_result_id = request_id
-                    state.last_result = record["response"]["data"]
-            self._save_state()
-            if await self._services.reconcile(state, template) != "ready":
-                raise RuntimeError("Reloaded services did not become ready.")
-            transfer = {
-                sid
-                for sid, definition in new_services.items()
-                if sid in old_services
-                and sid in changed_services
-                and definition["module"]["name"] == old_services[sid]["module"]["name"]
-            }
-            manifest = await asyncio.to_thread(
-                self._snapshots._validate_snapshot,
-                self._project_root
-                / "snapshots"
-                / state.experiment_directory.name
-                / snapshot_id,
-            )
-            exports = {
-                sid: Path(path)
-                for sid, path in manifest["services"].items()
-                if sid in transfer
-            }
-            await self._services.load_states(state, exports, service_ids=transfer)
-            if any(
-                state.services[sid].service_instance_id != prior_instances[sid]
-                for sid in new_services.keys() & old_services.keys()
-                if sid not in changed_services
-            ):
-                raise RuntimeError("An unchanged service restarted during reload.")
-            for sid in dict.fromkeys([*old_services, *new_services]):
-                instance = state.services.get(sid)
-                logger.record_event(
-                    "reload.service",
-                    {
-                        "service_id": sid,
-                        "state_loaded": sid in exports,
-                        "state_path": None
-                        if sid not in exports
-                        else exports[sid].as_posix(),
-                        "service_instance_id": None
-                        if instance is None
-                        else instance.service_instance_id,
-                        "previous_instance_id": prior_instances.get(sid),
-                        "previous_restart_count": prior_service_retries.get(sid),
-                        "restart_count": None
-                        if instance is None
-                        else instance.restart_count,
-                        "ready": False if instance is None else instance.ready,
-                        "definition": new_services.get(sid),
-                    },
-                    operation=operation,
-                )
-            logger.record_template_applied(
-                template,
-                template_yaml=template_yaml,
-                template_revision_id=candidate_revision,
-                previous_template_revision_id=previous_revision,
-                reason="reload_template",
+            self._pending_advance = state.pending_advance
+            with self._journal.client.operation(
+                "rebuild",
+                "reload_template_rollback",
                 context={
                     "experiment_id": state.experiment_id,
-                    "run_id": candidate_run,
-                    "previous_run_id": candidate_run.split(":", 1)[1],
+                    "run_id": state.run_id,
+                    "parent_operation_id": application.operation.get_operation_id(),
                 },
-            )
-            state.phase, state.mode = "waiting", "paused"
-            state.pause_requested = False
-            pending = state.pending_rebuild
-            state.pending_rebuild = None
-            try:
-                self._save_state()
-            except BaseException:
-                state.pending_rebuild = pending
-                raise
-            committed = True
-            result.update(
-                template_revision_id=candidate_revision,
-                stage_position=new_position,
-                pending_advance=new_pending,
-            )
-            return result
-        except BaseException as error:
-            if state.pending_rebuild is None or committed:
-                if (
-                    detached
-                    and not committed
-                    and not isinstance(error, asyncio.CancelledError)
-                    and not (
-                        # Snapshot rejection is recoverable only while the original
-                        # services are healthy and no freeze remains unconfirmed.
-                        not isinstance(error, LoggingError)
-                        and state.phase == "waiting"
-                        and self._services._snapshot_id is None
-                        and self._services._pending_action is None
-                        and state.services.keys() == prior_instances.keys()
-                        and all(
-                            instance.service_instance_id == prior_instances[sid]
-                            and instance.ready
-                            and not instance.stopped
-                            and not instance.stopping
-                            and not instance.manually_stopped
-                            and not instance.blocked_action
-                            and not instance.failure
-                            and instance.freeze_id is None
-                            and instance.prepared_freeze_id is None
-                            for sid, instance in state.services.items()
-                        )
-                    )
-                ):
-                    await self._fail(error, {})
-                raise
-            failure_id = None
-            try:
-                failure_id = logger.record_error(
-                    error, operation=operation, include_traceback=True
-                )
-                logger.finish_operation(
-                    operation,
-                    status="cancelled"
-                    if isinstance(error, asyncio.CancelledError)
-                    else "failed",
-                )
-                self._reload_operation = None
-                if isinstance(error, (asyncio.CancelledError, LoggingError)):
-                    # A priority stop must retain the recovery point, never finalize
-                    # the partially published tree as a valid experiment snapshot.
-                    raise
-                await self._snapshots.restore(
-                    state,
-                    state.pending_rebuild["snapshot_id"],
-                    preserve_rebuild_diagnostics=True,
-                    suspend_resources=self._suspend_resources,
-                )
-                self._last_attempt = self._last_response = None
-                self._pending_advance = state.pending_advance
-                with self._journal.client.operation(
-                    "rebuild",
-                    "reload_template_rollback",
-                    context={
-                        "experiment_id": state.experiment_id,
-                        "run_id": state.run_id,
-                        "parent_operation_id": operation.get_operation_id(),
+            ) as recovery:
+                self._journal.client.record_event(
+                    "control.reconciled",
+                    {
+                        "action": "reload_template",
+                        "state": "rolled_back",
+                        "error_id": failure_id,
                     },
-                ) as recovery:
-                    self._journal.client.record_event(
-                        "control.reconciled",
-                        {
-                            "action": "reload_template",
-                            "state": "rolled_back",
-                            "error_id": failure_id,
-                        },
-                        operation=recovery,
-                    )
-                self._save_state()
-            except BaseException as rollback_error:  # noqa: BLE001 - Cancellation must preserve unfinished ownership.
-                if rollback_error is not error:
-                    error.add_note(f"Reload rollback failed: {rollback_error}")
-                    try:
-                        self._journal.client.record_error(
-                            rollback_error,
-                            caused_by_error_id=failure_id,
-                            context={
-                                "experiment_id": state.experiment_id,
-                                "parent_operation_id": operation.get_operation_id(),
-                            },
-                            include_traceback=True,
-                        )
-                    except (LoggingError, OSError) as logging_error:
-                        error.add_note(
-                            f"Rollback error recording failed: {logging_error}"
-                        )
-                if not isinstance(rollback_error, asyncio.CancelledError):
-                    await self._fail(error, {})
-            raise
-        finally:
-            if state.pending_rebuild is None and state.phase == "waiting":
-                self._desired_mode = "paused"
-                self._recover_live = False
-                self._wake.clear()
-                if detached and not self._stop_requested and not self._closed:
-                    self._task = asyncio.create_task(
-                        self._advance_dag(), name=f"dag:{state.experiment_id}"
-                    )
-            if self._resume_resources is not None:
-                self._resume_resources()
-            self._publish_resources()
-            # Keep failed rebuild work until recovery; only remove an owned tree.
-            if (
-                state.pending_rebuild is None
-                and workspace.exists()
-                and workspace.resolve().is_relative_to(
-                    state.experiment_directory.resolve() / "runner/rebuilds"
+                    operation=recovery,
                 )
-                and not workspace.is_symlink()
-                and not workspace.is_junction()
-            ):
+            self._save_state()
+        except BaseException as rollback_error:  # noqa: BLE001 - Cancellation must preserve unfinished ownership.
+            if rollback_error is not error:
+                error.add_note(f"Reload rollback failed: {rollback_error}")
                 try:
-                    await asyncio.to_thread(shutil.rmtree, workspace)
-                except OSError as cleanup_error:
                     self._journal.client.record_error(
-                        cleanup_error,
+                        rollback_error,
+                        caused_by_error_id=failure_id,
                         context={
                             "experiment_id": state.experiment_id,
-                            "parent_operation_id": operation.get_operation_id(),
+                            "parent_operation_id": application.operation.get_operation_id(),
                         },
+                        include_traceback=True,
                     )
+                except (LoggingError, OSError) as logging_error:
+                    error.add_note(
+                        f"Rollback error recording failed: {logging_error}"
+                    )
+            if not isinstance(rollback_error, asyncio.CancelledError):
+                await self._fail(error, {})
+
+    async def _handle_detached_reload_failure(self, state: RunnerState, application: ReloadApplication, error: BaseException) -> None:
+        if (
+            application.detached
+            and not application.committed
+            and not isinstance(error, asyncio.CancelledError)
+            and not (
+                # Snapshot rejection is recoverable only while the original
+                # services are healthy and no freeze remains unconfirmed.
+                not isinstance(error, LoggingError)
+                and state.phase == "waiting"
+                and self._services._snapshot_id is None
+                and self._services._pending_action is None
+                and state.services.keys() == application.prior_instances.keys()
+                and all(
+                    instance.service_instance_id == application.prior_instances[sid]
+                    and instance.ready
+                    and not instance.stopped
+                    and not instance.stopping
+                    and not instance.manually_stopped
+                    and not instance.blocked_action
+                    and not instance.failure
+                    and instance.freeze_id is None
+                    and instance.prepared_freeze_id is None
+                    for sid, instance in state.services.items()
+                )
+            )
+        ):
+            await self._fail(error, {})
+
+    async def _cleanup_reload_application(self, state: RunnerState, application: ReloadApplication) -> None:
+        if state.pending_rebuild is None and state.phase == "waiting":
+            self._desired_mode = "paused"
+            self._recover_live = False
+            self._wake.clear()
+            if application.detached and not self._stop_requested and not self._closed:
+                self._task = asyncio.create_task(
+                    self._advance_dag(), name=f"dag:{state.experiment_id}"
+                )
+        if self._resume_resources is not None:
+            self._resume_resources()
+        self._publish_resources()
+        # Keep failed rebuild work until recovery; only remove an owned tree.
+        if (
+            state.pending_rebuild is None
+            and application.workspace.exists()
+            and application.workspace.resolve().is_relative_to(
+                state.experiment_directory.resolve() / "runner/rebuilds"
+            )
+            and not application.workspace.is_symlink()
+            and not application.workspace.is_junction()
+        ):
+            try:
+                await asyncio.to_thread(shutil.rmtree, application.workspace)
+            except OSError as cleanup_error:
+                self._journal.client.record_error(
+                    cleanup_error,
+                    context={
+                        "experiment_id": state.experiment_id,
+                        "parent_operation_id": application.operation.get_operation_id(),
+                    },
+                )
+
 
     async def snapshot(self, label: str | None = None) -> JsonObject:
         if label is not None:

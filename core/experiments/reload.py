@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from core.experiments.state import RunnerState, ServiceInstance
+from core.journal.logger import Operation, OperationLogger
 from core.primitives.json_values import JsonObject
 
 
@@ -29,6 +30,29 @@ class ReloadCursor:
     pending_advance: bool
     rewind: bool
     preserved: set[str]
+
+
+@dataclass
+class ReloadApplication:
+    template: JsonObject
+    template_yaml: str
+    previous: JsonObject
+    layout: ReloadLayout
+    cursor: ReloadCursor
+    completed: set[str]
+    previous_revision: str
+    candidate_revision: str
+    candidate_run: str
+    workspace: Path
+    logger: OperationLogger
+    operation: Operation
+    result: JsonObject
+    prior_instances: dict[str, str]
+    prior_service_retries: dict[str, int]
+    parameters: str | None = None
+    snapshot_id: str | None = None
+    detached: bool = False
+    committed: bool = False
 
 
 def _reload_layout(

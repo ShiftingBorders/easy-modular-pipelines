@@ -115,6 +115,12 @@ state module reconstructs attempt data without I/O. Minimal attempt ownership
 is bound before optional files are read, so failure handling still confirms
 termination before repeating unresolved work.
 
+Reload publication uses an internal application record for the computed plan,
+original audit references and detach/commit flags. The runner separates candidate
+audit, protective snapshot, service-data isolation, DAG publication, state
+transfer, durable commit, rollback and cleanup. Persisted pending-rebuild state
+and publication barriers retain their existing format and ownership.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
