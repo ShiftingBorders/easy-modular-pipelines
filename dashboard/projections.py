@@ -11,6 +11,8 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import pairwise
 
+from core.models.dashboard_metadata import CompactTemplate
+
 
 def compact_event(event: dict) -> dict:
     """Keep exact calculation inputs; original diagnostic payloads stay in the journal."""
@@ -116,9 +118,10 @@ def compact_event(event: dict) -> dict:
             if metric["scope"] in {"operation", "process"}
         }
     if kind == "template.applied":
+        template = CompactTemplate.model_validate(data["template"])
         reduced = {
             "template_revision_id": data["template_revision_id"],
-            "template": compact_template(data["template"]),
+            "template": compact_template(template.model_dump(exclude_unset=True)),
             "template_yaml": "",
         }
     return {**event, "data": reduced}

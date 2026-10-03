@@ -25,6 +25,7 @@ from core.journal.history_cache import (
 )
 from core.journal.logger import OperationLogger
 from core.models.dashboard_cache import CacheWorkerResult, ModulePublication
+from core.models.dashboard_metadata import CompactTemplate, SchedulingMetadata
 from core.models.dashboard_queries import (
     DetailIdentity,
     DetailReference,
@@ -537,13 +538,11 @@ class LocalJournals:
                 state = read_object(path) if path.exists() else {}
                 if state.get("experiment_id") not in (None, identifier):
                     raise ValueError("Experiment state belongs to another experiment.")
-                template = state.get("template", {})
-                if not isinstance(template, dict):
-                    raise TypeError("Experiment state template must be a JSON object.")
+                metadata = SchedulingMetadata.model_validate(state)
                 states[identifier] = {
-                    "phase": state.get("phase", "unknown"),
-                    "mode": state.get("mode"),
-                    "name": template.get("name") or identifier,
+                    "phase": metadata.phase,
+                    "mode": metadata.mode,
+                    "name": metadata.template.get("name") or identifier,
                 }
             except (OSError, ValueError, TypeError) as error:
                 states[identifier] = {"phase": "unknown", "error": str(error)}
@@ -782,6 +781,8 @@ class LocalJournals:
     def _reader_configuration(
         self, identifier: str, state: dict, database: Path, identity: dict
     ) -> Path:
+        # Check the compact projection contract before writing reader settings.
+        CompactTemplate.model_validate(state.get("template", {}))
         logging = state.get("template", {}).get("logging")
         if not isinstance(logging, dict):
             raise TypeError("Recorded logging settings are missing.")
