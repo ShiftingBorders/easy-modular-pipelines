@@ -155,6 +155,10 @@ Stage launch separates attempt/identity creation, context preparation, durable
 intent binding, owned executor spawn and startup observation. Public run and
 launcher hooks retain their existing contracts and effect order.
 
+Synchronous and asynchronous module registration share manifest-identity checks
+and source hashing. The async path keeps file/network work in workers and HashDB
+calls on its owning thread; cancellation still waits for the registration outcome.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

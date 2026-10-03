@@ -397,9 +397,7 @@ class ModuleManager:
         module_name, source_folder, work_root = self._registration_source(
             module_name, module_version, module_folder
         )
-        manifest = read_module_manifest(source_folder)
-        _validate_registration_manifest(manifest, module_name, module_version)
-        module_hash = self.module_hash(module_name, source_folder)
+        module_hash = self._registration_hash(module_name, module_version, source_folder)
         archive_exists = self.module_db.check_module_stored(module_name, module_version)
         if self._registration_exists(
             module_name, module_version, module_hash, archive_exists
@@ -462,10 +460,8 @@ class ModuleManager:
         module_name, source_folder, work_root = self._registration_source(
             module_name, module_version, module_folder
         )
-        manifest = await asyncio.to_thread(read_module_manifest, source_folder)
-        _validate_registration_manifest(manifest, module_name, module_version)
         module_hash = await asyncio.to_thread(
-            self.module_hash, module_name, source_folder
+            self._registration_hash, module_name, module_version, source_folder
         )
         archive_exists = await asyncio.to_thread(
             self.module_db.check_module_stored, module_name, module_version
@@ -517,6 +513,12 @@ class ModuleManager:
                 _cleanup_registration, temporary, work_root, failure
             )
         return True
+
+    def _registration_hash(self, name: str, version: str, source: Path) -> str:
+        """Check the manifest identity before hashing the registration's source."""
+        manifest = read_module_manifest(source)
+        _validate_registration_manifest(manifest, name, version)
+        return self.module_hash(name, source)
 
     def _validate_registration_result(
         self,

@@ -28,13 +28,7 @@ def clear_str(*args) -> tuple[str, ...]:
 
 
 def check_valid_characters(valid_characters: str, string_to_check: str) -> bool:
-    valid_characters_set, string_characters = (
-        set(valid_characters),
-        set(string_to_check),
-    )
-    return not any(
-        character not in valid_characters_set for character in string_characters
-    )
+    return set(string_to_check).issubset(valid_characters)
 
 
 def check_input_metadata(module_name: str, module_version: str):
