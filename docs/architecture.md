@@ -69,6 +69,13 @@ filesystem checks. Resource-history and event reads validate query structure
 before invoking their owners. Maintenance separates request execution from
 failure mapping and retains serial module mutations and concurrent reads.
 
+CLI commands and chain files reuse the server admission models. Command receipts
+share state/result constraints with controller outcomes; chain receipts validate
+their member envelopes and server/membership consistency. The public JSON helper
+and client wait method remain compatible, while polling consumes checked objects.
+The client retains correlation with submitted IDs/order, restart detection,
+shutdown error mapping and the shared chain deadline.
+
 Controller queues validate command and chain documents before admission, while
 runtime notifications preserve their metadata contract and live-process guards.
 Service response handling consumes typed observations and separates heartbeat

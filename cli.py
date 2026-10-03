@@ -22,6 +22,8 @@ from core.models.client_settings import (
     ClientConfiguration,
     ClientConnectionConfiguration,
 )
+from core.models.server_commands import ServerChain, ServerCommand
+from core.models.server_receipts import ChainReceipt, CommandReceipt
 from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
@@ -86,30 +88,47 @@ def json_argument(value: str) -> JsonObject:
 
 def command_receipt(value: object) -> JsonObject:
     """Reject malformed success responses instead of treating absent fields as success."""
+    return _command_receipt(value).model_dump(exclude_unset=True)
+
+
+def _command_receipt(value: object) -> CommandReceipt:
     try:
-        result = copy_json_object(value, "command receipt")
-        UUID(require_text(result.get("command_id"), "command_id"))
-        UUID(require_text(result.get("server_instance_id"), "server_instance_id"))
-        expected = {
-            "pending": None,
-            "unknown": None,
-            "unavailable": None,
-            "succeeded": "success",
-            "failed": "fail",
-            "cancelled": "fail",
-        }
-        state = require_text(result.get("state"), "state")
-        if (
-            state not in expected
-            or "result" not in result
-            or result["result"] != expected[state]
-        ):
-            raise ValueError("Invalid command state/result combination.")
-        return result
+        return CommandReceipt.model_validate(value)
     except (ValueError, TypeError) as error:
         raise ClientError(
             "Server returned an invalid command receipt.", code="invalid_response"
         ) from error
+
+
+def _chain_receipt(
+    value: object, chain_id: str, identifiers: list[str]
+) -> ChainReceipt:
+    try:
+        receipt = ChainReceipt.model_validate(value)
+    except (ValueError, TypeError) as error:
+        raise ClientError(
+            "Server returned invalid chain receipts.", code="invalid_response"
+        ) from error
+    if (
+        receipt.chain_id != chain_id
+        or [item.command_id for item in receipt.commands] != identifiers
+    ):
+        raise ClientError(
+            "Server returned receipts for another chain.",
+            code="invalid_response",
+            details=copy_json_object({"command_ids": identifiers}, "command IDs"),
+        )
+    return receipt
+
+
+def _chain_document(path: Path, chain_id: str | None) -> ServerChain:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    document = copy_json_object(
+        {"commands": loaded} if isinstance(loaded, list) else loaded, "chain"
+    )
+    if chain_id is not None:
+        document["chain_id"] = chain_id
+    return ServerChain.model_validate(document)
 
 
 def load_settings(config_path: Path | None, overrides: JsonObject) -> JsonObject:
@@ -340,12 +359,14 @@ class APIClient:
             ) from error
 
     async def wait(self, receipt: JsonObject, timeout: float) -> JsonObject:
-        receipt = command_receipt(receipt)
-        identifier = require_text(receipt.get("command_id"), "command_id")
-        instance = receipt.get("server_instance_id")
+        return await self._wait(_command_receipt(receipt), timeout)
+
+    async def _wait(self, receipt: CommandReceipt, timeout: float) -> JsonObject:
+        identifier = receipt.command_id
+        instance = receipt.server_instance_id
         deadline = time.monotonic() + timeout
         result = receipt
-        while result.get("state") == "pending":
+        while result.state == "pending":
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ClientError(
@@ -357,7 +378,7 @@ class APIClient:
             await asyncio.sleep(min(self.interval, remaining))
             try:
                 async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
-                    result = command_receipt(
+                    result = _command_receipt(
                         await self.request(
                             "GET", "/commands/" + quote(identifier, safe="")
                         )
@@ -374,19 +395,19 @@ class APIClient:
                     command_id=identifier, expected_server_instance_id=instance
                 )
                 raise
-            if result.get("server_instance_id") != instance:
+            if result.server_instance_id != instance:
                 raise ClientError(
                     "Server instance changed; the previous command outcome is unknown.",
                     code="server_restarted",
                     details={"command_id": identifier, "server_instance_id": instance},
                 )
-            if result["command_id"] != identifier:
+            if result.command_id != identifier:
                 raise ClientError(
                     "Server returned a result for another command.",
                     code="invalid_response",
                     details={"command_id": identifier},
                 )
-        return result
+        return result.model_dump(exclude_unset=True)
 
 
 def execution_options(
@@ -662,6 +683,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_arguments(options: argparse.Namespace) -> JsonObject:
+    args: JsonObject = {"delayed_start": options.delayed_start}
+    if options.continue_from is not None:
+        if options.experiment_id is not None:
+            raise ValueError("--experiment-id cannot be combined with --continue-from.")
+        args.update({"experiment_id": options.continue_from, "continue": True})
+    else:
+        args["template_path"] = options.template
+        if options.experiment_id is not None:
+            args["experiment_id"] = options.experiment_id
+    return args
+
+
+def _rerun_arguments(options: argparse.Namespace) -> JsonObject:
+    args: JsonObject = {"scope": options.scope}
+    if options.scope == "stage":
+        if options.position is None or options.experiment_id is not None:
+            raise ValueError("Stage rerun requires --position and no --experiment-id.")
+        args["position"] = options.position
+    elif options.position is not None:
+        raise ValueError("Experiment rerun does not accept --position.")
+    elif options.experiment_id is not None:
+        args["experiment_id"] = options.experiment_id
+    return args
+
+
 def command_document(options: argparse.Namespace) -> JsonObject:
     name = options.action
     args: JsonObject = {}
@@ -683,29 +730,9 @@ def command_document(options: argparse.Namespace) -> JsonObject:
                 raise ValueError("--name requires --version.")
             args.update({"name": options.name, "version": version})
     elif name == "run":
-        args["delayed_start"] = options.delayed_start
-        if options.continue_from is not None:
-            if options.experiment_id is not None:
-                raise ValueError(
-                    "--experiment-id cannot be combined with --continue-from."
-                )
-            args.update({"experiment_id": options.continue_from, "continue": True})
-        else:
-            args["template_path"] = options.template
-            if options.experiment_id is not None:
-                args["experiment_id"] = options.experiment_id
+        args = _run_arguments(options)
     elif name == "rerun":
-        args["scope"] = options.scope
-        if options.scope == "stage":
-            if options.position is None or options.experiment_id is not None:
-                raise ValueError(
-                    "Stage rerun requires --position and no --experiment-id."
-                )
-            args["position"] = options.position
-        elif options.position is not None:
-            raise ValueError("Experiment rerun does not accept --position.")
-        elif options.experiment_id is not None:
-            args["experiment_id"] = options.experiment_id
+        args = _rerun_arguments(options)
     elif name == "move":
         args["position"] = options.position
     elif name in ("retry", "reset-retries"):
@@ -746,7 +773,7 @@ def command_document(options: argparse.Namespace) -> JsonObject:
     }
     if target is not None:
         document["target"] = target
-    return document
+    return ServerCommand.model_validate(document).model_dump(exclude_none=True)
 
 
 def display(document: JsonObject, *, as_json: bool, streaming: bool = False) -> None:
@@ -943,49 +970,23 @@ async def execute(
             response = await client.wait(response, timeout)
         display(response, as_json=as_json)
         return outcome_code(response)
-    if action == "chain":
-        loaded = json.loads(options.file.read_text(encoding="utf-8"))
-        document = copy_json_object(
-            {"commands": loaded} if isinstance(loaded, list) else loaded, "chain"
-        )
-        entries = document.get("commands")
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("A chain requires a nonempty commands array.")
-        prepared = []
-        for item in entries:
-            item = copy_json_object(item, "chain command")
-            item.setdefault("command_id", str(uuid4()))
-            prepared.append(item)
-        document["commands"] = copy_json_object({"items": prepared}, "commands")[
-            "items"
-        ]
-        document["chain_id"] = options.chain_id or document.get(
-            "chain_id", str(uuid4())
-        )
-        document["chain_id"] = str(UUID(require_text(document["chain_id"], "chain_id")))
-        identifiers = [
-            str(UUID(require_text(item["command_id"], "command_id")))
-            for item in prepared
-        ]
-        path = "/chains"
-    else:
-        document = command_document(options)
-        identifiers = [require_text(document["command_id"], "command_id")]
-        path = "/commands"
-    print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
-    wait = not interactive if options.wait is None else options.wait
-    wait_for_shutdown = document.get("command") == "server.shutdown" and wait
+    return await _execute_submission(
+        client, options, timeout, as_json=as_json,
+        wait=not interactive if options.wait is None else options.wait,
+    )
+
+
+async def _send_submission(
+    client: APIClient, path: str, document: JsonObject,
+    identifiers: list[str], timeout: float, *, wait_for_shutdown: bool,
+) -> JsonObject:
     try:
         if wait_for_shutdown:
-            receipt = await client.request(
-                "POST",
-                path,
-                document=document,
-                params={"wait": "true"},
-                timeout=timeout,
+            return await client.request(
+                "POST", path, document=document,
+                params={"wait": "true"}, timeout=timeout,
             )
-        else:
-            receipt = await client.request("POST", path, document=document)
+        return await client.request("POST", path, document=document)
     except ClientError as error:
         error.details.update(
             copy_json_object({"command_ids": identifiers}, "command IDs")
@@ -993,11 +994,31 @@ async def execute(
         if wait_for_shutdown and error.code == "http_timeout":
             raise ClientError(
                 "Shutdown wait expired; the server operation was not cancelled.",
-                code="wait_timeout",
-                exit_code=4,
-                details=error.details,
+                code="wait_timeout", exit_code=4, details=error.details,
             ) from error
         raise
+
+
+async def _execute_submission(
+    client: APIClient, options: argparse.Namespace, timeout: float,
+    *, as_json: bool, wait: bool,
+) -> int:
+    action = options.action
+    if action == "chain":
+        chain = _chain_document(options.file, options.chain_id)
+        document = chain.model_dump(exclude_none=True)
+        identifiers = [item.command_id for item in chain.commands]
+        path = "/chains"
+    else:
+        document = command_document(options)
+        identifiers = [require_text(document["command_id"], "command_id")]
+        path = "/commands"
+    print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
+    wait_for_shutdown = document.get("command") == "server.shutdown" and wait
+    receipt = await _send_submission(
+        client, path, document, identifiers, timeout,
+        wait_for_shutdown=wait_for_shutdown,
+    )
     if action != "chain":
         receipt = command_receipt(receipt)
         if receipt["command_id"] != identifiers[0]:
@@ -1007,36 +1028,14 @@ async def execute(
                 details={"command_id": identifiers[0]},
             )
     else:
-        tickets = receipt.get("commands")
-        if not isinstance(tickets, list):
-            raise ClientError(
-                "Server returned no chain receipts.", code="invalid_response"
-            )
-        validated = [command_receipt(item) for item in tickets]
-        if (
-            receipt.get("chain_id") != document["chain_id"]
-            or [item["command_id"] for item in validated] != identifiers
-            or any(
-                item["server_instance_id"] != receipt.get("server_instance_id")
-                for item in validated
-            )
-        ):
-            raise ClientError(
-                "Server returned receipts for another chain.",
-                code="invalid_response",
-                details=copy_json_object({"command_ids": identifiers}, "command IDs"),
-            )
-    wait = not interactive if options.wait is None else options.wait
+        receipt = _chain_receipt(
+            receipt, document["chain_id"], identifiers
+        ).model_dump(exclude_unset=True)
     if not wait:
         display(receipt, as_json=as_json)
         if action == "chain":
-            tickets = receipt.get("commands")
-            if not isinstance(tickets, list):
-                raise ClientError(
-                    "Server returned no chain receipts.", code="invalid_response"
-                )
             return max(
-                (outcome_code(command_receipt(item)) for item in tickets),
+                (outcome_code(item) for item in receipt["commands"]),
                 default=0,
             )
         return outcome_code(receipt)
@@ -1044,13 +1043,9 @@ async def execute(
         result = await client.wait(receipt, timeout)
         display(result, as_json=as_json)
         return outcome_code(result)
-    tickets = receipt.get("commands")
-    if not isinstance(tickets, list):
-        raise ClientError("Server returned no chain receipts.", code="invalid_response")
     results = []
     deadline = time.monotonic() + timeout
-    for item in tickets:
-        ticket = command_receipt(item)
+    for ticket in receipt["commands"]:
         results.append(await client.wait(ticket, max(0, deadline - time.monotonic())))
     receipt["commands"] = copy_json_object({"items": results}, "chain results")["items"]
     display(receipt, as_json=as_json)

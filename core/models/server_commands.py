@@ -134,7 +134,22 @@ class RuntimeStopped(_Document):
     message: JsonValue = "Controller stopped."
 
 
-class ControllerOutcome(_Document):
+class CommandStatus(_Document):
+    state: Literal["pending", "unknown", "unavailable", "succeeded", "failed", "cancelled"]
+    result: Literal["success", "fail"] | None
+
+    @model_validator(mode="after")
+    def match_result(self) -> Self:
+        expected = (
+            "success" if self.state == "succeeded"
+            else "fail" if self.state in ("failed", "cancelled") else None
+        )
+        if self.result != expected:
+            raise ValueError("Invalid controller command outcome.")
+        return self
+
+
+class ControllerOutcome(CommandStatus):
     """Optional payload fields retain the existing partial-outcome contract."""
 
     model_config = ConfigDict(extra="allow")
@@ -144,10 +159,3 @@ class ControllerOutcome(_Document):
     result: Literal["success", "fail"]
     data: JsonValue = None
     error: JsonValue = None
-
-    @model_validator(mode="after")
-    def match_result(self) -> Self:
-        expected = "success" if self.state == "succeeded" else "fail"
-        if self.result != expected:
-            raise ValueError("Invalid controller command outcome.")
-        return self
