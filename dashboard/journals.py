@@ -24,6 +24,12 @@ from core.journal.history_cache import (
     acquire_cache_writer,
 )
 from core.journal.logger import OperationLogger
+from core.models.dashboard_queries import (
+    DetailIdentity,
+    DetailReference,
+    KeysetCursor,
+    PageLimit,
+)
 from core.models.experiment_registry import RegistryEntry
 from core.primitives.json_files import read_json, write_json
 from dashboard.api_client import SystemAPIError
@@ -89,6 +95,74 @@ def publish_module_statistics(settings: dict) -> bool:
         return journals.publish_modules()
     finally:
         journals.close()
+
+
+def _timeline_statistics(
+    cache: JournalHistoryCache, where: str, args: list, start_sql: str
+) -> dict:
+    finish_sql = "julianday(json_extract(payload,'$.finished_at'))"
+    recorded_end = f"MAX({start_sql},COALESCE({finish_sql},{start_sql}))"
+    first, last, count, has_open = cache.query(
+        f"SELECT MIN({start_sql}),MAX({recorded_end}),COUNT(*),MAX({finish_sql} IS NULL) FROM records WHERE {where}",
+        tuple(args),
+    )[0]
+    first_ms = (
+        round((first - 2440587.5) * 86400000) if first is not None else None
+    )
+    last_ms = round((last - 2440587.5) * 86400000) if last is not None else None
+    histogram = [0] * 64
+    if count:
+        bins = cache.query(
+            f"SELECT MIN(63,CAST((ROUND(({start_sql}-2440587.5)*86400000)-?)*64.0/? AS INTEGER)),COUNT(*) FROM records WHERE {where} GROUP BY 1",
+            (first_ms, max(last_ms - first_ms, 1), *args),
+        )
+        for bucket, number in bins:
+            histogram[max(0, bucket)] = number
+    return {
+        "has_open": bool(has_open),
+        "timeline": {
+            "start": first_ms,
+            "end": last_ms,
+            "histogram_end": last_ms,
+            "histogram": histogram,
+            "operation_count": count,
+        },
+    }
+
+
+def _timeline_ancestors(
+    cache: JournalHistoryCache, selected: list[tuple], identity: dict
+) -> list[dict]:
+    seeds = json.dumps(
+        [{"key": key, "scope": partition} for _, key, partition, _ in selected]
+    )
+    ancestors = cache.query(
+        """WITH RECURSIVE tree(record_key,scope,run_id,payload) AS (
+            SELECT r.record_key,r.scope,r.run_id,r.payload
+            FROM json_each(?) seed CROSS JOIN records r
+            WHERE r.kind='operations' AND r.record_key=json_extract(seed.value,'$.key')
+              AND r.scope=json_extract(seed.value,'$.scope')
+            UNION
+            SELECT p.record_key,p.scope,p.run_id,p.payload
+            FROM tree child CROSS JOIN records p
+            WHERE p.kind='operations' AND p.run_id IS child.run_id
+              AND p.record_key=json_extract(child.payload,'$.parent_operation_id')
+        ) SELECT payload FROM tree LIMIT 1001""",
+        (seeds,),
+    )
+    if len(ancestors) > 1000:
+        raise SystemAPIError(
+            "history_limit",
+            "Too many timeline ancestors; request a smaller page.",
+            413,
+        )
+    items = []
+    for (encoded,) in ancestors:
+        row = json.loads(encoded)
+        if row.get("detail_ref"):
+            row["detail_ref"] = {**row["detail_ref"], **identity}
+        items.append(row)
+    return items
 
 
 class LocalJournals:
@@ -745,30 +819,24 @@ class LocalJournals:
         position = [0, "", ""]
         if params.get("cursor"):
             try:
-                cursor = json.loads(params["cursor"])
+                cursor = KeysetCursor.model_validate_json(params["cursor"])
                 if (
-                    cursor["scope"] != scope
-                    or cursor["version"] != dataset["version"]
-                    or time.time() - cursor["at"] > 300
+                    cursor.scope != scope
+                    or cursor.version != dataset["version"]
+                    or time.time() - cursor.at > 300
                 ):
                     raise ValueError("Timeline changed.")
-                position = cursor["position"]
-                if (
-                    not isinstance(position, list)
-                    or len(position) != 3
-                    or type(position[0]) is not int
-                    or not all(isinstance(value, str) for value in position[1:])
-                ):
-                    raise ValueError("Invalid timeline cursor.")
+                position = list(cursor.position)
             except (KeyError, TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "history_changed", "Refresh this timeline range.", 409
                 ) from error
-        limit = int(params.get("limit", 200))
-        if not 1 <= limit <= 1000:
+        try:
+            limit = PageLimit.model_validate(params.get("limit", 200)).root
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_limit", "limit must be between 1 and 1000.", 400
-            )
+            ) from error
         start_sql = "julianday(json_extract(payload,'$.started_at'))"
         # Open operations extend only to the last available observation.
         end_sql = f"MAX({start_sql},COALESCE(julianday(json_extract(payload,'$.finished_at')),julianday(?),{start_sql}))"
@@ -785,34 +853,7 @@ class LocalJournals:
             if overview is not None:
                 self._timeline_overviews.move_to_end(overview_key)
         if overview is None:
-            finish_sql = "julianday(json_extract(payload,'$.finished_at'))"
-            recorded_end = f"MAX({start_sql},COALESCE({finish_sql},{start_sql}))"
-            first, last, count, has_open = cache.query(
-                f"SELECT MIN({start_sql}),MAX({recorded_end}),COUNT(*),MAX({finish_sql} IS NULL) FROM records WHERE {where}",
-                tuple(args),
-            )[0]
-            first_ms = (
-                round((first - 2440587.5) * 86400000) if first is not None else None
-            )
-            last_ms = round((last - 2440587.5) * 86400000) if last is not None else None
-            histogram = [0] * 64
-            if count:
-                bins = cache.query(
-                    f"SELECT MIN(63,CAST((ROUND(({start_sql}-2440587.5)*86400000)-?)*64.0/? AS INTEGER)),COUNT(*) FROM records WHERE {where} GROUP BY 1",
-                    (first_ms, max(last_ms - first_ms, 1), *args),
-                )
-                for bucket, number in bins:
-                    histogram[max(0, bucket)] = number
-            overview = {
-                "has_open": bool(has_open),
-                "timeline": {
-                    "start": first_ms,
-                    "end": last_ms,
-                    "histogram_end": last_ms,
-                    "histogram": histogram,
-                    "operation_count": count,
-                },
-            }
+            overview = _timeline_statistics(cache, where, args, start_sql)
             with self._timeline_lock:
                 self._timeline_overviews[overview_key] = overview
                 self._timeline_overviews.move_to_end(overview_key)
@@ -841,35 +882,7 @@ class LocalJournals:
             (*args, *position, limit + 1),
         )
         selected = rows[:limit]
-        seeds = json.dumps(
-            [{"key": key, "scope": partition} for _, key, partition, _ in selected]
-        )
-        ancestors = cache.query(
-            """WITH RECURSIVE tree(record_key,scope,run_id,payload) AS (
-                SELECT r.record_key,r.scope,r.run_id,r.payload
-                FROM json_each(?) seed CROSS JOIN records r
-                WHERE r.kind='operations' AND r.record_key=json_extract(seed.value,'$.key')
-                  AND r.scope=json_extract(seed.value,'$.scope')
-                UNION
-                SELECT p.record_key,p.scope,p.run_id,p.payload
-                FROM tree child CROSS JOIN records p
-                WHERE p.kind='operations' AND p.run_id IS child.run_id
-                  AND p.record_key=json_extract(child.payload,'$.parent_operation_id')
-            ) SELECT payload FROM tree LIMIT 1001""",
-            (seeds,),
-        )
-        if len(ancestors) > 1000:
-            raise SystemAPIError(
-                "history_limit",
-                "Too many timeline ancestors; request a smaller page.",
-                413,
-            )
-        items = []
-        for (encoded,) in ancestors:
-            row = json.loads(encoded)
-            if row.get("detail_ref"):
-                row["detail_ref"] = {**row["detail_ref"], **dataset["identity"]}
-            items.append(row)
+        items = _timeline_ancestors(cache, selected, dataset["identity"])
         return {
             "items": items,
             "total": total,
@@ -897,23 +910,19 @@ class LocalJournals:
         position = [0, "", ""]
         if params.get("cursor"):
             try:
-                cursor = json.loads(params["cursor"])
+                cursor = KeysetCursor.model_validate_json(params["cursor"])
                 if (
-                    cursor["scope"] != scope
-                    or cursor["version"] != dataset["version"]
-                    or time.time() - cursor["at"] > 300
+                    cursor.scope != scope
+                    or cursor.version != dataset["version"]
+                    or time.time() - cursor.at > 300
                 ):
                     raise ValueError("History changed.")
-                position = cursor["position"]
-                if len(position) != 3 or type(position[0]) is not int:
-                    raise ValueError("Invalid cursor position.")
+                position = list(cursor.position)
             except (KeyError, TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "history_changed", "Refresh this history publication.", 409
                 ) from error
-        limit = int(params.get("limit", 200))
-        if not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000.")
+        limit = PageLimit.model_validate(params.get("limit", 200)).root
         if view == "events":
             return self._event_page(dataset, params, scope, position, limit)
         if view == "runs":
@@ -1064,28 +1073,30 @@ class LocalJournals:
         }
 
     def detail(self, dataset: dict, reference: dict, row: dict | None = None) -> dict:
-        if not isinstance(reference, dict):
+        try:
+            identity = DetailIdentity.model_validate(reference)
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_reference", "Detail reference must be an object.", 400
-            )
-        if any(
-            reference.get(key) != dataset["identity"][key]
-            for key in ("journal_id", "generation")
+            ) from error
+        if (
+            identity.journal_id != dataset["identity"]["journal_id"]
+            or identity.generation != dataset["identity"]["generation"]
         ):
             raise SystemAPIError(
                 "history_changed", "This detail belongs to replaced history.", 409
             )
-        identifiers = reference.get("event_ids")
-        if (
-            not isinstance(identifiers, list)
-            or not 1 <= len(identifiers) <= 1000
-            or any(not isinstance(key, str) or not key for key in identifiers)
-        ):
+        try:
+            validated = DetailReference.model_validate(reference)
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_reference", "Detail requires a bounded list of event IDs.", 400
-            )
-        events = dataset["cache"].events(identifiers)
-        kind = reference.get("kind")
+            ) from error
+        return self._detail(dataset, validated, row)
+
+    def _detail(self, dataset: dict, reference: DetailReference, row: dict | None) -> dict:
+        events = dataset["cache"].events(reference.event_ids)
+        kind = reference.kind
         if kind == "events":
             return events[0]
         result = dict(row or {})

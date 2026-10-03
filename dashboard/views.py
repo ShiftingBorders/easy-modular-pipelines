@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from core.journal.events import LoggingError
 from core.models.dashboard_commands import DashboardCommand, SavedCommandHistory
+from core.models.dashboard_queries import OffsetCursor, PageLimit, PublicationCursor
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
     CollectorSamples,
@@ -1108,8 +1109,8 @@ class DashboardViews:
         cursor = params.get("cursor")
         if cursor:
             try:
-                cursor = json.loads(cursor)
-                token = cursor["publication"]
+                cursor = PublicationCursor.model_validate_json(cursor)
+                token = cursor.publication
                 publication = self._publications[token]
                 if (
                     publication["scope"] != scope
@@ -1117,7 +1118,7 @@ class DashboardViews:
                     or publication["metadata"]["journal"] != dataset["identity"]
                 ):
                     raise ValueError("History publication changed.")
-                internal = {**publication["cursor"], "position": cursor["position"]}
+                internal = {**publication["cursor"], "position": list(cursor.position)}
                 params = {**params, "cursor": json.dumps(internal)}
             except (ValueError, TypeError, KeyError) as error:
                 raise SystemAPIError(
@@ -1241,7 +1242,7 @@ class DashboardViews:
         return template
 
     def page(self, items: list[dict], metadata: dict, view: str, params: dict) -> dict:
-        limit = int(params.get("limit", 200))
+        limit = PageLimit.model_validate(params.get("limit", 200)).root
         now = time.monotonic()
         self._publications = {
             key: publication
@@ -1256,14 +1257,12 @@ class DashboardViews:
         )
         if params.get("cursor"):
             try:
-                cursor = json.loads(params["cursor"])
-                publication = self._publications[cursor["publication"]]
-                offset = cursor["offset"]
+                cursor = OffsetCursor.model_validate_json(params["cursor"])
+                publication = self._publications[cursor.publication]
+                offset = cursor.offset
                 if (
                     publication["scope"] != scope
                     or publication["metadata"]["journal"] != metadata["journal"]
-                    or type(offset) is not int
-                    or offset < 0
                 ):
                     raise ValueError("Invalid publication cursor.")
             except (ValueError, KeyError, TypeError) as error:
@@ -1272,7 +1271,7 @@ class DashboardViews:
                     "The selected publication is unavailable; refresh the history.",
                     409,
                 ) from error
-            token = cursor["publication"]
+            token = cursor.publication
             items, metadata = publication["items"], publication["metadata"]
         else:
             offset, token = 0, uuid4().hex

@@ -210,6 +210,12 @@ Live state/services are checked before publishing availability, with partial
 legacy read metadata preserved. Failed-HTTP diagnostic decoding uses separate
 models and retains existing fallback messages/status mappings.
 
+Dashboard query and cursor models describe syntax and bounded references. Cursor
+lookup, publication lifetime, actual journal identity, version and scope remain
+read-operation checks. Timeline histogram/statistics and ancestor hydration are
+focused SQL helpers with explicit inputs; their weak-reference overview cache
+and readonly publication policy remain with LocalJournals.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

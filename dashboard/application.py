@@ -8,8 +8,10 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
+from core.models.dashboard_queries import DashboardQuery
 from dashboard.alerts import AlertMonitor
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
@@ -19,34 +21,14 @@ from dashboard.views import DashboardViews
 
 
 def query_parameters(request: Request) -> dict:
-    allowed = {
-        "run_id",
-        "view",
-        "cursor",
-        "limit",
-        "q",
-        "module",
-        "metric",
-        "since",
-        "until",
-        "revision",
-        "ref",
-        "compact",
-    }
-    if request.query_params.keys() - allowed:
-        raise HTTPException(400, "Unknown query parameter.")
-    result = dict(request.query_params)
-    for value in result.values():
-        if len(value) > 4096:
-            raise HTTPException(400, "Query parameter is too long.")
-    if "limit" in result:
-        try:
-            limit = int(result["limit"])
-        except ValueError as error:
-            raise HTTPException(400, "limit must be an integer.") from error
-        if not 1 <= limit <= 1000:
-            raise HTTPException(400, "limit must be between 1 and 1000.")
-    return result
+    try:
+        return DashboardQuery.model_validate(dict(request.query_params)).model_dump(
+            exclude_unset=True
+        )
+    except ValidationError as error:
+        context = error.errors()[0].get("ctx", {})
+        message = str(context.get("error", error))
+        raise HTTPException(400, message) from error
 
 
 def check_write_origin(request: Request) -> None:
