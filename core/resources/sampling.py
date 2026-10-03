@@ -14,6 +14,11 @@ import psutil
 
 from core.journal.logger import OperationLogger
 from core.journal.settings import load_logging_settings
+from core.models.resource_messages import (
+    CollectorCommand,
+    CollectorStop,
+    CollectorUpdate,
+)
 from core.primitives.json_files import write_json
 from core.primitives.json_values import JsonObject
 from core.primitives.processes import process_identity
@@ -330,8 +335,8 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
             timeout = max(0, min(next_sample, next_status) - now)
             changed = False
             if connection.poll(timeout):
-                message = connection.recv()
-                if message["command"] == "stop":
+                message = CollectorCommand.validate_python(connection.recv())
+                if isinstance(message, CollectorStop):
                     return
                 last_owner = time.monotonic()
                 snapshot, targets, revision, received_notice, changed = (
@@ -381,7 +386,7 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
 
 
 def _apply_collector_update(
-    message: JsonObject,
+    message: CollectorUpdate,
     writer: ResourceWriter,
     sampler: ResourceSampler,
     snapshot: JsonObject,
@@ -390,19 +395,22 @@ def _apply_collector_update(
     received_notice: bool,
     changed: bool,
 ) -> tuple[JsonObject, list[ResourceTarget], int, bool, bool]:
-    if not received_notice and message.get("restart_notice") is not None:
-        writer.restart_notice = message["restart_notice"]
+    if not received_notice and message.restart_notice is not None:
+        writer.restart_notice = message.restart_notice.model_dump(exclude_unset=True)
         received_notice = True
-    if message["revision"] != revision:
-        incoming = message["snapshot"]
+    if message.revision != revision:
+        incoming = message.snapshot.model_dump(mode="json", exclude_unset=True)
         if (
             incoming["context"] != snapshot["context"]
             or incoming["logging_config_path"] != snapshot["logging_config_path"]
         ):
             sampler.reset()
         writer.select(incoming["logging_config_path"])
-        targets = [ResourceTarget.from_document(item) for item in incoming["targets"]]
+        targets = [
+            ResourceTarget(target.series_id, target.identity.model_dump(), target.context)
+            for target in message.snapshot.targets
+        ]
         snapshot = incoming
-        revision = message["revision"]
+        revision = message.revision
         changed = True
     return snapshot, targets, revision, received_notice, changed

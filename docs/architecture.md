@@ -52,6 +52,11 @@ the executor validates its fixed launch document before opening its journal or
 endpoint. Shared models describe progress limits and the exact stdout result
 shape. Application settings and result data remain opaque JSON.
 
+Collector snapshots and IPC commands are validated before selecting a journal
+or replacing process targets. Incoming packets are validated before updating
+resource history and freshness. Supervision retains worker ownership, restart
+and journal-closure checks; `ResourceTarget` keeps its public dataclass form.
+
 The low-level `SQLiteEventStore` constructor validates scalar arguments with
 standard-library rules and performs no file I/O. File-based journal settings
 use Pydantic after their explicit read, reusing those same opening rules.

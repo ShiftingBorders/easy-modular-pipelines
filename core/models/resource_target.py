@@ -9,6 +9,8 @@ from core.models.process_identity import ProcessIdentity
 from core.models.values import NonnegativeInteger, UUIDText
 from core.primitives.json_values import JsonObject, copy_json_object
 
+ResourceContext = Annotated[JsonObject, BeforeValidator(validate_context)]
+
 
 class ResourceProcessIdentity(ProcessIdentity):
     created_at_os: NonnegativeInteger = Field(gt=0)
@@ -21,7 +23,7 @@ class ResourceTargetDocument(BaseModel):
 
     series_id: UUIDText
     identity: ResourceProcessIdentity
-    context: Annotated[JsonObject, BeforeValidator(validate_context)]
+    context: ResourceContext
 
     @model_validator(mode="before")
     @classmethod

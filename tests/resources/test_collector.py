@@ -12,6 +12,7 @@ from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from core.primitives.processes import process_identity
 from core.resources.collector import ResourceCollector
@@ -318,17 +319,36 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         )
         collector._settings = settings(self.root, sample_interval_seconds=1)
         collector._history = ResourceHistory(collector._settings)
+        collector_id = str(uuid4())
         packets = []
         for observed, value in ((10, 25), (12, None)):
             packets.append(
                 {
+                    "collector_id": collector_id,
+                    "pid": os.getpid(),
                     "revision": 0,
+                    "journal_closed": True,
+                    "journal_error": None,
+                    "unconfirmed_samples": 0,
                     "samples": [
                         {
                             "series_id": "host",
+                            "context": {},
                             "observed_monotonic": observed,
                             "observed_at": f"time-{observed}",
-                            "resources": {"cpu": {"value": value}},
+                            "resources": {
+                                "cpu": {
+                                    "value": value,
+                                    "unit": "percent",
+                                    "kind": "gauge",
+                                    "scope": "host",
+                                    "estimated": False,
+                                    "attributes": {
+                                        "observed_at": f"time-{observed}",
+                                        "available": value is not None,
+                                    },
+                                }
+                            },
                         }
                     ],
                 }

@@ -8,6 +8,7 @@ import time
 from multiprocessing.connection import Connection
 from pathlib import Path
 
+from core.models.resource_messages import CollectorPacket, CollectorSnapshot
 from core.primitives.json_values import JsonObject, copy_json_object
 from core.resources.sampling import collect_resources
 from core.resources.state import CollectorSettings, ResourceHistory
@@ -49,7 +50,10 @@ class ResourceCollector:
 
     def update(self, snapshot: JsonObject) -> None:
         """Replace the desired target set without waiting for the collector process."""
-        snapshot = copy_json_object(snapshot, "resource snapshot")
+        self._update(CollectorSnapshot.model_validate(snapshot))
+
+    def _update(self, snapshot: CollectorSnapshot) -> None:
+        snapshot = snapshot.model_dump(mode="json", exclude_unset=True)
         if snapshot == self._snapshot:
             return
         self._snapshot = snapshot
@@ -170,21 +174,24 @@ class ResourceCollector:
 
     async def _receive_samples(self) -> None:
         while True:
-            packet = await asyncio.to_thread(self._connection.recv)
+            packet = CollectorPacket.model_validate(
+                await asyncio.to_thread(self._connection.recv)
+            )
             self._last_received = time.monotonic()
-            self._packet = packet
+            self._packet = packet.model_dump(exclude_unset=True)
             self._state = "running"
             self._error = None
-            if packet["revision"] == self._revision:
-                for sample in packet["samples"]:
-                    self._history.append(sample)
-                    self._latest[sample["series_id"]] = sample
-                    successes = self._last_success.setdefault(sample["series_id"], {})
-                    for name, measurement in sample["resources"].items():
-                        if measurement["value"] is not None:
+            if packet.revision == self._revision:
+                for sample in packet.samples:
+                    document = sample.model_dump(exclude_unset=True)
+                    self._history.append(document)
+                    self._latest[sample.series_id] = document
+                    successes = self._last_success.setdefault(sample.series_id, {})
+                    for name, measurement in sample.resources.items():
+                        if measurement.value is not None:
                             successes[name] = (
-                                sample["observed_monotonic"],
-                                sample["observed_at"],
+                                sample.observed_monotonic,
+                                sample.observed_at,
                             )
             self._observed.set()
 
