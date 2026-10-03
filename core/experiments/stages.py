@@ -30,6 +30,7 @@ from core.experiments.state import (
     state_to_document,
 )
 from core.journal.events import LoggingError
+from core.models.participant_observations import ExecutorCommandStateResponse
 from core.participants.connection import ParticipantConnection
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, JsonValue
@@ -683,16 +684,20 @@ class StageRunner:
                 await self._connect(attempt, timeout)
             request_id = str(uuid4())
             state.used_request_ids.add(request_id)
-            reply = await self._connection.query_command_state(
-                request_id, timeout_seconds=timeout
+            reply = ExecutorCommandStateResponse.model_validate(
+                await self._connection.query_command_state(
+                    request_id, timeout_seconds=timeout
+                )
             )
             first_observation = (
                 attempt.process_identity is None
-                and reply["data"].get("process") is not None
+                and reply.data.process is not None
             )
-            attempt.executor_status = reply["data"]
-            attempt.process_identity = reply["data"].get("process")
-            attempt.started_at = reply["data"].get("started_at")
+            attempt.executor_status = reply.data.model_dump(exclude_unset=True)
+            attempt.process_identity = (
+                None if reply.data.process is None else reply.data.process.model_dump()
+            )
+            attempt.started_at = reply.data.started_at
             self._save_state(state, checkpoint=first_observation)
             if first_observation and self._notify_resources is not None:
                 self._notify_resources()

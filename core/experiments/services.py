@@ -28,6 +28,11 @@ from core.experiments.state import (
     state_to_document,
 )
 from core.journal.events import LoggingError
+from core.models.participant_observations import (
+    CommandState,
+    CommandStateResponse,
+    ServiceStateExport,
+)
 from core.participants.connection import ParticipantConnection
 from core.participants.protocol import PROTOCOL_VERSION, error_details
 from core.primitives.json_files import read_json, write_json
@@ -1379,6 +1384,11 @@ class ServiceManager:
             if action != "ready":
                 return True, action
             return False, None
+        return await self._recover_connected_instance(state, service_id, instance)
+
+    async def _recover_connected_instance(
+        self, state: RunnerState, service_id: str, instance: ServiceInstance
+    ) -> tuple[bool, ServiceAction | None]:
         timeout = instance.definition["heartbeat"]["grace_seconds"]
         if not instance.ever_ready:
             if instance.start_deadline is None:
@@ -1415,41 +1425,35 @@ class ServiceManager:
             {"action": "command_state", "request_id": request_id},
             context=context,
         )
-        reply = await connection.query_command_state(
-            request_id,
-            timeout_seconds=max(0.001, reconnect_deadline - time.monotonic()),
-        )
-        observed = copy_json_object(reply["data"], "service command state")
-        if (
-            type(reply.get("protocol_version")) is not int
-            or reply["protocol_version"] != PROTOCOL_VERSION
-            or reply.get("message_type") != "response"
-        ):
-            raise ValueError("Invalid service command_state envelope.")
-        if reply.get("result") != "success" or not {
-            "current",
-            "pending",
-        }.issubset(observed):
-            raise ValueError(
-                "command_state requires a successful current/pending response."
+        reply = CommandStateResponse.model_validate(
+            await connection.query_command_state(
+                request_id,
+                timeout_seconds=max(0.001, reconnect_deadline - time.monotonic()),
             )
-        if (
-            type(observed["pending"]) is not list
-            or observed["current"] is not None
-            and type(observed["current"]) is not dict
-        ):
-            raise ValueError("Invalid current/pending service commands.")
+        )
+        return await self._reconcile_commands(
+            state, service_id, instance, reply.data, context
+        )
+
+    async def _reconcile_commands(
+        self,
+        state: RunnerState,
+        service_id: str,
+        instance: ServiceInstance,
+        observed: CommandState,
+        context: JsonObject,
+    ) -> tuple[bool, ServiceAction | None]:
         self._journal.client.record_event(
-            "service.commands_reconciled", observed, context=context
+            "service.commands_reconciled",
+            observed.model_dump(exclude_unset=True),
+            context=context,
         )
         active = instance.active_request
-        participant_work = [*observed["pending"]]
-        if observed["current"] is not None:
-            participant_work.append(observed["current"])
+        participant_work = [*observed.pending]
+        if observed.current is not None:
+            participant_work.append(observed.current)
         if any(
-            type(item) is not dict
-            or active is None
-            or item.get("request_id") != active["request_id"]
+            active is None or item.request_id != active["request_id"]
             for item in participant_work
         ):
             instance.failure = error_details(
@@ -1557,15 +1561,15 @@ class ServiceManager:
         )
         if reply["result"] != "success" or state.services[service_id] is not instance:
             raise RuntimeError(f"Service {service_id} state export failed.")
-        data = copy_json_object(reply["data"], "service state export")
-        state_path = data.get("state_path")
-        if state_path is None and not instance.definition["state_required"]:
+        data = ServiceStateExport.model_validate(reply["data"])
+        if data.state_path is None:
+            if instance.definition["state_required"]:
+                raise ValueError("Required service export is missing state_path.")
             return None
-        relative = Path(require_text(state_path, "state_path"))
+        relative = Path(data.state_path)
         resolved = (state.experiment_directory / relative).resolve()
         if (
-            relative.anchor
-            or not resolved.is_relative_to(output.resolve())
+            not resolved.is_relative_to(output.resolve())
             or not resolved.exists()
         ):
             raise ValueError(

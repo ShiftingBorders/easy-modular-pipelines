@@ -52,6 +52,11 @@ the executor validates its fixed launch document before opening its journal or
 endpoint. Shared models describe progress limits and the exact stdout result
 shape. Application settings and result data remain opaque JSON.
 
+Recovery validates command-state observations before updating executor records
+or reconciling service work. Service exports validate their relative path before
+the owner checks actual filesystem confinement. Conditional result models check
+decision structure; the runner retains current DAG membership and payload policy.
+
 Collector snapshots and IPC commands are validated before selecting a journal
 or replacing process targets. Incoming packets are validated before updating
 resource history and freshness. Supervision retains worker ownership, restart

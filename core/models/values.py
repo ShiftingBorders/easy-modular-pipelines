@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BeforeValidator, Field, ValidationInfo
+from pydantic import AfterValidator, BeforeValidator, Field, ValidationInfo
 
 from core.primitives.json_values import require_number, require_text
 
@@ -46,4 +46,5 @@ NonnegativeInteger = Annotated[int, Field(strict=True, ge=0)]
 SchemaVersionOne = Annotated[int, Field(strict=True, ge=1, le=1)]
 AbsolutePath = Annotated[Path, BeforeValidator(_absolute_path)]
 UUIDText = Annotated[str, BeforeValidator(_uuid_text)]
+NormalizedUUIDText = Annotated[UUIDText, AfterValidator(lambda value: str(UUID(value)))]
 Boolean = Annotated[bool, BeforeValidator(_boolean)]

@@ -1,10 +1,8 @@
 """Participant wire documents; authentication and live ownership stay outside."""
 
 from typing import Annotated, Literal
-from uuid import UUID
 
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -14,11 +12,11 @@ from pydantic import (
 
 from core.models.participant_identity import ParticipantIdentity
 from core.models.process_identity import ProcessIdentity
-from core.models.values import Number, Text, UUIDText
+from core.models.values import NormalizedUUIDText, Number, Text, UUIDText
 from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
 
 ProtocolVersion = Annotated[int, Field(strict=True, ge=2, le=2)]
-RequestId = Annotated[UUIDText, AfterValidator(lambda value: str(UUID(value)))]
+RequestId = NormalizedUUIDText
 
 
 class _Message(BaseModel):

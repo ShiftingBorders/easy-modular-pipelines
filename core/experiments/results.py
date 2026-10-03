@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from uuid import UUID
-
+from core.models.conditional_result import ConditionalDecision
 from core.participants.protocol import validate_response
-from core.primitives.json_values import JsonObject, JsonValue, require_text
+from core.primitives.json_values import JsonObject, JsonValue
 
 
 class MissingConditionalDataError(ValueError):
@@ -19,33 +18,33 @@ def normalize_conditional_result(
     template: JsonObject,
 ) -> JsonObject:
     """Separate a conditional decision from its accepted application output."""
-    decision = response["data"]
-    if decision is None:
-        decision = {}
-    if type(decision) is not dict:
-        raise ValueError("A conditional result must be null or a decision object.")
-    if decision.keys() - {"command", "stage_id", "data"}:
-        raise ValueError("Unknown conditional decision fields.")
-    command = decision.get("command")
-    if command not in (None, "pause", "stop", "move"):
-        raise ValueError("Conditional commands are pause, stop, or move.")
-    control = {"command": command}
-    if command == "move":
-        target = str(UUID(require_text(decision.get("stage_id"), "move.stage_id")))
-        if target not in {stage["stage_id"] for stage in template["stages"]}:
+    decision = ConditionalDecision.model_validate(response["data"])
+    return _apply_conditional_decision(
+        decision, response, input_data, definition["returns_data"], template
+    )
+
+
+def _apply_conditional_decision(
+    decision: ConditionalDecision,
+    response: JsonObject,
+    input_data: JsonValue,
+    returns_data: bool,
+    template: JsonObject,
+) -> JsonObject:
+    control = {"command": decision.command}
+    if decision.command == "move":
+        if decision.stage_id not in {stage["stage_id"] for stage in template["stages"]}:
             raise ValueError("Conditional move target is not a node in this DAG.")
-        control["stage_id"] = target
-    elif "stage_id" in decision:
-        raise ValueError("Only move accepts a target stage_id.")
-    if definition["returns_data"] and "data" not in decision:
+        control["stage_id"] = decision.stage_id
+    if returns_data and "data" not in decision.model_fields_set:
         raise MissingConditionalDataError(
             "Conditional stage with returns_data=true must return a data field."
         )
     # Without a command this stage simply forwards its input. Explicit null is
     # a payload only when data is enabled and a command is present.
     output = input_data
-    if command is not None and definition["returns_data"]:
-        output = decision["data"]
+    if decision.command is not None and returns_data:
+        output = decision.data
     return {
         **response,
         "data": output,
