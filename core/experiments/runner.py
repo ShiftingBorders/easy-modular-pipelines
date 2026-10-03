@@ -17,11 +17,17 @@ import yaml
 
 from core.experiments.archiver import ExperimentArchiver
 from core.experiments.assembler import ExperimentAssembler, find_experiment
-from core.experiments.journal import RunnerJournal, _read_recovery_checkpoint
+from core.experiments.journal import (
+    RunnerJournal,
+    _read_recovery_checkpoint,
+    _read_reload_progress,
+)
 from core.experiments.launch import ModuleLauncher
 from core.experiments.reload import (
     _definition_change,
     _prepare_reload_candidate,
+    _reload_cursor,
+    _reload_layout,
     _service_state,
 )
 from core.experiments.service_inputs import _service_definition
@@ -1302,81 +1308,18 @@ class ExperimentRunner:
             logger.record_event("reload.unchanged", result, operation=operation)
             return result
         old = state.template
-        old_services = {s["service_id"]: s for s in old["services"]}
-        new_services = {s["service_id"]: s for s in template["services"]}
-        changed_services = {
-            sid
-            for sid in old_services.keys() | new_services.keys()
-            if json.dumps(old_services.get(sid), sort_keys=True)
-            != json.dumps(new_services.get(sid), sort_keys=True)
-        }
-        old_stages, new_stages = old["stages"], template["stages"]
-        prefix = 0
-        for before, after in zip(old_stages, new_stages):
-            if json.dumps(before, sort_keys=True) != json.dumps(
-                after, sort_keys=True
-            ) or ("service_id" in before and before["service_id"] in changed_services):
-                break
-            prefix += 1
-        old_next = state.stage_position - 1 + int(self._pending_advance)
-        if not 0 <= old_next <= len(old_stages):
-            raise ValueError("Saved cursor is outside the applied DAG.")
-        new_positions = {s["stage_id"]: i for i, s in enumerate(new_stages)}
-        next_position = len(new_stages)
-        for definition in old_stages[old_next:]:
-            if definition["stage_id"] in new_positions:
-                next_position = new_positions[definition["stage_id"]]
-                break
-        if old_next == prefix:
-            next_position = prefix
-        # Results cover successes. Checkpoints also retain policy-accepted skips;
-        # numerical positions alone cannot prove progress after move/rerun.
-        completed = set(state.stage_result_ids)
-        lineage = set()
-        ancestor = state.experiment_id
-        while ancestor:
-            lineage.add(ancestor)
-            ancestor = ancestor.partition(":")[2]
-        checkpoint = boundary = None
-        while True:
-            page = await asyncio.to_thread(logger.read_events, checkpoint, limit=1000)
-            if boundary is None:
-                boundary = page["boundary"]["cursor"]
-            for entry in page["events"]:
-                if entry["cursor"] > boundary:
-                    break
-                event = entry["event"]
-                document = event["data"]
-                if (
-                    event["event_type"] == "runner.checkpoint"
-                    and document.get("experiment_id") in lineage
-                    and document.get("template_revision_id") == previous_revision
-                    and document.get("cycle_number") == state.cycle_number
-                    and document.get("pending_advance")
-                ):
-                    completed.add(
-                        document["template"]["stages"][document["stage_position"] - 1][
-                            "stage_id"
-                        ]
-                    )
-                elif (
-                    event["event_type"] == "reload.progress"
-                    and event["context"].get("experiment_id") in lineage
-                    and document.get("template_revision_id") == previous_revision
-                    and document.get("cycle_number") == state.cycle_number
-                ):
-                    completed.update(document.get("preserved_completed_stage_ids", []))
-            checkpoint = page["checkpoint"]
-            if checkpoint["cursor"] >= boundary or not page["has_more"]:
-                break
-        invalidated = {s["stage_id"] for s in old_stages[prefix:]}
-        rewind = bool(completed & invalidated) and prefix < next_position
-        if rewind:
-            next_position = prefix
-        next_position = min(next_position, len(new_stages))
-        new_pending = next_position == len(new_stages)
-        new_position = len(new_stages) if new_pending else next_position + 1
-        preserved = {s["stage_id"] for s in new_stages[:prefix]}
+        layout = _reload_layout(old, template, state.stage_position, self._pending_advance)
+        old_services, new_services = layout.old_services, layout.new_services
+        changed_services = layout.changed_services
+        new_stages, prefix = layout.new_stages, layout.prefix
+        completed = await _read_reload_progress(
+            logger, state.experiment_id, previous_revision, state.cycle_number,
+            set(state.stage_result_ids),
+        )
+        cursor = _reload_cursor(layout, completed)
+        next_position, new_position = cursor.next_position, cursor.stage_position
+        new_pending, rewind = cursor.pending_advance, cursor.rewind
+        preserved = cursor.preserved
         for role in ("stage", "service"):
             before = {
                 s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(old[f"{role}s"])

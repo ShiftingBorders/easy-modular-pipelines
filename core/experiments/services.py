@@ -1683,6 +1683,51 @@ class ServiceManager:
         instance.ready = False
         instance.stopping = True
         context = _context(state, service_id, instance.service_instance_id)
+        await self._detach_service_tasks(service_id)
+        deadline = time.monotonic() + state.template["start_timeout"]
+        owned_process = self._processes.get(service_id)
+        if (
+            owned_process is not None
+            and instance.process_identity is not None
+            and owned_process.pid == instance.process_identity["pid"]
+            and owned_process.poll() is not None
+        ):
+            instance.stopped = True
+        request_id = str(uuid4())
+        if request_id in state.used_request_ids:
+            raise RuntimeError("Request ID collision.")
+        state.used_request_ids.add(request_id)
+        error_message = self._record_service_stop_intent(
+            state, service_id, request_id, context
+        )
+        shutdown_response, shutdown_error = await self._request_service_shutdown(
+            state, service_id, instance, request_id, deadline
+        )
+        if shutdown_error is not None:
+            error_message = shutdown_error
+        process = self._processes.get(service_id)
+        error_message = await self._confirm_service_exit(
+            instance, process, deadline, error_message
+        )
+        if not instance.stopped:
+            error_message = error_message or "Service termination is unconfirmed."
+            instance.failure = error_details("service_failure", error_message)
+            instance.blocked_action = "stop"
+            self._pending_action = "stop"
+        error_message = self._cancel_service_stop_requests(
+            state, instance, preserve_pending, error_message
+        )
+        instance.stopping = False
+        if self._notify_resources is not None:
+            self._notify_resources()
+        if process is not None:
+            process.poll()
+        results[service_id] = {"stopped": instance.stopped, "error": error_message}
+        self._record_service_stop_outcome(
+            state, service_id, request_id, shutdown_response, context, results
+        )
+
+    async def _detach_service_tasks(self, service_id: str) -> None:
         tasks = [
             self._connecting.pop(service_id, None),
         ]
@@ -1702,21 +1747,11 @@ class ServiceManager:
         if connection is not None:
             await connection.close()
         self._probes.pop(service_id, None)
+
+    def _record_service_stop_intent(
+        self, state: RunnerState, service_id: str, request_id: str, context: JsonObject
+    ) -> str | None:
         error_message = None
-        shutdown_response = None
-        deadline = time.monotonic() + state.template["start_timeout"]
-        owned_process = self._processes.get(service_id)
-        if (
-            owned_process is not None
-            and instance.process_identity is not None
-            and owned_process.pid == instance.process_identity["pid"]
-            and owned_process.poll() is not None
-        ):
-            instance.stopped = True
-        request_id = str(uuid4())
-        if request_id in state.used_request_ids:
-            raise RuntimeError("Request ID collision.")
-        state.used_request_ids.add(request_id)
         try:
             self._journal.client.record_event(
                 "control.intent",
@@ -1734,6 +1769,15 @@ class ServiceManager:
                 )
             except OSError as secondary:
                 error.add_note(f"Emergency service-stop recording failed: {secondary}")
+        return error_message
+
+    async def _request_service_shutdown(
+        self, state: RunnerState, service_id: str, instance: ServiceInstance,
+        request_id: str, deadline: float,
+    ) -> tuple[JsonObject | None, str | None]:
+        connection = None
+        shutdown_response = None
+        error_message = None
         try:
             if not instance.stopped and instance.endpoint_path is not None:
                 connection = ParticipantConnection(
@@ -1786,7 +1830,12 @@ class ServiceManager:
         finally:
             if connection is not None:
                 await connection.close()
-        process = self._processes.get(service_id)
+        return shutdown_response, error_message
+
+    async def _confirm_service_exit(
+        self, instance: ServiceInstance, process: subprocess.Popen | None,
+        deadline: float, error_message: str | None,
+    ) -> str | None:
         while not instance.stopped:
             try:
                 if (
@@ -1838,11 +1887,12 @@ class ServiceManager:
                 except OSError as error:
                     error_message = str(error)
             instance.stopped = process.poll() is not None
-        if not instance.stopped:
-            error_message = error_message or "Service termination is unconfirmed."
-            instance.failure = error_details("service_failure", error_message)
-            instance.blocked_action = "stop"
-            self._pending_action = "stop"
+        return error_message
+
+    def _cancel_service_stop_requests(
+        self, state: RunnerState, instance: ServiceInstance,
+        preserve_pending: bool, error_message: str | None,
+    ) -> str | None:
         cancelled = [] if preserve_pending else instance.pending_requests[:]
         if not preserve_pending:
             instance.pending_requests.clear()
@@ -1860,23 +1910,23 @@ class ServiceManager:
                 )
             except LoggingError as error:
                 error_message = str(error)
-        instance.stopping = False
-        if self._notify_resources is not None:
-            self._notify_resources()
-        if process is not None:
-            process.poll()
-        results[service_id] = {"stopped": instance.stopped, "error": error_message}
+        return error_message
+
+    def _record_service_stop_outcome(
+        self, state: RunnerState, service_id: str, request_id: str,
+        shutdown_response: JsonObject | None, context: JsonObject, results: JsonObject,
+    ) -> None:
         try:
             self._journal.client.record_command_result(
                 request_id,
                 shutdown_response
                 or {
-                    "result": "success" if instance.stopped else "fail",
+                    "result": "success" if results[service_id]["stopped"] else "fail",
                     "data": results[service_id],
                 },
                 author="runner",
                 outcome="succeeded"
-                if instance.stopped
+                if results[service_id]["stopped"]
                 and (shutdown_response or {}).get("result") != "fail"
                 else "failed",
                 context=context,

@@ -195,3 +195,53 @@ async def _read_recovery_checkpoint(
             "Recovery requires a valid saved state or committed journal checkpoint."
         ) from state_error
     return state
+
+
+async def _read_reload_progress(
+    logger: OperationLogger,
+    experiment_id: str,
+    template_revision_id: str,
+    cycle_number: int,
+    completed_stage_ids: set[str],
+) -> set[str]:
+    # Results cover successes. Checkpoints also retain policy-accepted skips;
+    # numerical positions alone cannot prove progress after move/rerun.
+    completed = set(completed_stage_ids)
+    lineage = set()
+    ancestor = experiment_id
+    while ancestor:
+        lineage.add(ancestor)
+        ancestor = ancestor.partition(":")[2]
+    checkpoint = boundary = None
+    while True:
+        page = await asyncio.to_thread(logger.read_events, checkpoint, limit=1000)
+        if boundary is None:
+            boundary = page["boundary"]["cursor"]
+        for entry in page["events"]:
+            if entry["cursor"] > boundary:
+                break
+            event = entry["event"]
+            document = event["data"]
+            if (
+                event["event_type"] == "runner.checkpoint"
+                and document.get("experiment_id") in lineage
+                and document.get("template_revision_id") == template_revision_id
+                and document.get("cycle_number") == cycle_number
+                and document.get("pending_advance")
+            ):
+                completed.add(
+                    document["template"]["stages"][document["stage_position"] - 1][
+                        "stage_id"
+                    ]
+                )
+            elif (
+                event["event_type"] == "reload.progress"
+                and event["context"].get("experiment_id") in lineage
+                and document.get("template_revision_id") == template_revision_id
+                and document.get("cycle_number") == cycle_number
+            ):
+                completed.update(document.get("preserved_completed_stage_ids", []))
+        checkpoint = page["checkpoint"]
+        if checkpoint["cursor"] >= boundary or not page["has_more"]:
+            break
+    return completed

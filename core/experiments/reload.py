@@ -3,11 +3,79 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from core.experiments.state import RunnerState, ServiceInstance
 from core.primitives.json_values import JsonObject
+
+
+@dataclass(frozen=True)
+class ReloadLayout:
+    old_services: dict[str, JsonObject]
+    new_services: dict[str, JsonObject]
+    changed_services: set[str]
+    old_stages: list[JsonObject]
+    new_stages: list[JsonObject]
+    prefix: int
+    next_position: int
+
+
+@dataclass(frozen=True)
+class ReloadCursor:
+    next_position: int
+    stage_position: int
+    pending_advance: bool
+    rewind: bool
+    preserved: set[str]
+
+
+def _reload_layout(
+    previous: JsonObject, candidate: JsonObject, stage_position: int, pending_advance: bool
+) -> ReloadLayout:
+    old_services = {item["service_id"]: item for item in previous["services"]}
+    new_services = {item["service_id"]: item for item in candidate["services"]}
+    changed_services = {
+        service_id for service_id in old_services.keys() | new_services.keys()
+        if json.dumps(old_services.get(service_id), sort_keys=True)
+        != json.dumps(new_services.get(service_id), sort_keys=True)
+    }
+    old_stages, new_stages = previous["stages"], candidate["stages"]
+    prefix = 0
+    for before, after in zip(old_stages, new_stages):
+        if (
+            json.dumps(before, sort_keys=True) != json.dumps(after, sort_keys=True)
+            or ("service_id" in before and before["service_id"] in changed_services)
+        ):
+            break
+        prefix += 1
+    old_next = stage_position - 1 + int(pending_advance)
+    if not 0 <= old_next <= len(old_stages):
+        raise ValueError("Saved cursor is outside the applied DAG.")
+    new_positions = {item["stage_id"]: index for index, item in enumerate(new_stages)}
+    next_position = len(new_stages)
+    for definition in old_stages[old_next:]:
+        if definition["stage_id"] in new_positions:
+            next_position = new_positions[definition["stage_id"]]
+            break
+    if old_next == prefix:
+        next_position = prefix
+    return ReloadLayout(
+        old_services, new_services, changed_services, old_stages, new_stages,
+        prefix, next_position,
+    )
+
+
+def _reload_cursor(layout: ReloadLayout, completed: set[str]) -> ReloadCursor:
+    invalidated = {item["stage_id"] for item in layout.old_stages[layout.prefix:]}
+    rewind = bool(completed & invalidated) and layout.prefix < layout.next_position
+    next_position = layout.prefix if rewind else layout.next_position
+    next_position = min(next_position, len(layout.new_stages))
+    pending = next_position == len(layout.new_stages)
+    position = len(layout.new_stages) if pending else next_position + 1
+    preserved = {item["stage_id"] for item in layout.new_stages[:layout.prefix]}
+    return ReloadCursor(next_position, position, pending, rewind, preserved)
 
 
 def _prepare_reload_candidate(state: RunnerState, template: JsonObject) -> None:

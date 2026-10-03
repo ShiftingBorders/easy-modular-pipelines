@@ -90,6 +90,13 @@ owner in focused modules. The owning classes retain state changes, transactions,
 process ownership, cancellation, and recovery decisions. Helpers do not receive
 an entire manager or runner merely to access its private fields.
 
+Reload layout and cursor calculations live in `experiments.reload` as ordinary
+computed records. `experiments.journal` reads progress evidence against an
+explicit initial journal boundary; the runner retains publication and rollback.
+Service shutdown separates task detachment, shutdown RPC, exit confirmation,
+request cancellation and outcome recording while sharing one deadline and
+retaining the manager's ownership checks.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
