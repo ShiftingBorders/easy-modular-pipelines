@@ -30,6 +30,8 @@ def _utc_text(value: str) -> str:
         raise ValueError("occurred_at must include the UTC timezone.")
     return value
 
+UTCText = Annotated[Text, AfterValidator(_utc_text)]
+
 
 class _Document(BaseModel):
     model_config = ConfigDict(
@@ -83,7 +85,7 @@ class JournalEvent(_Document):
     event_id: Text
     producer_instance_id: Text
     sequence_number: SQLiteSequence
-    occurred_at: Annotated[Text, AfterValidator(_utc_text)]
+    occurred_at: UTCText
     event_type: Text
     context: JournalContext
     operation_id: Text | None

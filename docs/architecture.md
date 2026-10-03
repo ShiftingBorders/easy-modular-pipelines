@@ -92,6 +92,12 @@ SQLite constructor. Event encoding retains caller key order and the complete
 UTF-8 byte limit. Operation ownership, generation checks and result precedence
 remain with journal operations.
 
+Diagnostic observers use one shared model for decoding and restoration inputs.
+Diagnostic and journal snapshot manifest models describe their data formats;
+file readers retain duplicate/reference checks and compare actual checksums,
+counts and database identities. Diagnostic event wrappers are validated apart
+from the enclosed event so they retain the event's JSON-depth allowance.
+
 Private operations that validate or prepare explicit inputs live beside their
 owner in focused modules. The owning classes retain state changes, transactions,
 process ownership, cancellation, and recovery decisions. Helpers do not receive

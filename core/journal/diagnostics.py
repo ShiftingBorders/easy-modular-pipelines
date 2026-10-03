@@ -5,18 +5,15 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
-from uuid import UUID
 
 from core.journal.events import (
     SCHEMA_VERSION,
     validate_command_result,
-    validate_context,
     validate_journal_identity,
 )
-from core.primitives.json_values import JsonObject, copy_json_object, require_text
+from core.primitives.json_values import JsonObject
 
 
 def _decode_author_observation(
@@ -25,6 +22,8 @@ def _decode_author_observation(
     request_id: str,
     identity: JsonObject,
 ) -> JsonObject:
+    from core.models.journal_diagnostics import AuthorObservation
+
     if (
         event["schema_version"] != SCHEMA_VERSION
         or event["event_type"] != "command.result"
@@ -38,26 +37,13 @@ def _decode_author_observation(
         raise ValueError("Command result request identity does not match.")
     if {key: event["context"].get(key) for key in identity} != identity:
         raise ValueError("Command result belongs to another request context.")
-    observation = copy_json_object(json.loads(observation_json), "observation")
-    if observation.keys() != {
-        "producer_instance_id",
-        "occurred_at",
-        "context",
-        "operation_id",
-    }:
-        raise ValueError("Invalid observation fields.")
-    if observation["operation_id"] is not None:
-        require_text(observation["operation_id"], "operation_id")
-    require_text(observation["producer_instance_id"], "producer_instance_id")
-    timestamp = datetime.fromisoformat(observation["occurred_at"])
-    if timestamp.utcoffset() != UTC.utcoffset(None):
-        raise ValueError("Observation time must be UTC.")
-    context = validate_context(observation["context"])
+    observation = AuthorObservation.model_validate(json.loads(observation_json))
+    context = observation.context.root
     if context.get("request_id") != request_id:
         raise ValueError("Observation request_id does not match.")
     if {key: context.get(key) for key in identity} != identity:
         raise ValueError("Observation belongs to another request context.")
-    return observation
+    return observation.model_dump()
 
 
 def _content_digest(connection: sqlite3.Connection) -> str:
@@ -85,98 +71,33 @@ def _content_digest(connection: sqlite3.Connection) -> str:
 def _validate_diagnostic_command(
     record: JsonObject, request_ids: set[str], commands: list[JsonObject]
 ) -> None:
-    request_id = require_text(record["request_id"], "request_id")
+    from core.models.journal_diagnostics import DiagnosticCommand
+
+    command = DiagnosticCommand.model_validate(record)
+    request_id = command.request_id
     if request_id in request_ids:
         raise ValueError("Duplicate diagnostic request ID.")
     request_ids.add(request_id)
-    identity = validate_context(record["identity"])
-    if identity.keys() != {
-        "experiment_id",
-        "participant_id",
-        "participant_instance_id",
-    }:
-        raise ValueError("Invalid diagnostic request identity.")
-    require_text(identity["experiment_id"], "experiment_id")
-    require_text(identity["participant_id"], "participant_id")
-    if record["runner"] is None and record["participant"] is None:
-        raise ValueError("Diagnostic result requires an observation.")
-    for author in ("runner", "participant"):
-        entry = record[author]
-        if entry is None:
-            continue
-        if type(entry) is not dict or entry.keys() != {
-            "event_id",
-            "observation",
-        }:
-            raise ValueError("Invalid diagnostic observation fields.")
-        require_text(entry["event_id"], "event_id")
-        observation = copy_json_object(entry["observation"], "observation")
-        if observation.keys() != {
-            "producer_instance_id",
-            "occurred_at",
-            "context",
-            "operation_id",
-        }:
-            raise ValueError("Invalid diagnostic observer.")
-        if observation["operation_id"] is not None:
-            require_text(observation["operation_id"], "operation_id")
-        require_text(observation["producer_instance_id"], "producer_instance_id")
-        timestamp = datetime.fromisoformat(observation["occurred_at"])
-        if timestamp.utcoffset() != UTC.utcoffset(None):
-            raise ValueError("Observation timestamp must be UTC.")
-        validate_context(observation["context"])
-    commands.append(record)
+    commands.append(command.model_dump(exclude_unset=True))
 
 
 def _validate_restore_input(
     snapshot_manifest: JsonObject, restoration_id: str, new_generation: str
 ) -> tuple[JsonObject, JsonObject, str, str]:
-    manifest = copy_json_object(snapshot_manifest, "snapshot manifest")
-    if manifest.keys() != {
-        "schema_version",
-        "snapshot_id",
-        "journal_id",
-        "generation",
-        "storage_schema_version",
-        "cursor",
-        "event_count",
-        "change_cursor",
-        "content_sha256",
-        "created_at",
-        "database",
-    }:
-        raise ValueError("Snapshot manifest fields do not match the format.")
-    if (
-        type(manifest["schema_version"]) is not int
-        or manifest["schema_version"] != SCHEMA_VERSION
-        or type(manifest["storage_schema_version"]) is not int
-        or manifest["storage_schema_version"] != SCHEMA_VERSION
-        or manifest["database"] != "journal.sqlite"
-    ):
-        raise ValueError("Unsupported snapshot manifest.")
+    from core.models.journal_diagnostics import JournalRestorationInput
+
+    restoration = JournalRestorationInput.model_validate(
+        {
+            "snapshot": snapshot_manifest,
+            "restoration_id": restoration_id,
+            "new_generation": new_generation,
+        }
+    )
+    manifest = restoration.snapshot.model_dump()
     identity = validate_journal_identity(
         {name: manifest[name] for name in ("journal_id", "generation")}
     )
-    UUID(require_text(manifest["snapshot_id"], "snapshot_id"))
-    restoration_id = UUID(require_text(restoration_id, "restoration_id")).hex
-    new_generation = UUID(require_text(new_generation, "new_generation")).hex
-    if new_generation == identity["generation"]:
-        raise ValueError("Restoration requires a fresh generation.")
-    for field in ("cursor", "event_count", "change_cursor"):
-        if (
-            type(manifest[field]) is not int
-            or not 0 <= manifest[field] <= 9223372036854775807
-        ):
-            raise ValueError(f"Invalid snapshot {field}.")
-    timestamp = datetime.fromisoformat(manifest["created_at"])
-    if timestamp.utcoffset() != UTC.utcoffset(None):
-        raise ValueError("Snapshot creation time must be UTC.")
-    digest_text = require_text(manifest["content_sha256"], "content_sha256")
-    if len(digest_text) != 64 or any(
-        char not in "0123456789abcdef" for char in digest_text
-    ):
-        raise ValueError("Invalid snapshot content checksum.")
-    return manifest, identity, restoration_id, new_generation
+    return manifest, identity, restoration.restoration_id, restoration.new_generation
 
 
 def _write_diagnostic_record(output: BinaryIO, digest, record: JsonObject) -> None:

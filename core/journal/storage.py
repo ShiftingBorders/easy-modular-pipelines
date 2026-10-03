@@ -12,7 +12,7 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from core.journal.diagnostics import (
     _close_preserving_failure,
@@ -34,7 +34,6 @@ from core.journal.events import (
     validate_checkpoint,
     validate_command_result,
     validate_context,
-    validate_journal_identity,
 )
 from core.journal.records import (
     _checkpoint,
@@ -63,6 +62,7 @@ from core.primitives.json_values import (
 _PAGE_BYTES = 16777216
 
 if TYPE_CHECKING:
+    from core.models.journal_diagnostics import DiagnosticManifest
     from core.models.journal_settings import JournalConfiguration
 
 
@@ -1434,43 +1434,15 @@ class SQLiteEventStore:
             raise ValueError("Diagnostics must use an absolute directory path.")
         with (path / "manifest.json").open(encoding="utf-8") as source:
             manifest = copy_json_object(json.load(source), "diagnostics manifest")
-        if manifest.keys() != {
-            "schema_version",
-            "kind",
-            "diagnostics_id",
-            "journal_id",
-            "generation",
-            "operation_ids",
-            "cursor",
-            "change_cursor",
-            "created_at",
-            "records",
-            "records_sha256",
-            "event_count",
-            "command_count",
-        }:
-            raise ValueError("Invalid diagnostics manifest fields.")
-        if (
-            type(manifest["schema_version"]) is not int
-            or manifest["schema_version"] != SCHEMA_VERSION
-            or manifest["kind"] != "journal.diagnostics"
-            or manifest["records"] != "records.jsonl"
-        ):
-            raise ValueError("Unsupported diagnostics format.")
-        validate_journal_identity(
-            {field: manifest[field] for field in ("journal_id", "generation")}
-        )
-        UUID(require_text(manifest["diagnostics_id"], "diagnostics_id"))
-        for field in ("cursor", "change_cursor", "event_count", "command_count"):
-            if type(manifest[field]) is not int or manifest[field] < 0:
-                raise ValueError(f"Invalid diagnostics {field}.")
-        if type(manifest["operation_ids"]) is not list or not manifest["operation_ids"]:
-            raise ValueError("Diagnostics must identify selected operations.")
-        for operation_id in manifest["operation_ids"]:
-            require_text(operation_id, "operation_id")
-        timestamp = datetime.fromisoformat(manifest["created_at"])
-        if timestamp.utcoffset() != UTC.utcoffset(None):
-            raise ValueError("Diagnostics creation time must be UTC.")
+        from core.models.journal_diagnostics import DiagnosticManifest
+
+        validated = DiagnosticManifest.model_validate(manifest)
+        events, commands = self._read_diagnostic_records(path, validated)
+        return manifest, events, commands
+
+    def _read_diagnostic_records(
+        self, path: Path, manifest: DiagnosticManifest
+    ) -> tuple[list[JsonObject], list[JsonObject]]:
         events, commands = [], []
         digest = hashlib.sha256()
         event_ids, request_ids = set(), set()
@@ -1502,11 +1474,11 @@ class SQLiteEventStore:
                     _validate_diagnostic_command(record, request_ids, commands)
                 else:
                     raise ValueError("Unknown diagnostic record format.")
-        if digest.hexdigest() != manifest["records_sha256"]:
+        if digest.hexdigest() != manifest.records_sha256:
             raise ValueError("Diagnostic records checksum does not match.")
         if (len(events), len(commands)) != (
-            manifest["event_count"],
-            manifest["command_count"],
+            manifest.event_count,
+            manifest.command_count,
         ):
             raise ValueError("Diagnostic record counts do not match.")
         for record in commands:
@@ -1516,7 +1488,7 @@ class SQLiteEventStore:
                     and record[author]["event_id"] not in event_ids
                 ):
                     raise ValueError("Diagnostic result refers outside its bundle.")
-        return manifest, events, commands
+        return events, commands
 
     def complete_restore(
         self,
