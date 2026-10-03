@@ -32,6 +32,14 @@ All Pydantic model definitions live in `core/models/`. Existing imports from
 Configuration consumers receive validated models where compatible with their
 public contracts. `CollectorSettings` retains its public dataclass form.
 
+Experiment template and module manifest models describe their structure and
+internal consistency before assembly or launch. Public loaders keep their JSON
+results; internal assembly, rebuild, and launch operations consume validated
+objects. `validate_template` calls the public `load_template` wrapper so caller
+overrides keep working, then validates its JSON result before module inspection.
+Registered hashes, actual module roles, filesystem boundaries, and resource
+ownership are checked by the operations that use those resources.
+
 The low-level `SQLiteEventStore` constructor validates scalar arguments with
 standard-library rules and performs no file I/O. File-based journal settings
 use Pydantic after their explicit read, reusing those same opening rules.

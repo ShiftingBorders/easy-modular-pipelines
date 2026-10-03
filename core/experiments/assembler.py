@@ -7,21 +7,28 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import yaml
 
 from core.experiments.state import RunnerState
-from core.experiments.template_validation import (
-    _validate_template_policies,
-    _validate_template_resources,
+from core.experiments.template_validation import _template_document
+from core.models.experiment_template import (
+    ErrorPolicy,
+    ExperimentTemplate,
+    ModuleReference,
+    ResourceDefinition,
+    ResourceInputs,
+    ServiceCallDefinition,
+    ServiceDefinition,
+    StageDefinition,
 )
+from core.models.module_manifest import ModuleManifest
 from core.modules.manager import ModuleManager
-from core.modules.manifest import read_module_manifest
+from core.modules.manifest import _read_module_manifest, read_module_manifest
 from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
-    require_number,
     require_text,
 )
 
@@ -63,8 +70,20 @@ class ExperimentAssembler:
         self._module_manager = module_manager
 
     def load_template(
-        self, template_path: Path, *, template_yaml: str | None = None
+        self,
+        template_path: Path,
+        *,
+        template_yaml: str | None = None,
     ) -> tuple[str, JsonObject]:
+        text, template = self._load_template(template_path, template_yaml=template_yaml)
+        return text, _template_document(template, Path(template_path))
+
+    def _load_template(
+        self,
+        template_path: Path,
+        *,
+        template_yaml: str | None = None,
+    ) -> tuple[str, ExperimentTemplate]:
         path = Path(template_path)
         if not path.is_absolute():
             raise ValueError("template_path must be absolute.")
@@ -73,168 +92,40 @@ class ExperimentAssembler:
             if template_yaml is None
             else require_text(template_yaml, "template YAML")
         )
-        template = copy_json_object(yaml.safe_load(text), "experiment template")
-        fields = {
-            "schema_version",
-            "name",
-            "cycles",
-            "keep_attempts",
-            "start_timeout",
-            "runner_timeout_margin_seconds",
-            "stages",
-            "services",
-            "resources",
-            "unknown_state",
-            "snapshots",
-            "storage",
-            "logging",
-        }
-        if template.keys() != fields:
-            raise ValueError(
-                f"Template fields: missing={fields - template.keys()}, unknown={template.keys() - fields}."
-            )
-        if (
-            type(template["schema_version"]) is not int
-            or template["schema_version"] != 2
-        ):
-            raise ValueError("Only template schema_version 2 is supported.")
-        require_text(template["name"], "name")
-        for key in ("cycles", "keep_attempts"):
-            value = template[key]
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{key} must be a positive integer.")
-        start_timeout = require_number(template["start_timeout"], "start_timeout")
-        require_number(
-            template["runner_timeout_margin_seconds"], "runner_timeout_margin_seconds"
-        )
-        if start_timeout <= 0:
-            raise ValueError("start_timeout must be positive.")
-        services = template["services"]
-        if type(services) is not list:
-            raise TypeError("services must be an array.")
-        _validate_template_policies(template)
-        self._validate_template_definitions(template, services)
-        _validate_template_resources(template, path)
-        return text, template
-
-    def _validate_template_definitions(
-        self, template: JsonObject, services: list[JsonObject]
-    ) -> None:
-        stages = template["stages"]
-        if type(stages) is not list or not stages:
-            raise ValueError("stages must be a nonempty array.")
-        seen = set()
-        definitions = [("stage", item) for item in stages]
-        definitions.extend(("service", item) for item in services)
-        socket_fields = {
-            "heartbeat",
-            "command_timeout_seconds",
-            "on_command_timeout",
-            "state_required",
-            "errors",
-        }
-        for role, definition in definitions:
-            if type(definition) is not dict:
-                raise TypeError(f"{role} must be a JSON object.")
-            identity_key = f"{role}_id"
-            required = {"module", "settings"}
-            if role == "stage":
-                required.update({"timeout_seconds", "errors"})
-                if "returns_data" in definition:
-                    if "service_id" in definition:
-                        raise ValueError(
-                            "returns_data belongs to conditional stage modules."
-                        )
-                    if type(definition["returns_data"]) is not bool:
-                        raise TypeError("returns_data must be a boolean.")
-                    required.add("returns_data")
-                if "service_id" in definition:
-                    required.remove("module")
-                    required.add("service_id")
-                    definition["service_id"] = str(
-                        UUID(require_text(definition["service_id"], "service_id"))
-                    )
-            else:
-                required.update(socket_fields)
-            if definition.keys() - {identity_key} != required:
-                raise ValueError(
-                    f"Invalid {role} fields; required: {sorted(required)}."
-                )
-            if identity_key in definition:
-                identifier = str(
-                    UUID(require_text(definition[identity_key], identity_key))
-                )
-                if identifier in seen:
-                    raise ValueError("Duplicate stage/service definition ID.")
-                seen.add(identifier)
-                definition[identity_key] = identifier
-            if "module" in definition:
-                module = copy_json_object(definition["module"], "module")
-                if module.keys() != {"name", "version", "hash"}:
-                    raise ValueError("module requires name/version/hash.")
-                for key in ("name", "version"):
-                    value = require_text(module[key], f"module.{key}").strip()
-                    if value in (".", "..") or any(c in value for c in '/\\:*?"<>|'):
-                        raise ValueError(f"Unsafe module {key}.")
-                    module[key] = value
-                digest = require_text(module["hash"], "module.hash")
-                if len(digest) != 64 or any(
-                    c not in "0123456789abcdefABCDEF" for c in digest
-                ):
-                    raise ValueError("module.hash must be SHA-256.")
-                definition["module"] = module
-            copy_json_object(definition["settings"], f"{role} settings")
-            if (
-                role == "stage"
-                and definition["timeout_seconds"] is not None
-                and require_number(definition["timeout_seconds"], "timeout_seconds")
-                <= 0
-            ):
-                raise ValueError("timeout_seconds must be positive or null.")
-            if role == "service":
-                self.validate_service_definition(definition)
-            self.validate_errors(definition["errors"])
-        service_ids = {item["service_id"] for item in services if "service_id" in item}
-        for definition in stages:
-            if (
-                "service_id" in definition
-                and definition["service_id"] not in service_ids
-            ):
-                raise ValueError(
-                    "A DAG service reference requires an explicit service_id in services."
-                )
+        return text, ExperimentTemplate.model_validate(yaml.safe_load(text))
 
     async def validate_template(self, template_path: Path) -> JsonObject:
         """Check structure and registered module references without assembling a run."""
         try:
             # File reads and YAML parsing must not stall the active experiment.
             # Keep module inspection below on the thread that owns HashDB.
-            _, template = await asyncio.to_thread(self.load_template, template_path)
+            _, document = await asyncio.to_thread(self.load_template, template_path)
+            # The compatible loader returns JSON and may be overridden by callers.
+            template = await asyncio.to_thread(
+                ExperimentTemplate.model_validate, document
+            )
         except yaml.YAMLError as error:
             raise ValueError(f"Invalid template YAML: {error}") from error
         warnings = [
             f"services[{index}] has no service_id; one will be generated during assembly."
-            for index, service in enumerate(template["services"])
-            if "service_id" not in service
+            for index, service in enumerate(template.services)
+            if service.service_id is None
         ]
         references = {}
-        for role in ("stage", "service"):
-            for definition in template[f"{role}s"]:
-                reference = self.module_reference(template, definition)
-                key = (reference["name"], reference["version"])
-                if key not in references:
-                    references[key] = await self._module_manager.inspect_module(*key)
-                registration = references[key]
-                if registration["module"]["hash"].lower() != reference["hash"].lower():
-                    raise ValueError(f"Registered hash differs from template: {key}.")
-                if not registration["archive_available"]:
-                    raise FileNotFoundError(
-                        f"Registered module archive is missing: {key}."
-                    )
+        for definition in (*template.stages, *template.services):
+            reference = template.module_reference(definition)
+            key = (reference.name, reference.version)
+            if key not in references:
+                references[key] = await self._module_manager.inspect_module(*key)
+            registration = references[key]
+            if registration["module"]["hash"].lower() != reference.hash.lower():
+                raise ValueError(f"Registered hash differs from template: {key}.")
+            if not registration["archive_available"]:
+                raise FileNotFoundError(f"Registered module archive is missing: {key}.")
         return {
             "valid": True,
             "warnings": warnings,
-            "name": template["name"],
+            "name": template.name,
             "template_path": str(template_path),
             "modules": [entry["module"] for entry in references.values()],
             "scope": "structure_and_registered_references",
@@ -253,53 +144,40 @@ class ExperimentAssembler:
         raise ValueError(f"Unknown service reference: {service_id}")
 
     def validate_errors(self, errors: JsonObject) -> None:
-        errors = copy_json_object(errors, "errors")
-        if errors.keys() != {"retries", "retry_delay_seconds", "on_exhausted"}:
-            raise ValueError("All error policy fields must be explicit.")
-        if type(errors["retries"]) is not int or errors["retries"] < 0:
-            raise ValueError("errors.retries must be nonnegative.")
-        require_number(errors["retry_delay_seconds"], "retry_delay_seconds")
-        if errors["on_exhausted"] not in ("stop", "pause", "skip"):
-            raise ValueError("Invalid errors.on_exhausted.")
+        ErrorPolicy.model_validate(copy_json_object(errors, "errors"))
 
     def validate_service_definition(self, definition: JsonObject) -> None:
-        required = {
-            "module",
-            "settings",
-            "heartbeat",
-            "command_timeout_seconds",
-            "on_command_timeout",
-            "state_required",
-            "errors",
-        }
-        if definition.keys() - {"service_id"} != required:
-            raise ValueError(
-                "A service requires explicit settings, heartbeat and policies."
-            )
-        copy_json_object(definition["settings"], "settings")
-        heartbeat = copy_json_object(definition["heartbeat"], "heartbeat")
-        if heartbeat.keys() != {"interval_seconds", "grace_seconds"}:
-            raise ValueError("heartbeat requires interval_seconds and grace_seconds.")
-        for name, value in heartbeat.items():
-            if require_number(value, name) <= 0:
-                raise ValueError(f"{name} must be positive.")
-        if (
-            require_number(definition["command_timeout_seconds"], "command timeout")
-            <= 0
-        ):
-            raise ValueError("command_timeout_seconds must be positive.")
-        if definition["on_command_timeout"] not in ("pause", "restart", "stop"):
-            raise ValueError("Invalid on_command_timeout.")
-        if type(definition["state_required"]) is not bool:
-            raise TypeError("state_required must be a boolean.")
-        self.validate_errors(definition["errors"])
+        ServiceDefinition.model_validate(
+            copy_json_object(definition, "service definition")
+        )
+
+    def _module_reference(
+        self,
+        template: JsonObject,
+        definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
+    ) -> ModuleReference:
+        if not isinstance(definition, ServiceCallDefinition):
+            return definition.module
+        for service in template["services"]:
+            if service.get("service_id") == definition.service_id:
+                return ModuleReference.model_validate(service["module"])
+        raise ValueError(f"Unknown service reference: {definition.service_id}")
 
     def read_module(self, module_directory: Path) -> JsonObject:
         return read_module_manifest(module_directory)
 
     async def assemble(self, template_path: Path, experiment_id: str) -> RunnerState:
         require_text(experiment_id, "experiment_id")
-        _, template = self.load_template(template_path)
+        _, validated = self._load_template(template_path)
+        return await self._assemble(Path(template_path), experiment_id, validated)
+
+    async def _assemble(
+        self,
+        template_path: Path,
+        experiment_id: str,
+        validated: ExperimentTemplate,
+    ) -> RunnerState:
+        template = _template_document(validated, template_path)
         registry_path = self._project_root / "experiments.json"
         registry = {}
         if registry_path.exists():
@@ -313,16 +191,9 @@ class ExperimentAssembler:
         directory.mkdir(parents=True, exist_ok=False)
         # load_template has validated every definition; preserve the same objects
         # so generated IDs also appear in the template written to the experiment.
-        definitions: list[tuple[str, JsonObject]] = []
         for role in ("stage", "service"):
-            entries = template[f"{role}s"]
-            if not isinstance(entries, list):
-                raise TypeError(f"{role}s must be an array.")
-            for definition in entries:
-                if not isinstance(definition, dict):
-                    raise TypeError(f"{role} must be a JSON object.")
+            for definition in template[f"{role}s"]:
                 definition.setdefault(f"{role}_id", str(uuid4()))
-                definitions.append((role, definition))
         template_yaml = yaml.safe_dump(template, allow_unicode=True, sort_keys=False)
         state = RunnerState(
             experiment_id,
@@ -334,89 +205,84 @@ class ExperimentAssembler:
             template,
             "paused",
         )
-        copy_task = None
-        temporary = None
         try:
-            for name in (
-                "modules",
-                "module_data",
-                "shared_settings",
-                "shared_data/resources",
-                "shared_artifacts",
-                "journals",
-                "runner/logging",
-            ):
-                (directory / name).mkdir(parents=True, exist_ok=True)
-            copied = {}
-            for role, item in definitions:
-                if role == "stage" and "service_id" in item:
-                    continue
-                key, source, target, definition = self._module_copy_inputs(
-                    item, role, directory, copied
-                )
-                if key not in copied:
-                    copy_task = asyncio.create_task(
-                        asyncio.to_thread(shutil.copytree, source, target)
-                    )
-                    await asyncio.shield(copy_task)
-                    copied[key] = definition
-                # Every reference must match, including repeated uses of shared code.
-                self.check_module(state, item)
-            resources = template["resources"]
-            if not isinstance(resources, list):
-                raise TypeError("resources must be an array.")
-            for resource in resources:
-                if not isinstance(resource, dict):
-                    raise TypeError("resource must be a JSON object.")
-                source = Path(require_text(resource["path"], "resource.path"))
-                resource_name = require_text(resource["name"], "resource.name")
-                target = directory / "shared_data" / "resources" / resource_name
-                if source.is_dir():
-                    copy_task = asyncio.create_task(
-                        asyncio.to_thread(shutil.copytree, source, target)
-                    )
-                else:
-                    copy_task = asyncio.create_task(
-                        asyncio.to_thread(shutil.copy2, source, target)
-                    )
-                await asyncio.shield(copy_task)
+            await self._copy_assembly_inputs(state, validated, template_path.parent)
             state.template_path.write_text(template_yaml, encoding="utf-8")
-            registry[experiment_id] = folder
-            temporary = registry_path.with_name(f".experiments-{uuid4()}.json")
-            temporary.write_text(
-                json.dumps(registry, ensure_ascii=False), encoding="utf-8"
-            )
-            temporary.replace(registry_path)
+            _publish_registry(registry_path, registry, experiment_id, folder)
         except BaseException as error:
-            # Cancelling an await does not stop the copying thread. Reap it before
-            # removing its destination, so it cannot recreate a discarded build.
-            if copy_task is not None:
-                await asyncio.gather(copy_task, return_exceptions=True)
             # Only the freshly allocated, unregistered instance belongs to this operation.
             try:
                 if directory.resolve().is_relative_to(
                     (self._project_root / "experiments").resolve()
                 ):
                     await asyncio.to_thread(shutil.rmtree, directory)
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
             except OSError as cleanup_error:
                 error.add_note(f"Build cleanup also failed: {cleanup_error}")
             raise
         return state
 
+    async def _copy_assembly_inputs(
+        self,
+        state: RunnerState,
+        template: ExperimentTemplate,
+        config_directory: Path,
+    ) -> None:
+        directory = state.experiment_directory
+        for name in (
+            "modules",
+            "module_data",
+            "shared_settings",
+            "shared_data/resources",
+            "shared_artifacts",
+            "journals",
+            "runner/logging",
+        ):
+            (directory / name).mkdir(parents=True, exist_ok=True)
+        copied: dict[tuple[str, str], ModuleManifest] = {}
+        copy_task = None
+        try:
+            for role, entries in (
+                ("stage", template.stages),
+                ("service", template.services),
+            ):
+                for item in entries:
+                    if isinstance(item, ServiceCallDefinition):
+                        continue
+                    key, source, target, manifest = self._module_copy_inputs(
+                        item.module, role, directory, copied
+                    )
+                    if key not in copied:
+                        copy_task = asyncio.create_task(
+                            asyncio.to_thread(shutil.copytree, source, target)
+                        )
+                        await asyncio.shield(copy_task)
+                        copied[key] = manifest
+                    self._check_module(
+                        state, item.module, "returns_data" in item.model_fields_set
+                    )
+            for resource in template.resources:
+                source = Path(resource.path)
+                if not source.is_absolute():
+                    source = config_directory / source
+                target = directory / "shared_data/resources" / resource.name
+                operation = shutil.copytree if source.is_dir() else shutil.copy2
+                copy_task = asyncio.create_task(
+                    asyncio.to_thread(operation, source, target)
+                )
+                await asyncio.shield(copy_task)
+        finally:
+            # Cancellation cannot stop a thread; reap copying before the caller removes its folder.
+            if copy_task is not None:
+                await asyncio.gather(copy_task, return_exceptions=True)
+
     def _module_copy_inputs(
         self,
-        item: JsonObject,
+        module: ModuleReference,
         role: str,
         directory: Path,
-        copied: dict[tuple[str, str], JsonObject],
-    ) -> tuple[tuple[str, str], Path, Path, JsonObject]:
-        module = copy_json_object(item["module"], "module")
-        key = (
-            require_text(module["name"], "module.name"),
-            require_text(module["version"], "module.version"),
-        )
+        copied: dict[tuple[str, str], ModuleManifest],
+    ) -> tuple[tuple[str, str], Path, Path, ModuleManifest]:
+        key = (module.name, module.version)
         source = self._project_root / "modules" / key[0] / key[1]
         target = directory / "modules" / key[0] / key[1]
         if (
@@ -427,12 +293,12 @@ class ExperimentAssembler:
             )
         ):
             raise ValueError("Module code must not contain filesystem links.")
-        definition = copied.get(key) or self.read_module(source)
-        if (definition["name"], definition["version"]) != key:
+        manifest = copied.get(key) or _read_module_manifest(source)
+        if (manifest.name, manifest.version) != key:
             raise ValueError("module.yaml identity differs from template.")
-        if definition["role"] != role:
+        if manifest.role != role:
             raise ValueError(f"Module {key} does not have role={role}.")
-        return key, source, target, definition
+        return key, source, target, manifest
 
     async def rebuild(
         self,
@@ -444,6 +310,18 @@ class ExperimentAssembler:
         prepare_only: bool = False,
     ) -> None:
         """Prepare checked additions, then publish without replacing immutable code."""
+        validated = ExperimentTemplate.model_validate(template)
+        await self._rebuild(state, template_yaml, validated, workspace, prepare_only)
+
+    async def _rebuild(
+        self,
+        state: RunnerState,
+        template_yaml: str,
+        template: ExperimentTemplate,
+        workspace: Path,
+        prepare_only: bool,
+    ) -> None:
+        document = template.model_dump(exclude_unset=True)
         root = state.experiment_directory.resolve()
         workspace = Path(workspace)
         if (
@@ -460,7 +338,7 @@ class ExperimentAssembler:
             state.template_path,
             state.template_revision_id,
             template_yaml,
-            template,
+            document,
             "paused",
         )
         staged = RunnerState(
@@ -470,41 +348,16 @@ class ExperimentAssembler:
             workspace / "experiment.yaml",
             state.template_revision_id,
             template_yaml,
-            template,
+            document,
             "paused",
         )
         if prepare_only:
             workspace.mkdir(parents=True, exist_ok=False)
         elif state.pending_rebuild is None:
             raise RuntimeError("Publication requires a recorded rebuild intent.")
-        seen = set()
-        for role in ("stage", "service"):
-            for definition in template[f"{role}s"]:
-                if role == "stage" and "service_id" in definition:
-                    continue
-                reference = definition["module"]
-                key = (reference["name"], reference["version"])
-                target = root / "modules" / key[0] / key[1]
-                prepared = workspace / "modules" / key[0] / key[1]
-                if prepare_only:
-                    source = self._rebuild_module_source(root, target, key, role)
-                    if not target.exists() and key not in seen:
-                        prepared.parent.mkdir(parents=True, exist_ok=True)
-                        copying = asyncio.create_task(
-                            asyncio.to_thread(shutil.copytree, source, prepared)
-                        )
-                        try:
-                            await asyncio.shield(copying)
-                        finally:
-                            await asyncio.gather(copying, return_exceptions=True)
-                    self.check_module(
-                        candidate if target.exists() else staged, definition
-                    )
-                else:
-                    self._publish_rebuild_module(
-                        root, target, prepared, candidate, staged, definition
-                    )
-                seen.add(key)
+        await self._rebuild_modules(
+            candidate, staged, template, workspace, prepare_only
+        )
         checking_resources = asyncio.create_task(
             asyncio.to_thread(self.check_resources, candidate)
         )
@@ -518,6 +371,54 @@ class ExperimentAssembler:
         else:
             # The durable pending_rebuild record covers the multi-file publication.
             (workspace / "experiment.yaml").replace(state.template_path)
+
+    async def _rebuild_modules(
+        self,
+        candidate: RunnerState,
+        staged: RunnerState,
+        template: ExperimentTemplate,
+        workspace: Path,
+        prepare_only: bool,
+    ) -> None:
+        root = candidate.experiment_directory
+        seen = set()
+        for role, entries in (
+            ("stage", template.stages),
+            ("service", template.services),
+        ):
+            for definition in entries:
+                if isinstance(definition, ServiceCallDefinition):
+                    continue
+                reference = definition.module
+                conditional = "returns_data" in definition.model_fields_set
+                key = (reference.name, reference.version)
+                target = root / "modules" / key[0] / key[1]
+                prepared = workspace / "modules" / key[0] / key[1]
+                if prepare_only:
+                    source = self._rebuild_module_source(root, target, key, role)
+                    if not target.exists() and key not in seen:
+                        prepared.parent.mkdir(parents=True, exist_ok=True)
+                        copying = asyncio.create_task(
+                            asyncio.to_thread(shutil.copytree, source, prepared)
+                        )
+                        try:
+                            await asyncio.shield(copying)
+                        finally:
+                            await asyncio.gather(copying, return_exceptions=True)
+                    self._check_module(
+                        candidate if target.exists() else staged, reference, conditional
+                    )
+                else:
+                    self._publish_rebuild_module(
+                        root,
+                        target,
+                        prepared,
+                        candidate,
+                        staged,
+                        reference,
+                        conditional,
+                    )
+                seen.add(key)
 
     def _rebuild_module_source(
         self, root: Path, target: Path, key: tuple[str, str], role: str
@@ -536,8 +437,8 @@ class ExperimentAssembler:
             or any(p.is_symlink() or p.is_junction() for p in source.rglob("*"))
         ):
             raise ValueError("Module code must not contain filesystem links.")
-        manifest = self.read_module(source)
-        if (manifest["name"], manifest["version"], manifest["role"]) != (
+        manifest = _read_module_manifest(source)
+        if (manifest.name, manifest.version, manifest.role) != (
             *key,
             role,
         ):
@@ -551,42 +452,47 @@ class ExperimentAssembler:
         prepared: Path,
         candidate: RunnerState,
         staged: RunnerState,
-        definition: JsonObject,
+        reference: ModuleReference,
+        conditional: bool,
     ) -> None:
         if not target.exists():
-            self.check_module(staged, definition)
+            self._check_module(staged, reference, conditional)
             if not target.parent.resolve().is_relative_to(root):
                 raise ValueError("Module destination escapes the experiment.")
             target.parent.mkdir(parents=True, exist_ok=True)
             prepared.replace(target)
-        self.check_module(candidate, definition)
+        self._check_module(candidate, reference, conditional)
 
     def check_modules(self, state: RunnerState) -> None:
-        for role in ("stage", "service"):
-            definitions = state.template[f"{role}s"]
-            if not isinstance(definitions, list):
-                raise TypeError(f"{role}s must be an array.")
-            for definition in definitions:
-                if not isinstance(definition, dict):
-                    raise TypeError(f"{role} must be a JSON object.")
-                self.check_module(state, definition)
+        self._check_modules(state, ExperimentTemplate.model_validate(state.template))
+
+    def _check_modules(self, state: RunnerState, template: ExperimentTemplate) -> None:
+        for definition in (*template.stages, *template.services):
+            self._check_module(
+                state,
+                template.module_reference(definition),
+                "returns_data" in definition.model_fields_set,
+            )
 
     def check_module(self, state: RunnerState, definition: JsonObject) -> None:
-        module = self.module_reference(state.template, definition)
-        name = require_text(module["name"], "module.name")
-        version = require_text(module["version"], "module.version")
-        expected_hash = require_text(module["hash"], "module.hash")
-        for key, component in (("name", name), ("version", version)):
-            if component in (".", "..") or any(
-                character in component for character in '/\\:*?"<>|'
-            ):
-                raise ValueError(f"Unsafe module {key}.")
+        module = ModuleReference.model_validate(
+            self.module_reference(state.template, definition)
+        )
+        self._check_module(state, module, "returns_data" in definition)
+
+    def _check_module(
+        self,
+        state: RunnerState,
+        module: ModuleReference,
+        returns_data: bool,
+    ) -> ModuleManifest:
+        name, version, expected_hash = module.name, module.version, module.hash
         directory = state.experiment_directory / "modules" / name / version
         if not directory.resolve().is_relative_to(state.experiment_directory.resolve()):
             raise ValueError("Module code escapes the experiment.")
-        manifest = self.read_module(directory)
-        conditional = manifest.get("stage_kind") == "conditional"
-        if conditional != ("returns_data" in definition):
+        manifest = _read_module_manifest(directory)
+        conditional = manifest.stage_kind == "conditional"
+        if conditional != returns_data:
             raise ValueError(
                 "Conditional stages require returns_data in the template; "
                 "ordinary stages and services must omit it."
@@ -600,18 +506,22 @@ class ExperimentAssembler:
         ):
             raise ValueError(f"Module integrity check failed: {name} / {version}")
 
+        return manifest
+
     def check_resources(self, state: RunnerState) -> None:
-        resources = state.template["resources"]
-        if not isinstance(resources, list):
-            raise TypeError("resources must be an array.")
+        self._check_resources(
+            state.experiment_directory,
+            ResourceInputs.validate_python(state.template["resources"]),
+        )
+
+    def _check_resources(
+        self, directory: Path, resources: list[ResourceDefinition]
+    ) -> None:
         for resource in resources:
-            if not isinstance(resource, dict):
-                raise TypeError("resource must be a JSON object.")
-            if resource["hash"] is None:
+            if resource.hash is None:
                 continue
-            name = require_text(resource["name"], "resource.name")
-            expected_hash = require_text(resource["hash"], "resource.hash")
-            path = state.experiment_directory / "shared_data" / "resources" / name
+            name, expected_hash = resource.name, resource.hash
+            path = directory / "shared_data" / "resources" / name
             if path.is_dir():
                 actual = self._module_manager.module_hash(name, target_folder=path)
             else:
@@ -619,3 +529,23 @@ class ExperimentAssembler:
                     actual = hashlib.file_digest(stream, "sha256").hexdigest()
             if actual.lower() != expected_hash.lower():
                 raise ValueError(f"Resource integrity check failed: {name}")
+
+
+def _publish_registry(
+    path: Path,
+    registry: JsonObject,
+    experiment_id: str,
+    folder: str,
+) -> None:
+    """Replacing the registry commits the newly assembled experiment's registration."""
+    registry[experiment_id] = folder
+    temporary = path.with_name(f".experiments-{uuid4()}.json")
+    try:
+        temporary.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    except BaseException as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            error.add_note(f"Build cleanup also failed: {cleanup_error}")
+        raise

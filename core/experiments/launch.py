@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 from core.experiments.assembler import ExperimentAssembler
 from core.experiments.journal import RunnerJournal
 from core.experiments.state import RunnerState
+from core.models.experiment_template import (
+    LaunchInput,
+    ServiceCallDefinition,
+    ServiceDefinition,
+    StageDefinition,
+)
+from core.models.module_manifest import ModuleManifest
 from core.participants.protocol import PROTOCOL_VERSION
 from core.primitives.json_files import write_json
 from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
@@ -29,33 +37,68 @@ class ModuleLauncher:
     ) -> JsonObject:
         if command != "start":
             raise ValueError("Participant shutdown is a protocol command.")
-        self._assembler.check_module(state, definition)
-        reference = self._assembler.module_reference(state.template, definition)
-        code_directory = (
-            state.experiment_directory
-            / "modules"
-            / reference["name"]
-            / reference["version"]
+        validated = LaunchInput.validate_python(
+            copy_json_object(definition, "module definition")
         )
-        module = self._assembler.read_module(code_directory)
-        service_call = "stage_id" in definition and "service_id" in definition
-        if service_call and module["role"] != "service":
+        return self._prepare(state, validated, context, artifacts_directory, input_data)
+
+    def _prepare(
+        self,
+        state: RunnerState,
+        definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
+        context: JsonObject,
+        artifacts_directory: Path,
+        input_data: JsonValue,
+    ) -> JsonObject:
+        reference = self._assembler._module_reference(state.template, definition)
+        module = self._assembler._check_module(
+            state,
+            reference,
+            "returns_data" in definition.model_fields_set,
+        )
+        service_call = isinstance(definition, ServiceCallDefinition)
+        if service_call and module.role != "service":
             raise ValueError("A service node must reference a service module.")
-        if not service_call and f"{module['role']}_id" not in definition:
+        if not service_call and (module.role == "service") != isinstance(
+            definition, ServiceDefinition
+        ):
             raise ValueError("Module role does not match its definition.")
-        if module["role"] == "service" and not service_call:
-            self._assembler.validate_service_definition(definition)
         settings = (
-            copy_json_object(definition["settings"], "call settings")
+            deepcopy(definition.settings)
             if service_call
-            else self._merge_settings(module["defaults"], definition["settings"])
+            else self._merge_settings(module.defaults, definition.settings)
         )
-        artifacts_directory.mkdir(parents=True, exist_ok=False)
         owner_id = (
-            definition["service_id"]
-            if module["role"] == "service"
-            else definition["stage_id"]
+            definition.service_id if module.role == "service" else definition.stage_id
         )
+        runtime_context, executor_config = self._prepare_context(
+            state,
+            context,
+            module,
+            service_call,
+            owner_id,
+            artifacts_directory,
+            settings,
+            input_data,
+        )
+        context_path = artifacts_directory / "context.json"
+        write_json(context_path, runtime_context)
+        return _launch_document(
+            state, module, definition, runtime_context, executor_config, context_path
+        )
+
+    def _prepare_context(
+        self,
+        state: RunnerState,
+        context: JsonObject,
+        module: ModuleManifest,
+        service_call: bool,
+        owner_id: str,
+        artifacts_directory: Path,
+        settings: JsonObject,
+        input_data: JsonValue,
+    ) -> tuple[JsonObject, Path | None]:
+        artifacts_directory.mkdir(parents=True, exist_ok=False)
         module_data = state.experiment_directory / "module_data" / owner_id
         module_data.mkdir(parents=True, exist_ok=True)
         logging_config, executor_config = self._prepare_logging_configs(
@@ -63,10 +106,10 @@ class ModuleLauncher:
         )
         endpoint_path = (
             state.experiment_directory / "runner/endpoints" / f"{owner_id}.json"
-            if module["role"] == "service"
+            if module.role == "service"
             else artifacts_directory / "executor.lock.json"
         )
-        runtime_context = {
+        return {
             "protocol_version": PROTOCOL_VERSION,
             "experiment_directory": str(state.experiment_directory),
             "resources_directory": str(
@@ -85,50 +128,13 @@ class ModuleLauncher:
             "context": context,
             "settings": settings,
             "input_data": input_data,
-        }
-        context_path = artifacts_directory / "context.json"
-        write_json(context_path, runtime_context)
-        return {
-            "argv": [*module["commands"]["start"], "--emp-context", str(context_path)],
-            "code_directory": str(code_directory),
-            "experiment_directory": str(state.experiment_directory),
-            "executor_logging_config": None
-            if executor_config is None
-            else str(executor_config),
-            "module": module,
-            "context": context,
-            "runtime_context": runtime_context,
-            "call": {
-                key: runtime_context[key]
-                for key in (
-                    "context",
-                    "input_data",
-                    "settings",
-                    "experiment_directory",
-                    "resources_directory",
-                    "settings_directory",
-                    "module_data_directory",
-                    "artifacts_directory",
-                )
-            },
-            "effective_settings": settings,
-            "endpoint_path": str(endpoint_path),
-            "service_id": definition["service_id"] if service_call else None,
-            "timeout_seconds": definition.get("timeout_seconds"),
-            "control_timeout_seconds": state.template["unknown_state"][
-                "timeout_seconds"
-            ],
-            "stop_timeout_seconds": state.template["start_timeout"],
-            "runner_timeout_margin_seconds": state.template[
-                "runner_timeout_margin_seconds"
-            ],
-        }
+        }, executor_config
 
     def _prepare_logging_configs(
         self,
         state: RunnerState,
         context: JsonObject,
-        module: JsonObject,
+        module: ModuleManifest,
         service_call: bool,
     ) -> tuple[Path | None, Path | None]:
         logging_config = (
@@ -140,7 +146,7 @@ class ModuleLauncher:
         )
         executor_config = (
             self._journal.write_client_config(state, {**context, "source": "executor"})
-            if module["role"] == "stage"
+            if module.role == "stage"
             else None
         )
         return logging_config, executor_config
@@ -148,11 +154,60 @@ class ModuleLauncher:
     def _merge_settings(
         self, defaults: JsonObject, overrides: JsonObject
     ) -> JsonObject:
-        result = copy_json_object(defaults, "module defaults")
-        overrides = copy_json_object(overrides, "settings overrides")
+        result = deepcopy(defaults)
         for key, value in overrides.items():
             if isinstance(value, dict) and isinstance(result.get(key), dict):
                 result[key] = self._merge_settings(result[key], value)
             else:
-                result[key] = value
+                result[key] = deepcopy(value)
         return result
+
+
+def _launch_document(
+    state: RunnerState,
+    module: ModuleManifest,
+    definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
+    runtime_context: JsonObject,
+    executor_config: Path | None,
+    context_path: Path,
+) -> JsonObject:
+    """Format the established executor/service wire document from checked data."""
+    code_directory = (
+        state.experiment_directory / "modules" / module.name / module.version
+    )
+    service_call = isinstance(definition, ServiceCallDefinition)
+    return {
+        "argv": [*module.commands.start, "--emp-context", str(context_path)],
+        "code_directory": str(code_directory),
+        "experiment_directory": str(state.experiment_directory),
+        "executor_logging_config": None
+        if executor_config is None
+        else str(executor_config),
+        "module": module.model_dump(exclude_unset=True),
+        "context": runtime_context["context"],
+        "runtime_context": runtime_context,
+        "call": {
+            key: runtime_context[key]
+            for key in (
+                "context",
+                "input_data",
+                "settings",
+                "experiment_directory",
+                "resources_directory",
+                "settings_directory",
+                "module_data_directory",
+                "artifacts_directory",
+            )
+        },
+        "effective_settings": runtime_context["settings"],
+        "endpoint_path": runtime_context["endpoint_path"],
+        "service_id": definition.service_id if service_call else None,
+        "timeout_seconds": None
+        if isinstance(definition, ServiceDefinition)
+        else definition.timeout_seconds,
+        "control_timeout_seconds": state.template["unknown_state"]["timeout_seconds"],
+        "stop_timeout_seconds": state.template["start_timeout"],
+        "runner_timeout_margin_seconds": state.template[
+            "runner_timeout_margin_seconds"
+        ],
+    }

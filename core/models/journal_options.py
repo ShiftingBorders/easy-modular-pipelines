@@ -37,17 +37,11 @@ def validate_journal_options(
     path = Path(db_path)
     if not path.is_absolute() or "\x00" in str(path):
         raise ValueError("db_path must be an absolute filesystem path.")
-    timeout = require_number(busy_timeout_seconds, "busy_timeout_seconds")
-    if not 0 < timeout <= 60:
-        raise ValueError("busy_timeout_seconds must be greater than 0 and at most 60.")
-    if max_event_bytes is not None and (
-        type(max_event_bytes) is not int or max_event_bytes < 1
-    ):
-        raise ValueError("max_event_bytes must be a positive integer or None.")
+    timeout = validate_journal_limits(
+        busy_timeout_seconds, max_event_bytes, min_free_bytes
+    )
     if open_mode not in ("create", "existing"):
         raise ValueError("open_mode must be create or existing.")
-    if type(min_free_bytes) is not int or min_free_bytes < 0:
-        raise ValueError("min_free_bytes must be a nonnegative integer.")
     if open_mode == "existing":
         expected_journal = validate_journal_identity(expected_journal)
     elif expected_journal is not None:
@@ -60,3 +54,21 @@ def validate_journal_options(
         min_free_bytes,
         expected_journal,
     )
+
+
+def validate_journal_limits(
+    busy_timeout_seconds: float,
+    max_event_bytes: int | None,
+    min_free_bytes: int,
+) -> int | float:
+    """Check shared template/store limits, preserving the input number representation."""
+    timeout = require_number(busy_timeout_seconds, "busy_timeout_seconds")
+    if not 0 < timeout <= 60:
+        raise ValueError("busy_timeout_seconds must be greater than 0 and at most 60.")
+    if max_event_bytes is not None and (
+        type(max_event_bytes) is not int or max_event_bytes < 1
+    ):
+        raise ValueError("max_event_bytes must be a positive integer or None.")
+    if type(min_free_bytes) is not int or min_free_bytes < 0:
+        raise ValueError("min_free_bytes must be a nonnegative integer.")
+    return timeout
