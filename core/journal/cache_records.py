@@ -9,13 +9,14 @@ from collections.abc import Iterator
 
 from core.journal.events import LoggingStateError
 from core.journal.logger import OperationLogger
+from core.models.journal_cache import CacheReaderContext
 
 
 def _publish_reader_context(
-    db: sqlite3.Connection, reader_context: dict, state: dict
+    db: sqlite3.Connection, reader_context: CacheReaderContext
 ) -> None:
     encoded = json.dumps(
-        {**reader_context, "state": state},
+        reader_context.document(),
         ensure_ascii=False,
         allow_nan=False,
     )

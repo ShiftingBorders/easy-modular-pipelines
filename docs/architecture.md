@@ -83,7 +83,8 @@ and journal-closure checks; `ResourceTarget` keeps its public dataclass form.
 The low-level `SQLiteEventStore` constructor validates scalar arguments with
 standard-library rules and performs no file I/O. File-based journal settings
 use Pydantic after their explicit read, reusing those same opening rules.
-Journal imports therefore do not trigger Pydantic plugin metadata discovery.
+Importing the low-level SQLite storage therefore does not trigger Pydantic
+plugin metadata discovery.
 
 Journal record models validate event envelopes, context, identified checkpoints,
 command observations and measurements. Their imports occur at record boundaries;
@@ -104,6 +105,14 @@ diagnostic inputs before its write transaction; command-state merge is separate
 from indexed persistence. SQLiteEventStore retains connection/lock ownership,
 BEGIN/COMMIT/ROLLBACK, actual file identity and failure handling for both fresh
 and idempotent restoration.
+
+History-cache parameters, finite targets, source metadata, checkpoints and
+publications have dedicated models. Refresh validates caller data before the
+writer lock and passes a checked request to ingestion. Reader-context publication
+retains input field order and path spelling for its revision fingerprint.
+Filtered-view metadata reuses journal boundary constraints. The cache owners
+retain actual source/file correspondence, publication-version checks, transactions
+and byte/event budgets; the filtered view and history cache remain separate.
 
 Private operations that validate or prepare explicit inputs live beside their
 owner in focused modules. The owning classes retain state changes, transactions,

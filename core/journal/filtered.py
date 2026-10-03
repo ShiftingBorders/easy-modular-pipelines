@@ -8,11 +8,10 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from core.journal.diagnostics import _close_preserving_failure
 from core.journal.events import (
-    SCHEMA_VERSION,
     JournalGenerationChanged,
     LoggingStateError,
     LoggingStorageError,
@@ -28,6 +27,7 @@ from core.journal.view_schema import (
     _CREATE_INFO,
     _validate_view_schema,
 )
+from core.models.journal_cache import FilteredPublication
 from core.primitives.json_values import JsonObject, copy_json_object
 
 _PAGE_BYTES = 16777216
@@ -154,33 +154,7 @@ class FilteredJournal:
         ).fetchone()
         if row is None:
             return None
-        data = copy_json_object(json.loads(row[0]), "filtered metadata")
-        if data.keys() != {
-            "schema_version",
-            "journal_id",
-            "generation",
-            "cursor",
-            "event_count",
-            "change_cursor",
-            "publication_id",
-            "published_at",
-        }:
-            raise ValueError("Invalid derived publication metadata.")
-        for key in ("journal_id", "generation", "publication_id"):
-            UUID(data[key])
-        for key in ("cursor", "event_count", "change_cursor"):
-            if type(data[key]) is not int or data[key] < 0:
-                raise ValueError("Invalid derived publication boundary.")
-        if (
-            type(data["schema_version"]) is not int
-            or data["schema_version"] != SCHEMA_VERSION
-        ):
-            raise ValueError("Invalid derived publication format.")
-        if datetime.fromisoformat(data["published_at"]).utcoffset() != UTC.utcoffset(
-            None
-        ):
-            raise ValueError("Derived publication timestamp must be UTC.")
-        return data
+        return FilteredPublication.model_validate(json.loads(row[0])).model_dump()
 
     def _write_entry(self, entry: JsonObject) -> None:
         event = entry["event"]
