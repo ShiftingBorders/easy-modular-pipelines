@@ -121,6 +121,11 @@ audit, protective snapshot, service-data isolation, DAG publication, state
 transfer, durable commit, rollback and cleanup. Persisted pending-rebuild state
 and publication barriers retain their existing format and ownership.
 
+New-run component rebinding is separate from selected-generation initialization.
+Stage launch separates attempt/identity creation, context preparation, durable
+intent binding, owned executor spawn and startup observation. Public run and
+launcher hooks retain their existing contracts and effect order.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

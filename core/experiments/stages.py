@@ -244,6 +244,31 @@ class StageRunner:
     ) -> StageAttempt:
         definition = state.template["stages"][state.stage_position - 1]
         module = self._launcher._assembler.module_reference(state.template, definition)
+        attempt, instance = self._new_stage_attempt(state, definition, module, input_data, execution_id)
+        launch, context = self._write_attempt_context(state, attempt, definition, module)
+        await self._bind_attempt_intent(state, attempt, instance, launch, context)
+        if state.pending_input is not None or attempt.attempt_number > 1:
+            # A self/backwards jump may reuse an attempt directory's parent
+            # immediately after the old executor published its result.
+            await self.close(state)
+        self._prune_artifacts(state, attempt)
+        if self._notify_resources is not None:
+            self._notify_resources()
+        deadline = self._deadline(attempt)
+        if deadline is not None and time.monotonic() >= deadline:
+            return attempt
+        if instance is not None:
+            return await self._start_service_call(
+                state, attempt, instance, launch, deadline
+            )
+        return await self._start_executor(
+            attempt, attempt.attempt_id, attempt.artifacts_directory, launch, deadline
+        )
+
+    def _new_stage_attempt(
+        self, state: RunnerState, definition: JsonObject, module: JsonObject,
+        input_data: JsonValue, execution_id: str | None,
+    ) -> tuple[StageAttempt, ServiceInstance | None]:
         stage_id = definition["stage_id"]
         number = state.stage_attempt_numbers.get(stage_id, 0) + 1
         attempt_id = str(uuid4())
@@ -279,6 +304,11 @@ class StageRunner:
         }
         attempt.queued_at = datetime.now(UTC).isoformat()
         attempt.queued_monotonic = time.monotonic()
+        return attempt, instance
+
+    def _write_attempt_context(
+        self, state: RunnerState, attempt: StageAttempt, definition: JsonObject, module: JsonObject
+    ) -> tuple[JsonObject, JsonObject]:
         context = {
             **self._context(state, attempt),
             "template_revision_id": state.template_revision_id,
@@ -287,7 +317,7 @@ class StageRunner:
             "module_hash": module["hash"],
         }
         launch = self._launcher.prepare(
-            state, definition, context, directory, input_data
+            state, definition, context, attempt.artifacts_directory, attempt.input_data
         )
         attempt.endpoint_path = Path(launch["endpoint_path"])
         attempt.effective_settings = launch["effective_settings"]
@@ -298,15 +328,21 @@ class StageRunner:
                 "service_id": attempt.service_id,
             }
         )
-        write_json(directory / "context.json", launch["runtime_context"])
+        write_json(attempt.artifacts_directory / "context.json", launch["runtime_context"])
+        return launch, context
+
+    async def _bind_attempt_intent(
+        self, state: RunnerState, attempt: StageAttempt, instance: ServiceInstance | None,
+        launch: JsonObject, context: JsonObject,
+    ) -> None:
         state.active_attempt = attempt
-        state.stage_attempt_numbers[stage_id] = number
+        state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number
         if attempt.request_id in state.used_request_ids:
             raise RuntimeError("Attempt request ID collision.")
         if instance is None:
             state.used_request_ids.add(attempt.request_id)
-        self._unstarted_attempt_id = attempt_id
-        self._process_attempt_id = attempt_id
+        self._unstarted_attempt_id = attempt.attempt_id
+        self._process_attempt_id = attempt.attempt_id
         self._process = None
         self._call_future = None
         if self._connection is not None:
@@ -330,23 +366,6 @@ class StageRunner:
             context=context,
         )
         self._save_state(state)
-        if state.pending_input is not None or number > 1:
-            # A self/backwards jump may reuse an attempt directory's parent
-            # immediately after the old executor published its result.
-            await self.close(state)
-        self._prune_artifacts(state, attempt)
-        if self._notify_resources is not None:
-            self._notify_resources()
-        deadline = self._deadline(attempt)
-        if deadline is not None and time.monotonic() >= deadline:
-            return attempt
-        if instance is not None:
-            return await self._start_service_call(
-                state, attempt, instance, launch, deadline
-            )
-        return await self._start_executor(
-            attempt, attempt_id, directory, launch, deadline
-        )
 
     async def _start_service_call(
         self,
@@ -381,6 +400,12 @@ class StageRunner:
     ) -> StageAttempt:
         launch_path = directory / "launch.json"
         write_json(launch_path, launch)
+        await self._spawn_executor(attempt, attempt_id, launch_path)
+        return await self._wait_executor_startup(attempt, attempt_id, launch, deadline)
+
+    async def _spawn_executor(
+        self, attempt: StageAttempt, attempt_id: str, launch_path: Path
+    ) -> None:
         library_root = repository_root()
         self._unstarted_attempt_id = None
         spawn = asyncio.create_task(
@@ -416,6 +441,11 @@ class StageRunner:
             self._unstarted_attempt_id = attempt_id
             raise
         self._executor_processes.append((self._process, attempt.request_id))
+
+    async def _wait_executor_startup(
+        self, attempt: StageAttempt, attempt_id: str,
+        launch: JsonObject, deadline: float | None,
+    ) -> StageAttempt:
         startup_deadline = time.monotonic() + launch["control_timeout_seconds"]
         if deadline is not None:
             startup_deadline = min(startup_deadline, deadline)
@@ -456,6 +486,7 @@ class StageRunner:
         if deadline is not None and time.monotonic() >= deadline:
             return attempt
         raise TimeoutError("Executor startup deadline expired.")
+
 
     def _deadline(self, attempt: StageAttempt) -> float | None:
         return (

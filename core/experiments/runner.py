@@ -187,6 +187,11 @@ class ExperimentRunner:
             template_path is None or not Path(template_path).is_absolute()
         ):
             raise ValueError("A new experiment requires an absolute template_path.")
+        await self._reset_run_components()
+        self._bind_new_run(experiment_id, template_path, source, delayed_start or continue_run)
+        return {"experiment_id": experiment_id, "signaled": True}
+
+    async def _reset_run_components(self) -> None:
         await self._services.close()
         self._services = ServiceManager(
             self._launcher,
@@ -207,11 +212,15 @@ class ExperimentRunner:
             notify_resources=self._publish_resources,
         )
         self._journal.close()
+
+    def _bind_new_run(
+        self, experiment_id: str, template_path: Path | None, source: Path | None, paused: bool
+    ) -> None:
         self._requested_id = experiment_id
         self._template_path = None if template_path is None else Path(template_path)
         self._continue_source = source
         self._recover_live = False
-        self._desired_mode = "paused" if delayed_start or continue_run else "running"
+        self._desired_mode = "paused" if paused else "running"
         self._state = None
         self._publish_resources()
         self._error = None
@@ -227,7 +236,6 @@ class ExperimentRunner:
         self._task = asyncio.create_task(
             self._advance_dag(), name=f"dag:{experiment_id}"
         )
-        return {"experiment_id": experiment_id, "signaled": True}
 
     async def _signal_existing_run(
         self, continue_run: bool, experiment_id: str | None
