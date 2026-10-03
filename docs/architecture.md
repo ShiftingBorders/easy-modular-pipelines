@@ -178,6 +178,12 @@ Synchronous and asynchronous module registration share manifest-identity checks
 and source hashing. The async path keeps file/network work in workers and HashDB
 calls on its owning thread; cancellation still waits for the registration outcome.
 
+Dashboard alert rules, notification channels and saved incidents have dedicated
+models under `core/models/`. Configuration is checked before the monitor applies
+state; saved-state reading resets incident freshness. Public JSON validator
+wrappers remain available. Rule limits, incident transitions, atomic persistence,
+rollback and notification scheduling stay with the monitor.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

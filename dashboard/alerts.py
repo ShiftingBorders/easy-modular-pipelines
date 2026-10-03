@@ -3,13 +3,18 @@
 import asyncio
 import copy
 import json
-import math
 import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from core.models.dashboard_alerts import (
+    AlertConfiguration,
+    AlertRule,
+    NotificationChannels,
+    SavedAlertState,
+)
 from dashboard.icmp import ICMPMonitor
 from dashboard.notifications import deliver
 from dashboard.projections import instant
@@ -45,131 +50,37 @@ class AlertMonitor:
         if path.exists():
             if path.stat().st_size > 8388608:
                 raise ValueError("Alert state is too large.")
-            document = json.loads(path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(document, dict)
-                or not isinstance(document.get("rules"), list)
-                or len(document["rules"]) > 100
-            ):
-                raise ValueError("Invalid saved Alert rules.")
-            self.rules = [self.validate_rule(rule) for rule in document["rules"]]
-            self.channels = self.validate_channels(document["channels"])
-            if not isinstance(document["incidents"], list):
-                raise ValueError("Invalid saved incidents.")
-            for item in document["incidents"]:
-                if (
-                    not isinstance(item, dict)
-                    or any(
-                        not isinstance(item.get(key), str)
-                        for key in ("id", "source", "status", "name", "started_at")
-                    )
-                    or item["status"] not in {"active", "resolved", "closed"}
-                ):
-                    raise ValueError("Invalid saved incident.")
-                if item["source"] == "system" and not isinstance(
-                    item.get("rule_id"), str
-                ):
-                    raise ValueError("Saved incident has no rule ID.")
-                item["fresh"] = False
-            self.incidents = document["incidents"][-1000:]
+            try:
+                document = SavedAlertState.model_validate(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            except TypeError as error:
+                raise ValueError(str(error)) from error
+            self._restore_state(document)
         self._tasks = [
             asyncio.create_task(self._run()),
             asyncio.create_task(self._deliver()),
         ]
 
+    def _restore_state(self, document: SavedAlertState) -> None:
+        self.rules = [rule.document() for rule in document.rules]
+        self.channels = document.channels.model_dump()
+        self.incidents = [
+            incident.model_dump(exclude_unset=True)
+            for incident in document.incidents[-1000:]
+        ]
+
     def validate_rule(self, rule: dict) -> dict:
-        if not isinstance(rule, dict) or rule.keys() - {
-            "id",
-            "name",
-            "enabled",
-            "kind",
-            "metric",
-            "operator",
-            "threshold",
-            "duration_seconds",
-            "experiment_id",
-            "window_seconds",
-        }:
-            raise ValueError("Unsupported Alert rule fields.")
-        if (
-            not isinstance(rule.get("name"), str)
-            or not 1 <= len(rule["name"].strip()) <= 100
-        ):
-            raise ValueError("An Alert name is required (up to 100 characters).")
-        if type(rule.get("enabled")) is not bool or rule.get("kind") not in {
-            "resource",
-            "errors",
-        }:
-            raise ValueError(
-                "A rule requires an enabled flag and resource/errors kind."
-            )
-        result = dict(rule)
-        result["id"] = str(rule.get("id") or uuid4())
-        if not 1 <= len(result["id"]) <= 100:
-            raise ValueError("Invalid rule ID.")
-        for name in ("threshold", "duration_seconds", "window_seconds"):
-            default = (
-                0
-                if name == "duration_seconds"
-                else 60
-                if name == "window_seconds"
-                else None
-            )
-            value = result.get(name, default)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value < 0
-            ):
-                raise ValueError(f"{name} must be a nonnegative finite number.")
-            result[name] = value
-        if (
-            result["duration_seconds"] > 86400
-            or not 1 <= result["window_seconds"] <= 86400
-        ):
-            raise ValueError("Rule duration/window exceeds one day.")
-        if result["kind"] == "resource":
-            if result.get("metric") not in {
-                "cpu",
-                "ram",
-                "disk",
-                "disk_free_gib",
-                "internet_receive",
-                "internet_transmit",
-            }:
-                raise ValueError("Choose a supported resource metric.")
-            if result.get("operator") not in {"above", "below"}:
-                raise ValueError("Choose above or below for the threshold.")
-        elif type(result["threshold"]) is not int or result["threshold"] < 1:
-            raise ValueError("An error rule needs a positive integer event count.")
-        if result.get("experiment_id") is not None and not isinstance(
-            result["experiment_id"], str
-        ):
-            raise ValueError("experiment_id must be a string or null.")
-        if len(result.get("experiment_id") or "") > 512:
-            raise ValueError("experiment_id is too long.")
-        return result
+        try:
+            return AlertRule.model_validate(rule).document()
+        except TypeError as error:
+            raise ValueError(str(error)) from error
 
     def validate_channels(self, document: dict) -> dict:
-        if not isinstance(document, dict) or document.keys() != {
-            "desktop",
-            "sound",
-            "on_recovery",
-            "repeat_seconds",
-        }:
-            raise ValueError(
-                "Notification settings require desktop, sound, on_recovery, repeat_seconds."
-            )
-        if any(
-            type(document[name]) is not bool
-            for name in ("desktop", "sound", "on_recovery")
-        ):
-            raise ValueError("Notification switches must be boolean.")
-        value = document["repeat_seconds"]
-        if type(value) is not int or not 10 <= value <= 86400:
-            raise ValueError("repeat_seconds must be an integer from 10 to 86400.")
-        return dict(document)
+        try:
+            return NotificationChannels.model_validate(document).model_dump()
+        except TypeError as error:
+            raise ValueError(str(error)) from error
 
     def _write(self) -> None:
         temporary = self.directory / f".alerts-{uuid4()}.json"
@@ -206,20 +117,28 @@ class AlertMonitor:
         delete: str | None = None,
         channels: dict | None = None,
     ) -> dict:
+        request = AlertConfiguration.model_validate({
+            "rule": self.validate_rule(rule) if rule is not None else None,
+            "channels": self.validate_channels(channels) if channels is not None else None,
+            "delete": delete,
+        })
+        return await self._configure(request)
+
+    async def _configure(self, request: AlertConfiguration) -> dict:
+        value = request.rule.document() if request.rule is not None else None
+        channels = request.channels.model_dump() if request.channels is not None else None
+        delete = request.delete
         async with self._lock:
             previous_rules, previous_channels = list(self.rules), dict(self.channels)
             previous_incidents = copy.deepcopy(self.incidents)
             previous_streaks = dict(self._streaks)
-            value = self.validate_rule(rule) if rule is not None else None
-            if channels is not None:
-                channels = self.validate_channels(channels)
             if (
                 value is not None
                 and len(self.rules) >= 100
                 and not any(item["id"] == value["id"] for item in self.rules)
             ):
                 raise ValueError("At most 100 Alert rules are supported.")
-            if rule is not None:
+            if value is not None:
                 self.rules = [
                     item for item in self.rules if item["id"] != value["id"]
                 ] + [value]
