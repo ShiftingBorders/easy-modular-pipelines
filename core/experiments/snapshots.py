@@ -17,6 +17,7 @@ import psutil
 
 from core.experiments.assembler import ExperimentAssembler
 from core.experiments.journal import RunnerJournal
+from core.experiments.restore_inputs import RestorePaths, _restored_state_document
 from core.experiments.services import ServiceManager
 from core.experiments.snapshot_validation import (
     _validate_journal_results,
@@ -889,6 +890,43 @@ class ExperimentSnapshots:
         transaction = validated.model_dump(exclude_unset=True)
         restoration_id = str(UUID(validated.restoration_id))
         snapshot_id = str(UUID(validated.snapshot_id))
+        paths = self._check_restore_paths(state, validated, marker)
+        if validate_only:
+            return state
+        if transaction["phase"] in ("services_starting", "failed"):
+            return await self._stop_interrupted_restore(
+                state, transaction, marker, paths.target, retry_failed
+            )
+        target = paths.target
+        stopped = state_from_document(target, transaction["stopped_state"])
+        if (
+            stopped.experiment_id != transaction["experiment_id"]
+            or stopped.active_attempt is not None
+            or any(not item.stopped for item in stopped.services.values())
+        ):
+            raise ValueError("Restore marker does not confirm the participant barrier.")
+        if transaction["phase"] != "complete":
+            await self._services.reset(stopped)
+            transaction["owner"] = process_identity(os.getpid())
+            write_json(marker, transaction)
+        if transaction["phase"] == "staging":
+            await self._stage_restore_snapshot(state, transaction, marker, paths, snapshot_id)
+        manifest = await self._cached_restore_manifest(transaction, paths.cached, snapshot_id)
+        if transaction["phase"] == "prepared":
+            await self._install_restore_files(transaction, marker, paths)
+        self._bind_restored_journal(state, transaction, marker, paths, manifest, restoration_id)
+        if transaction["phase"] == "complete":
+            return state
+        await self._start_restore_services(
+            state, transaction, marker, manifest, snapshot_id, restoration_id
+        )
+        if not transaction["preserve_diagnostics"]:
+            await self._cleanup_completed_restore(paths)
+        return state
+
+    def _check_restore_paths(
+        self, state: RunnerState, validated: RestoreTransaction, marker: Path
+    ) -> RestorePaths:
         owner = validated.owner.model_dump()
         if owner.get("pid") != os.getpid():
             try:
@@ -906,11 +944,11 @@ class ExperimentSnapshots:
                     error, (FileNotFoundError, ProcessLookupError)
                 ) and getattr(error, "winerror", None) not in (87, 1168):
                     raise
-        target = self._project_root / "experiments" / transaction["target_folder"]
-        work = self._project_root / "controller/restores" / restoration_id
+        target = self._project_root / "experiments" / validated.target_folder
+        work = self._project_root / "controller/restores" / str(UUID(validated.restoration_id))
         if (
             target.resolve() != state.experiment_directory.resolve()
-            or transaction["experiment_id"] != state.experiment_id
+            or validated.experiment_id != state.experiment_id
             or not work.resolve().is_relative_to(self._project_root)
         ):
             raise ValueError("Restore transaction belongs to another experiment.")
@@ -928,191 +966,151 @@ class ExperimentSnapshots:
                 or not path.resolve().is_relative_to(self._project_root)
             ):
                 raise ValueError("Restoration paths cannot escape the project.")
-        if validate_only:
-            return state
-        if transaction["phase"] in ("services_starting", "failed"):
-            # An interrupted load is not evidence that it was never executed.
-            # Stop its participants, retain diagnostics, and require a new rollback.
-            if not (target / "runner/state.json").is_file():
-                raise RuntimeError(
-                    "Restored participant state is missing; termination cannot be confirmed."
-                )
-            recovered = self._state_store.load(target)
-            if recovered.experiment_id != state.experiment_id:
-                raise ValueError(
-                    "Restored participant state belongs to another experiment."
-                )
-            vars(state).update(vars(recovered))
-            self._journal.close()
-            self._journal.open(state, create=False)
-            for definition in state.template["services"]:
-                service_id = definition["service_id"]
-                endpoint = target / "runner/endpoints" / f"{service_id}.json"
-                if not endpoint.is_file():
-                    continue
-                announced = read_json(endpoint)
-                current = state.services.get(service_id)
-                if (
-                    current is not None
-                    and announced.get("participant_instance_id")
-                    == current.service_instance_id
-                ):
-                    continue
-                instance_id = str(UUID(announced["participant_instance_id"]))
-                artifacts = (
-                    target / "shared_artifacts/services" / service_id / instance_id
-                )
-                if (
-                    not artifacts.resolve().is_relative_to(target)
-                    or not (artifacts / "process.json").is_file()
-                ):
-                    raise RuntimeError(
-                        "An unaccounted-for restored service cannot be confirmed stopped."
-                    )
-                recorded = read_json(artifacts / "process.json")
-                identity = {
-                    "experiment_id": state.experiment_id,
-                    "participant_id": service_id,
-                    "participant_instance_id": instance_id,
-                }
-                if any(
-                    announced.get(key) != value or recorded.get(key) != value
-                    for key, value in identity.items()
-                ) or recorded.get("process") != announced.get("process"):
-                    raise RuntimeError("Restored service ownership cannot be verified.")
-                instance = ServiceInstance(service_id, instance_id, definition)
-                instance.process_identity = recorded["process"]
-                instance.endpoint_path = endpoint
-                instance.artifacts_directory = artifacts
-                metadata = self._assembler.read_module(
-                    target
-                    / "modules"
-                    / definition["module"]["name"]
-                    / definition["module"]["version"]
-                )
-                instance.implementation = metadata["implementation"]
-                state.services[service_id] = instance
-            stops = await self._services.stop_all(state)
-            transaction["stopped_state"] = state_to_document(state)
-            if any(not item["stopped"] or item["error"] for item in stops.values()):
-                transaction["phase"] = "failed"
-                write_json(marker, transaction)
-                raise RuntimeError(
-                    "Interrupted restoration participants have not stopped cleanly."
-                )
-            await self._services.reset(state)
+        return RestorePaths(target, work, work / "snapshot", work / "replacement", work / "previous")
+
+    async def _stop_interrupted_restore(
+        self, state: RunnerState, transaction: JsonObject, marker: Path,
+        target: Path, retry_failed: bool,
+    ) -> RunnerState:
+        # An interrupted load is not evidence that it was never executed.
+        # Stop its participants, retain diagnostics, and require a new rollback.
+        if not (target / "runner/state.json").is_file():
+            raise RuntimeError(
+                "Restored participant state is missing; termination cannot be confirmed."
+            )
+        recovered = self._state_store.load(target)
+        if recovered.experiment_id != state.experiment_id:
+            raise ValueError(
+                "Restored participant state belongs to another experiment."
+            )
+        vars(state).update(vars(recovered))
+        self._journal.close()
+        self._journal.open(state, create=False)
+        self._restore_announced_services(state, target)
+        stops = await self._services.stop_all(state)
+        transaction["stopped_state"] = state_to_document(state)
+        if any(not item["stopped"] or item["error"] for item in stops.values()):
             transaction["phase"] = "failed"
             write_json(marker, transaction)
-            if retry_failed:
-                return state
             raise RuntimeError(
-                "Service restoration was interrupted; request a fresh rollback."
+                "Interrupted restoration participants have not stopped cleanly."
             )
-        stopped = state_from_document(target, transaction["stopped_state"])
-        if (
-            stopped.experiment_id != transaction["experiment_id"]
-            or stopped.active_attempt is not None
-            or any(not item.stopped for item in stopped.services.values())
-        ):
-            raise ValueError("Restore marker does not confirm the participant barrier.")
-        if transaction["phase"] != "complete":
-            await self._services.reset(stopped)
-            transaction["owner"] = process_identity(os.getpid())
-            write_json(marker, transaction)
-        cached = work / "snapshot"
-        replacement = work / "replacement"
-        previous = work / "previous"
-        if transaction["phase"] == "staging":
-            archive = (
-                self._project_root
-                / "snapshots"
-                / transaction["source_folder"]
-                / snapshot_id
-            )
-            manifest = await asyncio.to_thread(self._validate_snapshot, archive)
-            for path in (cached, replacement):
-                if path.exists():
-                    if (
-                        path.is_symlink()
-                        or path.is_junction()
-                        or not path.resolve().is_relative_to(work.resolve())
-                    ):
-                        raise ValueError("Unsafe incomplete restoration cleanup.")
-                    await asyncio.to_thread(shutil.rmtree, path)
-            copy_task = asyncio.create_task(
-                asyncio.to_thread(shutil.copytree, archive, cached)
-            )
-            try:
-                await asyncio.shield(copy_task)
-            except BaseException:
-                await asyncio.gather(copy_task, return_exceptions=True)
-                raise
-            await asyncio.to_thread(self._validate_snapshot, cached)
-            copy_task = asyncio.create_task(
-                asyncio.to_thread(shutil.copytree, cached / "files", replacement)
-            )
-            try:
-                await asyncio.shield(copy_task)
-            except BaseException:
-                await asyncio.gather(copy_task, return_exceptions=True)
-                raise
-            (replacement / "journals").mkdir()
-            shutil.copyfile(
-                cached / "journal/journal.sqlite",
-                replacement / "journals/events.sqlite",
-            )
-            document = copy_json_object(manifest["state"], "restored state")
-            document["experiment_id"] = state.experiment_id
-            document["run_id"] = transaction["run_id"]
-            document["template_path"] = "experiment.yaml"
-            document["mode"], document["phase"], document["pause_requested"] = (
-                "paused",
-                "restoring",
-                False,
-            )
-            document["checkpoint_id"] = None
-            document["owner_identity"] = None
+        await self._services.reset(state)
+        transaction["phase"] = "failed"
+        write_json(marker, transaction)
+        if retry_failed:
+            return state
+        raise RuntimeError(
+            "Service restoration was interrupted; request a fresh rollback."
+        )
+
+    def _restore_announced_services(self, state: RunnerState, target: Path) -> None:
+        for definition in state.template["services"]:
+            service_id = definition["service_id"]
+            endpoint = target / "runner/endpoints" / f"{service_id}.json"
+            if not endpoint.is_file():
+                continue
+            announced = read_json(endpoint)
+            current = state.services.get(service_id)
             if (
-                manifest["state"]["phase"] == "stopped"
-                and document.get("last_dag_decision") is not None
-                and document["last_dag_decision"]["decision"]["command"] == "stop"
+                current is not None
+                and announced.get("participant_instance_id")
+                == current.service_instance_id
             ):
-                # The stop completed in this snapshot. A continuation resumes
-                # after the condition, rather than issuing the stop again.
-                document["last_dag_decision"] = None
-            document["used_request_ids"] = sorted(
-                set(document["used_request_ids"])
-                | set(transaction["stopped_state"]["used_request_ids"])
+                continue
+            instance_id = str(UUID(announced["participant_instance_id"]))
+            artifacts = (
+                target / "shared_artifacts/services" / service_id / instance_id
             )
-            for stage_id in document["stage_result_ids"]:
-                document["stage_result_origins"].setdefault(
-                    stage_id, manifest["experiment_id"]
+            if (
+                not artifacts.resolve().is_relative_to(target)
+                or not (artifacts / "process.json").is_file()
+            ):
+                raise RuntimeError(
+                    "An unaccounted-for restored service cannot be confirmed stopped."
                 )
-            for instance in document["services"].values():
-                instance.update(
-                    process_identity=None,
-                    ready=False,
-                    ever_ready=False,
-                    started_at=None,
-                    start_deadline=None,
-                    last_status=None,
-                    stopping=False,
-                    stopped=True,
-                    blocked_action=None,
-                    failure=None,
-                    freeze_id=None,
-                    prepared_freeze_id=None,
-                    active_request=None,
-                    pending_requests=[],
-                )
-            restored = state_from_document(replacement, document)
-            self._state_store.save(restored)
-            write_json(
-                replacement / "runner/journal.json",
-                {key: manifest["journal"][key] for key in ("journal_id", "generation")},
+            recorded = read_json(artifacts / "process.json")
+            identity = {
+                "experiment_id": state.experiment_id,
+                "participant_id": service_id,
+                "participant_instance_id": instance_id,
+            }
+            if any(
+                announced.get(key) != value or recorded.get(key) != value
+                for key, value in identity.items()
+            ) or recorded.get("process") != announced.get("process"):
+                raise RuntimeError("Restored service ownership cannot be verified.")
+            instance = ServiceInstance(service_id, instance_id, definition)
+            instance.process_identity = recorded["process"]
+            instance.endpoint_path = endpoint
+            instance.artifacts_directory = artifacts
+            metadata = self._assembler.read_module(
+                target
+                / "modules"
+                / definition["module"]["name"]
+                / definition["module"]["version"]
             )
-            transaction["phase"] = "prepared"
-            write_json(marker, transaction)
+            instance.implementation = metadata["implementation"]
+            state.services[service_id] = instance
+
+    async def _stage_restore_snapshot(
+        self, state: RunnerState, transaction: JsonObject, marker: Path,
+        paths: RestorePaths, snapshot_id: str,
+    ) -> None:
+        work, cached, replacement = paths.work, paths.cached, paths.replacement
+        archive = (
+            self._project_root
+            / "snapshots"
+            / transaction["source_folder"]
+            / snapshot_id
+        )
+        manifest = await asyncio.to_thread(self._validate_snapshot, archive)
+        for path in (cached, replacement):
+            if path.exists():
+                if (
+                    path.is_symlink()
+                    or path.is_junction()
+                    or not path.resolve().is_relative_to(work.resolve())
+                ):
+                    raise ValueError("Unsafe incomplete restoration cleanup.")
+                await asyncio.to_thread(shutil.rmtree, path)
+        copy_task = asyncio.create_task(
+            asyncio.to_thread(shutil.copytree, archive, cached)
+        )
+        try:
+            await asyncio.shield(copy_task)
+        except BaseException:
+            await asyncio.gather(copy_task, return_exceptions=True)
+            raise
+        await asyncio.to_thread(self._validate_snapshot, cached)
+        copy_task = asyncio.create_task(
+            asyncio.to_thread(shutil.copytree, cached / "files", replacement)
+        )
+        try:
+            await asyncio.shield(copy_task)
+        except BaseException:
+            await asyncio.gather(copy_task, return_exceptions=True)
+            raise
+        (replacement / "journals").mkdir()
+        shutil.copyfile(
+            cached / "journal/journal.sqlite",
+            replacement / "journals/events.sqlite",
+        )
+        document = _restored_state_document(
+            manifest, transaction["stopped_state"], state.experiment_id, transaction["run_id"]
+        )
+        restored = state_from_document(replacement, document)
+        self._state_store.save(restored)
+        write_json(
+            replacement / "runner/journal.json",
+            {key: manifest["journal"][key] for key in ("journal_id", "generation")},
+        )
+        transaction["phase"] = "prepared"
+        write_json(marker, transaction)
+
+    async def _cached_restore_manifest(
+        self, transaction: JsonObject, cached: Path, snapshot_id: str
+    ) -> JsonObject:
         manifest = await asyncio.to_thread(self._validate_snapshot, cached)
         if (
             manifest["snapshot_id"] != snapshot_id
@@ -1123,28 +1121,39 @@ class ExperimentSnapshots:
             )
         ):
             raise ValueError("Cached restoration snapshot has a different identity.")
-        if transaction["phase"] == "prepared":
-            if not previous.exists():
-                if not target.is_dir() or not replacement.is_dir():
-                    raise RuntimeError(
-                        "Prepared restoration is missing its source or replacement."
-                    )
-                # Read-only dashboard clients open the source briefly. Give them
-                # a bounded opportunity to release it, without bypassing the
-                # barrier for a persistently open external journal on Windows.
-                await self._replace_restore_directory(target, previous)
-            if not target.exists():
-                if not replacement.is_dir():
-                    raise RuntimeError(
-                        "Restoration replacement is missing after displacement."
-                    )
-                await self._replace_restore_directory(replacement, target)
-            elif replacement.exists():
+        return manifest
+
+    async def _install_restore_files(
+        self, transaction: JsonObject, marker: Path, paths: RestorePaths
+    ) -> None:
+        target, previous, replacement = paths.target, paths.previous, paths.replacement
+        if not previous.exists():
+            if not target.is_dir() or not replacement.is_dir():
                 raise RuntimeError(
-                    "Ambiguous restoration directories; no files were overwritten."
+                    "Prepared restoration is missing its source or replacement."
                 )
-            transaction["phase"] = "files_installed"
-            write_json(marker, transaction)
+            # Read-only dashboard clients open the source briefly. Give them
+            # a bounded opportunity to release it, without bypassing the
+            # barrier for a persistently open external journal on Windows.
+            await self._replace_restore_directory(target, previous)
+        if not target.exists():
+            if not replacement.is_dir():
+                raise RuntimeError(
+                    "Restoration replacement is missing after displacement."
+                )
+            await self._replace_restore_directory(replacement, target)
+        elif replacement.exists():
+            raise RuntimeError(
+                "Ambiguous restoration directories; no files were overwritten."
+            )
+        transaction["phase"] = "files_installed"
+        write_json(marker, transaction)
+
+    def _bind_restored_journal(
+        self, state: RunnerState, transaction: JsonObject, marker: Path,
+        paths: RestorePaths, manifest: JsonObject, restoration_id: str,
+    ) -> None:
+        target, work = paths.target, paths.work
         restored = self._state_store.load(target)
         if restored.experiment_id != transaction["experiment_id"]:
             raise ValueError("Installed state has another experiment identity.")
@@ -1157,8 +1166,11 @@ class ExperimentSnapshots:
             write_json(marker, transaction)
         elif transaction["phase"] == "journal_restored":
             self._journal.open(state, create=False)
-        if transaction["phase"] == "complete":
-            return state
+
+    async def _start_restore_services(
+        self, state: RunnerState, transaction: JsonObject, marker: Path,
+        manifest: JsonObject, snapshot_id: str, restoration_id: str,
+    ) -> None:
         transaction["phase"] = "services_starting"
         write_json(marker, transaction)
         try:
@@ -1188,20 +1200,22 @@ class ExperimentSnapshots:
             transaction["phase"] = "failed"
             write_json(marker, transaction)
             raise
-        if not transaction["preserve_diagnostics"]:
-            for path in (previous, cached):
-                if (
-                    path.is_symlink()
-                    or path.is_junction()
-                    or not path.resolve().is_relative_to(work.resolve())
-                ):
-                    raise ValueError("Unsafe completed restoration cleanup.")
-                if any(
-                    item.is_symlink() or item.is_junction() for item in path.rglob("*")
-                ):
-                    continue
-                await asyncio.to_thread(shutil.rmtree, path)
-        return state
+
+    async def _cleanup_completed_restore(self, paths: RestorePaths) -> None:
+        previous, cached, work = paths.previous, paths.cached, paths.work
+        for path in (previous, cached):
+            if (
+                path.is_symlink()
+                or path.is_junction()
+                or not path.resolve().is_relative_to(work.resolve())
+            ):
+                raise ValueError("Unsafe completed restoration cleanup.")
+            if any(
+                item.is_symlink() or item.is_junction() for item in path.rglob("*")
+            ):
+                continue
+            await asyncio.to_thread(shutil.rmtree, path)
+
 
     async def _replace_restore_directory(self, source: Path, target: Path) -> None:
         deadline = time.monotonic() + 1

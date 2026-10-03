@@ -97,6 +97,12 @@ Service shutdown separates task detachment, shutdown RPC, exit confirmation,
 request cancellation and outcome recording while sharing one deadline and
 retaining the manager's ownership checks.
 
+Snapshot restoration exposes its transaction phases in `_finish_restore`:
+owner/path checks, interrupted participant stop, staging, installation, journal
+binding, service restoration and cleanup. Pure state-document preparation lives
+in `experiments.restore_inputs`; the snapshot owner retains marker publication,
+filesystem/process checks and cancellation barriers.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
