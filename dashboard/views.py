@@ -10,14 +10,16 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from core.journal.events import LoggingError
+from core.models.dashboard_commands import DashboardCommand, SavedCommandHistory
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
     CollectorSamples,
     CollectorStatus,
 )
+from core.models.server_receipts import CommandReceipt
 from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import (
@@ -44,6 +46,15 @@ def validate_samples(samples: object) -> list[dict]:
         ]
     except (ValueError, TypeError) as error:
         raise SystemAPIError("invalid_response", "Invalid collector measurements.") from error
+
+
+def _command_receipt(document: object) -> CommandReceipt:
+    try:
+        return CommandReceipt.model_validate(document)
+    except (TypeError, ValueError) as error:
+        raise SystemAPIError(
+            "invalid_response", "System API returned an invalid command receipt.", 502
+        ) from error
 
 
 class DashboardViews:
@@ -100,19 +111,7 @@ class DashboardViews:
         path = self.settings["state_directory"] / "commands.json"
         if path.exists():
             document = await asyncio.to_thread(read_object, path, 8388608)
-            if not isinstance(document.get("items"), list):
-                raise ValueError("Invalid dashboard command history.")
-            for record in document["items"]:
-                if (
-                    not isinstance(record, dict)
-                    or not isinstance(record.get("status"), str)
-                    or type(record.get("polling")) is not bool
-                ):
-                    raise ValueError("Invalid saved command record.")
-                UUID(record["command_id"])
-                if record["status"] == "submitting":
-                    record.update(status="unknown", polling=True)
-            self._commands = document["items"][-1000:]
+            self._restore_commands(SavedCommandHistory.model_validate(document))
         self._replace_cache_pool()
         try:
             self._registry = await asyncio.to_thread(self.journals.registry)
@@ -127,6 +126,15 @@ class DashboardViews:
             asyncio.create_task(self._poll_journals()),
             asyncio.create_task(self._poll_windows()),
         ]
+
+    def _restore_commands(self, history: SavedCommandHistory) -> None:
+        records = []
+        for saved in history.items[-1000:]:
+            record = saved.model_dump()
+            if saved.status == "submitting":
+                record.update(status="unknown", polling=True)
+            records.append(record)
+        self._commands = records
 
     async def _prime_caches(self) -> None:
         """Bootstrap at most one batch per worker before accepting HTTP reads."""
@@ -1493,32 +1501,10 @@ class DashboardViews:
         }
 
     async def command(self, command: dict) -> dict:
-        allowed = {
-            "run",
-            "pause",
-            "resume",
-            "step",
-            "stop",
-            "rerun",
-            "retry",
-            "move",
-            "reset_retries",
-            "replace",
-            "reload_template",
-            "snapshot",
-            "rollback",
-            "recover",
-        }
-        if command.get("command") not in allowed or command.keys() - {
-            "command",
-            "args",
-            "target",
-            "command_id",
-            "expected_experiment_id",
-        }:
-            raise ValueError("Unsupported dashboard command.")
-        command = dict(command)
-        expected = command.pop("expected_experiment_id", None)
+        return await self._command(DashboardCommand.model_validate(command))
+
+    async def _command(self, request: DashboardCommand) -> dict:
+        expected = request.expected_experiment_id
         if expected is not None:
             self._live_at = 0
             live = await self.state(refresh=True)
@@ -1532,13 +1518,12 @@ class DashboardViews:
                     "The runtime selection changed or is unavailable. Refresh before sending a command.",
                     409,
                 )
-        command["command_id"] = (
-            str(UUID(command["command_id"]))
-            if command.get("command_id")
-            else str(uuid4())
-        )
-        if not isinstance(command.get("args", {}), dict):
-            raise TypeError("Command args must be an object.")
+        record = await self._reserve_command(request)
+        return await self._submit_reserved_command(request, record)
+
+    async def _reserve_command(self, request: DashboardCommand) -> dict:
+        """Persist a local submission record before the first network effect."""
+        command = request.wire_document()
         async with self._command_lock:
             if any(
                 item["command_id"] == command["command_id"] for item in self._commands
@@ -1572,13 +1557,24 @@ class DashboardViews:
                     "command_storage_unavailable",
                     "Command was not sent because its receipt could not be saved.",
                 ) from error
+        return record
+
+    async def _submit_reserved_command(
+        self, request: DashboardCommand, record: dict
+    ) -> dict:
+        command = request.wire_document()
         try:
-            receipt = await self.system.submit(command)
+            validated_receipt = _command_receipt(await self.system.submit(command))
+            if validated_receipt.command_id != command["command_id"]:
+                raise SystemAPIError(
+                    "invalid_response", "System returned a receipt for another command.", 502
+                )
+            receipt = validated_receipt.model_dump(exclude_unset=True)
         except SystemAPIError as error:
             async with self._command_lock:
                 record.update(
                     status="unknown"
-                    if error.code in {"connection_error", "timeout"}
+                    if error.code in {"connection_error", "timeout", "invalid_response"}
                     else "failed",
                     error=str(error),
                 )
@@ -1587,16 +1583,21 @@ class DashboardViews:
             raise
         async with self._command_lock:
             record.update(
-                status=receipt.get("state", "pending"),
-                server_instance_id=receipt.get("server_instance_id"),
-                polling=receipt.get("state", "pending") == "pending",
+                status=validated_receipt.state,
+                server_instance_id=validated_receipt.server_instance_id,
+                polling=validated_receipt.state == "pending",
                 result=receipt,
             )
             await self._save_commands()
         return receipt
 
     async def command_result(self, identifier: str) -> dict:
-        result = await self.system.read(f"commands/{identifier}")
+        validated_result = _command_receipt(await self.system.read(f"commands/{identifier}"))
+        if validated_result.command_id != identifier:
+            raise SystemAPIError(
+                "invalid_response", "System returned a result for another command.", 502
+            )
+        result = validated_result.model_dump(exclude_unset=True)
         refresh_history = None
         async with self._command_lock:
             record = next(
@@ -1606,7 +1607,7 @@ class DashboardViews:
             if record:
                 if record.get("server_instance_id") not in (
                     None,
-                    result.get("server_instance_id"),
+                    validated_result.server_instance_id,
                 ):
                     record.update(
                         status="unknown",
@@ -1617,14 +1618,14 @@ class DashboardViews:
                     return {**result, "state": "unknown", "result": None}
                 if (
                     record.get("polling")
-                    and result.get("result") == "success"
-                    and result.get("state") != "pending"
+                    and validated_result.result == "success"
+                    and validated_result.state != "pending"
                 ):
                     refresh_history = result.get("experiment_id") or record.get(
                         "experiment_id"
                     )
-                record.update(status=result.get("state", "unknown"), result=result)
-                record["polling"] = result.get("state") == "pending"
+                record.update(status=validated_result.state, result=result)
+                record["polling"] = validated_result.state == "pending"
                 if result.get("experiment_id"):
                     record["experiment_id"] = result["experiment_id"]
                 await self._save_commands()

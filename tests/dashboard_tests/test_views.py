@@ -141,10 +141,11 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.views = DashboardViews(self.config, self.api)
         self.addAsyncCleanup(self.views.close)
         self.status = resource_status()
+        self.server_instance_id = str(uuid4())
         self.result = {
             "state": "succeeded",
             "result": "success",
-            "server_instance_id": "server",
+            "server_instance_id": self.server_instance_id,
             "experiment_id": "exp",
         }
 
@@ -153,7 +154,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "fresh": True,
                 "experiment_id": "exp",
-                "server_instance_id": "server",
+                "server_instance_id": self.server_instance_id,
                 "phase": "waiting",
                 "mode": "paused",
             }
@@ -161,7 +162,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             return self.status
         if path == "resources/history":
             return {"samples": [], "cursor": 0, "gap": False, "history_id": "history"}
-        return self.result
+        return {**self.result, "command_id": path.rsplit("/", 1)[-1]}
 
     async def submit(self, document):
         saved = json.loads(
@@ -172,7 +173,8 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         return {
             "command_id": document["command_id"],
             "state": "pending",
-            "server_instance_id": "server",
+            "result": None,
+            "server_instance_id": self.server_instance_id,
         }
 
     async def test_pages_never_wait_for_blocked_live_sources_and_age_becomes_stale(
@@ -301,7 +303,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_server_instance_change_cannot_confirm_old_command(self):
         receipt = await self.views.command({"command": "stop"})
-        self.result["server_instance_id"] = "replacement"
+        self.result["server_instance_id"] = str(uuid4())
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["state"], "unknown")
         self.assertIsNone(result["result"])

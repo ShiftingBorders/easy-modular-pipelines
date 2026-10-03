@@ -197,6 +197,12 @@ validates each incoming bounded batch before changing retained state. Typed
 status/history application retains epoch/cursor/gap checks and independent history
 failure handling; rendering does not revalidate the retained sample array.
 
+Dashboard command input shares server command/target constraints and keeps its
+own operation whitelist and selection preflight. Local saved records have a
+separate model that preserves minimal legacy history. The owner persists a
+submission before POST, validates complete upstream receipts before consuming
+their state, and keeps unknown outcomes reconcilable without resubmission.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
