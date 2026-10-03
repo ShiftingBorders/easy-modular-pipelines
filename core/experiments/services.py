@@ -208,63 +208,16 @@ class ServiceManager:
     async def _start(
         self, state: RunnerState, definition: JsonObject
     ) -> ServiceInstance:
-        service_id = require_text(definition["service_id"], "service_id")
-        old = state.services.get(service_id)
-        if old is not None and not old.stopped:
-            raise RuntimeError(
-                "The previous service must be confirmed stopped before launch."
-            )
-        instance_id = str(uuid4())
-        context = _context(state, service_id, instance_id)
-        directory = (
-            state.experiment_directory
-            / "shared_artifacts/services"
-            / service_id
-            / instance_id
+        instance, directory, launch, context = self._prepare_service_start(
+            state, definition
         )
-        launch = self._launcher.prepare(state, definition, context, directory, None)
-        instance = ServiceInstance(service_id, instance_id, definition)
-        instance.implementation = launch["module"]["implementation"]
-        instance.artifacts_directory = directory
-        instance.endpoint_path = Path(launch["endpoint_path"])
-        if old is not None:
-            instance.restart_count = old.restart_count
-            for entry in old.pending_requests:
-                if entry.get("expected_instance") is not None:
-                    self._finish_request(
-                        state,
-                        old,
-                        entry,
-                        {
-                            "result": "fail",
-                            "data": {"reason": "service_instance_changed"},
-                        },
-                        "invalidated",
-                    )
-                else:
-                    instance.pending_requests.append(entry)
-        state.services[service_id] = instance
+        service_id = instance.service_id
+        instance_id = instance.service_instance_id
         self._starting.add(service_id)
         instance.start_deadline = time.monotonic() + state.template["start_timeout"]
         spawn = None
         try:
-            self._journal.client.record_event(
-                "service.parameters",
-                {
-                    "definition": definition,
-                    "effective_settings": launch["effective_settings"],
-                    "template_revision_id": state.template_revision_id,
-                },
-                context=context,
-            )
-            self._journal.client.record_event(
-                "control.intent",
-                {"action": "start_service", "argv": launch["argv"]},
-                context=context,
-            )
-            if state.pending_rebuild is not None:
-                # Retain the prospective instance even if the owner dies during spawn.
-                self._save(state)
+            self._publish_service_start_intent(state, definition, launch, context)
             with (
                 (directory / "stdout.log").open("ab") as stdout,
                 (directory / "stderr.log").open("ab") as stderr,
@@ -301,38 +254,14 @@ class ServiceManager:
                 process_identity(process.pid) if process.poll() is None else None
             )
             launcher_identity = instance.process_identity
-            write_json(
-                directory / "process.json",
-                {
-                    **context,
-                    "process": instance.process_identity,
-                    "launcher_process": launcher_identity,
-                    "started_at": instance.started_at,
-                },
-            )
+            self._write_service_process(directory, instance, context, launcher_identity)
             self._save(state)
             await self._confirm_service_readiness(
                 state, service_id, instance_id, instance, process, context
             )
-            write_json(
-                directory / "process.json",
-                {
-                    **context,
-                    "process": instance.process_identity,
-                    "launcher_process": launcher_identity,
-                    "started_at": instance.started_at,
-                },
+            self._publish_service_start(
+                state, directory, instance, context, launcher_identity
             )
-            self._journal.client.record_event(
-                "service.started",
-                {
-                    "process": instance.process_identity,
-                    "launcher_process": launcher_identity,
-                    "implementation": instance.implementation,
-                },
-                context=context,
-            )
-            self._save(state)
             return instance
         except BaseException:
             if (
@@ -348,6 +277,114 @@ class ServiceManager:
             if self._notify_resources is not None:
                 self._notify_resources()
             self._changed.set()
+
+    def _prepare_service_start(
+        self, state: RunnerState, definition: JsonObject
+    ) -> tuple[ServiceInstance, Path, JsonObject, JsonObject]:
+        service_id = require_text(definition["service_id"], "service_id")
+        old = state.services.get(service_id)
+        if old is not None and not old.stopped:
+            raise RuntimeError(
+                "The previous service must be confirmed stopped before launch."
+            )
+        instance_id = str(uuid4())
+        context = _context(state, service_id, instance_id)
+        directory = (
+            state.experiment_directory
+            / "shared_artifacts/services"
+            / service_id
+            / instance_id
+        )
+        launch = self._launcher.prepare(state, definition, context, directory, None)
+        instance = ServiceInstance(service_id, instance_id, definition)
+        instance.implementation = launch["module"]["implementation"]
+        instance.artifacts_directory = directory
+        instance.endpoint_path = Path(launch["endpoint_path"])
+        if old is not None:
+            self._inherit_service_requests(state, old, instance)
+        state.services[service_id] = instance
+        return instance, directory, launch, context
+
+    def _inherit_service_requests(
+        self, state: RunnerState, old: ServiceInstance, instance: ServiceInstance
+    ) -> None:
+        instance.restart_count = old.restart_count
+        for entry in old.pending_requests:
+            if entry.get("expected_instance") is not None:
+                self._finish_request(
+                    state,
+                    old,
+                    entry,
+                    {
+                        "result": "fail",
+                        "data": {"reason": "service_instance_changed"},
+                    },
+                    "invalidated",
+                )
+            else:
+                instance.pending_requests.append(entry)
+
+    def _publish_service_start_intent(
+        self,
+        state: RunnerState,
+        definition: JsonObject,
+        launch: JsonObject,
+        context: JsonObject,
+    ) -> None:
+        self._journal.client.record_event(
+            "service.parameters",
+            {
+                "definition": definition,
+                "effective_settings": launch["effective_settings"],
+                "template_revision_id": state.template_revision_id,
+            },
+            context=context,
+        )
+        self._journal.client.record_event(
+            "control.intent",
+            {"action": "start_service", "argv": launch["argv"]},
+            context=context,
+        )
+        if state.pending_rebuild is not None:
+            # Retain the prospective instance even if the owner dies during spawn.
+            self._save(state)
+
+    def _write_service_process(
+        self,
+        directory: Path,
+        instance: ServiceInstance,
+        context: JsonObject,
+        launcher_identity: JsonObject | None,
+    ) -> None:
+        write_json(
+            directory / "process.json",
+            {
+                **context,
+                "process": instance.process_identity,
+                "launcher_process": launcher_identity,
+                "started_at": instance.started_at,
+            },
+        )
+
+    def _publish_service_start(
+        self,
+        state: RunnerState,
+        directory: Path,
+        instance: ServiceInstance,
+        context: JsonObject,
+        launcher_identity: JsonObject | None,
+    ) -> None:
+        self._write_service_process(directory, instance, context, launcher_identity)
+        self._journal.client.record_event(
+            "service.started",
+            {
+                "process": instance.process_identity,
+                "launcher_process": launcher_identity,
+                "implementation": instance.implementation,
+            },
+            context=context,
+        )
+        self._save(state)
 
     async def _confirm_service_readiness(
         self,
