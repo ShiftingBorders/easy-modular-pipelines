@@ -19,14 +19,17 @@ from core.models.server_arguments import (
     ArchiveInstall,
     ArchiveSelection,
     ControlInvocation,
+    EventReadArguments,
     ExperimentReference,
     NoArguments,
     PositionArguments,
     RerunArguments,
     ResetRetriesArguments,
+    ResourceHistoryArguments,
     RunArguments,
     SnapshotArguments,
     SnapshotReference,
+    StateQueryArguments,
     TemplateArguments,
 )
 from core.modules.manager import ModuleManager
@@ -391,14 +394,14 @@ class ExperimentController:
         if name in ("stats.modules", "stats.module", "stats.template"):
             if self._module_manager is None:
                 raise RuntimeError("Module manager is not configured for reads.")
-            _validate_module_read_args(name, args)
+            arguments = _validate_module_read_args(name, args)
             if name == "stats.modules":
                 return self._module_manager.list_modules()
             if name == "stats.module":
-                return await self._module_manager.inspect_module(**args)
+                return await self._module_manager.inspect_module(**arguments.model_dump())
             assembler = ExperimentAssembler(self._project_root, self._module_manager)
             return await assembler.validate_template(
-                Path(require_text(args["template_path"], "template_path"))
+                arguments.template_path
             )
         if request["command"] in (
             "stats.experiments",
@@ -415,18 +418,15 @@ class ExperimentController:
                 self._runner.get_state()["experiment_id"],
             )
         if request["command"] == "stats.resources":
-            if args:
-                raise ValueError("stats.resources does not accept arguments.")
+            NoArguments.model_validate(args)
             return self.resources.get_status()
         if request["command"] == "stats.resources.history":
-            if args.keys() - {"after", "limit"}:
-                raise ValueError("Unknown resource history arguments.")
-            return self.resources.read_history(**args)
+            arguments = ResourceHistoryArguments.model_validate(args)
+            return self.resources.read_history(**arguments.model_dump(exclude_unset=True))
         if request["command"] == "stats.state":
-            if args.keys() - {"experiment_id"}:
-                raise ValueError("Unknown stats.state arguments.")
+            arguments = StateQueryArguments.model_validate(args)
             state = self._runner.get_state()
-            if args.get("experiment_id") not in (None, state["experiment_id"]):
+            if arguments.experiment_id not in (None, state["experiment_id"]):
                 raise FileNotFoundError("The requested experiment is not selected.")
             return copy_json_object(
                 {
@@ -438,11 +438,9 @@ class ExperimentController:
                 "controller state",
             )
         if request["command"] == "logs.read":
-            if args.keys() - {"experiment_id", "cursor", "limit"}:
-                raise ValueError("Unknown logs.read arguments.")
-            experiment_id = require_text(args.get("experiment_id"), "experiment_id")
+            arguments = EventReadArguments.model_validate(args)
             return await self._runner.read_events(
-                experiment_id, args.get("cursor"), limit=args.get("limit", 100)
+                arguments.experiment_id, arguments.cursor, limit=arguments.limit
             )
         raise NotImplementedError(
             "The initial read API provides stats.state and logs.read."

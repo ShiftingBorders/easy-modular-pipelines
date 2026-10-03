@@ -7,6 +7,12 @@ from uuid import UUID
 
 from core.journal.storage import SQLiteEventStore
 from core.models.experiment_registry import RegistryEntry
+from core.models.server_arguments import (
+    ArtifactReference,
+    ExperimentReference,
+    NoArguments,
+    SnapshotMetadataReference,
+)
 from core.primitives.json_files import read_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
@@ -247,22 +253,19 @@ class ExperimentReader:
         self, command: str, args: JsonObject, selected_id: str | None
     ) -> JsonObject:
         handlers = {
-            "stats.artifacts": (self.list_artifacts, {"experiment_id"}),
-            "stats.artifact": (self.get_artifact, {"experiment_id", "artifact_id"}),
-            "stats.experiments": (self.list_experiments, set()),
-            "stats.experiment": (self.inspect_experiment, {"experiment_id"}),
-            "stats.snapshots": (self.list_snapshots, {"experiment_id"}),
-            "stats.snapshot": (self.inspect_snapshot, {"experiment_id", "snapshot_id"}),
+            "stats.artifacts": (self.list_artifacts, ExperimentReference),
+            "stats.artifact": (self.get_artifact, ArtifactReference),
+            "stats.experiments": (self.list_experiments, NoArguments),
+            "stats.experiment": (self.inspect_experiment, ExperimentReference),
+            "stats.snapshots": (self.list_snapshots, ExperimentReference),
+            "stats.snapshot": (self.inspect_snapshot, SnapshotMetadataReference),
         }
-        handler, allowed = handlers[command]
-        if args.keys() - allowed:
-            raise ValueError("Unknown metadata read arguments.")
+        handler, model = handlers[command]
         args = dict(args)
         if command in ("stats.snapshots", "stats.snapshot"):
             args.setdefault("experiment_id", selected_id)
-        for field in allowed:
-            require_text(args.get(field), field)
-        result = handler(**args)
+        arguments = model.model_validate(args)
+        result = handler(**arguments.model_dump(exclude_unset=True))
         if command == "stats.experiments":
             for item in result["items"]:
                 item["selected"] = item["experiment_id"] == selected_id

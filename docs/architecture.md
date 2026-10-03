@@ -63,6 +63,12 @@ methods. Outcome models check identifiers and state/result consistency before
 response sizing and caching. Runtime retains mode gates, queue ownership,
 identifier retention, priority stop and lifecycle transitions.
 
+Module reads share argument models across run and maintenance modes. Metadata
+reads validate references while retaining snapshot selection defaults and actual
+filesystem checks. Resource-history and event reads validate query structure
+before invoking their owners. Maintenance separates request execution from
+failure mapping and retains serial module mutations and concurrent reads.
+
 Collector snapshots and IPC commands are validated before selecting a journal
 or replacing process targets. Incoming packets are validated before updating
 resource history and freshness. Supervision retains worker ownership, restart

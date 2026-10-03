@@ -1,11 +1,18 @@
 """Arguments of existing controller operations, before their runtime effects."""
 
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.models.server_commands import CommandTarget
-from core.models.values import AbsolutePath, Boolean, PositiveInteger, Text, UUIDText
+from core.models.values import (
+    AbsolutePath,
+    Boolean,
+    NonnegativeInteger,
+    PositiveInteger,
+    Text,
+    UUIDText,
+)
 from core.primitives.json_values import JsonObject, copy_json_object
 
 
@@ -73,6 +80,41 @@ class ArchiveInstall(ArchiveArguments):
     destination: AbsolutePath
 
 
+class ModuleCoordinates(_Arguments):
+    name: Text
+    version: Text
+
+
+class ModuleSource(_Arguments):
+    folder: AbsolutePath
+
+
+class TemplatePathArguments(_Arguments):
+    template_path: AbsolutePath
+
+
+class StateQueryArguments(_Arguments):
+    experiment_id: Text | None = None
+
+
+class ResourceHistoryArguments(_Arguments):
+    after: NonnegativeInteger = 0
+    limit: Annotated[PositiveInteger, Field(le=1000)] = 100
+
+
+class EventReadArguments(ExperimentReference):
+    cursor: JsonObject | None = None
+    limit: Annotated[PositiveInteger, Field(le=1000)] = 100
+
+
+class SnapshotMetadataReference(ExperimentReference):
+    snapshot_id: UUIDText
+
+
+class ArtifactReference(ExperimentReference):
+    artifact_id: Text
+
+
 class ControlInvocation(_Arguments):
     command: Text
     args: JsonObject
@@ -111,3 +153,11 @@ class ControlInvocation(_Arguments):
         if self.command == "run" and "continue" in result:
             result["continue_run"] = result.pop("continue")
         return result
+
+
+class MaintenanceInvocation(ControlInvocation):
+    @model_validator(mode="after")
+    def validate_target(self) -> Self:
+        if self.target is not None:
+            raise ValueError("Maintenance commands do not accept target.")
+        return self

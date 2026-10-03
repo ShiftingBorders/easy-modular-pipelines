@@ -11,9 +11,15 @@ from core.experiments.assembler import ExperimentAssembler
 from core.experiments.reader import ExperimentReader
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
+from core.models.server_arguments import (
+    MaintenanceInvocation,
+    ModuleCoordinates,
+    ModuleSource,
+    StateQueryArguments,
+)
 from core.modules.manager import ModuleManager
 from core.modules.manifest import read_module_manifest
-from core.primitives.json_values import JsonObject, copy_json_object, require_text
+from core.primitives.json_values import JsonObject, copy_json_object
 from core.server.module_reads import _validate_module_read_args
 from core.storage.errors import StorageConflict, StorageError, StoredObjectNotFound
 
@@ -158,67 +164,14 @@ class MaintenanceController:
 
     async def _execute(self, command: JsonObject) -> JsonObject:
         try:
-            args = copy_json_object(command.get("args", {}), "args")
-            name = require_text(command.get("command"), "command")
-            if command.get("target"):
-                raise ValueError("Maintenance commands do not accept target.")
-            if name in (
-                "stats.experiments",
-                "stats.experiment",
-                "stats.snapshots",
-                "stats.snapshot",
-                "stats.artifacts",
-                "stats.artifact",
-            ):
-                data = await asyncio.to_thread(
-                    self._experiment_reader.read, name, args, None
-                )
-            elif name == "stats.modules":
-                _validate_module_read_args(name, args)
-                data = self._manager.list_modules()
-            elif name == "stats.module":
-                _validate_module_read_args(name, args)
-                data = await self._manager.inspect_module(**args)
-            elif name == "stats.template":
-                _validate_module_read_args(name, args)
-                data = await self._assembler.validate_template(
-                    Path(require_text(args["template_path"], "template_path"))
-                )
-            elif name == "stats.state":
-                if args.keys() - {"experiment_id"}:
-                    raise ValueError("Unknown stats.state arguments.")
-                if args.get("experiment_id") is not None:
-                    raise FileNotFoundError("Maintenance has no selected experiment.")
-                data = {
-                    "server_mode": "maintenance",
-                    "experiment_id": None,
-                    "current_command": self._current_command,
-                    "recovery_required": self._recovery_required,
+            invocation = MaintenanceInvocation.model_validate(
+                {
+                    "command": command.get("command"),
+                    "args": command.get("args", {}),
+                    "target": command.get("target", {}),
                 }
-            elif name in ("module.add", "module.validate", "module.remove"):
-                if name != "module.validate" and self._recovery_required:
-                    return self._failure(
-                        command,
-                        "invalid_state",
-                        "Recover and stop unfinished experiments in run mode before changing modules: "
-                        + ", ".join(self._recovery_required),
-                    )
-                data = await self._execute_module_command(command, name, args)
-            else:
-                return self._failure(
-                    command,
-                    "invalid_mode",
-                    "This command is unavailable in maintenance mode. Restart with --mode run.",
-                )
-            return {
-                "command_id": command["command_id"],
-                "chain_id": command.get("chain_id"),
-                "experiment_id": None,
-                "state": "succeeded",
-                "result": "success",
-                "data": data,
-                "error": None,
-            }
+            )
+            return await self._execute_request(command, invocation)
         except Exception as error:  # noqa: BLE001 - Report operation failures through the command protocol.
             code = "operation_failed"
             if isinstance(error, LoggingError):
@@ -242,37 +195,85 @@ class MaintenanceController:
                     error.add_note(f"Logging the failure also failed: {logging_error}")
             return self._failure(command, code, str(error), error)
 
+    async def _execute_request(
+        self, command: JsonObject, invocation: MaintenanceInvocation
+    ) -> JsonObject:
+        name, args = invocation.command, invocation.args
+        if name in (
+            "stats.experiments",
+            "stats.experiment",
+            "stats.snapshots",
+            "stats.snapshot",
+            "stats.artifacts",
+            "stats.artifact",
+        ):
+            data = await asyncio.to_thread(self._experiment_reader.read, name, args, None)
+        elif name in ("stats.modules", "stats.module", "stats.template"):
+            arguments = _validate_module_read_args(name, args)
+            if name == "stats.modules":
+                data = self._manager.list_modules()
+            elif name == "stats.module":
+                data = await self._manager.inspect_module(**arguments.model_dump())
+            else:
+                data = await self._assembler.validate_template(arguments.template_path)
+        elif name == "stats.state":
+            arguments = StateQueryArguments.model_validate(args)
+            if arguments.experiment_id is not None:
+                raise FileNotFoundError("Maintenance has no selected experiment.")
+            data = {
+                "server_mode": "maintenance",
+                "experiment_id": None,
+                "current_command": self._current_command,
+                "recovery_required": self._recovery_required,
+            }
+        elif name in ("module.add", "module.validate", "module.remove"):
+            if name != "module.validate" and self._recovery_required:
+                return self._failure(
+                    command, "invalid_state",
+                    "Recover and stop unfinished experiments in run mode before changing modules: "
+                    + ", ".join(self._recovery_required),
+                )
+            data = await self._execute_module_command(command, name, args)
+        else:
+            return self._failure(
+                command, "invalid_mode",
+                "This command is unavailable in maintenance mode. Restart with --mode run.",
+            )
+        return {
+            "command_id": command["command_id"],
+            "chain_id": command.get("chain_id"),
+            "experiment_id": None,
+            "state": "succeeded",
+            "result": "success",
+            "data": data,
+            "error": None,
+        }
+
     async def _execute_module_command(
         self, command: JsonObject, name: str, args: JsonObject
     ) -> JsonObject:
         self._logger.record_event("module.command_started", {"command": command})
         if name == "module.add":
-            if args.keys() != {"folder"}:
-                raise ValueError("module.add requires only folder.")
+            arguments = ModuleSource.model_validate(args)
             data = await self._manager.register_and_install_module_async(
-                Path(require_text(args["folder"], "folder"))
+                arguments.folder
             )
         elif name == "module.validate" and "folder" in args:
-            if args.keys() != {"folder"}:
-                raise ValueError("Source validation requires only folder.")
+            arguments = ModuleSource.model_validate(args)
             manifest = await asyncio.to_thread(
-                read_module_manifest,
-                Path(require_text(args["folder"], "folder")),
+                read_module_manifest, arguments.folder,
             )
             data = {"scope": "source", "valid": True, "manifest": manifest}
         else:
-            if args.keys() != {"name", "version"}:
-                raise ValueError("Stored module operations require name and version.")
-            module_name = require_text(args["name"], "name")
-            version = require_text(args["version"], "version")
+            arguments = ModuleCoordinates.model_validate(args)
             if name == "module.validate":
                 reference = await self._manager.validate_stored_module_async(
-                    module_name, version
+                    arguments.name, arguments.version
                 )
                 data = {"scope": "stored", "valid": True, "module": reference}
             else:
                 removed = await self._manager.unregister_module_async(
-                    module_name, version
+                    arguments.name, arguments.version
                 )
                 data = {"status": "removed" if removed else "already_absent"}
         self._logger.record_event(
