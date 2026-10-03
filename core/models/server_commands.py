@@ -4,6 +4,7 @@ from typing import Annotated, Literal, Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from core.models.values import (
     NormalizedUUIDText,
@@ -13,6 +14,10 @@ from core.models.values import (
     UUIDText,
 )
 from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
+
+type CommandState = Literal[
+    "pending", "unknown", "unavailable", "succeeded", "failed", "cancelled"
+]
 
 
 class _Document(BaseModel):
@@ -36,7 +41,9 @@ class ServerCommand(_Document):
     command_id: NormalizedUUIDText = Field(default_factory=lambda: str(uuid4()))
     command: Text
     args: JsonObject = Field(default_factory=dict)
-    target: CommandTarget | None = None
+    target: CommandTarget | SkipJsonSchema[None] = Field(
+        default=None, json_schema_extra=lambda schema: schema.pop("default", None)
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -135,7 +142,7 @@ class RuntimeStopped(_Document):
 
 
 class CommandStatus(_Document):
-    state: Literal["pending", "unknown", "unavailable", "succeeded", "failed", "cancelled"]
+    state: CommandState
     result: Literal["success", "fail"] | None
 
     @model_validator(mode="after")

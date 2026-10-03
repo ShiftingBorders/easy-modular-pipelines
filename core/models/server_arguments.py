@@ -4,11 +4,12 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from core.models.server_commands import CommandTarget
+from core.models.server_commands import CommandState, CommandTarget
 from core.models.values import (
     AbsolutePath,
     Boolean,
     NonnegativeInteger,
+    NormalizedUUIDText,
     PositiveInteger,
     Text,
     UUIDText,
@@ -100,6 +101,13 @@ class StateQueryArguments(_Arguments):
 class ResourceHistoryArguments(_Arguments):
     after: NonnegativeInteger = 0
     limit: Annotated[PositiveInteger, Field(le=1000)] = 100
+
+
+class CommandListArguments(_Arguments):
+    limit: Annotated[PositiveInteger, Field(le=1000)] = 100
+    state: CommandState | None = None
+    command: Text | None = None
+    after: NormalizedUUIDText | None = None
 
 
 class EventReadArguments(ExperimentReference):

@@ -38,13 +38,15 @@ def _boolean(value: object, info: ValidationInfo) -> bool:
     return value
 
 
-Text = Annotated[str, BeforeValidator(_text)]
+Text = Annotated[str, BeforeValidator(_text), Field(json_schema_extra={"minLength": 1})]
 Number = Annotated[int | float, BeforeValidator(_number)]
 PositiveNumber = Annotated[Number, Field(gt=0)]
 PositiveInteger = Annotated[int, Field(strict=True, gt=0)]
 NonnegativeInteger = Annotated[int, Field(strict=True, ge=0)]
 SchemaVersionOne = Annotated[int, Field(strict=True, ge=1, le=1)]
 AbsolutePath = Annotated[Path, BeforeValidator(_absolute_path)]
-UUIDText = Annotated[str, BeforeValidator(_uuid_text)]
+UUIDText = Annotated[
+    str, BeforeValidator(_uuid_text), Field(json_schema_extra={"format": "uuid"})
+]
 NormalizedUUIDText = Annotated[UUIDText, AfterValidator(lambda value: str(UUID(value)))]
 Boolean = Annotated[bool, BeforeValidator(_boolean)]

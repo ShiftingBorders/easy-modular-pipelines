@@ -76,6 +76,18 @@ and client wait method remain compatible, while polling consumes checked objects
 The client retains correlation with submitted IDs/order, restart detection,
 shutdown error mapping and the shared chain deadline.
 
+HTTP-only query models decode the bounded journal cursor and shutdown wait value.
+Resource-history and command-list arguments reuse library models; retained cursor
+membership remains a runtime check. Command request-body documentation comes from
+the admission models through the OpenAPI schema hook. The HTTP handlers continue
+to stream bodies with explicit byte/time limits, enforce authentication and
+query rules, and map errors without automatic body-model parsing. Module/template
+and metadata arguments are checked at the independent controller IPC boundary.
+
+Runtime command/chain receipt formation uses the same models as the client;
+public result methods return detached JSON documents. Chain formation retains
+its existing overall JSON-depth guard before checking member envelopes.
+
 Controller queues validate command and chain documents before admission, while
 runtime notifications preserve their metadata contract and live-process guards.
 Service response handling consumes typed observations and separates heartbeat

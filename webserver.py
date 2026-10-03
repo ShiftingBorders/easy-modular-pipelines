@@ -18,8 +18,12 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 
+from core.models.http_queries import EventQuery, ShutdownQuery
+from core.models.server_arguments import ResourceHistoryArguments
+from core.models.server_commands import ServerChain, ServerCommand
 from core.primitives.json_values import JsonObject, copy_json_object
 from core.server.runtime import ServerError, ServerRuntime
 from core.server.settings import ServerSettings, load_server_settings
@@ -150,18 +154,20 @@ async def submit_command(request: Request, wait: str = "false") -> JSONResponse:
     query_fields(
         request, {"wait"} if document.get("command") == "server.shutdown" else set()
     )
-    if wait not in ("true", "false"):
-        raise ServerError("invalid_request", "wait must be true or false.", 400)
+    try:
+        query = ShutdownQuery.model_validate({"wait": wait})
+    except ValueError as error:
+        raise ServerError("invalid_request", "wait must be true or false.", 400) from error
     try:
         result = runtime.submit(document)
     except (TypeError, ValueError, KeyError) as error:
         raise ServerError("invalid_request", str(error), 400) from error
-    if wait == "true" and result["state"] == "pending":
+    if query.wait == "true" and result["state"] == "pending":
         await asyncio.shield(runtime._restart_task)
         result = runtime.result(result["command_id"])
     return JSONResponse(
         result,
-        status_code=200 if wait == "true" else 202,
+        status_code=200 if query.wait == "true" else 202,
         headers={
             "Location": str(
                 request.url_for("command_result", command_id=result["command_id"])
@@ -342,14 +348,16 @@ async def resource_history(
     request: Request, after: int = 0, limit: int = 100
 ) -> JSONResponse:
     query_fields(request, {"after", "limit"})
-    if after < 0 or not 1 <= limit <= 1000:
+    try:
+        arguments = ResourceHistoryArguments.model_validate({"after": after, "limit": limit})
+    except ValueError as error:
         raise ServerError(
             "invalid_request",
             "after must be nonnegative and limit must be 1..1000.",
             400,
-        )
+        ) from error
     return await read_controller(
-        request, "stats.resources.history", {"after": after, "limit": limit}
+        request, "stats.resources.history", arguments.model_dump()
     )
 
 
@@ -358,54 +366,38 @@ async def events(
 ) -> JSONResponse:
     """Read the selected experiment's journal using its original opaque JSON cursor."""
     query_fields(request, {"cursor", "limit"})
-    if not 1 <= limit <= 1000:
-        raise ServerError("invalid_request", "limit must be 1..1000.", 400)
-    checkpoint = None
-    if cursor is not None:
-        if len(cursor) > 4096:
-            raise ServerError("invalid_request", "Journal cursor is too large.", 400)
-        try:
-            checkpoint = copy_json_object(json.loads(cursor), "cursor")
-        except (ValueError, TypeError) as error:
-            raise ServerError("invalid_request", str(error), 400) from error
+    try:
+        arguments = EventQuery.model_validate(
+            {"experiment_id": experiment_id, "cursor": cursor, "limit": limit}
+        )
+    except (ValueError, TypeError) as error:
+        raise ServerError("invalid_request", str(error), 400) from error
     return await read_controller(
         request,
         "logs.read",
-        {"experiment_id": experiment_id, "cursor": checkpoint, "limit": limit},
+        arguments.model_dump(),
     )
 
 
 app = FastAPI(title="Easy Modular Pipelines API", version="1", lifespan=lifespan)
-COMMAND_SCHEMA = {
-    "type": "object",
-    "required": ["command"],
-    "additionalProperties": False,
-    "properties": {
-        "api_version": {"type": "integer", "const": 1, "default": 1},
-        "command_id": {"type": "string", "format": "uuid"},
-        "command": {"type": "string", "minLength": 1},
-        "args": {"type": "object", "additionalProperties": True},
-        "target": {
-            "type": "object",
-            "required": ["kind", "position"],
-            "additionalProperties": False,
-            "properties": {
-                "kind": {"enum": ["stage", "service"]},
-                "position": {"type": "integer", "minimum": 1},
-            },
-        },
-    },
-}
-CHAIN_SCHEMA = {
-    "type": "object",
-    "required": ["commands"],
-    "additionalProperties": False,
-    "properties": {
-        "api_version": {"type": "integer", "const": 1, "default": 1},
-        "chain_id": {"type": "string", "format": "uuid"},
-        "commands": {"type": "array", "minItems": 1, "items": COMMAND_SCHEMA},
-    },
-}
+
+
+def _api_schema() -> JsonObject:
+    """Describe the manually streamed bodies with the actual admission models."""
+    if app.openapi_schema is None:
+        schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+        components = schema.setdefault("components", {}).setdefault("schemas", {})
+        for model in (ServerCommand, ServerChain):
+            document = model.model_json_schema(ref_template="#/components/schemas/{model}")
+            components.update(document.pop("$defs", {}))
+            components[model.__name__] = document
+        app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _api_schema
+COMMAND_SCHEMA = {"$ref": "#/components/schemas/ServerCommand"}
+CHAIN_SCHEMA = {"$ref": "#/components/schemas/ServerChain"}
 app.add_exception_handler(ServerError, server_error)
 app.add_api_route("/api/health", health, methods=["GET"])
 app.add_api_route(

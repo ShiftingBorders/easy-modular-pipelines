@@ -24,6 +24,7 @@ from queue import Empty, Full
 from typing import TYPE_CHECKING, BinaryIO, Self
 from uuid import UUID, uuid4
 
+from core.models.server_arguments import CommandListArguments
 from core.models.server_commands import (
     ControllerOutcome,
     RuntimeReady,
@@ -31,6 +32,7 @@ from core.models.server_commands import (
     ServerChain,
     ServerCommand,
 )
+from core.models.server_receipts import ChainReceipt, CommandReceipt
 from core.primitives.file_lock import _lock_open_stream
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -965,7 +967,7 @@ class ServerRuntime:
     def _receipt(self, identifiers: list[str], chain_id: str | None) -> JsonObject:
         if chain_id is None:
             return self.result(identifiers[0])
-        return copy_json_object(
+        document = copy_json_object(
             {
                 "server_instance_id": self.instance_id,
                 "chain_id": chain_id,
@@ -973,6 +975,7 @@ class ServerRuntime:
             },
             "receipt",
         )
+        return ChainReceipt.model_validate(document).model_dump(exclude_unset=True)
 
     def result(self, command_id: str) -> JsonObject:
         identifier = str(UUID(command_id))
@@ -993,11 +996,11 @@ class ServerRuntime:
             "data": None,
             "error": None,
         }
-        return {
+        return CommandReceipt.model_validate({
             **response,
             "server_instance_id": self.instance_id,
             "submitted_at": record.submitted_at,
-        }
+        }).model_dump(exclude_unset=True)
 
     def list_commands(
         self,
@@ -1007,38 +1010,30 @@ class ServerRuntime:
         state: str | None = None,
         command: str | None = None,
     ) -> JsonObject:
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000.")
-        if state is not None and state not in (
-            "pending",
-            "succeeded",
-            "failed",
-            "cancelled",
-            "unknown",
-            "unavailable",
-        ):
-            raise ValueError("Unknown command state filter.")
-        if command is not None:
-            require_text(command, "command")
+        arguments = CommandListArguments.model_validate(
+            {"limit": limit, "state": state, "command": command, "after": after}
+        )
+        return self._list_commands(arguments)
+
+    def _list_commands(self, arguments: CommandListArguments) -> JsonObject:
         self._prune()
         entries = list(self._records.items())
-        if after is not None:
-            after = str(UUID(after))
+        if arguments.after is not None:
             identifiers = [identifier for identifier, _ in entries]
-            if after not in identifiers:
+            if arguments.after not in identifiers:
                 raise ServerError(
                     "unknown_command",
                     "List cursor is unknown or expired; restart pagination.",
                     404,
                 )
-            entries = entries[identifiers.index(after) + 1 :]
+            entries = entries[identifiers.index(arguments.after) + 1 :]
         items = []
         for identifier, record in entries:
             response = record.response or {}
             current_state = response.get("state", "pending")
-            if state is not None and current_state != state:
+            if arguments.state is not None and current_state != arguments.state:
                 continue
-            if command is not None and record.command != command:
+            if arguments.command is not None and record.command != arguments.command:
                 continue
             items.append(
                 {
@@ -1050,10 +1045,10 @@ class ServerRuntime:
                     "experiment_id": response.get("experiment_id"),
                 }
             )
-            if len(items) > limit:
+            if len(items) > arguments.limit:
                 break
-        has_more = len(items) > limit
-        items = items[:limit]
+        has_more = len(items) > arguments.limit
+        items = items[:arguments.limit]
         return {
             "items": items,
             "has_more": has_more,
