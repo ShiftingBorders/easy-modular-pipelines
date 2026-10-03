@@ -7,9 +7,21 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from core.models.dashboard_alerts import DeliveryChannels
 
-async def deliver(title: str, message: str, channels: dict) -> dict:
-    if not channels.get("desktop") and not channels.get("sound"):
+
+async def deliver(
+    title: str, message: str, channels: dict | DeliveryChannels
+) -> dict:
+    validated = (
+        channels if isinstance(channels, DeliveryChannels)
+        else DeliveryChannels.model_validate(channels)
+    )
+    return await _deliver(title, message, validated)
+
+
+async def _deliver(title: str, message: str, channels: DeliveryChannels) -> dict:
+    if not channels.desktop and not channels.sound:
         return {"status": "disabled"}
     process = None
     try:
@@ -50,7 +62,10 @@ async def deliver(title: str, message: str, channels: dict) -> dict:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
             payload = json.dumps(
-                {"title": title[:100], "message": message[:1000], **channels},
+                {
+                    "title": title[:100], "message": message[:1000],
+                    **channels.model_dump(exclude_unset=True),
+                },
                 ensure_ascii=True,
             ).encode()
             _, error = await asyncio.wait_for(process.communicate(payload), 12)
@@ -61,7 +76,7 @@ async def deliver(title: str, message: str, channels: dict) -> dict:
                 )
         else:
             commands = []
-            if channels.get("desktop"):
+            if channels.desktop:
                 executable = shutil.which("notify-send")
                 if executable is None:
                     raise OSError("notify-send is unavailable on the dashboard host.")
@@ -74,7 +89,7 @@ async def deliver(title: str, message: str, channels: dict) -> dict:
                         message[:1000],
                     ]
                 )
-            if channels.get("sound"):
+            if channels.sound:
                 executable = shutil.which("canberra-gtk-play")
                 if executable is None:
                     raise OSError(

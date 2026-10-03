@@ -77,9 +77,18 @@ class AlertRule(_Document):
         return document
 
 
-class NotificationChannels(_Document):
-    desktop: Boolean
-    sound: Boolean
+class DeliveryChannels(_Document):
+    model_config = ConfigDict(extra="allow")
+
+    desktop: Boolean = False
+    sound: Boolean = False
+
+
+class NotificationChannels(DeliveryChannels):
+    model_config = ConfigDict(extra="forbid")
+
+    desktop: Boolean = Field(...)
+    sound: Boolean = Field(...)
     on_recovery: Boolean
     repeat_seconds: Annotated[int, Field(ge=10, le=86400)]
 

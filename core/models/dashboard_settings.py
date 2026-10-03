@@ -1,12 +1,13 @@
 """Dashboard configuration without filesystem or environment access."""
 
 import re
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from core.models.values import Number, PositiveInteger
+from core.models.values import AbsolutePath, Number, PositiveInteger
 
 
 class DashboardConnectionConfiguration(BaseModel):
@@ -66,7 +67,14 @@ class DashboardConfiguration(DashboardConnectionConfiguration):
 
     @field_validator("host", "state_directory", "project_root")
     @classmethod
-    def validate_nonempty_text(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
+    def validate_nonempty_text(cls, value: str | Path | None) -> str | Path | None:
+        if isinstance(value, str) and not value.strip():
             raise ValueError("Configured hosts and paths must be nonempty.")
         return value
+
+
+class DashboardRuntimeConfiguration(DashboardConfiguration):
+    """The already resolved, native-path configuration used by runtime consumers."""
+
+    state_directory: AbsolutePath
+    project_root: AbsolutePath | None = None

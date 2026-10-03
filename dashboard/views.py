@@ -21,6 +21,7 @@ from core.models.dashboard_resources import (
     CollectorSamples,
     CollectorStatus,
 )
+from core.models.dashboard_settings import DashboardRuntimeConfiguration
 from core.models.dashboard_upstream import LiveState
 from core.models.server_receipts import CommandReceipt
 from core.primitives.json_files import write_json
@@ -61,10 +62,17 @@ def _command_receipt(document: object) -> CommandReceipt:
 
 
 class DashboardViews:
-    def __init__(self, settings: dict, system: SystemAPIClient) -> None:
-        self.settings = settings
+    def __init__(
+        self, settings: dict | DashboardRuntimeConfiguration, system: SystemAPIClient
+    ) -> None:
+        validated = (
+            settings if isinstance(settings, DashboardRuntimeConfiguration)
+            else DashboardRuntimeConfiguration.model_validate(settings)
+        )
+        self.settings = settings if isinstance(settings, dict) else validated.model_dump()
+        self.settings.update(validated.model_dump())
         self.system = system
-        self.journals = LocalJournals(settings)
+        self.journals = LocalJournals(self.settings)
         self._live: dict = {}
         self._live_at = 0.0
         self._live_lock = asyncio.Lock()

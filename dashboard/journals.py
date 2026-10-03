@@ -31,6 +31,7 @@ from core.models.dashboard_queries import (
     KeysetCursor,
     PageLimit,
 )
+from core.models.dashboard_settings import DashboardRuntimeConfiguration
 from core.models.experiment_registry import RegistryEntry
 from core.models.journal_cache import CachePublication, CacheReaderContext, CacheSource
 from core.primitives.json_files import read_json, write_json
@@ -168,16 +169,24 @@ def _timeline_ancestors(
 
 
 class LocalJournals:
-    def __init__(self, settings: dict) -> None:
-        self.settings = settings
-        self.project = settings["project_root"]
-        self.state_directory = settings["state_directory"] / "readers"
-        self.max_events = settings["history_max_events"]
-        self.max_bytes = settings["history_max_bytes"]
-        self.interval = min(settings["refresh_seconds"], 5)
+    def __init__(self, settings: dict | DashboardRuntimeConfiguration) -> None:
+        validated = (
+            settings if isinstance(settings, DashboardRuntimeConfiguration)
+            else DashboardRuntimeConfiguration.model_validate(settings)
+        )
+        self.settings = settings if isinstance(settings, dict) else validated.model_dump()
+        self.settings.update(validated.model_dump())
+        self._configure(validated)
+
+    def _configure(self, settings: DashboardRuntimeConfiguration) -> None:
+        self.project = settings.project_root
+        self.state_directory = settings.state_directory / "readers"
+        self.max_events = settings.history_max_events
+        self.max_bytes = settings.history_max_bytes
+        self.interval = min(settings.refresh_seconds, 5)
         self._cache: dict[str, dict] = {}
         self._snapshots: dict[str, dict] = {}
-        self.window_events = settings.get("history_window_events", 1000)
+        self.window_events = settings.history_window_events
         self._lock = threading.RLock()
         self._experiment_locks: dict[str, threading.RLock] = {}
         self._module_signature: tuple | None = None

@@ -223,6 +223,13 @@ have typed source/statistics records. Cached reader source/context/publication
 models reuse journal contracts and are checked when their signature changes.
 Snapshot reconstruction is separate from read-transaction/signature/window policy.
 
+Runtime dashboard settings use the same validated configuration with resolved
+native paths in views, local journals and worker construction. Existing shared
+settings dictionaries remain shared and receive normalized defaults. Notification
+delivery has a partial-channel facade and consumes a checked channel object in
+its OS operation; complete saved notification configuration retains its required
+fields.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
