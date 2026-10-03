@@ -24,6 +24,7 @@ from queue import Empty, Full
 from typing import TYPE_CHECKING, BinaryIO, Self
 from uuid import UUID, uuid4
 
+from core.models.server_commands import ControllerOutcome, ServerChain, ServerCommand
 from core.primitives.file_lock import _lock_open_stream
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -31,7 +32,7 @@ from core.primitives.json_values import (
     copy_json_object,
     require_text,
 )
-from core.server.settings import DEFAULT_CONFIG, ServerSettings, integer_setting
+from core.server.settings import DEFAULT_CONFIG, ServerSettings
 
 if TYPE_CHECKING:
     from core.experiments.state import RunnerState
@@ -784,55 +785,17 @@ class ServerRuntime:
         return self._requests
 
     def _command(self, value: object, *, chain_id: str | None = None) -> JsonObject:
-        command = copy_json_object(value, "command")
-        if command.keys() - {"api_version", "command_id", "command", "args", "target"}:
-            raise ValueError("Unknown command fields.")
-        version = command.get("api_version", 1)
-        if type(version) is not int or version != 1:
-            raise ValueError("Only api_version 1 is supported.")
-        name = require_text(command.get("command"), "command")
-        if name.startswith("server.") and name not in (
-            "server.restart",
-            "server.mode",
-            "server.shutdown",
-        ):
-            raise ValueError("Unsupported server lifecycle command.")
-        command["api_version"] = 1
-        command["command_id"] = str(
-            UUID(require_text(command.get("command_id", str(uuid4())), "command_id"))
-        )
-        command["args"] = copy_json_object(command.get("args", {}), "args")
-        target = copy_json_object(command.get("target", {}), "target")
-        if name in ("server.restart", "server.mode", "server.shutdown"):
-            self._validate_lifecycle_command(name, command, target, chain_id)
-        if target:
-            if target.keys() != {"kind", "position"} or target["kind"] not in (
-                "stage",
-                "service",
-            ):
-                raise ValueError("target requires kind=stage|service and position.")
-            integer_setting(target, "position")
-            command["target"] = target
-        else:
-            command.pop("target", None)
-        if chain_id is not None:
-            command["chain_id"] = chain_id
-        return command
+        return self._command_document(ServerCommand.model_validate(value), chain_id)
 
-    def _validate_lifecycle_command(
-        self, name: str, command: JsonObject, target: JsonObject, chain_id: str | None
-    ) -> None:
-        if chain_id is not None or target:
-            raise ValueError(
-                "Runtime lifecycle commands do not accept chains or targets."
-            )
-        args = command["args"]
-        if name in ("server.restart", "server.shutdown") and args:
-            raise ValueError(f"{name} does not accept arguments.")
-        if name == "server.mode" and (
-            args.keys() != {"mode"} or args["mode"] not in ("run", "maintenance")
-        ):
-            raise ValueError("server.mode requires mode=run|maintenance.")
+    def _command_document(
+        self, command: ServerCommand, chain_id: str | None
+    ) -> JsonObject:
+        if chain_id is not None and command.command.startswith("server."):
+            raise ValueError("Runtime lifecycle commands do not accept chains or targets.")
+        document = command.model_dump(exclude_none=True)
+        if chain_id is not None:
+            document["chain_id"] = chain_id
+        return document
 
     def submit(self, document: object, *, chain: bool = False) -> JsonObject:
         """Validate and enqueue without awaiting: disconnect cannot split admission."""
@@ -960,22 +923,12 @@ class ServerRuntime:
     ) -> tuple[str | None, list[JsonObject], JsonObject]:
         chain_id = None
         if chain:
-            value = copy_json_object(document, "chain")
-            if value.keys() - {"api_version", "chain_id", "commands"}:
-                raise ValueError("Unknown chain fields.")
-            version = value.get("api_version", 1)
-            if type(version) is not int or version != 1:
-                raise ValueError("Only api_version 1 is supported.")
-            chain_id = str(
-                UUID(require_text(value.get("chain_id", str(uuid4())), "chain_id"))
-            )
-            entries = value.get("commands")
-            if not isinstance(entries, list) or not entries:
-                raise ValueError("commands must be a nonempty array.")
-            commands = [self._command(item, chain_id=chain_id) for item in entries]
-            message = copy_json_object(
-                {"api_version": 1, "chain_id": chain_id, "commands": commands}, "chain"
-            )
+            validated = ServerChain.model_validate(document)
+            chain_id = validated.chain_id
+            commands = [
+                self._command_document(item, chain_id) for item in validated.commands
+            ]
+            message = {"api_version": 1, "chain_id": chain_id, "commands": commands}
         else:
             message = self._command(document)
             commands = [message]
@@ -1188,54 +1141,54 @@ class ServerRuntime:
             kind = response.get("_runtime")
             if self._accept_runtime_response(response, kind):
                 return
-            identifier = str(
-                UUID(require_text(response.get("command_id"), "command_id"))
-            )
-            state = response.get("state")
-            expected = "success" if state == "succeeded" else "fail"
-            if (
-                state not in ("succeeded", "failed", "cancelled")
-                or response.get("result") != expected
-            ):
-                raise ValueError("Invalid controller command outcome.")
-            encoded_size = len(
-                json.dumps(response, ensure_ascii=False, allow_nan=False).encode(
-                    "utf-8"
-                )
-            )
-            if encoded_size > self.settings.max_response_bytes:
-                response = {
-                    "command_id": identifier,
-                    "chain_id": response.get("chain_id"),
-                    "state": "unavailable",
-                    "result": None,
-                    "data": None,
-                    "error": {
-                        "code": "response_too_large",
-                        "message": "Controller response exceeded its configured limit.",
-                        "details": {
-                            "command_state": response.get("state"),
-                            "command_result": response.get("result"),
-                        },
-                    },
-                }
-                encoded_size = len(json.dumps(response).encode("utf-8"))
-            if self._accept_read_response(identifier, response):
-                return
-            record = self._records.get(identifier)
-            if record is not None and (
-                record.response is None or record.response.get("state") == "unknown"
-            ):
-                # A complete queued reply is stronger evidence than an earlier
-                # process-exit observation. Never replace an already known outcome.
-                self._cache_bytes -= record.size
-                record.response = response
-                record.finished_at = time.monotonic()
-                record.size = encoded_size
-                self._cache_bytes += encoded_size
-                self._prune()
+            outcome = ControllerOutcome.model_validate(response)
+            self._accept_command_response(outcome)
         except Exception as error:  # noqa: BLE001 - Do not leave a failed response consumer reporting readiness.
             self._unavailable(f"Invalid controller response: {error}")
+
+    def _accept_command_response(self, outcome: ControllerOutcome) -> None:
+        identifier = str(UUID(outcome.command_id))
+        response, encoded_size = self._bounded_response(outcome, identifier)
+        if self._accept_read_response(identifier, response):
+            return
+        record = self._records.get(identifier)
+        if record is not None and (
+            record.response is None or record.response.get("state") == "unknown"
+        ):
+            # A complete queued reply is stronger evidence than an earlier
+            # process-exit observation. Never replace an already known outcome.
+            self._cache_bytes -= record.size
+            record.response = response
+            record.finished_at = time.monotonic()
+            record.size = encoded_size
+            self._cache_bytes += encoded_size
+            self._prune()
+
+    def _bounded_response(
+        self, outcome: ControllerOutcome, identifier: str
+    ) -> tuple[JsonObject, int]:
+        response = outcome.model_dump(exclude_unset=True)
+        encoded_size = len(
+            json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        )
+        if encoded_size <= self.settings.max_response_bytes:
+            return response, encoded_size
+        response = {
+            "command_id": identifier,
+            "chain_id": response.get("chain_id"),
+            "state": "unavailable",
+            "result": None,
+            "data": None,
+            "error": {
+                "code": "response_too_large",
+                "message": "Controller response exceeded its configured limit.",
+                "details": {
+                    "command_state": outcome.state,
+                    "command_result": outcome.result,
+                },
+            },
+        }
+        return response, len(json.dumps(response).encode("utf-8"))
 
     def _accept_runtime_response(self, response: JsonObject, kind: object) -> bool:
         if kind == "ready":

@@ -1,0 +1,98 @@
+"""Server wire documents; admission, mode and queue ownership stay in runtime."""
+
+from typing import Annotated, Literal, Self
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from core.models.values import (
+    NormalizedUUIDText,
+    PositiveInteger,
+    SchemaVersionOne,
+    Text,
+    UUIDText,
+)
+from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
+
+
+class _Document(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        return copy_json_object(document, "server document")
+
+
+class CommandTarget(_Document):
+    kind: Literal["stage", "service"]
+    position: PositiveInteger
+
+
+class ServerCommand(_Document):
+    api_version: SchemaVersionOne = 1
+    command_id: NormalizedUUIDText = Field(default_factory=lambda: str(uuid4()))
+    command: Text
+    args: JsonObject = Field(default_factory=dict)
+    target: CommandTarget | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        document = copy_json_object(document, "command")
+        if document.keys() - cls.model_fields.keys():
+            raise ValueError("Unknown command fields.")
+        if "target" in document:
+            target = copy_json_object(document["target"], "target")
+            if not target:
+                document.pop("target")
+        return document
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> Self:
+        if not self.command.startswith("server."):
+            return self
+        if self.command not in ("server.restart", "server.mode", "server.shutdown"):
+            raise ValueError("Unsupported server lifecycle command.")
+        if self.target is not None:
+            raise ValueError("Runtime lifecycle commands do not accept chains or targets.")
+        if self.command in ("server.restart", "server.shutdown") and self.args:
+            raise ValueError(f"{self.command} does not accept arguments.")
+        if self.command == "server.mode" and (
+            self.args.keys() != {"mode"} or self.args["mode"] not in ("run", "maintenance")
+        ):
+            raise ValueError("server.mode requires mode=run|maintenance.")
+        return self
+
+
+class ServerChain(_Document):
+    api_version: SchemaVersionOne = 1
+    chain_id: NormalizedUUIDText = Field(default_factory=lambda: str(uuid4()))
+    commands: Annotated[list[ServerCommand], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def exclude_lifecycle(self) -> Self:
+        if any(command.command.startswith("server.") for command in self.commands):
+            raise ValueError("Runtime lifecycle commands do not accept chains or targets.")
+        return self
+
+
+class ControllerOutcome(_Document):
+    """Optional payload fields retain the existing partial-outcome contract."""
+
+    model_config = ConfigDict(extra="allow")
+
+    command_id: UUIDText
+    state: Literal["succeeded", "failed", "cancelled"]
+    result: Literal["success", "fail"]
+    data: JsonValue = None
+    error: JsonValue = None
+
+    @model_validator(mode="after")
+    def match_result(self) -> Self:
+        expected = "success" if self.state == "succeeded" else "fail"
+        if self.result != expected:
+            raise ValueError("Invalid controller command outcome.")
+        return self

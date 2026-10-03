@@ -57,6 +57,12 @@ or reconciling service work. Service exports validate their relative path before
 the owner checks actual filesystem confinement. Conditional result models check
 decision structure; the runner retains current DAG membership and payload policy.
 
+Server command, chain and target models normalize admission payloads. Controller
+argument models check supported control operations before invoking public runner
+methods. Outcome models check identifiers and state/result consistency before
+response sizing and caching. Runtime retains mode gates, queue ownership,
+identifier retention, priority stop and lifecycle transitions.
+
 Collector snapshots and IPC commands are validated before selecting a journal
 or replacing process targets. Incoming packets are validated before updating
 resource history and freshness. Supervision retains worker ownership, restart

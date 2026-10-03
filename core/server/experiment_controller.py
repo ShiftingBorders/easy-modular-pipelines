@@ -14,6 +14,21 @@ from core.experiments.assembler import ExperimentAssembler
 from core.experiments.reader import ExperimentReader
 from core.experiments.runner import ExperimentRunner
 from core.journal.events import LoggingError
+from core.models.server_arguments import (
+    ArchiveArguments,
+    ArchiveInstall,
+    ArchiveSelection,
+    ControlInvocation,
+    ExperimentReference,
+    NoArguments,
+    PositionArguments,
+    RerunArguments,
+    ResetRetriesArguments,
+    RunArguments,
+    SnapshotArguments,
+    SnapshotReference,
+    TemplateArguments,
+)
 from core.modules.manager import ModuleManager
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 from core.primitives.paths import repository_root
@@ -327,61 +342,43 @@ class ExperimentController:
     async def _execute_control_command(
         self, name: str, args: JsonObject, command: JsonObject
     ) -> JsonObject | None:
-        target = copy_json_object(command.get("target", {}), "target")
-        if name in ("service.start", "service.stop") and (not target or args):
-            raise ValueError(
-                "Service control requires a service target and empty args."
-            )
-        if target:
-            if target.keys() != {"kind", "position"} or target["kind"] not in (
-                "stage",
-                "service",
-            ):
-                raise ValueError("target requires kind and position.")
-            if type(target["position"]) is not int or target["position"] < 1:
-                raise ValueError("target.position must be a positive integer.")
-            if name in ("retry", "service.start", "service.stop"):
-                if target["kind"] != "service":
-                    raise ValueError(f"{name} targets a service.")
-                args["position"] = target["position"]
-            elif name in ("replace", "reset_retries"):
-                args.update(target)
-            else:
-                raise ValueError("This command does not accept target.")
-        if name == "run" and "continue" in args:
-            args["continue_run"] = args.pop("continue")
-        for field in ("template_path", "archive_path", "destination"):
-            if field in args and args[field] is not None:
-                args[field] = Path(require_text(args[field], field))
+        invocation = ControlInvocation.model_validate(
+            {"command": name, "args": args, "target": command.get("target", {})}
+        )
+        args = invocation.arguments()
         handlers = {
-            "run": self._runner.run,
-            "pause": self._runner.pause,
-            "resume": self._runner.resume,
-            "stop": self._runner.stop,
-            "step": self._runner.step,
-            "rerun": self._runner.rerun,
-            "retry": self._runner.retry,
-            "service.start": self._runner.start_service,
-            "service.stop": self._runner.stop_service,
-            "move": self._runner.move,
-            "reset_retries": self._runner.reset_retries,
-            "replace": self._runner.replace,
-            "reload_template": self._runner.reload_template,
-            "snapshot": self._runner.snapshot,
-            "rollback": self._runner.rollback,
-            "recover": self._runner.recover,
-            "archive.create": self._runner.create_archive,
-            "archive.inspect": self._runner.inspect_archive,
-            "archive.install": self._runner.install_archive,
+            "run": (self._runner.run, RunArguments),
+            "pause": (self._runner.pause, NoArguments),
+            "resume": (self._runner.resume, NoArguments),
+            "stop": (self._runner.stop, NoArguments),
+            "step": (self._runner.step, NoArguments),
+            "rerun": (self._runner.rerun, RerunArguments),
+            "retry": (self._runner.retry, PositionArguments),
+            "service.start": (self._runner.start_service, PositionArguments),
+            "service.stop": (self._runner.stop_service, PositionArguments),
+            "move": (self._runner.move, PositionArguments),
+            "reset_retries": (self._runner.reset_retries, ResetRetriesArguments),
+            "replace": (self._runner.replace, None),
+            "reload_template": (self._runner.reload_template, TemplateArguments),
+            "snapshot": (self._runner.snapshot, SnapshotArguments),
+            "rollback": (self._runner.rollback, SnapshotReference),
+            "recover": (self._runner.recover, ExperimentReference),
+            "archive.create": (self._runner.create_archive, ArchiveSelection),
+            "archive.inspect": (self._runner.inspect_archive, ArchiveArguments),
+            "archive.install": (self._runner.install_archive, ArchiveInstall),
         }
         if name not in handlers:
             raise NotImplementedError(f"Unsupported command: {name}")
+        handler, model = handlers[name]
+        # Replacement is currently unsupported and has no effect to validate.
+        if model is not None:
+            args = model.model_validate(args).model_dump(exclude_unset=True)
         self._runner._command_context = {
             "command_id": command["command_id"],
             "command_chain_id": command.get("chain_id"),
         }
         try:
-            data = handlers[name](**args)
+            data = handler(**args)
             if isinstance(data, Coroutine):
                 data = await data
         finally:
