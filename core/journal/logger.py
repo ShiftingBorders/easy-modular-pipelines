@@ -13,7 +13,7 @@ import time
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from types import TracebackType
 from typing import Self
 from uuid import uuid4
@@ -671,40 +671,22 @@ class OperationLogger:
         context: JsonObject | None = None,
     ) -> str:
         """Return artifact_id; register metadata without accessing or accepting the file."""
-        require_text(path, "artifact path")
-        require_text(purpose, "purpose")
-        windows_path = PureWindowsPath(path)
-        relative_path = PurePosixPath(path.replace("\\", "/"))
-        if (
-            windows_path.drive
-            or windows_path.root
-            or relative_path.is_absolute()
-            or ".." in relative_path.parts
-            or not relative_path.parts
-            or ":" in path
-        ):
-            raise ValueError(
-                "Artifact path must stay relative to its attempt directory."
-            )
-        if size_bytes is not None and (type(size_bytes) is not int or size_bytes < 0):
-            raise ValueError("size_bytes must be a nonnegative integer or None.")
-        for name, value in (
-            ("artifact_id", artifact_id),
-            ("content_hash", content_hash),
-        ):
-            if value is not None:
-                require_text(value, name)
+        from core.models.artifacts import ArtifactRegistration
+
+        parameters = ArtifactRegistration.model_validate({
+            "artifact_id": artifact_id,
+            "path": path,
+            "purpose": purpose,
+            "size_bytes": size_bytes,
+            "content_hash": content_hash,
+        })
+        artifact = parameters.model_dump()
         if artifact_id is None:
             artifact_id = uuid4().hex
+            artifact["artifact_id"] = artifact_id
         self._record(
             "artifact.recorded",
-            {
-                "artifact_id": artifact_id,
-                "path": str(relative_path),
-                "purpose": purpose,
-                "size_bytes": size_bytes,
-                "content_hash": content_hash,
-            },
+            artifact,
             operation,
             context,
         )

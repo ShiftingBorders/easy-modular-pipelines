@@ -235,6 +235,11 @@ models. These preserve sparse legacy documents and opaque fields while checking
 the inspection contract. Location/identity checks remain with the reader;
 inspection does not run restoration or traverse the snapshot inventory.
 
+Artifact registration and historical lookup share lexical relative-path rules.
+Dedicated models validate metadata and the merged context required for lookup.
+Registration performs no filesystem access; the reader resolves confinement and
+checks the actual file using a validated location.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

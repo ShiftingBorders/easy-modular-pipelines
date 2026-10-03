@@ -2,10 +2,11 @@
 
 from collections.abc import Iterator
 from contextlib import closing
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from uuid import UUID
 
 from core.journal.storage import SQLiteEventStore
+from core.models.artifacts import ArtifactLocation
 from core.models.experiment_registry import RegistryEntry
 from core.models.runner_state import SavedStateMetadata
 from core.models.server_arguments import (
@@ -184,30 +185,21 @@ class ExperimentReader:
     def _artifact_path(
         self, directory: Path, event: JsonObject, context: JsonObject
     ) -> Path:
-        for name in ("cycle_number", "attempt_number"):
-            if type(context.get(name)) is not int or context[name] < 1:
-                raise ValueError(f"Artifact context lacks a valid {name}.")
-        for name in ("attempt_id", "module_name", "stage_id"):
-            component = require_text(context.get(name), name)
-            if component in (".", "..") or any(c in component for c in '/\\:*?"<>|'):
-                raise ValueError(f"Invalid artifact context: {name}.")
+        location = ArtifactLocation.model_validate(
+            {"context": context, "path": event["data"].get("path")}
+        )
+        return self._resolve_artifact_path(directory, location)
+
+    def _resolve_artifact_path(
+        self, directory: Path, location: ArtifactLocation
+    ) -> Path:
+        context = location.context
         attempt = self._path(
             directory,
-            f"shared_artifacts/epoch_{context['cycle_number']}/{context['module_name']}/"
-            f"{context['stage_id']}/attempt_{context['attempt_number']}",
+            f"shared_artifacts/epoch_{context.cycle_number}/{context.module_name}/"
+            f"{context.stage_id}/attempt_{context.attempt_number}",
         )
-        relative = require_text(event["data"].get("path"), "artifact path")
-        windows = PureWindowsPath(relative)
-        posix = PurePosixPath(relative.replace("\\", "/"))
-        if (
-            windows.drive
-            or windows.root
-            or posix.is_absolute()
-            or ".." in posix.parts
-            or ":" in relative
-        ):
-            raise ValueError("Artifact path must remain inside its attempt directory.")
-        path = self._path(attempt, posix.as_posix())
+        path = self._path(attempt, location.path)
         if not path.is_file():
             raise FileNotFoundError("Recorded artifact file is unavailable.")
         return path
