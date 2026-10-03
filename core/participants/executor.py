@@ -13,10 +13,11 @@ from pathlib import Path
 
 from core.journal.logger import OperationLogger
 from core.journal.streams import capture_stream
-from core.participants.protocol import participant_identity
+from core.models.participant_launch import StageLaunch
+from core.models.participant_protocol import ModuleProgress, StageResult
 from core.participants.server import ParticipantServer
 from core.primitives.json_files import read_json, write_json
-from core.primitives.json_values import JsonObject, copy_json_object, require_number
+from core.primitives.json_values import JsonObject, copy_json_object
 from core.primitives.processes import module_process_arguments, process_identity
 
 
@@ -38,22 +39,24 @@ class StageExecutor:
         self._finished = False
 
     async def run(self) -> None:
-        self._launch = read_json(self._launch_path)
-        self._context = self._launch["context"]
-        self._identity = participant_identity(self._context)
+        launch = StageLaunch.model_validate(read_json(self._launch_path))
+        await self._run(launch)
+
+    async def _run(self, launch: StageLaunch) -> None:
+        self._launch = launch
+        self._context = launch.context.model_dump()
         self._directory = self._launch_path.parent
-        self._logger = OperationLogger(Path(self._launch["executor_logging_config"]))
-        self._logger.open()
+        self._logger = OperationLogger(launch.executor_logging_config)
         self._server = ParticipantServer(
-            Path(self._launch["endpoint_path"]),
+            launch.endpoint_path,
             self._context,
             self._logger,
             self._handle_request,
             module_handler=self._handle_module,
             describe=self._describe,
-            control_timeout_seconds=self._launch["control_timeout_seconds"],
+            control_timeout_seconds=launch.control_timeout_seconds,
         )
-        completed = started = stopped = None
+        self._logger.open()
         try:
             await self._server.start()
             write_json(
@@ -65,23 +68,34 @@ class StageExecutor:
                     "started_at": None,
                 },
             )
-            completed = asyncio.create_task(
-                self._server.wait_completed(self._context["request_id"])
-            )
-            started = asyncio.create_task(self._started.wait())
-            stopped = asyncio.create_task(self._stop_requested.wait())
+            await self._wait_for_call(launch)
+        finally:
+            try:
+                await self._interrupt("executor_closed")
+            finally:
+                try:
+                    await self._server.close()
+                finally:
+                    self._logger.close()
+
+    async def _wait_for_call(self, launch: StageLaunch) -> None:
+        request_id = launch.context.request_id
+        completed = asyncio.create_task(self._server.wait_completed(request_id))
+        started = asyncio.create_task(self._started.wait())
+        stopped = asyncio.create_task(self._stop_requested.wait())
+        try:
             done, _ = await asyncio.wait(
                 (completed, started, stopped),
-                timeout=self._launch["control_timeout_seconds"],
+                timeout=launch.control_timeout_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if (
                 not done
                 or stopped in done
-                and not self._server.has_call(self._context["request_id"])
+                and not self._server.has_call(request_id)
             ):
                 self._logger.record_command_result(
-                    self._context["request_id"],
+                    request_id,
                     {
                         "result": "fail",
                         "data": {"reason": self._reason or "execute_not_received"},
@@ -94,17 +108,11 @@ class StageExecutor:
             await completed
         finally:
             for task in (completed, started, stopped):
-                if task is not None:
-                    task.cancel()
+                task.cancel()
             await asyncio.gather(
-                *(task for task in (completed, started, stopped) if task is not None),
+                completed, started, stopped,
                 return_exceptions=True,
             )
-            try:
-                await self._interrupt("executor_closed")
-            finally:
-                await self._server.close()
-                self._logger.close()
 
     def _describe(self) -> JsonObject:
         return {
@@ -125,9 +133,9 @@ class StageExecutor:
                 "data": {"cancel_requested": self._reason is not None},
             }
         if command == "report_progress":
-            if require_number(data["value"], "progress") > 1:
-                raise ValueError("Progress exceeds 1.")
-            self._progress = copy_json_object(data, "progress")
+            self._progress = ModuleProgress.model_validate(data).model_dump(
+                exclude_unset=True
+            )
         elif command == "report_state":
             self._module_state = copy_json_object(data, "module state")
         else:
@@ -156,7 +164,7 @@ class StageExecutor:
         if self._started.is_set():
             raise RuntimeError("This executor already started its assigned call.")
         if json.dumps(request["args"], sort_keys=True) != json.dumps(
-            self._launch["call"], sort_keys=True
+            self._launch.call.model_dump(mode="json", exclude_unset=True), sort_keys=True
         ):
             raise ValueError("Execute arguments differ from the fixed attempt context.")
         self._started.set()
@@ -189,14 +197,9 @@ class StageExecutor:
             except TimeoutError:
                 await self._interrupt("timeout")
                 await streams
-            response = copy_json_object(
-                json.loads(output.decode("utf-8")), "stage stdout"
-            )
-            if response.keys() != {"result", "data"} or response["result"] not in (
-                "success",
-                "fail",
-            ):
-                raise ValueError("Stage stdout requires exactly result and data.")
+            response = StageResult.model_validate(
+                json.loads(output.decode("utf-8"))
+            ).model_dump(exclude_unset=True)
         except asyncio.CancelledError:
             await self._interrupt("interrupted")
         except Exception as failure:  # noqa: BLE001 - Every execution failure becomes a durable failed call.
@@ -226,11 +229,11 @@ class StageExecutor:
         return {**response, "execution": execution}
 
     async def _start_process(self) -> None:
-        argv, environment = module_process_arguments(self._launch["argv"])
+        argv, environment = module_process_arguments(self._launch.argv)
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 *argv,
-                cwd=self._launch["code_directory"],
+                cwd=self._launch.code_directory,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -271,9 +274,9 @@ class StageExecutor:
             if self._process is None or self._process.returncode is not None:
                 return
             self._reason = self._reason or reason
-            timeout = self._launch["stop_timeout_seconds"]
+            timeout = self._launch.stop_timeout_seconds
             deadline = time.monotonic() + timeout
-            margin = self._launch["runner_timeout_margin_seconds"]
+            margin = self._launch.runner_timeout_margin_seconds
             if self._server.has_module_client():
                 try:
                     async with asyncio.timeout(min(timeout, margin)):

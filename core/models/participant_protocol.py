@@ -14,7 +14,7 @@ from pydantic import (
 
 from core.models.participant_identity import ParticipantIdentity
 from core.models.process_identity import ProcessIdentity
-from core.models.values import Text, UUIDText
+from core.models.values import Number, Text, UUIDText
 from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
 
 ProtocolVersion = Annotated[int, Field(strict=True, ge=2, le=2)]
@@ -69,6 +69,34 @@ class ResultEnvelope(ParticipantResult):
     protocol_version: JsonValue = None
     message_type: JsonValue = None
     request_id: JsonValue = None
+
+
+class StageResult(ParticipantResult):
+    """Stdout contains only the application result, without transport metadata."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        document = copy_json_object(document, "stage stdout")
+        if document.keys() != {"result", "data"} or document["result"] not in (
+            "success", "fail"
+        ):
+            raise ValueError("Stage stdout requires exactly result and data.")
+        return document
+
+
+class ModuleProgress(BaseModel):
+    model_config = ConfigDict(
+        extra="allow", strict=True, frozen=True, hide_input_in_errors=True
+    )
+
+    value: Annotated[Number, Field(le=1)]
+    message: Text | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        return copy_json_object(document, "module progress")
 
 
 class ParticipantResponse(ParticipantResult):

@@ -11,15 +11,14 @@ from typing import Self
 from uuid import uuid4
 
 from core.journal.logger import OperationLogger
+from core.models.participant_launch import ModuleContext
+from core.models.participant_protocol import ModuleProgress, StageResult
 from core.participants.connection import ParticipantConnection
-from core.participants.protocol import PROTOCOL_VERSION
 from core.primitives.json_files import read_json
 from core.primitives.json_values import (
     JsonObject,
     JsonValue,
     copy_json_object,
-    require_number,
-    require_text,
 )
 
 
@@ -47,20 +46,16 @@ class StageClient:
     def open(self) -> None:
         if self._thread is not None:
             raise RuntimeError("StageClient is already open.")
-        context = read_json(self._context_path)
-        if (
-            type(context.get("protocol_version")) is not int
-            or context["protocol_version"] != PROTOCOL_VERSION
-        ):
-            raise ValueError("Unsupported module context protocol.")
-        self.context = context
-        self.input_data = context["input_data"]
-        self.settings = copy_json_object(context["settings"], "settings")
-        self._timeout = float(
-            require_number(context["control_timeout_seconds"], "control timeout")
-        )
-        if require_number(self._timeout, "control timeout") <= 0:
-            raise ValueError("control timeout must be positive.")
+        document = read_json(self._context_path)
+        context = ModuleContext.model_validate(document)
+        self.context = document
+        self._open(context)
+
+    def _open(self, context: ModuleContext) -> None:
+        self._runtime_context = context
+        self.input_data = context.input_data
+        self.settings = context.settings
+        self._timeout = float(context.control_timeout_seconds)
         self._ready.clear()
         self._cancelled.clear()
         self._error = None
@@ -90,9 +85,10 @@ class StageClient:
     async def _serve(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
-        self._logger = OperationLogger(Path(self.context["logging_config_path"]))
+        context = self._runtime_context
+        self._logger = OperationLogger(context.logging_config_path)
         self._connection = ParticipantConnection(
-            Path(self.context["endpoint_path"]), self.context["context"], role="module"
+            context.endpoint_path, context.context.model_dump(), role="module"
         )
         try:
             self._logger.open()
@@ -148,11 +144,8 @@ class StageClient:
             raise
 
     def report_progress(self, value: float, message: str | None = None) -> None:
-        if require_number(value, "progress") > 1:
-            raise ValueError("progress must be between 0 and 1.")
-        if message is not None:
-            require_text(message, "progress message")
-        self._report("report_progress", {"value": value, "message": message})
+        progress = ModuleProgress.model_validate({"value": value, "message": message})
+        self._report("report_progress", progress.model_dump())
 
     def report_state(self, data: JsonObject) -> None:
         self._report("report_state", copy_json_object(data, "module state"))
@@ -163,7 +156,9 @@ class StageClient:
 
     def _finish(self, result: str, data: JsonValue) -> None:
         self._check_open()
-        response = copy_json_object({"result": result, "data": data}, "stage result")
+        response = StageResult.model_validate(
+            {"result": result, "data": data}
+        ).model_dump(exclude_unset=True)
         encoded = json.dumps(response, ensure_ascii=True, allow_nan=False)
         with self._result_lock:
             if self._result_written:

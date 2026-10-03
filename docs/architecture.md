@@ -46,6 +46,12 @@ endpoints and replies; public protocol helpers and application handlers retain
 their JSON contracts. Authentication, live OS identity, request correlation,
 deadlines, and work ownership remain with the participant runtime.
 
+Module preparation validates caller identity and input before writing runtime
+files. StageClient validates its context before starting its communication thread;
+the executor validates its fixed launch document before opening its journal or
+endpoint. Shared models describe progress limits and the exact stdout result
+shape. Application settings and result data remain opaque JSON.
+
 The low-level `SQLiteEventStore` constructor validates scalar arguments with
 standard-library rules and performs no file I/O. File-based journal settings
 use Pydantic after their explicit read, reusing those same opening rules.

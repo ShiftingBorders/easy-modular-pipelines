@@ -15,6 +15,7 @@ from core.models.experiment_template import (
     StageDefinition,
 )
 from core.models.module_manifest import ModuleManifest
+from core.models.participant_launch import ModulePreparation
 from core.participants.protocol import PROTOCOL_VERSION
 from core.primitives.json_files import write_json
 from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
@@ -40,15 +41,20 @@ class ModuleLauncher:
         validated = LaunchInput.validate_python(
             copy_json_object(definition, "module definition")
         )
-        return self._prepare(state, validated, context, artifacts_directory, input_data)
+        inputs = ModulePreparation.model_validate(
+            {
+                "context": context,
+                "artifacts_directory": artifacts_directory,
+                "input_data": input_data,
+            }
+        )
+        return self._prepare(state, validated, inputs)
 
     def _prepare(
         self,
         state: RunnerState,
         definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
-        context: JsonObject,
-        artifacts_directory: Path,
-        input_data: JsonValue,
+        inputs: ModulePreparation,
     ) -> JsonObject:
         reference = self._assembler._module_reference(state.template, definition)
         module = self._assembler._check_module(
@@ -73,15 +79,13 @@ class ModuleLauncher:
         )
         runtime_context, executor_config = self._prepare_context(
             state,
-            context,
+            inputs,
             module,
             service_call,
             owner_id,
-            artifacts_directory,
             settings,
-            input_data,
         )
-        context_path = artifacts_directory / "context.json"
+        context_path = inputs.artifacts_directory / "context.json"
         write_json(context_path, runtime_context)
         return _launch_document(
             state, module, definition, runtime_context, executor_config, context_path
@@ -90,24 +94,22 @@ class ModuleLauncher:
     def _prepare_context(
         self,
         state: RunnerState,
-        context: JsonObject,
+        inputs: ModulePreparation,
         module: ModuleManifest,
         service_call: bool,
         owner_id: str,
-        artifacts_directory: Path,
         settings: JsonObject,
-        input_data: JsonValue,
     ) -> tuple[JsonObject, Path | None]:
-        artifacts_directory.mkdir(parents=True, exist_ok=False)
+        inputs.artifacts_directory.mkdir(parents=True, exist_ok=False)
         module_data = state.experiment_directory / "module_data" / owner_id
         module_data.mkdir(parents=True, exist_ok=True)
         logging_config, executor_config = self._prepare_logging_configs(
-            state, context, module, service_call
+            state, inputs.context.model_dump(), module, service_call
         )
         endpoint_path = (
             state.experiment_directory / "runner/endpoints" / f"{owner_id}.json"
             if module.role == "service"
-            else artifacts_directory / "executor.lock.json"
+            else inputs.artifacts_directory / "executor.lock.json"
         )
         return {
             "protocol_version": PROTOCOL_VERSION,
@@ -117,7 +119,7 @@ class ModuleLauncher:
             ),
             "settings_directory": str(state.experiment_directory / "shared_settings"),
             "module_data_directory": str(module_data),
-            "artifacts_directory": str(artifacts_directory),
+            "artifacts_directory": str(inputs.artifacts_directory),
             "logging_config_path": None
             if logging_config is None
             else str(logging_config),
@@ -125,9 +127,9 @@ class ModuleLauncher:
             "control_timeout_seconds": state.template["unknown_state"][
                 "timeout_seconds"
             ],
-            "context": context,
+            "context": inputs.context.model_dump(),
             "settings": settings,
-            "input_data": input_data,
+            "input_data": inputs.input_data,
         }, executor_config
 
     def _prepare_logging_configs(
