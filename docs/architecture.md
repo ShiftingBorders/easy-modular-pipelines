@@ -98,6 +98,13 @@ file readers retain duplicate/reference checks and compare actual checksums,
 counts and database identities. Diagnostic event wrappers are validated apart
 from the enclosed event so they retain the event's JSON-depth allowance.
 
+Diagnostic operation-tree selection, observer facts, dependency closure and
+bundle preparation live in `journal.diagnostics`. Restoration prepares encoded
+diagnostic inputs before its write transaction; command-state merge is separate
+from indexed persistence. SQLiteEventStore retains connection/lock ownership,
+BEGIN/COMMIT/ROLLBACK, actual file identity and failure handling for both fresh
+and idempotent restoration.
+
 Private operations that validate or prepare explicit inputs live beside their
 owner in focused modules. The owning classes retain state changes, transactions,
 process ownership, cancellation, and recovery decisions. Helpers do not receive

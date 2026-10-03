@@ -15,14 +15,20 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from core.journal.diagnostics import (
+    _add_diagnostic_observer_events,
     _close_preserving_failure,
     _content_digest,
     _decode_author_observation,
+    _diagnostic_dependencies,
+    _diagnostic_manifest,
+    _diagnostic_operation_events,
+    _merge_diagnostic_command,
+    _prepare_diagnostic_events,
     _publish_manifest,
     _save_command_state,
     _validate_diagnostic_command,
     _validate_restore_input,
-    _write_diagnostic_record,
+    _write_diagnostic_records,
 )
 from core.journal.events import (
     SCHEMA_VERSION,
@@ -1278,136 +1284,24 @@ class SQLiteEventStore:
                 ):
                     raise LoggingStorageError("Diagnostic source changed.")
                 self._validate_snapshot_source(reader)
-                metadata = {}
-                starts = {}
-                for row in reader.execute("SELECT * FROM events ORDER BY cursor"):
-                    event = self._decode_row(row)["event"]
-                    operation_id = event["operation_id"]
-                    parent = event["context"].get("parent_operation_id")
-                    metadata[event["event_id"]] = (operation_id, parent)
-                    if event["event_type"] == "operation.started":
-                        starts[operation_id] = event["event_id"]
-                known = {op for op, _ in metadata.values() if op is not None}
-                if not set(roots) <= known:
-                    raise LoggingStateError(
-                        "Some selected operations are absent from this journal."
-                    )
-                selected_operations = set(roots)
-                while True:
-                    children = {
-                        op
-                        for op, parent in metadata.values()
-                        if op is not None and parent in selected_operations
-                    }
-                    if children <= selected_operations:
-                        break
-                    selected_operations.update(children)
-                selected = {
-                    event_id
-                    for event_id, (op, parent) in metadata.items()
-                    if op in selected_operations or parent in selected_operations
-                }
-                # A matching reply can exist only in observer metadata. Its raw
-                # event may belong to the other participant, outside this tree.
-                for (request_id,) in reader.execute(
-                    "SELECT request_id FROM command_results"
-                ):
-                    state = self._load_command_result(request_id, connection=reader)
-                    for author in ("runner", "participant"):
-                        entry = state[author]
-                        if entry is None:
-                            continue
-                        observation = entry["observation"]
-                        if (
-                            observation["operation_id"] in selected_operations
-                            or observation["context"].get("parent_operation_id")
-                            in selected_operations
-                        ):
-                            selected.add(entry["event_id"])
-                pending = list(selected)
-                requests = {}
-                while pending:
-                    event_id = pending.pop()
-                    event = self._event_entry(event_id, reader)["event"]
-                    dependencies = []
-                    if event["operation_id"] in starts:
-                        dependencies.append(starts[event["operation_id"]])
-                    parent = event["context"].get("parent_operation_id")
-                    if parent in starts:
-                        dependencies.append(starts[parent])
-                    if event["event_type"] in (
-                        "control.intent",
-                        "control.observed",
-                        "control.reconciled",
-                    ):
-                        for field in ("intent_event_id", "parameters_event_id"):
-                            reference = event["data"].get(field)
-                            if reference is not None:
-                                dependencies.append(require_text(reference, field))
-                    if event["event_type"] == "command.result":
-                        request_id = event["data"]["request_id"]
-                        state = self._load_command_result(request_id, connection=reader)
-                        requests[request_id] = state
-                        dependencies.extend(
-                            state[author]["event_id"]
-                            for author in ("runner", "participant")
-                            if state[author] is not None
-                        )
-                    for reference in dependencies:
-                        if reference not in metadata:
-                            raise LoggingStorageError(
-                                "Diagnostic dependency is missing."
-                            )
-                        if reference not in selected:
-                            selected.add(reference)
-                            pending.append(reference)
+                read_event = lambda event_id: self._event_entry(event_id, reader)
+                read_result = lambda request_id: self._load_command_result(request_id, connection=reader)
+                metadata, starts, selected_operations, selected = _diagnostic_operation_events(
+                    reader, roots, self._decode_row
+                )
+                _add_diagnostic_observer_events(reader, selected_operations, selected, read_result)
+                requests = _diagnostic_dependencies(metadata, starts, selected, read_event, read_result)
                 source_phase = False
                 target.mkdir()
-                digest = hashlib.sha256()
-                with (target / "records.jsonl.part").open("xb") as output:
-                    for event_id in metadata:
-                        if event_id not in selected:
-                            continue
-                        record = {
-                            "kind": "event",
-                            "event": self._event_entry(event_id, reader)["event"],
-                        }
-                        _write_diagnostic_record(output, digest, record)
-                    for request_id, state in requests.items():
-                        record = {
-                            "kind": "command",
-                            "request_id": request_id,
-                            "identity": state["identity"],
-                            "runner": None,
-                            "participant": None,
-                        }
-                        for author in ("runner", "participant"):
-                            if state[author] is not None:
-                                record[author] = {
-                                    field: state[author][field]
-                                    for field in ("event_id", "observation")
-                                }
-                        _write_diagnostic_record(output, digest, record)
-                    output.flush()
-                    os.fsync(output.fileno())
+                records_sha256 = _write_diagnostic_records(
+                    target, metadata, selected, requests, read_event
+                )
                 reader.execute("ROLLBACK")
                 source_phase = True
                 self._check_health()
-                manifest = {
-                    "schema_version": SCHEMA_VERSION,
-                    "kind": "journal.diagnostics",
-                    "diagnostics_id": uuid4().hex,
-                    "journal_id": boundary["journal_id"],
-                    "generation": boundary["generation"],
-                    "operation_ids": roots,
-                    "cursor": boundary["cursor"],
-                    "change_cursor": boundary["change_cursor"],
-                    "created_at": datetime.now(UTC).isoformat(timespec="microseconds"),
-                    "records": "records.jsonl",
-                    "records_sha256": digest.hexdigest(),
-                    "event_count": len(selected),
-                    "command_count": len(requests),
-                }
+                manifest = _diagnostic_manifest(
+                    roots, boundary, records_sha256, len(selected), len(requests)
+                )
                 source_phase = False
                 (target / "records.jsonl.part").rename(target / "records.jsonl")
                 _publish_manifest(target, manifest)
@@ -1512,19 +1406,8 @@ class SQLiteEventStore:
                 raise LoggingStateError(
                     "Close the journal before completing restoration."
                 )
-            bundle, events, commands = None, [], []
-            if diagnostics is not None:
-                bundle, events, commands = self._read_diagnostics(diagnostics)
-                if bundle["journal_id"] != identity["journal_id"]:
-                    raise ValueError("Diagnostic bundle belongs to another journal.")
-            parameters = json.dumps(
-                {
-                    "snapshot": manifest,
-                    "new_generation": new_generation,
-                    "diagnostics": bundle,
-                },
-                sort_keys=True,
-                ensure_ascii=True,
+            prepared_events, commands, parameters = self._prepare_restore_import(
+                manifest, identity, new_generation, diagnostics
             )
             connection = None
             try:
@@ -1544,179 +1427,14 @@ class SQLiteEventStore:
                 connection.execute("PRAGMA synchronous=EXTRA")
                 connection.execute("BEGIN IMMEDIATE")
                 self._check_free_space(self.db_path.parent, self._min_free_bytes)
-                info = _read_journal_info(connection)
-                actual = {name: info[name] for name in ("journal_id", "generation")}
-                if self._expected_journal not in (identity, actual):
-                    raise LoggingStateError(
-                        "Restoration client must identify the restored journal."
-                    )
-                previous = connection.execute(
-                    "SELECT parameters_json, result_json FROM journal_restorations WHERE restoration_id=?",
-                    (restoration_id,),
-                ).fetchone()
-                if previous is not None:
-                    if previous[0] != parameters:
-                        raise ValueError(
-                            "restoration_id already belongs to another restoration."
-                        )
-                    result = copy_json_object(
-                        json.loads(previous[1]), "restoration result"
-                    )
-                    if (
-                        result.keys()
-                        != {
-                            "schema_version",
-                            "journal_id",
-                            "generation",
-                            "cursor",
-                            "event_count",
-                            "change_cursor",
-                            "restoration_id",
-                            "snapshot_id",
-                            "imported_events",
-                        }
-                        or result["restoration_id"] != restoration_id
-                        or result["generation"] != new_generation
-                    ):
-                        raise LoggingStorageError(
-                            "Invalid recorded restoration result."
-                        )
-                    if actual != {
-                        name: result[name] for name in ("journal_id", "generation")
-                    }:
-                        raise LoggingStateError(
-                            "This restoration has already been superseded."
-                        )
+                result, changed = self._restore_journal_records(
+                    connection, manifest, identity, restoration_id, new_generation,
+                    parameters, prepared_events, commands,
+                )
+                if not changed:
                     connection.execute("ROLLBACK")
-                    self._journal_id, self._generation = (
-                        result["journal_id"],
-                        result["generation"],
-                    )
-                    self._expected_journal = actual
-                    self._file_identity = file_identity
-                    self._failed = False
+                    self._remember_restored_journal(result, file_identity)
                     return result
-                if actual != identity:
-                    raise JournalGenerationChanged(identity, actual)
-                if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                    raise LoggingStorageError(
-                        "Restored journal failed its integrity check."
-                    )
-                self._validate_snapshot_source(connection)
-                boundary = _read_boundary(connection)
-                if any(
-                    boundary[key] != manifest[key]
-                    for key in ("cursor", "event_count", "change_cursor")
-                ):
-                    raise ValueError(
-                        "Restored journal does not match the snapshot boundary."
-                    )
-                if _content_digest(connection) != manifest["content_sha256"]:
-                    raise ValueError(
-                        "Restored journal does not match the snapshot contents."
-                    )
-                inserted = []
-                for event in events:
-                    encoded = encode_event(event, self._max_event_bytes)
-                    previous = connection.execute(
-                        "SELECT event_json FROM events WHERE event_id=?",
-                        (event["event_id"],),
-                    ).fetchone()
-                    if previous is not None:
-                        if json.dumps(
-                            json.loads(previous[0]), sort_keys=True
-                        ) != json.dumps(event, sort_keys=True):
-                            raise ValueError(
-                                "Diagnostic event ID conflicts with restored history."
-                            )
-                        continue
-                    if connection.execute(
-                        "SELECT 1 FROM events WHERE producer_instance_id=? AND sequence_number=?",
-                        (event["producer_instance_id"], event["sequence_number"]),
-                    ).fetchone():
-                        raise ValueError(
-                            "Diagnostic producer sequence conflicts with restored history."
-                        )
-                    self._insert_event(event, encoded, connection=connection)
-                    inserted.append(event)
-                changed_requests = {}
-                for record in commands:
-                    request_id = record["request_id"]
-                    state = self._load_command_result(request_id, connection=connection)
-                    before = (
-                        None
-                        if state is None
-                        else (state["effective_author"], state["effective_event_id"])
-                    )
-                    if state is None:
-                        state = {
-                            "identity": record["identity"],
-                            "runner": None,
-                            "participant": None,
-                        }
-                    if state["identity"] != record["identity"]:
-                        raise ValueError(
-                            "Diagnostic request belongs to another context."
-                        )
-                    changed = False
-                    for author in ("runner", "participant"):
-                        incoming, current = record[author], state[author]
-                        if incoming is None:
-                            continue
-                        if current is not None:
-                            old = {
-                                key: current[key] for key in ("event_id", "observation")
-                            }
-                            if json.dumps(old, sort_keys=True) != json.dumps(
-                                incoming, sort_keys=True
-                            ):
-                                raise ValueError(
-                                    "Diagnostic observation conflicts with restored history."
-                                )
-                        else:
-                            state[author] = incoming
-                            changed = True
-                    _save_command_state(connection, request_id, state)
-                    checked = self._load_command_result(
-                        request_id, connection=connection
-                    )
-                    if changed:
-                        changed_requests[request_id] = (
-                            checked["effective_event_id"],
-                            before
-                            != (
-                                checked["effective_author"],
-                                checked["effective_event_id"],
-                            ),
-                        )
-                for event in inserted:
-                    if event["event_type"] != "command.result":
-                        self._record_change(event["event_id"], connection=connection)
-                    else:
-                        self._effective_entry(
-                            self._event_entry(event["event_id"], connection), connection
-                        )
-                for request_id, (event_id, changed) in changed_requests.items():
-                    self._record_change(
-                        event_id,
-                        request_id=request_id,
-                        result_changed=changed,
-                        connection=connection,
-                    )
-                connection.execute(
-                    "UPDATE journal_info SET generation=? WHERE singleton=1",
-                    (new_generation,),
-                )
-                result = {
-                    **_read_boundary(connection),
-                    "restoration_id": restoration_id,
-                    "snapshot_id": manifest["snapshot_id"],
-                    "imported_events": len(inserted),
-                }
-                connection.execute(
-                    "INSERT INTO journal_restorations VALUES (?, ?, ?)",
-                    (restoration_id, parameters, json.dumps(result, sort_keys=True)),
-                )
                 self._validate_snapshot_source(connection)
                 # Content was checked through this transaction. A second SQLite
                 # reader here could wait on our own write lock after cache spill.
@@ -1724,15 +1442,7 @@ class SQLiteEventStore:
                 if (status.st_dev, status.st_ino) != file_identity:
                     raise LoggingStorageError("Restored file changed before commit.")
                 connection.execute("COMMIT")
-                self._journal_id, self._generation = (
-                    result["journal_id"],
-                    result["generation"],
-                )
-                self._expected_journal = {
-                    name: result[name] for name in ("journal_id", "generation")
-                }
-                self._file_identity = file_identity
-                self._failed = False
+                self._remember_restored_journal(result, file_identity)
                 return result
             except (ValueError, LoggingStateError) as error:
                 if connection is not None:
@@ -1745,6 +1455,209 @@ class SQLiteEventStore:
             finally:
                 if connection is not None:
                     _close_preserving_failure(connection)
+
+    def _prepare_restore_import(
+        self, manifest: JsonObject, identity: JsonObject, new_generation: str,
+        diagnostics: str | Path | None,
+    ) -> tuple[list[tuple[JsonObject, str]], list[JsonObject], str]:
+        bundle, events, commands = None, [], []
+        if diagnostics is not None:
+            bundle, events, commands = self._read_diagnostics(diagnostics)
+            if bundle["journal_id"] != identity["journal_id"]:
+                raise ValueError("Diagnostic bundle belongs to another journal.")
+        prepared_events = _prepare_diagnostic_events(events, self._max_event_bytes)
+        parameters = json.dumps(
+            {
+                "snapshot": manifest,
+                "new_generation": new_generation,
+                "diagnostics": bundle,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        return prepared_events, commands, parameters
+
+    def _restore_journal_records(
+        self, connection: sqlite3.Connection, manifest: JsonObject, identity: JsonObject,
+        restoration_id: str, new_generation: str, parameters: str,
+        prepared_events: list[tuple[JsonObject, str]], commands: list[JsonObject],
+    ) -> tuple[JsonObject, bool]:
+        info = _read_journal_info(connection)
+        actual = {name: info[name] for name in ("journal_id", "generation")}
+        if self._expected_journal not in (identity, actual):
+            raise LoggingStateError(
+                "Restoration client must identify the restored journal."
+            )
+        previous = connection.execute(
+            "SELECT parameters_json, result_json FROM journal_restorations WHERE restoration_id=?",
+            (restoration_id,),
+        ).fetchone()
+        if previous is not None:
+            result = self._recorded_restoration_result(
+                previous, parameters, restoration_id, new_generation, actual
+            )
+            return result, False
+        if actual != identity:
+            raise JournalGenerationChanged(identity, actual)
+        self._check_restored_snapshot(connection, manifest)
+        inserted = self._import_diagnostic_events(connection, prepared_events)
+        changed_requests = self._import_diagnostic_commands(connection, commands)
+        self._record_restored_changes(connection, inserted, changed_requests)
+        connection.execute(
+            "UPDATE journal_info SET generation=? WHERE singleton=1",
+            (new_generation,),
+        )
+        result = {
+            **_read_boundary(connection),
+            "restoration_id": restoration_id,
+            "snapshot_id": manifest["snapshot_id"],
+            "imported_events": len(inserted),
+        }
+        connection.execute(
+            "INSERT INTO journal_restorations VALUES (?, ?, ?)",
+            (restoration_id, parameters, json.dumps(result, sort_keys=True)),
+        )
+        return result, True
+
+    def _recorded_restoration_result(
+        self, previous: tuple, parameters: str, restoration_id: str,
+        new_generation: str, actual: JsonObject,
+    ) -> JsonObject:
+        if previous[0] != parameters:
+            raise ValueError(
+                "restoration_id already belongs to another restoration."
+            )
+        result = copy_json_object(
+            json.loads(previous[1]), "restoration result"
+        )
+        if (
+            result.keys()
+            != {
+                "schema_version",
+                "journal_id",
+                "generation",
+                "cursor",
+                "event_count",
+                "change_cursor",
+                "restoration_id",
+                "snapshot_id",
+                "imported_events",
+            }
+            or result["restoration_id"] != restoration_id
+            or result["generation"] != new_generation
+        ):
+            raise LoggingStorageError(
+                "Invalid recorded restoration result."
+            )
+        if actual != {
+            name: result[name] for name in ("journal_id", "generation")
+        }:
+            raise LoggingStateError(
+                "This restoration has already been superseded."
+            )
+        return result
+
+    def _check_restored_snapshot(
+        self, connection: sqlite3.Connection, manifest: JsonObject
+    ) -> None:
+        if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise LoggingStorageError(
+                "Restored journal failed its integrity check."
+            )
+        self._validate_snapshot_source(connection)
+        boundary = _read_boundary(connection)
+        if any(
+            boundary[key] != manifest[key]
+            for key in ("cursor", "event_count", "change_cursor")
+        ):
+            raise ValueError(
+                "Restored journal does not match the snapshot boundary."
+            )
+        if _content_digest(connection) != manifest["content_sha256"]:
+            raise ValueError(
+                "Restored journal does not match the snapshot contents."
+            )
+
+    def _import_diagnostic_events(
+        self, connection: sqlite3.Connection, events: list[tuple[JsonObject, str]]
+    ) -> list[JsonObject]:
+        inserted = []
+        for event, encoded in events:
+            previous = connection.execute(
+                "SELECT event_json FROM events WHERE event_id=?",
+                (event["event_id"],),
+            ).fetchone()
+            if previous is not None:
+                if json.dumps(
+                    json.loads(previous[0]), sort_keys=True
+                ) != json.dumps(event, sort_keys=True):
+                    raise ValueError(
+                        "Diagnostic event ID conflicts with restored history."
+                    )
+                continue
+            if connection.execute(
+                "SELECT 1 FROM events WHERE producer_instance_id=? AND sequence_number=?",
+                (event["producer_instance_id"], event["sequence_number"]),
+            ).fetchone():
+                raise ValueError(
+                    "Diagnostic producer sequence conflicts with restored history."
+                )
+            self._insert_event(event, encoded, connection=connection)
+            inserted.append(event)
+        return inserted
+
+    def _import_diagnostic_commands(
+        self, connection: sqlite3.Connection, commands: list[JsonObject]
+    ) -> dict[str, tuple[str, bool]]:
+        changed_requests = {}
+        for record in commands:
+            request_id = record["request_id"]
+            state = self._load_command_result(request_id, connection=connection)
+            state, before, changed = _merge_diagnostic_command(state, record)
+            _save_command_state(connection, request_id, state)
+            checked = self._load_command_result(
+                request_id, connection=connection
+            )
+            if changed:
+                changed_requests[request_id] = (
+                    checked["effective_event_id"],
+                    before
+                    != (
+                        checked["effective_author"],
+                        checked["effective_event_id"],
+                    ),
+                )
+        return changed_requests
+
+    def _record_restored_changes(
+        self, connection: sqlite3.Connection, inserted: list[JsonObject],
+        changed_requests: dict[str, tuple[str, bool]],
+    ) -> None:
+        for event in inserted:
+            if event["event_type"] != "command.result":
+                self._record_change(event["event_id"], connection=connection)
+            else:
+                self._effective_entry(
+                    self._event_entry(event["event_id"], connection), connection
+                )
+        for request_id, (event_id, changed) in changed_requests.items():
+            self._record_change(
+                event_id,
+                request_id=request_id,
+                result_changed=changed,
+                connection=connection,
+            )
+
+    def _remember_restored_journal(self, result: JsonObject, file_identity: tuple[int, int]) -> None:
+        self._journal_id, self._generation = (
+            result["journal_id"],
+            result["generation"],
+        )
+        self._expected_journal = {
+            name: result[name] for name in ("journal_id", "generation")
+        }
+        self._file_identity = file_identity
+        self._failed = False
 
     def close(self) -> None:
         self._check_process()

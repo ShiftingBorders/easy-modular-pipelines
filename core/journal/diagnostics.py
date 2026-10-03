@@ -5,15 +5,21 @@ import json
 import os
 import sqlite3
 import sys
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
+from uuid import uuid4
 
 from core.journal.events import (
     SCHEMA_VERSION,
+    LoggingStateError,
+    LoggingStorageError,
+    encode_event,
     validate_command_result,
     validate_journal_identity,
 )
-from core.primitives.json_values import JsonObject
+from core.primitives.json_values import JsonObject, require_text
 
 
 def _decode_author_observation(
@@ -161,3 +167,207 @@ def _save_command_state(
             author,
         ),
     )
+
+
+def _diagnostic_operation_events(
+    reader: sqlite3.Connection, roots: list[str], decode_row: Callable[[tuple], JsonObject]
+) -> tuple[dict[str, tuple[str | None, str | None]], dict[str | None, str], set[str], set[str]]:
+    metadata = {}
+    starts = {}
+    for row in reader.execute("SELECT * FROM events ORDER BY cursor"):
+        event = decode_row(row)["event"]
+        operation_id = event["operation_id"]
+        parent = event["context"].get("parent_operation_id")
+        metadata[event["event_id"]] = (operation_id, parent)
+        if event["event_type"] == "operation.started":
+            starts[operation_id] = event["event_id"]
+    known = {op for op, _ in metadata.values() if op is not None}
+    if not set(roots) <= known:
+        raise LoggingStateError(
+            "Some selected operations are absent from this journal."
+        )
+    selected_operations = set(roots)
+    while True:
+        children = {
+            op
+            for op, parent in metadata.values()
+            if op is not None and parent in selected_operations
+        }
+        if children <= selected_operations:
+            break
+        selected_operations.update(children)
+    selected = {
+        event_id
+        for event_id, (op, parent) in metadata.items()
+        if op in selected_operations or parent in selected_operations
+    }
+    return metadata, starts, selected_operations, selected
+
+
+def _add_diagnostic_observer_events(
+    reader: sqlite3.Connection, selected_operations: set[str], selected: set[str],
+    read_result: Callable[[str], dict],
+) -> None:
+    # A matching reply can exist only in observer metadata. Its raw
+    # event may belong to the other participant, outside this tree.
+    for (request_id,) in reader.execute(
+        "SELECT request_id FROM command_results"
+    ):
+        state = read_result(request_id)
+        for author in ("runner", "participant"):
+            entry = state[author]
+            if entry is None:
+                continue
+            observation = entry["observation"]
+            if (
+                observation["operation_id"] in selected_operations
+                or observation["context"].get("parent_operation_id")
+                in selected_operations
+            ):
+                selected.add(entry["event_id"])
+
+
+def _diagnostic_dependencies(
+    metadata: dict[str, tuple[str | None, str | None]], starts: dict[str | None, str],
+    selected: set[str], read_event: Callable[[str], JsonObject],
+    read_result: Callable[[str], dict],
+) -> dict[str, dict]:
+    pending = list(selected)
+    requests = {}
+    while pending:
+        event_id = pending.pop()
+        event = read_event(event_id)["event"]
+        dependencies = []
+        if event["operation_id"] in starts:
+            dependencies.append(starts[event["operation_id"]])
+        parent = event["context"].get("parent_operation_id")
+        if parent in starts:
+            dependencies.append(starts[parent])
+        if event["event_type"] in (
+            "control.intent",
+            "control.observed",
+            "control.reconciled",
+        ):
+            for field in ("intent_event_id", "parameters_event_id"):
+                reference = event["data"].get(field)
+                if reference is not None:
+                    dependencies.append(require_text(reference, field))
+        if event["event_type"] == "command.result":
+            request_id = event["data"]["request_id"]
+            state = read_result(request_id)
+            requests[request_id] = state
+            dependencies.extend(
+                state[author]["event_id"]
+                for author in ("runner", "participant")
+                if state[author] is not None
+            )
+        for reference in dependencies:
+            if reference not in metadata:
+                raise LoggingStorageError(
+                    "Diagnostic dependency is missing."
+                )
+            if reference not in selected:
+                selected.add(reference)
+                pending.append(reference)
+    return requests
+
+
+def _write_diagnostic_records(
+    target: Path, metadata: dict[str, tuple[str | None, str | None]], selected: set[str],
+    requests: dict[str, dict], read_event: Callable[[str], JsonObject],
+) -> str:
+    digest = hashlib.sha256()
+    with (target / "records.jsonl.part").open("xb") as output:
+        for event_id in metadata:
+            if event_id not in selected:
+                continue
+            record = {
+                "kind": "event",
+                "event": read_event(event_id)["event"],
+            }
+            _write_diagnostic_record(output, digest, record)
+        for request_id, state in requests.items():
+            record = {
+                "kind": "command",
+                "request_id": request_id,
+                "identity": state["identity"],
+                "runner": None,
+                "participant": None,
+            }
+            for author in ("runner", "participant"):
+                if state[author] is not None:
+                    record[author] = {
+                        field: state[author][field]
+                        for field in ("event_id", "observation")
+                    }
+            _write_diagnostic_record(output, digest, record)
+        output.flush()
+        os.fsync(output.fileno())
+    return digest.hexdigest()
+
+
+def _prepare_diagnostic_events(
+    events: list[JsonObject], max_event_bytes: int | None
+) -> list[tuple[JsonObject, str]]:
+    return [(event, encode_event(event, max_event_bytes)) for event in events]
+
+
+def _merge_diagnostic_command(
+    state: dict | None, record: JsonObject
+) -> tuple[dict, tuple[str, str] | None, bool]:
+    before = (
+        None
+        if state is None
+        else (state["effective_author"], state["effective_event_id"])
+    )
+    if state is None:
+        state = {
+            "identity": record["identity"],
+            "runner": None,
+            "participant": None,
+        }
+    if state["identity"] != record["identity"]:
+        raise ValueError(
+            "Diagnostic request belongs to another context."
+        )
+    changed = False
+    for author in ("runner", "participant"):
+        incoming, current = record[author], state[author]
+        if incoming is None:
+            continue
+        if current is not None:
+            old = {
+                key: current[key] for key in ("event_id", "observation")
+            }
+            if json.dumps(old, sort_keys=True) != json.dumps(
+                incoming, sort_keys=True
+            ):
+                raise ValueError(
+                    "Diagnostic observation conflicts with restored history."
+                )
+        else:
+            state[author] = incoming
+            changed = True
+    return state, before, changed
+
+
+def _diagnostic_manifest(
+    roots: list[str], boundary: JsonObject, records_sha256: str,
+    event_count: int, command_count: int,
+) -> JsonObject:
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "journal.diagnostics",
+        "diagnostics_id": uuid4().hex,
+        "journal_id": boundary["journal_id"],
+        "generation": boundary["generation"],
+        "operation_ids": roots,
+        "cursor": boundary["cursor"],
+        "change_cursor": boundary["change_cursor"],
+        "created_at": datetime.now(UTC).isoformat(timespec="microseconds"),
+        "records": "records.jsonl",
+        "records_sha256": records_sha256,
+        "event_count": event_count,
+        "command_count": command_count,
+    }
+    return manifest
