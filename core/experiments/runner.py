@@ -243,46 +243,9 @@ class ExperimentRunner:
         wake_task = None
         readiness_task = None
         try:
-            if (
-                self._state is not None
-                and self._state.last_dag_decision is not None
-                and self._state.last_dag_decision["decision"]["command"] == "stop"
-            ):
-                await self._stop_from_stage(recovering=True)
+            state = await self._prepare_dag_state()
+            if state is None:
                 return
-            if self._state is None and self._continue_source is not None:
-                state, action = await self._prepare_continuation()
-            elif self._state is None:
-                state, action = await self._prepare_initial_run()
-            else:
-                state, action = await self._prepare_live_run()
-            if action == "stop":
-                raise RuntimeError(
-                    "Service startup or recovery requires experiment stop."
-                )
-            if action == "pause":
-                self._desired_mode = "paused"
-            state.mode = self._desired_mode
-            if (
-                state.mode == "running"
-                and state.last_dag_decision is not None
-                and state.last_dag_decision["decision"]["command"] == "pause"
-            ):
-                state.last_dag_decision = None
-            state.phase = (
-                "stage_running"
-                if state.active_attempt is not None
-                else ("waiting" if state.mode == "paused" else "starting")
-            )
-            self._save_state()
-            self._ready.set()
-            if state.active_attempt is not None:
-                self._idle.clear()
-                self._stage_task = asyncio.create_task(
-                    self._stages.recover(state, wait_services=self._services.wait_ready)
-                )
-            else:
-                self._idle.set()
             wake_task = asyncio.create_task(self._wake.wait())
             if state.template["services"]:
                 self._service_task = asyncio.create_task(self._services.monitor(state))
@@ -300,109 +263,14 @@ class ExperimentRunner:
                 )
                 # Apply service decisions even while a stage runs or the DAG is paused.
                 if self._service_task is not None and self._service_task.done():
-                    action = self._service_task.result()
-                    if action == "stop":
-                        raise RuntimeError(
-                            "Service supervision requires experiment stop."
-                        )
-                    state.mode = self._desired_mode = "paused"
-                    state.pause_requested = True
-                    if self._stage_task is None:
-                        state.phase = "waiting"
-                    self._save_state()
-                    if self._step_future is not None:
-                        future, self._step_future = self._step_future, None
-                        if not future.done():
-                            future.set_exception(
-                                RuntimeError("A service requires a pause.")
-                            )
-                    self._service_task = asyncio.create_task(
-                        self._services.monitor(state)
-                    )
+                    self._apply_supervision_result(state)
 
                 if self._stage_task is not None and self._stage_task.done():
-                    outcome = self._stage_task.result()
-                    self._stage_task = None
-                    self._last_attempt = outcome.attempt
-                    self._last_response = outcome.result
-                    if outcome.attempt.outcome == "unknown":
-                        state.mode = self._desired_mode = "paused"
-                        state.pause_requested = True
-                        state.phase = "waiting"
-                        self._idle.clear()
-                        self._pending_advance = False
-                        self._save_state()
-                        if outcome.action == "stop":
-                            raise RuntimeError(
-                                "Previous stage ownership or termination is unconfirmed."
-                            )
-                        if self._step_future is not None:
-                            future, self._step_future = self._step_future, None
-                            if not future.done():
-                                future.set_exception(
-                                    RuntimeError(
-                                        "Stage state is unknown; recover or stop it first."
-                                    )
-                                )
+                    stage_action = await self._complete_stage_task(state)
+                    if stage_action == "unknown":
                         continue
-                    if outcome.action == "stop":
-                        state.last_result = None
-                        state.last_result_id = None
-                        state.stage_result_ids.pop(outcome.attempt.stage_id, None)
-                        state.stage_result_origins.pop(outcome.attempt.stage_id, None)
-                        raise RuntimeError("Stage execution requires experiment stop.")
-                    response = outcome.result
-                    self._apply_stage_outcome(outcome)
-                    final = self._at_dag_end()
-                    state.phase = "waiting"
-                    self._save_state()
-                    if (
-                        state.last_dag_decision is not None
-                        and state.last_dag_decision["decision"]["command"] == "stop"
-                    ):
-                        await self._stop_from_stage()
+                    if stage_action == "stopped":
                         return
-                    mode = state.template["snapshots"]["mode"]
-                    if (
-                        outcome.action == "advance"
-                        and not final
-                        and (
-                            mode == "after_stage"
-                            or mode == "after_epoch"
-                            and self._pending_advance
-                            and state.stage_position == len(state.template["stages"])
-                        )
-                    ):
-                        self._maintenance = True
-                        state.phase = "snapshotting"
-                        try:
-                            await self._snapshots.create(state)
-                        finally:
-                            self._maintenance = False
-                            if state.phase == "snapshotting":
-                                state.phase = "waiting"
-                        self._save_state()
-                    self._idle.set()
-                    # The final step also waits for confirmed service shutdown.
-                    if self._step_future is not None and not final:
-                        future, self._step_future = self._step_future, None
-                        if not future.done():
-                            if outcome.action == "advance":
-                                future.set_result(
-                                    {
-                                        "attempt_id": outcome.attempt.attempt_id,
-                                        "result": response,
-                                        "phase": state.phase,
-                                    }
-                                )
-                            else:
-                                future.set_exception(
-                                    RuntimeError(
-                                        "Stage did not complete or skip under its policy."
-                                    )
-                                )
-                    if state.mode == "running" or final:
-                        self._wake.set()
 
                 if wake_task.done():
                     self._wake.clear()
@@ -425,85 +293,18 @@ class ExperimentRunner:
                     continue
                 action = readiness_task.result()
                 readiness_task = None
-                if action == "stop":
-                    raise RuntimeError("Service readiness requires experiment stop.")
-                if action == "pause":
-                    state.mode = self._desired_mode = "paused"
-                    state.pause_requested = True
-                    state.phase = "waiting"
-                    self._save_state()
-                    if self._step_future is not None:
-                        future, self._step_future = self._step_future, None
-                        if not future.done():
-                            future.set_exception(
-                                RuntimeError("Service readiness requires a pause.")
-                            )
+                if not self._apply_readiness_result(state, action):
                     continue
                 # Manual recovery must finish before a new stage or final shutdown.
                 if self._service_retrying or self._maintenance:
                     continue
                 final = self._at_dag_end()
                 if final:
-                    state.pending_advance = self._pending_advance
-                    self._maintenance = True
-                    try:
-                        self._last_snapshot = await self._snapshots.finalize(
-                            state, terminal_phase="completed"
-                        )
-                        if not self._last_snapshot["valid"]:
-                            raise RuntimeError(
-                                f"Final snapshot is invalid: {self._last_snapshot['error']}"
-                            )
-                    finally:
-                        self._maintenance = False
-                    self._termination_confirmed = all(
-                        item.stopped for item in state.services.values()
-                    )
-                    await self._services.close()
-                    state.phase = "completed"
-                    self._save_state()
-                    if self._step_future is not None:
-                        future, self._step_future = self._step_future, None
-                        if not future.done():
-                            future.set_result(
-                                {
-                                    "attempt_id": None
-                                    if self._last_attempt is None
-                                    else self._last_attempt.attempt_id,
-                                    "result": self._last_response,
-                                    "phase": state.phase,
-                                }
-                            )
+                    await self._complete_dag(state)
                     break
                 if state.mode == "paused" and self._step_future is None:
                     continue
-                self._idle.clear()
-                if self._pending_advance:
-                    state.pending_input = None
-                    state.stage_position += 1
-                    if state.stage_position > len(state.template["stages"]):
-                        state.cycle_number += 1
-                        state.stage_position = 1
-                        state.stage_result_ids.clear()
-                        state.stage_result_origins.clear()
-                        state.stage_attempt_numbers.clear()
-                        state.last_result = None
-                        state.last_result_id = None
-                        for instance in state.services.values():
-                            instance.restart_count = 0
-                    self._pending_advance = False
-                state.last_dag_decision = None
-                state.pause_requested = False
-                state.phase = "stage_running"
-                self._save_state()
-                self._stage_task = asyncio.create_task(
-                    self._stages.execute(
-                        state,
-                        manual=self._manual,
-                        wait_services=self._services.wait_ready,
-                    )
-                )
-                self._manual = False
+                self._launch_next_stage(state)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - Background failures become explicit experiment state.
@@ -518,6 +319,249 @@ class ExperimentRunner:
             self._publish_resources()
             self._ready.set()
             self._idle.set()
+
+    async def _prepare_dag_state(self) -> RunnerState | None:
+        if (
+            self._state is not None
+            and self._state.last_dag_decision is not None
+            and self._state.last_dag_decision["decision"]["command"] == "stop"
+        ):
+            await self._stop_from_stage(recovering=True)
+            return
+        if self._state is None and self._continue_source is not None:
+            state, action = await self._prepare_continuation()
+        elif self._state is None:
+            state, action = await self._prepare_initial_run()
+        else:
+            state, action = await self._prepare_live_run()
+        if action == "stop":
+            raise RuntimeError(
+                "Service startup or recovery requires experiment stop."
+            )
+        if action == "pause":
+            self._desired_mode = "paused"
+        state.mode = self._desired_mode
+        if (
+            state.mode == "running"
+            and state.last_dag_decision is not None
+            and state.last_dag_decision["decision"]["command"] == "pause"
+        ):
+            state.last_dag_decision = None
+        state.phase = (
+            "stage_running"
+            if state.active_attempt is not None
+            else ("waiting" if state.mode == "paused" else "starting")
+        )
+        self._save_state()
+        self._ready.set()
+        if state.active_attempt is not None:
+            self._idle.clear()
+            self._stage_task = asyncio.create_task(
+                self._stages.recover(state, wait_services=self._services.wait_ready)
+            )
+        else:
+            self._idle.set()
+        return state
+
+    def _apply_supervision_result(self, state: RunnerState) -> None:
+        action = self._service_task.result()
+        if action == "stop":
+            raise RuntimeError(
+                "Service supervision requires experiment stop."
+            )
+        state.mode = self._desired_mode = "paused"
+        state.pause_requested = True
+        if self._stage_task is None:
+            state.phase = "waiting"
+        self._save_state()
+        if self._step_future is not None:
+            future, self._step_future = self._step_future, None
+            if not future.done():
+                future.set_exception(
+                    RuntimeError("A service requires a pause.")
+                )
+        self._service_task = asyncio.create_task(
+            self._services.monitor(state)
+        )
+
+    async def _complete_stage_task(
+        self, state: RunnerState
+    ) -> Literal["unknown", "stopped", "ready"]:
+        outcome = self._stage_task.result()
+        self._stage_task = None
+        self._last_attempt = outcome.attempt
+        self._last_response = outcome.result
+        if outcome.attempt.outcome == "unknown":
+            self._pause_unknown_stage(state, outcome)
+            return "unknown"
+        if outcome.action == "stop":
+            state.last_result = None
+            state.last_result_id = None
+            state.stage_result_ids.pop(outcome.attempt.stage_id, None)
+            state.stage_result_origins.pop(outcome.attempt.stage_id, None)
+            raise RuntimeError("Stage execution requires experiment stop.")
+        response = outcome.result
+        self._apply_stage_outcome(outcome)
+        final = self._at_dag_end()
+        state.phase = "waiting"
+        self._save_state()
+        if (
+            state.last_dag_decision is not None
+            and state.last_dag_decision["decision"]["command"] == "stop"
+        ):
+            await self._stop_from_stage()
+            return "stopped"
+        await self._snapshot_stage_boundary(state, outcome, final)
+        self._idle.set()
+        self._finish_stage_step(state, outcome, response, final)
+        if state.mode == "running" or final:
+            self._wake.set()
+        return "ready"
+
+    def _pause_unknown_stage(self, state: RunnerState, outcome: StageOutcome) -> None:
+        state.mode = self._desired_mode = "paused"
+        state.pause_requested = True
+        state.phase = "waiting"
+        self._idle.clear()
+        self._pending_advance = False
+        self._save_state()
+        if outcome.action == "stop":
+            raise RuntimeError(
+                "Previous stage ownership or termination is unconfirmed."
+            )
+        if self._step_future is not None:
+            future, self._step_future = self._step_future, None
+            if not future.done():
+                future.set_exception(
+                    RuntimeError(
+                        "Stage state is unknown; recover or stop it first."
+                    )
+                )
+
+    async def _snapshot_stage_boundary(
+        self, state: RunnerState, outcome: StageOutcome, final: bool
+    ) -> None:
+        mode = state.template["snapshots"]["mode"]
+        if (
+            outcome.action == "advance"
+            and not final
+            and (
+                mode == "after_stage"
+                or mode == "after_epoch"
+                and self._pending_advance
+                and state.stage_position == len(state.template["stages"])
+            )
+        ):
+            self._maintenance = True
+            state.phase = "snapshotting"
+            try:
+                await self._snapshots.create(state)
+            finally:
+                self._maintenance = False
+                if state.phase == "snapshotting":
+                    state.phase = "waiting"
+            self._save_state()
+
+    def _finish_stage_step(
+        self, state: RunnerState, outcome: StageOutcome,
+        response: JsonObject | None, final: bool,
+    ) -> None:
+        # The final step also waits for confirmed service shutdown.
+        if self._step_future is not None and not final:
+            future, self._step_future = self._step_future, None
+            if not future.done():
+                if outcome.action == "advance":
+                    future.set_result(
+                        {
+                            "attempt_id": outcome.attempt.attempt_id,
+                            "result": response,
+                            "phase": state.phase,
+                        }
+                    )
+                else:
+                    future.set_exception(
+                        RuntimeError(
+                            "Stage did not complete or skip under its policy."
+                        )
+                    )
+
+    def _apply_readiness_result(self, state: RunnerState, action: str) -> bool:
+        if action == "stop":
+            raise RuntimeError("Service readiness requires experiment stop.")
+        if action == "pause":
+            state.mode = self._desired_mode = "paused"
+            state.pause_requested = True
+            state.phase = "waiting"
+            self._save_state()
+            if self._step_future is not None:
+                future, self._step_future = self._step_future, None
+                if not future.done():
+                    future.set_exception(
+                        RuntimeError("Service readiness requires a pause.")
+                    )
+            return False
+        return True
+
+    async def _complete_dag(self, state: RunnerState) -> None:
+        state.pending_advance = self._pending_advance
+        self._maintenance = True
+        try:
+            self._last_snapshot = await self._snapshots.finalize(
+                state, terminal_phase="completed"
+            )
+            if not self._last_snapshot["valid"]:
+                raise RuntimeError(
+                    f"Final snapshot is invalid: {self._last_snapshot['error']}"
+                )
+        finally:
+            self._maintenance = False
+        self._termination_confirmed = all(
+            item.stopped for item in state.services.values()
+        )
+        await self._services.close()
+        state.phase = "completed"
+        self._save_state()
+        if self._step_future is not None:
+            future, self._step_future = self._step_future, None
+            if not future.done():
+                future.set_result(
+                    {
+                        "attempt_id": None
+                        if self._last_attempt is None
+                        else self._last_attempt.attempt_id,
+                        "result": self._last_response,
+                        "phase": state.phase,
+                    }
+                )
+
+    def _launch_next_stage(self, state: RunnerState) -> None:
+        self._idle.clear()
+        if self._pending_advance:
+            state.pending_input = None
+            state.stage_position += 1
+            if state.stage_position > len(state.template["stages"]):
+                state.cycle_number += 1
+                state.stage_position = 1
+                state.stage_result_ids.clear()
+                state.stage_result_origins.clear()
+                state.stage_attempt_numbers.clear()
+                state.last_result = None
+                state.last_result_id = None
+                for instance in state.services.values():
+                    instance.restart_count = 0
+            self._pending_advance = False
+        state.last_dag_decision = None
+        state.pause_requested = False
+        state.phase = "stage_running"
+        self._save_state()
+        self._stage_task = asyncio.create_task(
+            self._stages.execute(
+                state,
+                manual=self._manual,
+                wait_services=self._services.wait_ready,
+            )
+        )
+        self._manual = False
 
     async def _prepare_continuation(self) -> tuple[RunnerState, str]:
         manifest = await asyncio.to_thread(

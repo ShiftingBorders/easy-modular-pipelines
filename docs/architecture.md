@@ -103,6 +103,12 @@ binding, service restoration and cleanup. Pure state-document preparation lives
 in `experiments.restore_inputs`; the snapshot owner retains marker publication,
 filesystem/process checks and cancellation barriers.
 
+The runner's DAG loop owns waiting and task cleanup. Focused owner methods
+prepare state, apply supervision/readiness decisions, accept stage outcomes,
+take boundary snapshots, finish a step or DAG, and launch the next stage.
+Unknown ownership, conditional stop and final completion keep distinct loop
+control paths.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the
