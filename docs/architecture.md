@@ -85,6 +85,13 @@ standard-library rules and performs no file I/O. File-based journal settings
 use Pydantic after their explicit read, reusing those same opening rules.
 Journal imports therefore do not trigger Pydantic plugin metadata discovery.
 
+Journal record models validate event envelopes, context, identified checkpoints,
+command observations and measurements. Their imports occur at record boundaries;
+shared standard-library identity/context rules remain available to the passive
+SQLite constructor. Event encoding retains caller key order and the complete
+UTF-8 byte limit. Operation ownership, generation checks and result precedence
+remain with journal operations.
+
 Private operations that validate or prepare explicit inputs live beside their
 owner in focused modules. The owning classes retain state changes, transactions,
 process ownership, cancellation, and recovery decisions. Helpers do not receive

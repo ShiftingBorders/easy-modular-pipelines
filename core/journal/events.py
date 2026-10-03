@@ -1,7 +1,6 @@
 """JSON event contract and configuration validation for core.journal.logger."""
 
 import json
-from datetime import datetime, timedelta
 from uuid import UUID
 
 from core.primitives.json_values import (
@@ -110,18 +109,14 @@ def validate_journal_identity(value: object) -> JsonObject:
 def validate_checkpoint(value: object, key: str) -> JsonObject | None:
     if value is None:
         return None
-    checkpoint = copy_json_object(value, "checkpoint")
-    if checkpoint.keys() != {"journal_id", "generation", key}:
-        raise ValueError(f"Checkpoint requires journal_id, generation and {key}.")
-    if (
-        type(checkpoint[key]) is not int
-        or not 0 <= checkpoint[key] <= 9223372036854775807
-    ):
-        raise ValueError(f"{key} must be a nonnegative SQLite integer.")
-    identity = validate_journal_identity(
-        {name: checkpoint[name] for name in ("journal_id", "generation")}
-    )
-    return {**identity, key: checkpoint[key]}
+    from core.models.journal_records import JournalCheckpoint
+
+    checkpoint = JournalCheckpoint.model_validate(value, context={"key": key})
+    return {
+        "journal_id": checkpoint.journal_id,
+        "generation": checkpoint.generation,
+        key: checkpoint.position,
+    }
 
 
 def validate_context(value: object) -> JsonObject:
@@ -143,26 +138,11 @@ def validate_context(value: object) -> JsonObject:
 
 def encode_event(event: object, max_bytes: int | None) -> str:
     """Validate the common envelope without depending on application event kinds."""
+    from core.models.journal_records import JournalEvent
+
     event = copy_json_object(event, "event")
-    if event.keys() != EVENT_FIELDS:
-        raise ValueError("Event fields do not match the journal envelope.")
-    if (
-        type(event["schema_version"]) is not int
-        or event["schema_version"] != SCHEMA_VERSION
-    ):
-        raise ValueError("Unsupported event schema_version.")
-    for name in ("event_id", "producer_instance_id", "event_type", "occurred_at"):
-        require_text(event[name], name)
-    if event["operation_id"] is not None:
-        require_text(event["operation_id"], "operation_id")
-    sequence = event["sequence_number"]
-    if type(sequence) is not int or not 1 <= sequence <= 9223372036854775807:
-        raise ValueError("sequence_number must be a positive SQLite integer.")
-    timestamp = datetime.fromisoformat(event["occurred_at"])
-    if timestamp.utcoffset() != timedelta(0):
-        raise ValueError("occurred_at must include the UTC timezone.")
-    validate_context(event["context"])
-    copy_json_object(event["data"], "event.data")
+    JournalEvent.model_validate(event)
+    # Preserve the existing JSON key order and complete UTF-8 byte contract.
     encoded = json.dumps(
         event, ensure_ascii=False, allow_nan=False, separators=(",", ":")
     )
@@ -173,35 +153,6 @@ def encode_event(event: object, max_bytes: int | None) -> str:
 
 def validate_command_result(data: object) -> JsonObject:
     """Validate a command observation without deciding runner/participant precedence."""
-    result = copy_json_object(data, "command result")
-    if result.keys() != {
-        "request_id",
-        "author",
-        "outcome",
-        "response",
-        "ignored",
-        "supersedes",
-    }:
-        raise ValueError("Command result fields do not match the contract.")
-    require_text(result["request_id"], "request_id")
-    if result["author"] not in ("runner", "participant"):
-        raise ValueError("Command result author must be runner or participant.")
-    if result["outcome"] not in (
-        "succeeded",
-        "failed",
-        "cancelled",
-        "timed_out",
-        "invalidated",
-    ):
-        raise ValueError("Unsupported command outcome.")
-    copy_json_object(result["response"], "response")
-    if result["ignored"] is not None:
-        require_text(result["ignored"], "ignored")
-    if type(result["supersedes"]) is not list:
-        raise TypeError("supersedes must be a list.")
-    for item in result["supersedes"]:
-        if type(item) is not dict or item.keys() != {"event_id", "ignored"}:
-            raise ValueError("Invalid superseded observation.")
-        require_text(item["event_id"], "supersedes.event_id")
-        require_text(item["ignored"], "supersedes.ignored")
-    return result
+    from core.models.journal_records import CommandObservation
+
+    return CommandObservation.model_validate(data).model_dump()
