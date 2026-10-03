@@ -8,6 +8,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
+from core.models.dashboard_cache import CacheWorkerResult
 from dashboard.config import load_settings
 from dashboard.journals import (
     LocalJournals,
@@ -42,7 +43,10 @@ def precache(settings: dict) -> int:
             finished, _ = wait(running, return_when=FIRST_COMPLETED)
             for future in finished:
                 identifier, target = running.pop(future)
-                result = future.result()
+                outcome = CacheWorkerResult.model_validate(future.result())
+                if outcome.experiment_id != identifier:
+                    raise ValueError("Cache worker result belongs to another experiment.")
+                result = outcome.model_dump(exclude_unset=True)
                 error = result.get("error")
                 if error and error["code"] == "cache_busy":
                     pending.append((identifier, target))

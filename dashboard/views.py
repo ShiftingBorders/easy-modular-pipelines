@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from core.journal.events import LoggingError
+from core.models.dashboard_cache import CacheWorkerResult
 from core.models.dashboard_commands import DashboardCommand, SavedCommandHistory
 from core.models.dashboard_queries import OffsetCursor, PageLimit, PublicationCursor
 from core.models.dashboard_resources import (
@@ -384,7 +385,10 @@ class DashboardViews:
                 continue
             del self._cache_jobs[identifier]
             try:
-                result = future.result()
+                outcome = CacheWorkerResult.model_validate(future.result())
+                if outcome.experiment_id != identifier:
+                    raise ValueError("Cache worker result belongs to another experiment.")
+                result = outcome.model_dump(exclude_unset=True)
             except Exception as error:  # noqa: BLE001 - Surface failed worker processes through history reads.
                 result = {
                     "error": {"code": "cache_worker_failed", "message": str(error)}

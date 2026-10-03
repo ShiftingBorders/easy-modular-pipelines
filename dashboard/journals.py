@@ -24,6 +24,7 @@ from core.journal.history_cache import (
     acquire_cache_writer,
 )
 from core.journal.logger import OperationLogger
+from core.models.dashboard_cache import CacheWorkerResult, ModulePublication
 from core.models.dashboard_queries import (
     DetailIdentity,
     DetailReference,
@@ -31,6 +32,7 @@ from core.models.dashboard_queries import (
     PageLimit,
 )
 from core.models.experiment_registry import RegistryEntry
+from core.models.journal_cache import CachePublication, CacheReaderContext, CacheSource
 from core.primitives.json_files import read_json, write_json
 from dashboard.api_client import SystemAPIError
 from dashboard.projections import (
@@ -67,15 +69,15 @@ def cache_experiment(
             publication["modules_published"] = journals.publish_modules()
         except Exception as error:  # noqa: BLE001 - Module publication failure must not invalidate journal projections.
             publication["modules_error"] = str(error)
-        return {
+        return CacheWorkerResult.model_validate({
             "experiment_id": identifier,
             "pid": os.getpid(),
             "complete": complete,
             **publication,
             **{key: dataset[key] for key in ("cached_through", "target_boundary")},
-        }
+        }).model_dump(exclude_unset=True)
     except Exception as error:  # noqa: BLE001 - A failed experiment must not break the worker pool.
-        return {
+        return CacheWorkerResult.model_validate({
             "experiment_id": identifier,
             "pid": os.getpid(),
             "complete": False,
@@ -83,7 +85,7 @@ def cache_experiment(
                 "code": getattr(error, "code", "cache_failed"),
                 "message": str(error),
             },
-        }
+        }).model_dump(exclude_unset=True)
     finally:
         journals.close()
 
@@ -215,9 +217,6 @@ class LocalJournals:
             )
             if not metadata.get("reader_revision") or "version" not in metadata:
                 return self._pending_dataset(identifier)
-            source = json.loads(metadata["source"])
-            if source.get("version") != JournalHistoryCache.SCHEMA_VERSION:
-                return self._pending_dataset(identifier)
             status = path.stat()
             signature = (
                 status.st_dev,
@@ -233,55 +232,9 @@ class LocalJournals:
             if previous and previous[0] == signature:
                 dataset = previous[1]
             else:
-                values = dict(
-                    db.execute(
-                        "SELECT key,value FROM metadata WHERE key IN ('reader_context','ready','cached_through','boundary','publication_boundary')"
-                    )
-                )
-                context = json.loads(values["reader_context"])
-                if (
-                    context["project_root"] != str(self.project)
-                    or source["experiment_id"] != identifier
-                ):
-                    return self._pending_dataset(identifier)
-                identity, file_key = source["identity"], tuple(source["file_key"])
-                reader = JournalHistoryCache(
-                    path,
-                    self.state_directory / f"{key}.json",
-                    identity,
-                    file_key,
-                    identifier,
-                    self.window_events,
-                    self.max_bytes,
-                    self.max_events,
-                )
-                latest = db.execute(
-                    "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
-                ).fetchone()
-                boundary = json.loads(values.get("boundary", "null"))
-                target_key = (
-                    "publication_boundary" if values.get("ready") == "1" else "boundary"
-                )
-                dataset = {
-                    "experiment_id": identifier,
-                    "directory": Path(context["directory"]),
-                    "identity": identity,
-                    "file_key": file_key,
-                    "state": context["state"],
-                    "entries": [],
-                    "cache": reader,
-                    "version": int(metadata["version"]),
-                    "complete": values.get("ready") == "1",
-                    "cached_through": json.loads(values["cached_through"]),
-                    "boundary": boundary,
-                    "target_boundary": json.loads(
-                        values.get(target_key, values.get("boundary", "null"))
-                    ),
-                    "observed_at": latest[0] if latest else None,
-                    "gap": None,
-                    "error": None,
-                    "refreshed": time.monotonic(),
-                }
+                dataset = self._load_cached_snapshot(identifier, path, key, db, metadata)
+                if "cache" not in dataset:
+                    return dataset
                 self._read_snapshots[identifier] = (signature, dataset)
             window = self._windows.get(identifier)
             if (
@@ -313,6 +266,68 @@ class LocalJournals:
                     }
                     dataset["complete"] = False
             return dataset
+
+    def _load_cached_snapshot(
+        self, identifier: str, path: Path, key: str,
+        db: sqlite3.Connection, metadata: dict[str, str],
+    ) -> dict:
+        source_document = json.loads(metadata["source"])
+        if source_document.get("version") != JournalHistoryCache.SCHEMA_VERSION:
+            return self._pending_dataset(identifier)
+        source = CacheSource.model_validate(source_document)
+        values = dict(
+            db.execute(
+                "SELECT key,value FROM metadata WHERE key IN ('reader_context','ready','cached_through','boundary','publication_boundary')"
+            )
+        )
+        context = CacheReaderContext.model_validate(json.loads(values["reader_context"]))
+        if (
+            context.project_root != str(self.project)
+            or source.experiment_id != identifier
+        ):
+            return self._pending_dataset(identifier)
+        identity, file_key = source.identity.model_dump(), tuple(source.file_key)
+        reader = JournalHistoryCache(
+            path,
+            self.state_directory / f"{key}.json",
+            identity,
+            file_key,
+            identifier,
+            self.window_events,
+            self.max_bytes,
+            self.max_events,
+        )
+        latest = db.execute(
+            "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
+        ).fetchone()
+        boundary = json.loads(values.get("boundary", "null"))
+        target_key = (
+            "publication_boundary" if values.get("ready") == "1" else "boundary"
+        )
+        publication = CachePublication.model_validate({
+            "version": int(metadata["version"]),
+            "complete": values.get("ready") == "1",
+            "cached_through": json.loads(values["cached_through"]),
+            "boundary": boundary,
+            "target_boundary": json.loads(
+                values.get(target_key, values.get("boundary", "null"))
+            ),
+            "observed_at": latest[0] if latest else None,
+            "gap": None,
+        }).model_dump(exclude_unset=True)
+        dataset = {
+            "experiment_id": identifier,
+            "directory": Path(context.directory),
+            "identity": identity,
+            "file_key": file_key,
+            "state": context.state,
+            "entries": [],
+            "cache": reader,
+            **publication,
+            "error": None,
+            "refreshed": time.monotonic(),
+        }
+        return dataset
 
     def _pending_dataset(self, identifier: str) -> dict:
         return {
@@ -367,14 +382,13 @@ class LocalJournals:
                     "complete": False,
                     "error": "Module statistics have not been prepared for this project.",
                 }
-            if (
-                not isinstance(document.get("items"), list)
-                or not isinstance(document.get("sources"), dict)
-                or type(document.get("complete")) is not bool
-            ):
+            try:
+                publication = ModulePublication.model_validate(document)
+            except (TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "cache_unavailable", "Invalid module statistics publication."
-                )
+                ) from error
+            document = publication.model_dump(exclude_unset=True)
             self._module_publication = document
             self._module_signature = signature
             return document
@@ -443,23 +457,23 @@ class LocalJournals:
                 connection.execute("PRAGMA query_only=ON")
                 connection.execute("BEGIN")
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-                identity = json.loads(metadata["source"])
+                identity = CacheSource.model_validate(json.loads(metadata["source"]))
                 configuration = read_object(
                     self.state_directory / f"{key}.json", 1048576
                 )
                 if (
-                    identity["experiment_id"] != identifier
+                    identity.experiment_id != identifier
                     or configuration["logging"]["expected_journal"]
-                    != identity["identity"]
+                    != identity.identity.model_dump()
                     or Path(configuration["logging"]["db_path"]).resolve()
                     != (directory / "journals/events.sqlite").resolve()
                 ):
                     source["error"] = "Cache belongs to a different journal."
                     continue
                 source.update(
-                    journal=identity["identity"],
-                    file_key=identity["file_key"],
-                    cache_schema_version=identity["version"],
+                    journal=identity.identity.model_dump(),
+                    file_key=identity.file_key,
+                    cache_schema_version=identity.version,
                     version=int(metadata.get("version", 0)),
                     cached_through=json.loads(metadata.get("cached_through", "null")),
                     complete=metadata.get("ready") == "1",

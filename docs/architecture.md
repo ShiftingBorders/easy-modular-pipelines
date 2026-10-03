@@ -216,6 +216,13 @@ read-operation checks. Timeline histogram/statistics and ancestor hydration are
 focused SQL helpers with explicit inputs; their weak-reference overview cache
 and readonly publication policy remain with LocalJournals.
 
+Cache worker results use one model at production and receiving boundaries in
+dashboard/precache. It checks experiment/PID/outcome and matching checkpoint
+identities; completion requires reaching the captured target. Module publications
+have typed source/statistics records. Cached reader source/context/publication
+models reuse journal contracts and are checked when their signature changes.
+Snapshot reconstruction is separate from read-transaction/signature/window policy.
+
 ## Import migration
 
 Legacy compatibility modules have been removed. Import directly from the

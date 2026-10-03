@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import unittest
 from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
@@ -113,11 +114,17 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         """T024/T052: completion ends an explicit stopped build."""
         await self.views.experiment("stopped", "summary", {})
         future = self.views._cache_jobs["stopped"]
+        identity = self.workspaces[2].identity
         future.set_result(
             {
+                "experiment_id": "stopped",
+                "pid": os.getpid(),
                 "complete": True,
-                "target_boundary": {"cursor": 1, "change_cursor": 1},
-                "cached_through": {"cursor": 1, "change_cursor": 1},
+                "target_boundary": {
+                    **identity, "schema_version": 2, "event_count": 1,
+                    "cursor": 1, "change_cursor": 1,
+                },
+                "cached_through": {**identity, "cursor": 1, "change_cursor": 1},
             }
         )
         self.views._collect_cache_jobs()
@@ -144,12 +151,18 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         """T056/T087: slow initial construction remains explicitly visible."""
         await self.views.experiment("stopped", "summary", {})
         future = self.views._cache_jobs["stopped"]
-        target = {"event_count": 10000, "cursor": 10000, "change_cursor": 10000}
+        identity = self.workspaces[2].identity
+        target = {
+            **identity, "schema_version": 2,
+            "event_count": 10000, "cursor": 10000, "change_cursor": 10000,
+        }
         future.set_result(
             {
+                "experiment_id": "stopped",
+                "pid": os.getpid(),
                 "complete": False,
                 "target_boundary": target,
-                "cached_through": {"cursor": 100, "change_cursor": 100},
+                "cached_through": {**identity, "cursor": 100, "change_cursor": 100},
             }
         )
         self.views._collect_cache_jobs()
@@ -159,7 +172,10 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(active["initial"])
         self.assertEqual(active["event_count"], 10000)
         self.views._cache_jobs["stopped"].set_result(
-            {"error": {"code": "journal_unavailable", "message": "Unavailable"}}
+            {
+                "experiment_id": "stopped", "pid": os.getpid(), "complete": False,
+                "error": {"code": "journal_unavailable", "message": "Unavailable"},
+            }
         )
         self.views._collect_cache_jobs()
         self.assertFalse(self.views.cache_activity()["building"])
