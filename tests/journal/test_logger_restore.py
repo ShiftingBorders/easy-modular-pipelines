@@ -11,12 +11,19 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.journal.diagnostics import _validate_restore_input
 from core.journal.events import (
     JournalGenerationChanged,
     LoggingStateError,
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
+from core.models.journal_diagnostics import (
+    AuthorObservation,
+    DiagnosticCommand,
+    JournalSnapshotManifest,
+)
+from core.models.journal_records import CommandObservation
 from tests.helpers.logging_fixtures import write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -41,6 +48,29 @@ class JournalRestorationTests(unittest.TestCase):
         self.logger.open()
         self.restoration_id = uuid4().hex
         self.new_generation = uuid4().hex
+
+    def test_sql_and_diagnostic_observations_remain_models_until_public_output(self):
+        self.prepare_diagnostics()
+        store = self.logger._store
+        with store._lock:
+            state = store._load_command_result("request")
+        self.assertIsInstance(state["runner"]["observation"], AuthorObservation)
+        self.assertIsInstance(state["participant"]["observation"], AuthorObservation)
+        self.assertIsInstance(state["runner"]["result"], CommandObservation)
+        self.assertIsInstance(state["participant"]["result"], CommandObservation)
+        public = self.logger.read_command_result("request")
+        self.assertIsInstance(public["observations"][0]["observation"], dict)
+        self.assertEqual(public["response"], state["runner"]["result"].response)
+        _, _, commands = store._read_diagnostics(self.diagnostics)
+        self.assertTrue(commands)
+        self.assertTrue(
+            all(isinstance(command, DiagnosticCommand) for command in commands)
+        )
+        manifest, _, _, _ = _validate_restore_input(
+            self.manifest, self.restoration_id, self.new_generation
+        )
+        self.assertIsInstance(manifest, JournalSnapshotManifest)
+        self.assertEqual(manifest.model_dump(), self.manifest)
 
     def prepare_diagnostics(self, *, shared_response=False):
         parent = self.logger.start_operation("runner", "parent")

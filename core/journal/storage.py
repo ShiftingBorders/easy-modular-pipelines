@@ -36,9 +36,9 @@ from core.journal.events import (
     LoggingConfigurationError,
     LoggingStateError,
     LoggingStorageError,
+    _validated_command_result,
     encode_event,
     validate_checkpoint,
-    validate_command_result,
     validate_context,
 )
 from core.journal.records import (
@@ -68,7 +68,11 @@ from core.primitives.json_values import (
 _PAGE_BYTES = 16777216
 
 if TYPE_CHECKING:
-    from core.models.journal_diagnostics import DiagnosticManifest
+    from core.models.journal_diagnostics import (
+        DiagnosticCommand,
+        DiagnosticManifest,
+        JournalSnapshotManifest,
+    )
     from core.models.journal_settings import JournalConfiguration
 
 
@@ -645,8 +649,8 @@ class SQLiteEventStore:
         event = entry["event"]
         if event["event_type"] != "command.result":
             return {**entry, "effective_author": None, "provisional": False}
-        data = validate_command_result(event["data"])
-        state = self._load_command_result(data["request_id"], connection=connection)
+        data = _validated_command_result(event["data"])
+        state = self._load_command_result(data.request_id, connection=connection)
         if state is None:
             raise LoggingStorageError("Command observation has no result index.")
         if event["event_id"] not in {
@@ -787,7 +791,7 @@ class SQLiteEventStore:
             if event["event_type"] != "command.result":
                 raise LoggingStorageError("Change refers to an unrelated event.")
             if (
-                validate_command_result(event["data"])["request_id"]
+                _validated_command_result(event["data"]).request_id
                 != change["request_id"]
             ):
                 raise LoggingStorageError("Change refers to another request.")
@@ -938,13 +942,14 @@ class SQLiteEventStore:
                 if stored is None:
                     raise ValueError("Command result refers to a missing event.")
                 event = self._decode_row(stored)["event"]
-                observation = _decode_author_observation(
+                observation, command_data = _decode_author_observation(
                     event, observation_json, request_id, identity
                 )
                 result[author] = {
                     "event_id": event_id,
                     "event": event,
                     "observation": observation,
+                    "result": command_data,
                 }
             _validate_result_precedence(result, row)
             return result
@@ -961,8 +966,8 @@ class SQLiteEventStore:
             or snapshot["event_type"] != "command.result"
         ):
             raise ValueError("append_command_result requires a command.result event.")
-        data = validate_command_result(snapshot["data"])
-        if data["ignored"] is not None or data["supersedes"]:
+        data = _validated_command_result(snapshot["data"])
+        if data.ignored is not None or data.supersedes:
             raise ValueError("Ignored/superseded state is assigned by the journal.")
         identity = {
             name: snapshot["context"].get(name)
@@ -970,20 +975,24 @@ class SQLiteEventStore:
         }
         require_text(identity["experiment_id"], "experiment_id")
         require_text(identity["participant_id"], "participant_id")
-        if snapshot["context"].get("request_id") != data["request_id"]:
+        if snapshot["context"].get("request_id") != data.request_id:
             raise ValueError("Command request_id must match the event context.")
         response_key = json.dumps(
-            [data["outcome"], data["response"]], sort_keys=True, ensure_ascii=True
+            [data.outcome, data.response], sort_keys=True, ensure_ascii=True
         )
-        request_id = data["request_id"]
-        author = data["author"]
+        request_id = data.request_id
+        author = data.author
         other_author = "participant" if author == "runner" else "runner"
-        observation = {
-            "producer_instance_id": snapshot["producer_instance_id"],
-            "occurred_at": snapshot["occurred_at"],
-            "context": snapshot["context"],
-            "operation_id": snapshot["operation_id"],
-        }
+        from core.models.journal_diagnostics import AuthorObservation
+
+        observation = AuthorObservation.model_validate(
+            {
+                "producer_instance_id": snapshot["producer_instance_id"],
+                "occurred_at": snapshot["occurred_at"],
+                "context": snapshot["context"],
+                "operation_id": snapshot["operation_id"],
+            }
+        )
         with self._lock:
             self._require_open(writing=True)
             writing_started = False
@@ -1018,7 +1027,7 @@ class SQLiteEventStore:
                     event_id = own["event_id"]
                 else:
                     reused, event_id = _prepare_other_author_result(
-                        response_key, other, author, snapshot
+                        response_key, other, author, snapshot, data
                     )
                     if not reused:
                         encoded = encode_event(snapshot, self._max_event_bytes)
@@ -1039,7 +1048,7 @@ class SQLiteEventStore:
                         request_id=request_id,
                         result_changed=before_effective
                         != (effective_author, state[effective_author]["event_id"]),
-                        observation={"author": author, **observation},
+                        observation={"author": author, **observation.model_dump()},
                     )
                 self._connection.execute("COMMIT")
                 self._check_health()
@@ -1322,7 +1331,9 @@ class SQLiteEventStore:
                 if reader is not None:
                     _close_preserving_failure(reader)
 
-    def _read_diagnostics(self, directory: str | Path) -> tuple[JsonObject, list, list]:
+    def _read_diagnostics(
+        self, directory: str | Path
+    ) -> tuple[JsonObject, list[JsonObject], list[DiagnosticCommand]]:
         path = Path(directory)
         if not path.is_absolute():
             raise ValueError("Diagnostics must use an absolute directory path.")
@@ -1336,7 +1347,7 @@ class SQLiteEventStore:
 
     def _read_diagnostic_records(
         self, path: Path, manifest: DiagnosticManifest
-    ) -> tuple[list[JsonObject], list[JsonObject]]:
+    ) -> tuple[list[JsonObject], list[DiagnosticCommand]]:
         events, commands = [], []
         digest = hashlib.sha256()
         event_ids, request_ids = set(), set()
@@ -1377,10 +1388,10 @@ class SQLiteEventStore:
             raise ValueError("Diagnostic record counts do not match.")
         for record in commands:
             for author in ("runner", "participant"):
-                if (
-                    record[author] is not None
-                    and record[author]["event_id"] not in event_ids
-                ):
+                observation = (
+                    record.runner if author == "runner" else record.participant
+                )
+                if observation is not None and observation.event_id not in event_ids:
                     raise ValueError("Diagnostic result refers outside its bundle.")
         return events, commands
 
@@ -1457,9 +1468,12 @@ class SQLiteEventStore:
                     _close_preserving_failure(connection)
 
     def _prepare_restore_import(
-        self, manifest: JsonObject, identity: JsonObject, new_generation: str,
+        self,
+        manifest: JournalSnapshotManifest,
+        identity: JsonObject,
+        new_generation: str,
         diagnostics: str | Path | None,
-    ) -> tuple[list[tuple[JsonObject, str]], list[JsonObject], str]:
+    ) -> tuple[list[tuple[JsonObject, str]], list[DiagnosticCommand], str]:
         bundle, events, commands = None, [], []
         if diagnostics is not None:
             bundle, events, commands = self._read_diagnostics(diagnostics)
@@ -1468,7 +1482,7 @@ class SQLiteEventStore:
         prepared_events = _prepare_diagnostic_events(events, self._max_event_bytes)
         parameters = json.dumps(
             {
-                "snapshot": manifest,
+                "snapshot": manifest.model_dump(),
                 "new_generation": new_generation,
                 "diagnostics": bundle,
             },
@@ -1478,9 +1492,15 @@ class SQLiteEventStore:
         return prepared_events, commands, parameters
 
     def _restore_journal_records(
-        self, connection: sqlite3.Connection, manifest: JsonObject, identity: JsonObject,
-        restoration_id: str, new_generation: str, parameters: str,
-        prepared_events: list[tuple[JsonObject, str]], commands: list[JsonObject],
+        self,
+        connection: sqlite3.Connection,
+        manifest: JournalSnapshotManifest,
+        identity: JsonObject,
+        restoration_id: str,
+        new_generation: str,
+        parameters: str,
+        prepared_events: list[tuple[JsonObject, str]],
+        commands: list[DiagnosticCommand],
     ) -> tuple[JsonObject, bool]:
         info = _read_journal_info(connection)
         actual = {name: info[name] for name in ("journal_id", "generation")}
@@ -1510,7 +1530,7 @@ class SQLiteEventStore:
         result = {
             **_read_boundary(connection),
             "restoration_id": restoration_id,
-            "snapshot_id": manifest["snapshot_id"],
+            "snapshot_id": manifest.snapshot_id,
             "imported_events": len(inserted),
         }
         connection.execute(
@@ -1558,25 +1578,19 @@ class SQLiteEventStore:
         return result
 
     def _check_restored_snapshot(
-        self, connection: sqlite3.Connection, manifest: JsonObject
+        self, connection: sqlite3.Connection, manifest: JournalSnapshotManifest
     ) -> None:
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-            raise LoggingStorageError(
-                "Restored journal failed its integrity check."
-            )
+            raise LoggingStorageError("Restored journal failed its integrity check.")
         self._validate_snapshot_source(connection)
         boundary = _read_boundary(connection)
         if any(
-            boundary[key] != manifest[key]
+            boundary[key] != getattr(manifest, key)
             for key in ("cursor", "event_count", "change_cursor")
         ):
-            raise ValueError(
-                "Restored journal does not match the snapshot boundary."
-            )
-        if _content_digest(connection) != manifest["content_sha256"]:
-            raise ValueError(
-                "Restored journal does not match the snapshot contents."
-            )
+            raise ValueError("Restored journal does not match the snapshot boundary.")
+        if _content_digest(connection) != manifest.content_sha256:
+            raise ValueError("Restored journal does not match the snapshot contents.")
 
     def _import_diagnostic_events(
         self, connection: sqlite3.Connection, events: list[tuple[JsonObject, str]]
@@ -1607,17 +1621,15 @@ class SQLiteEventStore:
         return inserted
 
     def _import_diagnostic_commands(
-        self, connection: sqlite3.Connection, commands: list[JsonObject]
+        self, connection: sqlite3.Connection, commands: list[DiagnosticCommand]
     ) -> dict[str, tuple[str, bool]]:
         changed_requests = {}
         for record in commands:
-            request_id = record["request_id"]
+            request_id = record.request_id
             state = self._load_command_result(request_id, connection=connection)
             state, before, changed = _merge_diagnostic_command(state, record)
             _save_command_state(connection, request_id, state)
-            checked = self._load_command_result(
-                request_id, connection=connection
-            )
+            checked = self._load_command_result(request_id, connection=connection)
             if changed:
                 changed_requests[request_id] = (
                     checked["effective_event_id"],

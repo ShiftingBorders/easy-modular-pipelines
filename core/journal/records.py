@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from core.journal.events import (
     SCHEMA_VERSION,
@@ -15,6 +16,9 @@ from core.journal.events import (
     validate_journal_identity,
 )
 from core.primitives.json_values import JsonObject
+
+if TYPE_CHECKING:
+    from core.models.journal_records import CommandObservation
 
 
 def _read_journal_info(connection: sqlite3.Connection) -> JsonObject:
@@ -76,12 +80,12 @@ def _checkpoint_position(
     return checkpoint[key]
 
 
-def _ignored_reason(runner_event: JsonObject) -> str:
+def _ignored_reason(result: CommandObservation) -> str:
     return {
         "timed_out": "request_timed_out",
         "cancelled": "request_cancelled",
         "invalidated": "request_invalidated",
-    }.get(runner_event["data"]["outcome"], "runner_result_precedence")
+    }.get(result.outcome, "runner_result_precedence")
 
 
 def _read_boundary(connection: sqlite3.Connection) -> JsonObject:
@@ -107,7 +111,7 @@ def _validate_result_precedence(result: dict, row: tuple) -> None:
     if not shared_event:
         for author in ("runner", "participant"):
             entry = result[author]
-            if entry is not None and entry["event"]["data"]["author"] != author:
+            if entry is not None and entry["result"].author != author:
                 raise ValueError("Command event author does not match its index.")
     effective_author = "runner" if result["runner"] is not None else "participant"
     effective = result[effective_author]
@@ -117,54 +121,54 @@ def _validate_result_precedence(result: dict, row: tuple) -> None:
         or row[5] != effective["event_id"]
     ):
         raise ValueError("Invalid effective command result.")
-    if runner is None and participant["event"]["data"]["ignored"] is not None:
+    if runner is None and participant["result"].ignored is not None:
         raise ValueError("An ignored participant response requires a runner result.")
     if shared_event:
-        shared_data = effective["event"]["data"]
-        if shared_data["ignored"] is not None or shared_data["supersedes"]:
+        shared_data = effective["result"]
+        if shared_data.ignored is not None or shared_data.supersedes:
             raise ValueError("A shared result cannot be ignored or superseded.")
     else:
-        if participant is not None and participant["event"]["data"]["supersedes"]:
+        if participant is not None and participant["result"].supersedes:
             raise ValueError("A participant response cannot supersede runner.")
         if runner is not None:
-            runner_data = runner["event"]["data"]
-            if runner_data["ignored"] is not None:
+            runner_data = runner["result"]
+            if runner_data.ignored is not None:
                 raise ValueError("A runner result cannot be ignored.")
-            supersedes = runner_data["supersedes"]
+            supersedes = runner_data.supersedes
             if supersedes and (
                 participant is None
-                or supersedes
-                != [
-                    {
-                        "event_id": participant["event_id"],
-                        "ignored": _ignored_reason(runner["event"]),
-                    }
-                ]
+                or len(supersedes) != 1
+                or supersedes[0].event_id != participant["event_id"]
+                or supersedes[0].ignored != _ignored_reason(runner_data)
             ):
                 raise ValueError("Invalid superseded participant reference.")
             if participant is not None:
-                participant_data = participant["event"]["data"]
-                reason = participant_data["ignored"]
-                if reason is not None and reason != _ignored_reason(runner["event"]):
+                participant_data = participant["result"]
+                reason = participant_data.ignored
+                if reason is not None and reason != _ignored_reason(runner_data):
                     raise ValueError("Invalid ignored participant reason.")
                 if json.dumps(
-                    [runner_data["outcome"], runner_data["response"]],
+                    [runner_data.outcome, runner_data.response],
                     sort_keys=True,
                 ) == json.dumps(
-                    [participant_data["outcome"], participant_data["response"]],
+                    [participant_data.outcome, participant_data.response],
                     sort_keys=True,
                 ):
                     raise ValueError("Matching results must share one event ID.")
 
 
 def _prepare_other_author_result(
-    response_key: str, other: dict | None, author: str, snapshot: JsonObject
+    response_key: str,
+    other: dict | None,
+    author: str,
+    snapshot: JsonObject,
+    result: CommandObservation,
 ) -> tuple[bool, str | None]:
     other_key = None
     if other is not None:
-        other_data = other["event"]["data"]
+        other_data = other["result"]
         other_key = json.dumps(
-            [other_data["outcome"], other_data["response"]],
+            [other_data.outcome, other_data.response],
             sort_keys=True,
             ensure_ascii=True,
         )
@@ -172,12 +176,12 @@ def _prepare_other_author_result(
         return True, other["event_id"]
     else:
         if author == "participant" and other is not None:
-            snapshot["data"]["ignored"] = _ignored_reason(other["event"])
+            snapshot["data"]["ignored"] = _ignored_reason(other["result"])
         elif author == "runner" and other is not None:
             snapshot["data"]["supersedes"] = [
                 {
                     "event_id": other["event_id"],
-                    "ignored": _ignored_reason(snapshot),
+                    "ignored": _ignored_reason(result),
                 }
             ]
     return False, None
@@ -185,7 +189,7 @@ def _prepare_other_author_result(
 
 def _command_result_document(request_id: str, state: dict) -> JsonObject:
     effective = state[state["effective_author"]]
-    data = effective["event"]["data"]
+    data = effective["result"]
     observations = []
     for author in ("runner", "participant"):
         entry = state[author]
@@ -197,13 +201,13 @@ def _command_result_document(request_id: str, state: dict) -> JsonObject:
             and state["runner"] is not None
             and entry["event_id"] != state["runner"]["event_id"]
         ):
-            ignored = _ignored_reason(state["runner"]["event"])
+            ignored = _ignored_reason(state["runner"]["result"])
         observations.append(
             {
                 "author": author,
                 "event_id": entry["event_id"],
                 "event": entry["event"],
-                "observation": entry["observation"],
+                "observation": entry["observation"].model_dump(),
                 "ignored": ignored,
             }
         )
@@ -211,8 +215,8 @@ def _command_result_document(request_id: str, state: dict) -> JsonObject:
         "request_id": request_id,
         "event_id": effective["event_id"],
         "author": state["effective_author"],
-        "outcome": data["outcome"],
-        "response": data["response"],
+        "outcome": data.outcome,
+        "response": data.response,
         "event": effective["event"],
         "observations": observations,
         "provisional": state["runner"] is None,

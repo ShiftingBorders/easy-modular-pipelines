@@ -1,5 +1,7 @@
 """Journal diagnostic exports and restoration record operations."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -8,18 +10,26 @@ import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import TYPE_CHECKING, BinaryIO
 from uuid import uuid4
 
 from core.journal.events import (
     SCHEMA_VERSION,
     LoggingStateError,
     LoggingStorageError,
+    _validated_command_result,
     encode_event,
-    validate_command_result,
     validate_journal_identity,
 )
 from core.primitives.json_values import JsonObject, require_text
+
+if TYPE_CHECKING:
+    from core.models.journal_diagnostics import (
+        AuthorObservation,
+        DiagnosticCommand,
+        JournalSnapshotManifest,
+    )
+    from core.models.journal_records import CommandObservation
 
 
 def _decode_author_observation(
@@ -27,7 +37,7 @@ def _decode_author_observation(
     observation_json: str,
     request_id: str,
     identity: JsonObject,
-) -> JsonObject:
+) -> tuple[AuthorObservation, CommandObservation]:
     from core.models.journal_diagnostics import AuthorObservation
 
     if (
@@ -35,9 +45,9 @@ def _decode_author_observation(
         or event["event_type"] != "command.result"
     ):
         raise ValueError("Command result refers to an unrelated event.")
-    data = validate_command_result(event["data"])
+    data = _validated_command_result(event["data"])
     if (
-        data["request_id"] != request_id
+        data.request_id != request_id
         or event["context"].get("request_id") != request_id
     ):
         raise ValueError("Command result request identity does not match.")
@@ -49,7 +59,7 @@ def _decode_author_observation(
         raise ValueError("Observation request_id does not match.")
     if {key: context.get(key) for key in identity} != identity:
         raise ValueError("Observation belongs to another request context.")
-    return observation.model_dump()
+    return observation, data
 
 
 def _content_digest(connection: sqlite3.Connection) -> str:
@@ -75,7 +85,7 @@ def _content_digest(connection: sqlite3.Connection) -> str:
 
 
 def _validate_diagnostic_command(
-    record: JsonObject, request_ids: set[str], commands: list[JsonObject]
+    record: JsonObject, request_ids: set[str], commands: list[DiagnosticCommand]
 ) -> None:
     from core.models.journal_diagnostics import DiagnosticCommand
 
@@ -84,12 +94,12 @@ def _validate_diagnostic_command(
     if request_id in request_ids:
         raise ValueError("Duplicate diagnostic request ID.")
     request_ids.add(request_id)
-    commands.append(command.model_dump(exclude_unset=True))
+    commands.append(command)
 
 
 def _validate_restore_input(
     snapshot_manifest: JsonObject, restoration_id: str, new_generation: str
-) -> tuple[JsonObject, JsonObject, str, str]:
+) -> tuple[JournalSnapshotManifest, JsonObject, str, str]:
     from core.models.journal_diagnostics import JournalRestorationInput
 
     restoration = JournalRestorationInput.model_validate(
@@ -99,9 +109,9 @@ def _validate_restore_input(
             "new_generation": new_generation,
         }
     )
-    manifest = restoration.snapshot.model_dump()
+    manifest = restoration.snapshot
     identity = validate_journal_identity(
-        {name: manifest[name] for name in ("journal_id", "generation")}
+        {"journal_id": manifest.journal_id, "generation": manifest.generation}
     )
     return manifest, identity, restoration.restoration_id, restoration.new_generation
 
@@ -161,8 +171,10 @@ def _save_command_state(
             json.dumps(state["identity"], sort_keys=True),
             runner["event_id"] if runner else None,
             participant["event_id"] if participant else None,
-            json.dumps(runner["observation"]) if runner else None,
-            json.dumps(participant["observation"]) if participant else None,
+            json.dumps(runner["observation"].model_dump()) if runner else None,
+            json.dumps(participant["observation"].model_dump())
+            if participant
+            else None,
             state[author]["event_id"],
             author,
         ),
@@ -205,14 +217,14 @@ def _diagnostic_operation_events(
 
 
 def _add_diagnostic_observer_events(
-    reader: sqlite3.Connection, selected_operations: set[str], selected: set[str],
+    reader: sqlite3.Connection,
+    selected_operations: set[str],
+    selected: set[str],
     read_result: Callable[[str], dict],
 ) -> None:
     # A matching reply can exist only in observer metadata. Its raw
     # event may belong to the other participant, outside this tree.
-    for (request_id,) in reader.execute(
-        "SELECT request_id FROM command_results"
-    ):
+    for (request_id,) in reader.execute("SELECT request_id FROM command_results"):
         state = read_result(request_id)
         for author in ("runner", "participant"):
             entry = state[author]
@@ -220,8 +232,8 @@ def _add_diagnostic_observer_events(
                 continue
             observation = entry["observation"]
             if (
-                observation["operation_id"] in selected_operations
-                or observation["context"].get("parent_operation_id")
+                observation.operation_id in selected_operations
+                or observation.context.root.get("parent_operation_id")
                 in selected_operations
             ):
                 selected.add(entry["event_id"])
@@ -273,8 +285,11 @@ def _diagnostic_dependencies(
 
 
 def _write_diagnostic_records(
-    target: Path, metadata: dict[str, tuple[str | None, str | None]], selected: set[str],
-    requests: dict[str, dict], read_event: Callable[[str], JsonObject],
+    target: Path,
+    metadata: dict[str, tuple[str | None, str | None]],
+    selected: set[str],
+    requests: dict[str, dict],
+    read_event: Callable[[str], JsonObject],
 ) -> str:
     digest = hashlib.sha256()
     with (target / "records.jsonl.part").open("xb") as output:
@@ -297,8 +312,8 @@ def _write_diagnostic_records(
             for author in ("runner", "participant"):
                 if state[author] is not None:
                     record[author] = {
-                        field: state[author][field]
-                        for field in ("event_id", "observation")
+                        "event_id": state[author]["event_id"],
+                        "observation": state[author]["observation"].model_dump(),
                     }
             _write_diagnostic_record(output, digest, record)
         output.flush()
@@ -313,7 +328,7 @@ def _prepare_diagnostic_events(
 
 
 def _merge_diagnostic_command(
-    state: dict | None, record: JsonObject
+    state: dict | None, record: DiagnosticCommand
 ) -> tuple[dict, tuple[str, str] | None, bool]:
     before = (
         None
@@ -322,31 +337,34 @@ def _merge_diagnostic_command(
     )
     if state is None:
         state = {
-            "identity": record["identity"],
+            "identity": record.identity.model_dump(),
             "runner": None,
             "participant": None,
         }
-    if state["identity"] != record["identity"]:
-        raise ValueError(
-            "Diagnostic request belongs to another context."
-        )
+    if state["identity"] != record.identity.model_dump():
+        raise ValueError("Diagnostic request belongs to another context.")
     changed = False
     for author in ("runner", "participant"):
-        incoming, current = record[author], state[author]
+        incoming = record.runner if author == "runner" else record.participant
+        current = state[author]
         if incoming is None:
             continue
         if current is not None:
             old = {
-                key: current[key] for key in ("event_id", "observation")
+                "event_id": current["event_id"],
+                "observation": current["observation"].model_dump(),
             }
             if json.dumps(old, sort_keys=True) != json.dumps(
-                incoming, sort_keys=True
+                incoming.model_dump(), sort_keys=True
             ):
                 raise ValueError(
                     "Diagnostic observation conflicts with restored history."
                 )
         else:
-            state[author] = incoming
+            state[author] = {
+                "event_id": incoming.event_id,
+                "observation": incoming.observation,
+            }
             changed = True
     return state, before, changed
 
