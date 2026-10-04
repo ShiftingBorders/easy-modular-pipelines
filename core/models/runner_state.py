@@ -82,6 +82,45 @@ class AttemptParameters(_Input):
         return document
 
 
+class RecoveryLaunchEvidence(_Document):
+    """Selected committed start context; queue metadata retains its old values."""
+
+    model_config = ConfigDict(extra="allow")
+
+    experiment_id: Text
+    participant_id: UUIDText
+    participant_instance_id: UUIDText
+    attempt_id: UUIDText
+    stage_id: UUIDText
+    stage_execution_id: UUIDText
+    cycle_number: PositiveInteger
+    attempt_number: PositiveInteger
+    request_id: JsonValue
+    queued_at: JsonValue
+    queued_monotonic: JsonValue
+
+
+class RecoveryContextIdentity(ParticipantIdentity):
+    """Reconstruction consumes identity plus the original request and attempt."""
+
+    request_id: JsonValue
+    attempt_id: JsonValue
+
+
+class RecoveredAttemptContext(_Document):
+    """Reconstruction fields only; unrelated module/process settings stay extras."""
+
+    model_config = ConfigDict(extra="allow")
+
+    context: RecoveryContextIdentity
+    input_data: JsonValue
+    settings: JsonValue
+    endpoint_path: str
+    service_id: JsonValue
+    queued_at: JsonValue
+    queued_monotonic: JsonValue
+
+
 class ServiceParameters(_Input):
     service_id: UUIDText
     service_instance_id: UUIDText

@@ -67,6 +67,8 @@ from core.models.runner_state import (
     LastDecision,
     PendingInput,
     PendingRebuild,
+    RecoveredAttemptContext,
+    RecoveryLaunchEvidence,
     ServiceCallExecutorStatus,
 )
 from core.modules.manager import ModuleManager
@@ -2444,23 +2446,24 @@ class ExperimentRunner:
             and state.active_attempt.attempt_id == launched["attempt_id"]
         ):
             return
+        evidence = RecoveryLaunchEvidence.model_validate(launched)
         definition = next(
-            item
-            for item in state.template.stages
-            if item.stage_id == launched["stage_id"]
+            item for item in state.template.stages if item.stage_id == evidence.stage_id
         )
         directory = (
             root
             / "shared_artifacts"
-            / f"epoch_{launched['cycle_number']}"
+            / f"epoch_{evidence.cycle_number}"
             / self._assembler._module_reference(state.template, definition).name
-            / launched["stage_id"]
-            / f"attempt_{launched['attempt_number']}"
+            / evidence.stage_id
+            / f"attempt_{evidence.attempt_number}"
         )
-        attempt = _attempt_from_launch(definition, launched, directory, root)
+        attempt = _attempt_from_launch(definition, evidence, directory, root)
         state.active_attempt = attempt
-        context = read_json(directory / "context.json")
-        if context["context"]["attempt_id"] != launched["attempt_id"]:
+        context = RecoveredAttemptContext.model_validate(
+            read_json(directory / "context.json")
+        )
+        if context.context.attempt_id != evidence.attempt_id:
             raise ValueError("Saved launch context has a different attempt identity.")
         _apply_recovered_attempt_context(attempt, context)
         record_path = directory / "process.json"

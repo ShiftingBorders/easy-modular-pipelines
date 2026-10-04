@@ -25,6 +25,8 @@ from core.models.runner_state import (
     LastDecision,
     PendingInput,
     PendingRebuild,
+    RecoveredAttemptContext,
+    RecoveryLaunchEvidence,
     SavedAttempt,
     SavedRunnerState,
     SavedService,
@@ -641,16 +643,16 @@ def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
 
 def _attempt_from_launch(
     definition: StageDefinition | ServiceCallDefinition,
-    launched: JsonObject,
+    launched: RecoveryLaunchEvidence,
     directory: Path,
     root: Path,
 ) -> StageAttempt:
     attempt = StageAttempt(
-        launched["attempt_id"],
-        launched["stage_id"],
-        launched["stage_execution_id"],
-        launched["cycle_number"],
-        launched["attempt_number"],
+        launched.attempt_id,
+        launched.stage_id,
+        launched.stage_execution_id,
+        launched.cycle_number,
+        launched.attempt_number,
         directory,
         {},
         {},
@@ -658,8 +660,12 @@ def _attempt_from_launch(
     )
     # Bind ownership before optional files are read so failure
     # handling still has to confirm this attempt's termination.
-    attempt.request_id = launched["request_id"]
-    attempt.participant = _participant_identity(launched)
+    attempt.request_id = launched.request_id
+    attempt.participant = ParticipantIdentity(
+        experiment_id=launched.experiment_id,
+        participant_id=launched.participant_id,
+        participant_instance_id=launched.participant_instance_id,
+    )
     attempt.service_id = (
         definition.service_id if isinstance(definition, ServiceCallDefinition) else None
     )
@@ -668,19 +674,19 @@ def _attempt_from_launch(
         if attempt.service_id is not None
         else directory / "executor.lock.json"
     )
-    attempt.queued_monotonic = launched["queued_monotonic"]
-    attempt.queued_at = launched["queued_at"]
+    attempt.queued_monotonic = launched.queued_monotonic
+    attempt.queued_at = launched.queued_at
     return attempt
 
 
 def _apply_recovered_attempt_context(
-    attempt: StageAttempt, context: JsonObject
+    attempt: StageAttempt, context: RecoveredAttemptContext
 ) -> None:
-    attempt.input_data = context["input_data"]
-    attempt.effective_settings = context["settings"]
-    attempt.request_id = context["context"]["request_id"]
-    attempt.participant = _participant_identity(context["context"])
-    attempt.endpoint_path = Path(context["endpoint_path"])
-    attempt.service_id = context["service_id"]
-    attempt.queued_at = context["queued_at"]
-    attempt.queued_monotonic = context["queued_monotonic"]
+    attempt.input_data = context.input_data
+    attempt.effective_settings = context.settings
+    attempt.request_id = context.context.request_id
+    attempt.participant = _participant_identity(context.context)
+    attempt.endpoint_path = Path(context.endpoint_path)
+    attempt.service_id = context.service_id
+    attempt.queued_at = context.queued_at
+    attempt.queued_monotonic = context.queued_monotonic

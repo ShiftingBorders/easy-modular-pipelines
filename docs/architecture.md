@@ -86,6 +86,8 @@ Stage attempts and accepted-executor tracking retain full process identities as
 models too. Historical partial attempt/process records keep their JSON contract.
 Reconnect compares original attempt inputs through a lightweight context
 observation model, preserving historical documents and canonical JSON matching.
+Recovery reconstructs missing attempts from typed selected launch evidence and
+recovered context fields, binding ownership before optional files are read.
 
 Server command, chain and target models normalize admission payloads. Controller
 argument models check supported control operations before invoking public runner

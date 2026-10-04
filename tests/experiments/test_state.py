@@ -20,6 +20,8 @@ from core.experiments.state import (
     RunnerStateStore,
     ServiceInstance,
     StageAttempt,
+    _apply_recovered_attempt_context,
+    _attempt_from_launch,
     _attempt_result_identity,
     _relative_state_path,
     state_from_document,
@@ -43,6 +45,8 @@ from core.models.runner_state import (
     LastDecision,
     PendingInput,
     PendingRebuild,
+    RecoveredAttemptContext,
+    RecoveryLaunchEvidence,
     ServiceCallExecutorStatus,
     ServiceFailure,
     ServiceFailureDetails,
@@ -379,6 +383,55 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(
             restored.services[service.service_id].process_identity.pid, os.getpid()
         )
+
+    def test_recovery_reconstruction_keeps_only_consumed_context_requirements(self):
+        stage = self.state.template.stages[0]
+        attempt_id, execution_id, request_id = str(uuid4()), str(uuid4()), str(uuid4())
+        evidence_document = {
+            "experiment_id": self.state.experiment_id,
+            "participant_id": stage.stage_id,
+            "participant_instance_id": attempt_id,
+            "stage_id": stage.stage_id,
+            "attempt_id": attempt_id,
+            "stage_execution_id": execution_id,
+            "request_id": request_id,
+            "cycle_number": 1,
+            "attempt_number": 1,
+            "queued_at": None,
+            "queued_monotonic": -1,
+            "historical": {"value": 1},
+        }
+        evidence = RecoveryLaunchEvidence.model_validate(evidence_document)
+        attempt = _attempt_from_launch(
+            stage, evidence, self.root / "attempt", self.root
+        )
+        self.assertEqual(attempt.attempt_id, attempt_id)
+        self.assertIsInstance(attempt.participant, ParticipantIdentity)
+        self.assertEqual(attempt.queued_monotonic, -1)
+        self.assertEqual(evidence.model_dump(exclude_unset=True), evidence_document)
+        document = {
+            "context": {
+                **attempt.participant.model_dump(),
+                "attempt_id": attempt_id,
+                "request_id": request_id,
+                "historical": True,
+            },
+            "input_data": {"value": [1, None]},
+            "settings": {"working": True},
+            "endpoint_path": str(self.root / "attempt/endpoint.json"),
+            "service_id": None,
+            "queued_at": None,
+            "queued_monotonic": -1,
+            "unrelated": {"legacy": [1, 1.0, True]},
+        }
+        context = RecoveredAttemptContext.model_validate(document)
+        _apply_recovered_attempt_context(attempt, context)
+        self.assertEqual(attempt.endpoint_path, Path(document["endpoint_path"]))
+        self.assertEqual(attempt.request_id, request_id)
+        self.assertEqual(attempt.input_data, document["input_data"])
+        self.assertEqual(context.model_dump(exclude_unset=True), document)
+        document["input_data"]["value"].append("external")
+        self.assertNotIn("external", attempt.input_data["value"])
 
     def test_attempt_identity_retains_extras_and_detaches_saved_json(self):
         attempt, _ = self._add_path_participants()
