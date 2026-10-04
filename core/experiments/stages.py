@@ -36,6 +36,7 @@ from core.models.experiment_template import (
     StageDefinition,
 )
 from core.models.participant_observations import ExecutorCommandStateResponse
+from core.models.runner_state import PendingInput
 from core.participants.connection import ParticipantConnection
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, JsonValue
@@ -191,18 +192,18 @@ class StageRunner:
             else None
         )
 
-    def _read_move_input(self, state: RunnerState, transfer: JsonObject) -> JsonValue:
+    def _read_move_input(self, state: RunnerState, transfer: PendingInput) -> JsonValue:
         if (
-            transfer["stage_id"]
+            transfer.stage_id
             != state.template.stages[state.stage_position - 1].stage_id
         ):
             raise ValueError("Pending input belongs to another stage.")
         record = read_result(
             self._journal.client,
-            transfer["request_id"],
+            transfer.request_id,
             expected={
-                "experiment_id": transfer["experiment_id"],
-                "stage_id": transfer["source_stage_id"],
+                "experiment_id": transfer.experiment_id,
+                "stage_id": transfer.source_stage_id,
             },
             accepted=True,
         )
@@ -211,7 +212,7 @@ class StageRunner:
             or record["outcome"] != "succeeded"
             or record["response"]["result"] != "success"
             or record["response"].get("execution", {}).get("dag_decision")
-            != {"command": "move", "stage_id": transfer["stage_id"]}
+            != {"command": "move", "stage_id": transfer.stage_id}
         ):
             raise ValueError("Move input has no accepted successful journal result.")
         return record["response"]["data"]
@@ -1095,7 +1096,7 @@ class StageRunner:
         request_ids = set(state.stage_result_ids.values())
         for transfer in (state.pending_input, state.last_dag_decision):
             if transfer is not None:
-                request_ids.add(transfer["request_id"])
+                request_ids.add(transfer.request_id)
         for request_id in request_ids:
             record = self._journal.client.read_command_result(request_id)
             if record is None:

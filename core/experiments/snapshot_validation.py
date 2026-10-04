@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from core.experiments.results import read_result
 from core.experiments.state import RunnerState
 from core.journal.storage import SQLiteEventStore
+from core.models.runner_state import LastDecision
 from core.models.snapshot_documents import SnapshotManifest
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
@@ -66,10 +67,10 @@ def _validate_journal_results(state: RunnerState, store: SQLiteEventStore) -> No
             continue
         record = read_result(
             store,
-            transfer["request_id"],
+            transfer.request_id,
             expected={
-                "experiment_id": transfer["experiment_id"],
-                "stage_id": transfer["source_stage_id"],
+                "experiment_id": transfer.experiment_id,
+                "stage_id": transfer.source_stage_id,
             },
             accepted=True,
         )
@@ -80,14 +81,15 @@ def _validate_journal_results(state: RunnerState, store: SQLiteEventStore) -> No
         ):
             raise ValueError("Snapshot transition has no accepted result.")
         decision = record["response"].get("execution", {}).get("dag_decision")
-        expected = transfer.get(
-            "decision",
-            {"command": "move", "stage_id": transfer.get("stage_id")},
+        expected = (
+            transfer.decision.model_dump(exclude_unset=True)
+            if isinstance(transfer, LastDecision)
+            else {"command": "move", "stage_id": transfer.stage_id}
         )
         if decision != expected:
             raise ValueError("Snapshot transition differs from its journal decision.")
         if (
-            transfer["request_id"] == state.last_result_id
+            transfer.request_id == state.last_result_id
             and record["response"]["data"] != state.last_result
         ):
             raise ValueError(

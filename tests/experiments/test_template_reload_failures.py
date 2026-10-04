@@ -748,7 +748,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         ):
             await runner.reload_template(work.files.write_template(document))
         self.assertIsNotNone(runner._state.pending_rebuild)
-        snapshot_id = runner._state.pending_rebuild["snapshot_id"]
+        snapshot_id = runner._state.pending_rebuild.snapshot_id
         await runner.stop()
         self.assertEqual([m["snapshot_id"] for m in work.manifests()], [snapshot_id])
         await runner.recover(runner._state.experiment_id)

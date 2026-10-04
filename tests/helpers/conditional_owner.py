@@ -52,7 +52,7 @@ async def run_owner(options) -> None:
         if (
             options.boundary == "transition"
             and transfer is not None
-            and transfer["source_stage_id"] == options.condition
+            and transfer.source_stage_id == options.condition
         ):
             crash()
 

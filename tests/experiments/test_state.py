@@ -27,7 +27,17 @@ from core.models.experiment_template import (
     HeartbeatPolicy,
     ServiceDefinition,
 )
+from core.models.process_identity import ProcessIdentity
+from core.models.runner_state import (
+    DagDecision,
+    LastDecision,
+    PendingInput,
+    PendingRebuild,
+    ServiceFailure,
+    ServiceFailureDetails,
+)
 from core.models.updates import _update_model
+from core.participants.protocol import error_details
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
 from tests.helpers.dag import DagWorkspace
@@ -81,6 +91,61 @@ class RunnerStateTests(unittest.TestCase):
                 self.assertRaises((TypeError, ValueError)),
             ):
                 state_from_document(self.root, {**document, "template": template})
+
+    def test_managed_records_remain_models_after_persistence(self):
+        _, service = self._add_path_participants()
+        stage_id = self.state.template.stages[0].stage_id
+        request_id, snapshot_id = str(uuid4()), str(uuid4())
+        decision = DagDecision.model_validate({"command": "move", "stage_id": stage_id})
+        self.state.last_dag_decision = LastDecision(
+            request_id=request_id,
+            source_stage_id=stage_id,
+            experiment_id=self.state.experiment_id,
+            decision=decision,
+        )
+        self.state.pending_input = PendingInput(
+            request_id=request_id,
+            source_stage_id=stage_id,
+            experiment_id=self.state.experiment_id,
+            stage_id=stage_id,
+        )
+        self.state.stable_snapshot_id = snapshot_id
+        self.state.pending_rebuild = PendingRebuild(
+            operation_id=str(uuid4()),
+            snapshot_id=snapshot_id,
+            template_revision_id=self.state.template_revision_id,
+            run_id=self.state.run_id,
+        )
+        self.state.owner_identity = ProcessIdentity.model_validate(
+            process_identity(os.getpid())
+        )
+        service.failure = ServiceFailureDetails(
+            code="service_failure", message="failed"
+        )
+        document = state_to_document(self.state)
+        self.store.save(self.state)
+        restored = self.store.load(self.root)
+        for value, expected in (
+            (restored.pending_input, PendingInput),
+            (restored.pending_rebuild, PendingRebuild),
+            (restored.last_dag_decision, LastDecision),
+            (restored.last_dag_decision.decision, DagDecision),
+            (restored.owner_identity, ProcessIdentity),
+            (restored.services[service.service_id].failure, ServiceFailureDetails),
+        ):
+            self.assertIsInstance(value, expected)
+        self.assertEqual(state_to_document(restored), document)
+        self.assertIs(self.state.last_dag_decision.decision, decision)
+
+    def test_live_failure_retains_empty_message_and_saved_contract(self):
+        failure = ServiceFailureDetails(
+            code="service_failure", message=str(TimeoutError())
+        )
+        self.assertEqual(
+            failure.model_dump(), error_details("service_failure", TimeoutError())
+        )
+        with self.assertRaises(ValueError):
+            ServiceFailure.model_validate(failure.model_dump())
 
     def _add_path_participants(self):
         stage_id = str(uuid4())
@@ -303,7 +368,9 @@ class RunnerStateTests(unittest.TestCase):
         stage_id = str(uuid4())
         self.state.pending_advance = True
         self.state.checkpoint_id = str(uuid4())
-        self.state.owner_identity = process_identity(os.getpid())
+        self.state.owner_identity = ProcessIdentity.model_validate(
+            process_identity(os.getpid())
+        )
         self.state.stage_result_ids[stage_id] = stage_id
         self.state.stage_result_origins[stage_id] = "source-experiment"
         self.store.save(self.state)

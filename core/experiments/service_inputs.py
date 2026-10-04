@@ -50,7 +50,7 @@ def _context(state: RunnerState, service_id: str, instance_id: str) -> JsonObjec
         "participant_instance_id": instance_id,
     }
     if state.pending_rebuild is not None:
-        context["parent_operation_id"] = state.pending_rebuild["operation_id"]
+        context["parent_operation_id"] = state.pending_rebuild.operation_id
     return context
 
 

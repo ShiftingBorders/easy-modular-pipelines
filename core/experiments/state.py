@@ -12,11 +12,16 @@ from core.models.experiment_template import (
     ServiceDefinition,
     StageDefinition,
 )
+from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     AttemptParameters,
+    LastDecision,
+    PendingInput,
+    PendingRebuild,
     SavedAttempt,
     SavedRunnerState,
     SavedService,
+    ServiceFailureDetails,
     ServiceParameters,
     StateParameters,
 )
@@ -155,7 +160,7 @@ class ServiceInstance:
         self.stopped = False
         self.manually_stopped = False
         self.blocked_action: Literal["pause", "stop"] | None = None
-        self.failure: JsonObject | None = None
+        self.failure: ServiceFailureDetails | None = None
         self.freeze_id: str | None = None
         self.prepared_freeze_id: str | None = None
         self.artifacts_directory: Path | None = None
@@ -187,7 +192,7 @@ class RunnerState:
     unknown_state_recovery_count: int
     used_request_ids: set[str]
     stable_snapshot_id: str | None
-    pending_rebuild: JsonObject | None
+    pending_rebuild: PendingRebuild | None
 
     def __init__(
         self,
@@ -240,9 +245,9 @@ class RunnerState:
         self.pending_advance = False
         self.stage_result_origins: dict[str, str] = {}
         self.checkpoint_id: str | None = None
-        self.owner_identity: JsonObject | None = None
-        self.pending_input: JsonObject | None = None
-        self.last_dag_decision: JsonObject | None = None
+        self.owner_identity: ProcessIdentity | None = None
+        self.pending_input: PendingInput | None = None
+        self.last_dag_decision: LastDecision | None = None
         self.retained_artifacts: list[str] = []
 
 
@@ -323,6 +328,14 @@ def state_to_document(state: RunnerState) -> JsonObject:
     document.pop("experiment_directory")
     document["schema_version"] = 4
     document["template"] = state.template.model_dump(exclude_unset=True)
+    for name in (
+        "pending_rebuild",
+        "pending_input",
+        "last_dag_decision",
+        "owner_identity",
+    ):
+        model = getattr(state, name)
+        document[name] = None if model is None else model.model_dump(exclude_unset=True)
     template_path = state.template_path.resolve()
     document["template_path"] = (
         template_path.relative_to(root).as_posix()
@@ -336,6 +349,11 @@ def state_to_document(state: RunnerState) -> JsonObject:
     for service_id, instance in state.services.items():
         saved = dict(vars(instance))
         saved["definition"] = instance.definition.model_dump(exclude_unset=True)
+        saved["failure"] = (
+            None
+            if instance.failure is None
+            else instance.failure.model_dump(exclude_unset=True)
+        )
         for name in ("endpoint_path", "artifacts_directory"):
             path = saved[name]
             saved[name] = (
@@ -417,29 +435,13 @@ def _restore_state(root: Path, document: SavedRunnerState) -> RunnerState:
     state.unknown_state_recovery_count = document.unknown_state_recovery_count
     state.used_request_ids = set(document.used_request_ids)
     state.stable_snapshot_id = document.stable_snapshot_id
-    state.pending_rebuild = (
-        None
-        if document.pending_rebuild is None
-        else document.pending_rebuild.model_dump(exclude_unset=True)
-    )
+    state.pending_rebuild = document.pending_rebuild
     state.pending_advance = document.pending_advance
     state.stage_result_origins = document.stage_result_origins
     state.checkpoint_id = document.checkpoint_id
-    state.owner_identity = (
-        None
-        if document.owner_identity is None
-        else document.owner_identity.model_dump(exclude_unset=True)
-    )
-    state.pending_input = (
-        None
-        if document.pending_input is None
-        else document.pending_input.model_dump(exclude_unset=True)
-    )
-    state.last_dag_decision = (
-        None
-        if document.last_dag_decision is None
-        else document.last_dag_decision.model_dump(exclude_unset=True)
-    )
+    state.owner_identity = document.owner_identity
+    state.pending_input = document.pending_input
+    state.last_dag_decision = document.last_dag_decision
     state.retained_artifacts = document.retained_artifacts
     return state
 
@@ -480,7 +482,9 @@ def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
     instance.failure = (
         None
         if document.failure is None
-        else document.failure.model_dump(exclude_unset=True)
+        else ServiceFailureDetails(
+            code=document.failure.code, message=document.failure.message
+        )
     )
     instance.freeze_id = document.freeze_id
     instance.prepared_freeze_id = document.prepared_freeze_id

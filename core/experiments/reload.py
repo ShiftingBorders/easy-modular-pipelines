@@ -247,7 +247,9 @@ def _service_state(
         "manually_stopped": instance is not None and instance.manually_stopped,
         "restart_count": 0 if instance is None else instance.restart_count,
         "blocked_action": None if instance is None else instance.blocked_action,
-        "failure": None if instance is None else instance.failure,
+        "failure": None
+        if instance is None or instance.failure is None
+        else instance.failure.model_dump(exclude_unset=True),
         "process": None if instance is None else instance.process_identity,
         "last_status": None if instance is None else instance.last_status,
         "active_request": None

@@ -166,9 +166,9 @@ class ConditionalTransitionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(runner._state.cycle_number, cycle)
                 self.assertEqual(runner._state.stage_result_ids, {})
                 transfer = runner._state.pending_input
-                self.assertEqual(transfer["source_stage_id"], condition["stage_id"])
+                self.assertEqual(transfer.source_stage_id, condition["stage_id"])
                 self.assertEqual(
-                    runner._journal.client.read_command_result(transfer["request_id"])[
+                    runner._journal.client.read_command_result(transfer.request_id)[
                         "response"
                     ]["data"],
                     payload,

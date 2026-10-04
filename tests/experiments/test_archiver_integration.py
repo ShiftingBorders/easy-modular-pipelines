@@ -11,6 +11,7 @@ from unittest.mock import patch
 from core.experiments.runner import ExperimentRunner
 from core.journal.events import LoggingStorageError
 from core.journal.logger import OperationLogger
+from core.models.process_identity import ProcessIdentity
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
 from tests.helpers.archives import ArchiveTestCase
@@ -156,13 +157,15 @@ class ArchiveDagTests(ArchiveTestCase):
         child, path, identity = await self.w.start_child("hold")
         state = self.w.state
         try:
-            state.owner_identity = identity
+            state.owner_identity = ProcessIdentity.model_validate(identity)
             with self.assertRaises(RuntimeError):
                 await self.w.create()
-            state.owner_identity = {
-                **identity,
-                "created_at_os": identity["created_at_os"] + 1,
-            }
+            state.owner_identity = ProcessIdentity.model_validate(
+                {
+                    **identity,
+                    "created_at_os": identity["created_at_os"] + 1,
+                }
+            )
             await self.w.create()
             self.assertIsNone(child.returncode)
         finally:

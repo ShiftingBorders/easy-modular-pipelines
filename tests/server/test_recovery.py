@@ -7,6 +7,7 @@ import yaml
 
 from core.experiments.assembler import ExperimentAssembler, find_experiment
 from core.experiments.state import RunnerStateStore
+from core.models.process_identity import ProcessIdentity
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
 from core.server.runtime import recovery_candidates
@@ -28,7 +29,9 @@ class ServerRecoveryTests(ServerTestCase):
         )
         for owner, expected in cases:
             with self.subTest(owner=owner):
-                state.owner_identity = owner
+                state.owner_identity = (
+                    None if owner is None else ProcessIdentity.model_validate(owner)
+                )
                 store.save(state)
                 self.assertEqual(
                     recovery_candidates(self.w.source),

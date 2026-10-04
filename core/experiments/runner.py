@@ -54,6 +54,13 @@ from core.models.experiment_template import (
     ExperimentTemplate,
     ServiceDefinition,
 )
+from core.models.process_identity import ProcessIdentity
+from core.models.runner_state import (
+    DagDecision,
+    LastDecision,
+    PendingInput,
+    PendingRebuild,
+)
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -340,7 +347,7 @@ class ExperimentRunner:
         if (
             self._state is not None
             and self._state.last_dag_decision is not None
-            and self._state.last_dag_decision["decision"]["command"] == "stop"
+            and self._state.last_dag_decision.decision.command == "stop"
         ):
             await self._stop_from_stage(recovering=True)
             return
@@ -351,16 +358,14 @@ class ExperimentRunner:
         else:
             state, action = await self._prepare_live_run()
         if action == "stop":
-            raise RuntimeError(
-                "Service startup or recovery requires experiment stop."
-            )
+            raise RuntimeError("Service startup or recovery requires experiment stop.")
         if action == "pause":
             self._desired_mode = "paused"
         state.mode = self._desired_mode
         if (
             state.mode == "running"
             and state.last_dag_decision is not None
-            and state.last_dag_decision["decision"]["command"] == "pause"
+            and state.last_dag_decision.decision.command == "pause"
         ):
             state.last_dag_decision = None
         state.phase = (
@@ -423,7 +428,7 @@ class ExperimentRunner:
         self._save_state()
         if (
             state.last_dag_decision is not None
-            and state.last_dag_decision["decision"]["command"] == "stop"
+            and state.last_dag_decision.decision.command == "stop"
         ):
             await self._stop_from_stage()
             return "stopped"
@@ -675,7 +680,7 @@ class ExperimentRunner:
         state = self._state
         conditional_pause = (
             state.last_dag_decision is not None
-            and state.last_dag_decision["decision"]["command"] == "pause"
+            and state.last_dag_decision.decision.command == "pause"
         )
         return (
             self._pending_advance
@@ -708,24 +713,29 @@ class ExperimentRunner:
         definition = state.template.stages[state.stage_position - 1]
         if "returns_data" not in definition.model_fields_set:
             return
-        decision = response["execution"]["dag_decision"]
-        source = {
-            "request_id": outcome.attempt.result_request_id,
-            "source_stage_id": stage_id,
-            "experiment_id": state.experiment_id,
-        }
-        state.last_dag_decision = {**source, "decision": decision}
+        decision = DagDecision.model_validate(response["execution"]["dag_decision"])
+        source = LastDecision.model_validate(
+            {
+                "request_id": outcome.attempt.result_request_id,
+                "source_stage_id": stage_id,
+                "experiment_id": state.experiment_id,
+                "decision": decision,
+            }
+        )
+        state.last_dag_decision = source
         self._retain_input_artifacts(response["data"])
-        command = decision["command"]
+        command = decision.command
         if command == "pause":
             state.mode = self._desired_mode = "paused"
             state.pause_requested = True
         elif command == "move":
-            target = decision["stage_id"]
+            target = decision.stage_id
+            if target is None:
+                raise ValueError("Conditional move requires a target stage.")
             self._apply_conditional_move(state, source, target)
 
     def _apply_conditional_move(
-        self, state: RunnerState, source: JsonObject, target: str
+        self, state: RunnerState, source: LastDecision, target: str
     ) -> None:
         position = next(
             index
@@ -734,7 +744,12 @@ class ExperimentRunner:
         )
         # The source remains in the journal even when a backwards jump
         # invalidates its current result reference.
-        state.pending_input = {**source, "stage_id": target}
+        state.pending_input = PendingInput(
+            request_id=source.request_id,
+            source_stage_id=source.source_stage_id,
+            experiment_id=source.experiment_id,
+            stage_id=target,
+        )
         for item in state.template.stages[position - 1 :]:
             state.stage_result_ids.pop(item.stage_id, None)
             state.stage_result_origins.pop(item.stage_id, None)
@@ -859,7 +874,7 @@ class ExperimentRunner:
         state.pause_requested = False
         if (
             state.last_dag_decision is not None
-            and state.last_dag_decision["decision"]["command"] == "pause"
+            and state.last_dag_decision.decision.command == "pause"
         ):
             state.last_dag_decision = None
         self._save_state()
@@ -890,7 +905,7 @@ class ExperimentRunner:
             raise RuntimeError("Start all declared services before stepping.")
         if (
             state.last_dag_decision is not None
-            and state.last_dag_decision["decision"]["command"] == "pause"
+            and state.last_dag_decision.decision.command == "pause"
         ):
             state.last_dag_decision = None
             self._save_state()
@@ -1580,12 +1595,14 @@ class ExperimentRunner:
         )
         application.snapshot_id = self._last_snapshot["snapshot_id"]
         application.result["snapshot_id"] = application.snapshot_id
-        state.pending_rebuild = {
-            "operation_id": application.operation.get_operation_id(),
-            "snapshot_id": application.snapshot_id,
-            "template_revision_id": application.candidate_revision,
-            "run_id": application.candidate_run,
-        }
+        state.pending_rebuild = PendingRebuild.model_validate(
+            {
+                "operation_id": application.operation.get_operation_id(),
+                "snapshot_id": application.snapshot_id,
+                "template_revision_id": application.candidate_revision,
+                "run_id": application.candidate_run,
+            }
+        )
         state.phase = "rebuilding"
         self._save_state()
         application.logger.record_event(
@@ -1693,18 +1710,17 @@ class ExperimentRunner:
             application.cursor.pending_advance
         )
         if state.pending_input is not None and (
-            state.pending_input["source_stage_id"] not in application.cursor.preserved
-            or state.pending_input["stage_id"] not in application.cursor.preserved
-            or state.pending_input["stage_id"]
+            state.pending_input.source_stage_id not in application.cursor.preserved
+            or state.pending_input.stage_id not in application.cursor.preserved
+            or state.pending_input.stage_id
             != application.layout.new_stages[
                 application.cursor.stage_position - 1
             ].stage_id
         ):
             state.pending_input = None
         if state.last_dag_decision is not None and (
-            state.last_dag_decision["source_stage_id"]
-            not in application.cursor.preserved
-            or state.last_dag_decision["decision"].get("stage_id") is not None
+            state.last_dag_decision.source_stage_id not in application.cursor.preserved
+            or state.last_dag_decision.decision.stage_id is not None
             and state.pending_input is None
         ):
             state.last_dag_decision = None
@@ -1820,7 +1836,9 @@ class ExperimentRunner:
             pending_advance=application.cursor.pending_advance,
         )
 
-    async def _handle_reload_failure(self, state: RunnerState, application: ReloadApplication, error: BaseException) -> None:
+    async def _handle_reload_failure(
+        self, state: RunnerState, application: ReloadApplication, error: BaseException
+    ) -> None:
         if state.pending_rebuild is None or application.committed:
             await self._handle_detached_reload_failure(state, application, error)
             return
@@ -1842,7 +1860,7 @@ class ExperimentRunner:
                 raise error
             await self._snapshots.restore(
                 state,
-                state.pending_rebuild["snapshot_id"],
+                state.pending_rebuild.snapshot_id,
                 preserve_rebuild_diagnostics=True,
                 suspend_resources=self._suspend_resources,
             )
@@ -1881,9 +1899,7 @@ class ExperimentRunner:
                         include_traceback=True,
                     )
                 except (LoggingError, OSError) as logging_error:
-                    error.add_note(
-                        f"Rollback error recording failed: {logging_error}"
-                    )
+                    error.add_note(f"Rollback error recording failed: {logging_error}")
             if not isinstance(rollback_error, asyncio.CancelledError):
                 await self._fail(error, {})
 
@@ -2282,11 +2298,11 @@ class ExperimentRunner:
                 "Saved service ownership is incomplete; recover participant metadata before continuing."
             )
         owner = state.owner_identity
-        if owner is not None and owner["pid"] != os.getpid():
+        if owner is not None and owner.pid != os.getpid():
             try:
-                if process_identity(owner["pid"]) == owner:
+                if process_identity(owner.pid) == owner.model_dump():
                     try:
-                        psutil.Process(owner["pid"]).wait(timeout=0)
+                        psutil.Process(owner.pid).wait(timeout=0)
                     except psutil.TimeoutExpired as error:
                         raise RuntimeError(
                             "The previous experiment owner is still alive."
@@ -2305,7 +2321,7 @@ class ExperimentRunner:
     ) -> None:
         if latest is not None and (
             latest["checkpoint_id"] != state.checkpoint_id
-            or latest["pending_rebuild"] != state.pending_rebuild
+            or state.pending_rebuild is not None
             or latest["pending_rebuild"] is not None
         ):
             # The mandatory journal is authoritative for DAG progress; the
@@ -2322,10 +2338,7 @@ class ExperimentRunner:
             vars(state).update(vars(committed))
 
     async def _recover_interrupted_rebuild(self, state: RunnerState) -> None:
-        if (
-            self._resource_observer is not None
-            and self._suspend_resources is None
-        ):
+        if self._resource_observer is not None and self._suspend_resources is None:
             raise RuntimeError(
                 "Reload recovery requires a resource restoration barrier."
             )
@@ -2336,7 +2349,7 @@ class ExperimentRunner:
             if instance.stopped:
                 continue
             await self._recover_service_process(state, sid, instance)
-        operation_id = state.pending_rebuild["operation_id"]
+        operation_id = state.pending_rebuild.operation_id
         self._journal.client.record_event(
             "control.reconciled",
             {
@@ -2351,7 +2364,7 @@ class ExperimentRunner:
         )
         await self._snapshots.restore(
             state,
-            state.pending_rebuild["snapshot_id"],
+            state.pending_rebuild.snapshot_id,
             preserve_rebuild_diagnostics=True,
             suspend_resources=self._suspend_resources,
         )
@@ -2379,9 +2392,7 @@ class ExperimentRunner:
         if instance.active_request is not None:
             requests.append(instance.active_request)
         for request in requests:
-            accepted = self._journal.client.read_command_result(
-                request["request_id"]
-            )
+            accepted = self._journal.client.read_command_result(request["request_id"])
             if accepted is None or accepted["author"] != "runner":
                 continue
             context = accepted["event"]["context"]
@@ -2393,8 +2404,7 @@ class ExperimentRunner:
             if (
                 context.get("experiment_id") != state.experiment_id
                 or context.get("participant_id") != sid
-                or context.get("participant_instance_id")
-                != expected_instance
+                or context.get("participant_instance_id") != expected_instance
             ):
                 raise ValueError(
                     "Rebuild request result belongs to another participant."
@@ -2414,9 +2424,7 @@ class ExperimentRunner:
                 context={
                     "experiment_id": state.experiment_id,
                     "run_id": state.run_id,
-                    "parent_operation_id": state.pending_rebuild[
-                        "operation_id"
-                    ],
+                    "parent_operation_id": state.pending_rebuild.operation_id,
                 },
             )
 
@@ -2639,7 +2647,7 @@ class ExperimentRunner:
                     "run_id": state.run_id,
                     "participant_id": sid,
                     "participant_instance_id": instance.service_instance_id,
-                    "parent_operation_id": state.pending_rebuild["operation_id"],
+                    "parent_operation_id": state.pending_rebuild.operation_id,
                 },
             )
 
@@ -2726,7 +2734,9 @@ class ExperimentRunner:
     def _save_state(self) -> None:
         self._state.pending_advance = self._pending_advance
         self._state.checkpoint_id = str(uuid4())
-        self._state.owner_identity = process_identity(os.getpid())
+        self._state.owner_identity = ProcessIdentity.model_validate(
+            process_identity(os.getpid())
+        )
         _record_runner_checkpoint(self._journal.client, self._state)
         self._publish_resources()
         try:
@@ -2880,8 +2890,12 @@ class ExperimentRunner:
             "active_attempt_id": None
             if state is None or state.active_attempt is None
             else state.active_attempt.attempt_id,
-            "pending_input": None if state is None else state.pending_input,
-            "dag_decision": None if state is None else state.last_dag_decision,
+            "pending_input": None
+            if state is None or state.pending_input is None
+            else state.pending_input.model_dump(exclude_unset=True),
+            "dag_decision": None
+            if state is None or state.last_dag_decision is None
+            else state.last_dag_decision.model_dump(exclude_unset=True),
             "attempt_id": None if attempt is None else attempt.attempt_id,
             "executor": None if attempt is None else attempt.executor_status,
             "result": None if state is None else state.last_result,
@@ -2895,7 +2909,7 @@ class ExperimentRunner:
             "stable_snapshot_id": None if state is None else state.stable_snapshot_id,
             "pending_rebuild": None
             if state is None or state.pending_rebuild is None
-            else dict(state.pending_rebuild),
+            else state.pending_rebuild.model_dump(exclude_unset=True),
             "template_revision_id": None
             if state is None
             else state.template_revision_id,

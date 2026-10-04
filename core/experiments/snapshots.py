@@ -533,7 +533,7 @@ class ExperimentSnapshots:
             and state.last_result_id not in state.stage_result_ids.values()
             and (
                 state.pending_input is None
-                or state.last_result_id != state.pending_input["request_id"]
+                or state.last_result_id != state.pending_input.request_id
             )
         ):
             raise ValueError(
@@ -842,7 +842,7 @@ class ExperimentSnapshots:
             )
             operations = [operation.get_operation_id()]
             if preserve_rebuild_diagnostics and state.pending_rebuild is not None:
-                operations.append(state.pending_rebuild["operation_id"])
+                operations.append(state.pending_rebuild.operation_id)
             self._journal.client.export_diagnostics(operations, work / "diagnostics")
             self._journal.close()
             transaction = {

@@ -40,8 +40,9 @@ from core.models.participant_observations import (
     ServiceObservation,
     ServiceStateExport,
 )
+from core.models.runner_state import ServiceFailureDetails
 from core.participants.connection import ParticipantConnection
-from core.participants.protocol import PROTOCOL_VERSION, error_details
+from core.participants.protocol import PROTOCOL_VERSION
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 from core.primitives.processes import module_process_arguments, process_identity
@@ -145,8 +146,8 @@ class ServiceManager:
             instance = state.services.get(definition.service_id)
             if instance is None:
                 raise
-            instance.failure = error_details(
-                "service_failure", f"{type(error).__name__}: {error}"
+            instance.failure = ServiceFailureDetails(
+                code="service_failure", message=f"{type(error).__name__}: {error}"
             )
             action = await self.restart(state, instance.service_id, automatic=True)
             return action
@@ -444,7 +445,7 @@ class ServiceManager:
             await self._handle_message(state, service_id, reply)
             if not instance.ready:
                 raise ConnectionError(
-                    instance.failure["message"]
+                    instance.failure.message
                     if instance.failure
                     else "Service did not confirm full readiness."
                 )
@@ -551,8 +552,9 @@ class ServiceManager:
                     try:
                         connecting.result()
                     except (OSError, EOFError, ValueError) as error:
-                        instance.failure = error_details(
-                            "connection_failed", f"Reconnect failed: {error}"
+                        instance.failure = ServiceFailureDetails(
+                            code="connection_failed",
+                            message=f"Reconnect failed: {error}",
                         )
                 await self._poll_result(state, service_id)
                 if (
@@ -560,9 +562,9 @@ class ServiceManager:
                     and instance.start_deadline is not None
                     and time.monotonic() >= instance.start_deadline
                 ):
-                    instance.failure = error_details(
-                        "startup_timeout",
-                        "The original service startup deadline expired.",
+                    instance.failure = ServiceFailureDetails(
+                        code="startup_timeout",
+                        message="The original service startup deadline expired.",
                     )
                 process = self._processes.get(service_id)
                 if (
@@ -571,8 +573,9 @@ class ServiceManager:
                     and process.pid == instance.process_identity["pid"]
                     and process.poll() is not None
                 ):
-                    instance.failure = error_details(
-                        "process_exited", "Service process exited unexpectedly."
+                    instance.failure = ServiceFailureDetails(
+                        code="process_exited",
+                        message="Service process exited unexpectedly.",
                     )
                 self._check_heartbeat_deadline(service_id, instance)
                 if instance.failure is not None:
@@ -624,9 +627,9 @@ class ServiceManager:
                 context=_context(state, service_id, instance.service_instance_id),
             )
             if self._bad_replies[service_id] >= 2:
-                instance.failure = error_details(
-                    "connection_failed",
-                    f"Participant communication failed: {error}",
+                instance.failure = ServiceFailureDetails(
+                    code="connection_failed",
+                    message=f"Participant communication failed: {error}",
                 )
             else:
                 self._connecting[service_id] = asyncio.create_task(
@@ -646,8 +649,9 @@ class ServiceManager:
             and time.monotonic() - probe["sent_monotonic"]
             >= instance.definition.heartbeat.grace_seconds
         ):
-            instance.failure = error_details(
-                "heartbeat_timeout", "Service heartbeat grace period expired."
+            instance.failure = ServiceFailureDetails(
+                code="heartbeat_timeout",
+                message="Service heartbeat grace period expired.",
             )
 
     def _schedule_heartbeat(
@@ -753,8 +757,8 @@ class ServiceManager:
                 raise
             except (OSError, ConnectionError) as error:
                 instance = state.services[service_id]
-                instance.failure = error_details(
-                    "service_failure", f"{type(error).__name__}: {error}"
+                instance.failure = ServiceFailureDetails(
+                    code="service_failure", message=f"{type(error).__name__}: {error}"
                 )
                 if not automatic:
                     if waiter is not None and not waiter.done():
@@ -993,9 +997,9 @@ class ServiceManager:
                 active.get("owner") != "caller"
                 and instance.definition.on_command_timeout == "restart"
             ):
-                instance.failure = error_details(
-                    "service_failure",
-                    "Timed-out command requires an explicit restart.",
+                instance.failure = ServiceFailureDetails(
+                    code="service_failure",
+                    message="Timed-out command requires an explicit restart.",
                 )
                 self._restarts[service_id] = asyncio.create_task(
                     self.restart(state, service_id, automatic=True)
@@ -1036,8 +1040,9 @@ class ServiceManager:
             and instance.start_deadline is not None
             and time.monotonic() >= instance.start_deadline
         ):
-            instance.failure = error_details(
-                "startup_timeout", "Service replied after its startup deadline."
+            instance.failure = ServiceFailureDetails(
+                code="startup_timeout",
+                message="Service replied after its startup deadline.",
             )
             instance.ready = False
         elif (
@@ -1045,9 +1050,9 @@ class ServiceManager:
             and time.monotonic() - probe["sent_monotonic"]
             >= instance.definition.heartbeat.grace_seconds
         ):
-            instance.failure = error_details(
-                "heartbeat_timeout",
-                "Service replied after heartbeat grace expired.",
+            instance.failure = ServiceFailureDetails(
+                code="heartbeat_timeout",
+                message="Service replied after heartbeat grace expired.",
             )
             instance.ready = False
         else:
@@ -1058,9 +1063,12 @@ class ServiceManager:
             }
             instance.ready = message["result"] == "success"
             instance.ever_ready = instance.ever_ready or instance.ready
-            instance.failure = error_details(
-                "service_failure",
-                None if instance.ready else "Service requested a full restart.",
+            instance.failure = (
+                None
+                if instance.ready
+                else ServiceFailureDetails(
+                    code="service_failure", message="Service requested a full restart."
+                )
             )
             self._bad_replies[service_id] = 0
         self._probes.pop(service_id, None)
@@ -1356,9 +1364,9 @@ class ServiceManager:
                 ):
                     instance.pending_requests.remove(entry)
                     continue
-                instance.failure = error_details(
-                    "service_failure",
-                    "Saved queue contains an already sent request with an unresolved outcome.",
+                instance.failure = ServiceFailureDetails(
+                    code="service_failure",
+                    message="Saved queue contains an already sent request with an unresolved outcome.",
                 )
                 instance.blocked_action = self._pending_action = "stop"
                 return "stop"
@@ -1384,9 +1392,9 @@ class ServiceManager:
             return False, None
         instance.ready = False
         if instance.process_identity is None or instance.endpoint_path is None:
-            instance.failure = error_details(
-                "service_failure",
-                "Cannot identify the previous service process.",
+            instance.failure = ServiceFailureDetails(
+                code="service_failure",
+                message="Cannot identify the previous service process.",
             )
             instance.blocked_action = "stop"
             self._pending_action = "stop"
@@ -1409,9 +1417,9 @@ class ServiceManager:
                     peer_alive = False
                 if peer_alive and instance.ever_ready:
                     instance.process_identity = None
-                    instance.failure = error_details(
-                        "ownership_unknown",
-                        "Endpoint belongs to an unaccounted-for service instance.",
+                    instance.failure = ServiceFailureDetails(
+                        code="ownership_unknown",
+                        message="Endpoint belongs to an unaccounted-for service instance.",
                     )
                     instance.blocked_action = self._pending_action = "stop"
                     return True, "stop"
@@ -1424,8 +1432,9 @@ class ServiceManager:
                 raise
             actual = None
         if actual != instance.process_identity:
-            instance.failure = error_details(
-                "service_failure", "Previous service process no longer exists."
+            instance.failure = ServiceFailureDetails(
+                code="service_failure",
+                message="Previous service process no longer exists.",
             )
             action = await self.restart(state, service_id, automatic=True)
             if action != "ready":
@@ -1444,9 +1453,9 @@ class ServiceManager:
                 )
             timeout = max(0, instance.start_deadline - time.monotonic())
             if timeout == 0:
-                instance.failure = error_details(
-                    "startup_timeout",
-                    "Service startup expired while runner was unavailable.",
+                instance.failure = ServiceFailureDetails(
+                    code="startup_timeout",
+                    message="Service startup expired while runner was unavailable.",
                 )
                 action = await self.restart(state, service_id, automatic=True)
                 if action != "ready":
@@ -1503,9 +1512,9 @@ class ServiceManager:
             active is None or item.request_id != active["request_id"]
             for item in participant_work
         ):
-            instance.failure = error_details(
-                "service_failure",
-                "Participant reports work not matched to the saved sent request.",
+            instance.failure = ServiceFailureDetails(
+                code="service_failure",
+                message="Participant reports work not matched to the saved sent request.",
             )
             # Unknown work needs an owner decision, not an automatic restart
             # that would destroy the very evidence recovery must reconcile.
@@ -1748,7 +1757,13 @@ class ServiceManager:
         )
         if not instance.stopped:
             error_message = error_message or "Service termination is unconfirmed."
-            instance.failure = error_details("service_failure", error_message)
+            instance.failure = (
+                None
+                if error_message is None
+                else ServiceFailureDetails(
+                    code="service_failure", message=str(error_message)
+                )
+            )
             instance.blocked_action = "stop"
             self._pending_action = "stop"
         error_message = self._cancel_service_stop_requests(

@@ -131,7 +131,7 @@ class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                                 60,
                             )
                             self.assertEqual(
-                                runner._state.pending_input["stage_id"],
+                                runner._state.pending_input.stage_id,
                                 target["stage_id"],
                             )
                             self.assertEqual(runner._state.stage_position, 4)
@@ -237,7 +237,7 @@ class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner.get_state()["phase"], "waiting", runner.get_state())
             self.assertNotEqual(runner._state.experiment_id, source_id)
             self.assertEqual(runner._state.pending_input, transfer)
-            self.assertEqual(transfer["experiment_id"], source_id)
+            self.assertEqual(transfer.experiment_id, source_id)
             restored_file = runner._state.experiment_directory / first["path"]
             self.assertEqual(restored_file.read_text(encoding="utf-8"), "attempt=1\n")
             second = (await runner.step())["result"]["data"]
@@ -340,8 +340,8 @@ class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(runner._state.stage_position, 2)
                             await runner.step()
                             self.assertNotEqual(
-                                runner._state.pending_input["request_id"],
-                                transfer["request_id"],
+                                runner._state.pending_input.request_id,
+                                transfer.request_id,
                             )
                             expected = seed_data
                         else:

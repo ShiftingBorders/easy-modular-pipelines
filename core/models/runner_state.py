@@ -47,7 +47,7 @@ class _Input(BaseModel):
 class _Document(_Input):
     @model_validator(mode="before")
     @classmethod
-    def detach(cls, value: object) -> JsonObject:
+    def detach(cls, value: object) -> object:
         return copy_json_object(value, "runner document")
 
 
@@ -131,10 +131,34 @@ class LastDecision(_Document):
     experiment_id: Text
     decision: DagDecision
 
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, value: object) -> object:
+        if type(value) is dict and type(value.get("decision")) is DagDecision:
+            document = dict(value)
+            decision = document.pop("decision")
+            detached: dict[str, object] = dict(
+                copy_json_object(document, "runner document")
+            )
+            detached["decision"] = decision
+            return detached
+        return copy_json_object(value, "runner document")
+
 
 class ServiceFailure(_Document):
     code: Text
     message: Text
+
+
+class ServiceFailureDetails(_Input):
+    """Live errors preserve str(exception), including empty messages.
+
+    The persisted ServiceFailure contract independently requires nonempty text.
+    Keep that check at saving, where publication errors were already reported.
+    """
+
+    code: Text
+    message: str
 
 
 class ServiceRequest(_Document):

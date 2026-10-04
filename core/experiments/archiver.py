@@ -206,9 +206,9 @@ class ExperimentArchiver:
             )
         if (
             state.owner_identity is not None
-            and state.owner_identity != process_identity(os.getpid())
+            and state.owner_identity.model_dump() != process_identity(os.getpid())
         ):
-            self._assert_exited(state.owner_identity)
+            self._assert_exited(state.owner_identity.model_dump())
         transaction = (
             self._project_root / "controller/restore_transactions" / f"{root.name}.json"
         )
