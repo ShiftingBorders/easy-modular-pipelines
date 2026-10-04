@@ -96,7 +96,7 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         commands_id = w.commands["service_id"]
         socket_id = w.socket["service_id"]
         socket = runner._state.services[socket_id]
-        before = socket.last_status["observed_monotonic"]
+        before = socket.last_status.observed_monotonic
         self.assertTrue(
             (await runner._services.stop_all(runner._state, service_ids={commands_id}))[
                 commands_id
@@ -107,7 +107,7 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         runner = w.replacement()
         await asyncio.wait_for(runner.recover(experiment_id), 30)
         recovered = runner._state.services[socket_id]
-        await wait_for(lambda: recovered.last_status["observed_monotonic"] > before, 5)
+        await wait_for(lambda: recovered.last_status.observed_monotonic > before, 5)
         self.assertEqual(recovered.service_instance_id, socket.service_instance_id)
         self.assertTrue(process_running(recovered.process_identity["pid"]))
         self.assertTrue(runner._state.services[commands_id].stopped)

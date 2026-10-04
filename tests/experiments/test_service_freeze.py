@@ -107,9 +107,9 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             paths = await w.manager.save_states(w.state, snapshot)
             frozen = read_json(counter)
             self.assertTrue(frozen["frozen"])
-            heartbeat = w.state.services[sid].last_status["request_id"]
+            heartbeat = w.state.services[sid].last_status.request_id
             await wait_for(
-                lambda: w.state.services[sid].last_status["request_id"] != heartbeat
+                lambda: w.state.services[sid].last_status.request_id != heartbeat
             )
             self.assertEqual(read_json(counter), frozen)
             self.assertEqual(read_json(paths[sid])["counter"], frozen["counter"])

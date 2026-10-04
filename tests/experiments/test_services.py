@@ -64,10 +64,10 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 w.state, second["service_id"], "echo", {"other": True}
             )
             self.assertEqual(reply["result"], "success")
-            before = w.state.services[first["service_id"]].last_status["request_id"]
+            before = w.state.services[first["service_id"]].last_status.request_id
             await wait_for(
                 lambda: (
-                    w.state.services[first["service_id"]].last_status["request_id"]
+                    w.state.services[first["service_id"]].last_status.request_id
                     != before
                 )
             )

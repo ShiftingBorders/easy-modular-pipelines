@@ -174,12 +174,12 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
             instance = w.state.services[sid]
             controls = w.controls[sid]
             (controls / "split-frames").touch()
-            previous = instance.last_status["request_id"]
+            previous = instance.last_status.request_id
             (controls / "malformed").write_text("1")
             await wait_for(
                 lambda: (
                     not (controls / "malformed").exists()
-                    and instance.last_status["request_id"] != previous
+                    and instance.last_status.request_id != previous
                 )
             )
             self.assertIs(w.state.services[sid], instance)

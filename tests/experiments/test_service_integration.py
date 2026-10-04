@@ -354,9 +354,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             began = time.monotonic()
             other = runner._state.services[healthy["service_id"]]
-            probe = other.last_status["request_id"]
+            probe = other.last_status.request_id
             self.assertEqual((await w.session.send("stats.state"))["result"], "success")
-            await wait_for(lambda: other.last_status["request_id"] != probe)
+            await wait_for(lambda: other.last_status.request_id != probe)
             await wait_for(lambda: runner.get_state()["phase"] == "failed", timeout=90)
             self.assertGreaterEqual(time.monotonic() - began, 10)
             self.assertFalse(process_running(stage["pid"]))
@@ -519,9 +519,7 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 runner._state.services[service["service_id"]].process_identity["pid"], 0
             )
             self.assertNotEqual(
-                runner._state.services[service["service_id"]].definition["module"][
-                    "name"
-                ],
+                runner._state.services[service["service_id"]].definition.module.name,
                 "changed",
             )
             self.assertEqual(len(runner.get_resource_snapshot()["targets"]), 2)

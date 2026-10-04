@@ -108,7 +108,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w.publish_service_definitions()
             await w.manager.start_all(w.state)
             original = w.state.services[sid]
-            previous = original.last_status["request_id"]
+            previous = original.last_status.request_id
             (w.controls[sid] / "silent-heartbeat").write_text(
                 original.service_instance_id
             )
@@ -131,7 +131,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
             reply = await w.manager.request(w.state, sid, "echo", {})
             self.assertEqual(reply["result"], "success")
-            self.assertEqual(original.last_status["request_id"], previous)
+            self.assertEqual(original.last_status.request_id, previous)
             await wait_for(
                 lambda: (
                     w.state.services[sid] is not original

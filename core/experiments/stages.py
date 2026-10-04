@@ -707,7 +707,9 @@ class StageRunner:
                         "request_id": attempt.request_id,
                         "process": instance.process_identity,
                         "finished": False,
-                        "current": instance.active_request,
+                        "current": None
+                        if instance.active_request is None
+                        else instance.active_request.model_dump(exclude_unset=True),
                     }
                     if (
                         self._call_future is not None

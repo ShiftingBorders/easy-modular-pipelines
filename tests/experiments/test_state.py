@@ -27,6 +27,10 @@ from core.models.experiment_template import (
     HeartbeatPolicy,
     ServiceDefinition,
 )
+from core.models.participant_observations import (
+    RetainedServiceStatus,
+    ServiceObservation,
+)
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     DagDecision,
@@ -203,6 +207,41 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(request.deadline_monotonic, -1)
         with self.assertRaises(ValueError):
             ServiceRequest.model_validate(request.model_dump(exclude_unset=True))
+
+    def test_retained_service_status_preserves_sparse_documents_and_observation(self):
+        _, service = self._add_path_participants()
+        for document in (
+            {},
+            {"legacy": {"value": None}},
+            {"request_id": "historical", "observed_monotonic": None},
+        ):
+            service.last_status = RetainedServiceStatus.model_validate(document)
+            self.store.save(self.state)
+            restored = (
+                self.store.load(self.root).services[service.service_id].last_status
+            )
+            self.assertIsInstance(restored, RetainedServiceStatus)
+            self.assertEqual(restored.model_dump(exclude_unset=True), document)
+        observation = ServiceObservation.model_validate(
+            {
+                "protocol_version": 2,
+                "request_id": str(uuid4()),
+                "result": "success",
+                "data": {"value": 1},
+                "command": "heartbeat",
+                "legacy": [None, False],
+            }
+        )
+        retained = RetainedServiceStatus.from_observation(observation, "observed", 3)
+        self.assertEqual(
+            retained.model_dump(exclude_unset=True),
+            {
+                **observation.model_dump(exclude_unset=True),
+                "observed_at": "observed",
+                "observed_monotonic": 3,
+            },
+        )
+        self.assertNotIn("observed_at", observation.model_extra or {})
 
     def _add_path_participants(self):
         stage_id = str(uuid4())

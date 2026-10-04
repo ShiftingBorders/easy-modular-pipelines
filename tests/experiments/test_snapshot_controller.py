@@ -40,7 +40,7 @@ class SnapshotControllerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await wait_for(started.is_set, 15)
                 instance = runner._state.services[self.socket["service_id"]]
-                previous = instance.last_status["observed_monotonic"]
+                previous = instance.last_status.observed_monotonic
                 self.assertIsNotNone(instance.freeze_id)
                 state = await asyncio.wait_for(w.session.send("stats.state"), 5)
                 self.assertEqual(state["result"], "success")
@@ -53,7 +53,7 @@ class SnapshotControllerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(events["result"], "success")
                 await wait_for(
-                    lambda: instance.last_status["observed_monotonic"] > previous, 5
+                    lambda: instance.last_status.observed_monotonic > previous, 5
                 )
                 with self.assertRaises(RuntimeError):
                     await runner.snapshot("conflict")

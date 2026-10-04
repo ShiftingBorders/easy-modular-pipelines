@@ -251,7 +251,9 @@ def _service_state(
         if instance is None or instance.failure is None
         else instance.failure.model_dump(exclude_unset=True),
         "process": None if instance is None else instance.process_identity,
-        "last_status": None if instance is None else instance.last_status,
+        "last_status": None
+        if instance is None or instance.last_status is None
+        else instance.last_status.model_dump(exclude_unset=True),
         "active_request": None
         if active is None
         else {

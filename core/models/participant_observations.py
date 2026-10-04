@@ -46,6 +46,29 @@ class ServiceObservation(_Observation):
     command: Text | None = None
 
 
+class RetainedServiceStatus(_Observation):
+    """Sparse retained status; recovery historically accepts partial JSON status."""
+
+    request_id: JsonValue = None
+    observed_at: JsonValue = None
+    observed_monotonic: JsonValue = None
+
+    @classmethod
+    def from_observation(
+        cls,
+        observation: ServiceObservation,
+        observed_at: str,
+        observed_monotonic: float,
+    ) -> "RetainedServiceStatus":
+        values: dict[str, object] = dict(observation.model_extra or {})
+        for name in (
+            observation.model_fields_set & ServiceObservation.model_fields.keys()
+        ):
+            values[name] = getattr(observation, name)
+        values.update(observed_at=observed_at, observed_monotonic=observed_monotonic)
+        return cls.model_validate(values)
+
+
 class CommandState(_Observation):
     current: CommandWork | None
     pending: list[CommandWork]

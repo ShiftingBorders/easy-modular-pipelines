@@ -12,6 +12,7 @@ from core.models.experiment_template import (
     ServiceDefinition,
     StageDefinition,
 )
+from core.models.participant_observations import RetainedServiceStatus
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     AttemptParameters,
@@ -125,7 +126,7 @@ class ServiceInstance:
     endpoint_path: Path | None
     ready: bool
     started_at: str | None
-    last_status: JsonObject | None
+    last_status: RetainedServiceStatus | None
     restart_count: int
     pending_requests: list[WorkingServiceRequest]
     active_request: WorkingServiceRequest | None
@@ -351,6 +352,11 @@ def state_to_document(state: RunnerState) -> JsonObject:
     for service_id, instance in state.services.items():
         saved = dict(vars(instance))
         saved["definition"] = instance.definition.model_dump(exclude_unset=True)
+        saved["last_status"] = (
+            None
+            if instance.last_status is None
+            else instance.last_status.model_dump(exclude_unset=True)
+        )
         saved["pending_requests"] = [
             request.model_dump(exclude_unset=True)
             for request in instance.pending_requests
@@ -474,7 +480,11 @@ def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
     )
     instance.ready = document.ready
     instance.started_at = document.started_at
-    instance.last_status = document.last_status
+    instance.last_status = (
+        None
+        if document.last_status is None
+        else RetainedServiceStatus.model_validate(document.last_status)
+    )
     instance.restart_count = document.restart_count
     instance.pending_requests = [
         _restore_request(request) for request in document.pending_requests

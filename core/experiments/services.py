@@ -37,6 +37,7 @@ from core.models.experiment_template import (
 from core.models.participant_observations import (
     CommandState,
     CommandStateResponse,
+    RetainedServiceStatus,
     ServiceObservation,
     ServiceStateExport,
 )
@@ -931,7 +932,6 @@ class ServiceManager:
         self, state: RunnerState, service_id: str, observation: ServiceObservation
     ) -> None:
         instance = state.services[service_id]
-        message = observation.model_dump(exclude_unset=True)
         context = {
             "experiment_id": state.experiment_id,
             "run_id": state.run_id,
@@ -941,17 +941,24 @@ class ServiceManager:
             "participant_instance_id": instance.service_instance_id,
         }
         for key in ("experiment_id", "service_id", "service_instance_id"):
-            if message.get(key, context[key]) != context[key]:
+            if (observation.model_extra or {}).get(key, context[key]) != context[key]:
                 self._journal.client.record_event(
                     "service.message_ignored",
-                    {"ignored": "different_instance", "message": message},
+                    {
+                        "ignored": "different_instance",
+                        "message": observation.model_dump(exclude_unset=True),
+                    },
                     context=context,
                 )
                 return
-        self._journal.client.record_event("service.message", message, context=context)
+        self._journal.client.record_event(
+            "service.message",
+            observation.model_dump(exclude_unset=True),
+            context=context,
+        )
         if observation.command == "heartbeat":
             if not self._handle_heartbeat(
-                service_id, instance, message, observation.request_id, context
+                service_id, instance, observation, observation.request_id, context
             ):
                 return
         elif not await self._handle_work_observation(
@@ -1033,7 +1040,7 @@ class ServiceManager:
         self,
         service_id: str,
         instance: ServiceInstance,
-        message: JsonObject,
+        message: ServiceObservation,
         request_id: str,
         context: JsonObject,
     ) -> bool:
@@ -1042,7 +1049,10 @@ class ServiceManager:
         if probe is None or probe["request_id"] != request_id:
             self._journal.client.record_event(
                 "service.message_ignored",
-                {"ignored": "old_probe", "message": message},
+                {
+                    "ignored": "old_probe",
+                    "message": message.model_dump(exclude_unset=True),
+                },
                 context=context,
             )
             return False
@@ -1067,12 +1077,10 @@ class ServiceManager:
             )
             instance.ready = False
         else:
-            instance.last_status = {
-                **message,
-                "observed_at": datetime.now(UTC).isoformat(),
-                "observed_monotonic": time.monotonic(),
-            }
-            instance.ready = message["result"] == "success"
+            instance.last_status = RetainedServiceStatus.from_observation(
+                message, datetime.now(UTC).isoformat(), time.monotonic()
+            )
+            instance.ready = message.result == "success"
             instance.ever_ready = instance.ever_ready or instance.ready
             instance.failure = (
                 None
