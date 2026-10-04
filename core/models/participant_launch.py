@@ -166,6 +166,29 @@ class StageExecutionIdentity(ParticipantIdentity):
     request_id: UUIDText
 
 
+class AttemptContextHeader(BaseModel):
+    """Recovery comparison header; the other context fields stay opaque here."""
+
+    model_config = ConfigDict(extra="allow", strict=True, frozen=True)
+
+    attempt_id: JsonValue
+
+
+class AttemptContextObservation(BaseModel):
+    """Only the original attempt inputs consumed by reconnect validation."""
+
+    model_config = ConfigDict(extra="allow", strict=True, frozen=True)
+
+    context: AttemptContextHeader
+    input_data: JsonValue
+    settings: JsonValue
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        return copy_json_object(document, "attempt context")
+
+
 class StageLaunch(BaseModel):
     model_config = ConfigDict(
         extra="allow", strict=True, frozen=True, hide_input_in_errors=True

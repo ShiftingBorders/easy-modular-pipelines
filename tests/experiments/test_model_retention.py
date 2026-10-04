@@ -19,6 +19,7 @@ from core.models.experiment_template import (
 )
 from core.models.participant_identity import ParticipantIdentity
 from core.models.participant_launch import (
+    AttemptContextObservation,
     ExecutionCall,
     ModuleContext,
     ModulePreparation,
@@ -322,3 +323,28 @@ class ModelRetentionTests(unittest.TestCase):
         self.assertEqual(
             launch.model_dump(mode="json", exclude_unset=True), captured[0]
         )
+
+    def test_recovery_context_projection_keeps_minimal_and_historical_inputs(self):
+        document = {
+            "context": {"attempt_id": str(uuid4()), "historical": {"value": 1}},
+            "input_data": {"value": [1, 1.0, True, None]},
+            "settings": {"application": "данные"},
+            "unrelated": {"legacy": True},
+        }
+        observed = AttemptContextObservation.model_validate(document)
+        self.assertEqual(observed.context.attempt_id, document["context"]["attempt_id"])
+        self.assertEqual(observed.model_dump(exclude_unset=True), document)
+        document["input_data"]["value"].append("external")
+        self.assertNotIn("external", observed.input_data["value"])
+        for value in (None, False, "historical", [], {}):
+            with self.subTest(value=value):
+                projection = AttemptContextObservation.model_validate(
+                    {
+                        "context": {"attempt_id": value},
+                        "input_data": value,
+                        "settings": value,
+                    }
+                )
+                self.assertEqual(projection.context.attempt_id, value)
+                self.assertEqual(projection.input_data, value)
+                self.assertEqual(projection.settings, value)

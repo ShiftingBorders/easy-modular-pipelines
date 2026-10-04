@@ -40,7 +40,7 @@ from core.models.experiment_template import (
     StageDefinition,
 )
 from core.models.participant_identity import ParticipantIdentity
-from core.models.participant_launch import PreparedLaunch
+from core.models.participant_launch import AttemptContextObservation, PreparedLaunch
 from core.models.participant_observations import (
     ExecutorCommandState,
     ExecutorCommandStateResponse,
@@ -937,12 +937,14 @@ class StageRunner:
             or attempt.cycle_number != state.cycle_number
         ):
             raise ValueError("Saved attempt does not match the DAG cursor.")
-        saved = read_json(attempt.artifacts_directory / "context.json")
+        saved = AttemptContextObservation.model_validate(
+            read_json(attempt.artifacts_directory / "context.json")
+        )
         if (
-            saved["context"]["attempt_id"] != attempt.attempt_id
-            or json.dumps(saved["input_data"], sort_keys=True)
+            saved.context.attempt_id != attempt.attempt_id
+            or json.dumps(saved.input_data, sort_keys=True)
             != json.dumps(attempt.input_data, sort_keys=True)
-            or json.dumps(saved["settings"], sort_keys=True)
+            or json.dumps(saved.settings, sort_keys=True)
             != json.dumps(attempt.effective_settings, sort_keys=True)
         ):
             raise ValueError("Attempt differs from its original context.")
