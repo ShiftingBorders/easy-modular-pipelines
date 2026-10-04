@@ -20,7 +20,7 @@ from core.journal.events import (
 )
 from core.journal.logger import OperationLogger
 from core.journal.records import _read_boundary
-from core.journal.settings import load_logging_settings
+from core.journal.settings import _load_logging_settings
 from core.journal.view_schema import (
     _APPLICATION_ID,
     _CREATE_EVENTS,
@@ -64,12 +64,12 @@ class FilteredJournal:
         with self._lock:
             if self._logger is not None:
                 raise LoggingStateError("Filtered journal is already open.")
-            settings, _ = load_logging_settings(self._config_path)
-            if settings["open_mode"] != "existing":
+            settings, _ = _load_logging_settings(self._config_path)
+            if settings.open_mode != "existing":
                 raise ValueError(
                     "FilteredJournal connects to an existing primary journal."
                 )
-            source_path = Path(settings["db_path"])
+            source_path = settings.db_path
             if self.view_path.resolve() in (
                 source_path.resolve(),
                 self._config_path.resolve(),
@@ -85,8 +85,8 @@ class FilteredJournal:
             logger = OperationLogger(self._config_path)
             logger.open()
             self._logger = logger
-            self._interval = float(settings["filtered_refresh_interval_seconds"])
-            self._timeout = settings["busy_timeout_seconds"]
+            self._interval = float(settings.filtered_refresh_interval_seconds)
+            self._timeout = float(settings.busy_timeout_seconds)
             try:
                 try:
                     self._open_view()

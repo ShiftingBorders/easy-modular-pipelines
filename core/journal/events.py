@@ -1,6 +1,9 @@
 """JSON event contract and configuration validation for core.journal.logger."""
 
+from __future__ import annotations
+
 import json
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from core.primitives.json_values import (
@@ -8,6 +11,9 @@ from core.primitives.json_values import (
     copy_json_object,
     require_text,
 )
+
+if TYPE_CHECKING:
+    from core.models.journal_records import CommandObservation
 
 SCHEMA_VERSION = 2
 RESERVED_EVENT_TYPES = frozenset(
@@ -153,6 +159,11 @@ def encode_event(event: object, max_bytes: int | None) -> str:
 
 def validate_command_result(data: object) -> JsonObject:
     """Validate a command observation without deciding runner/participant precedence."""
+    return _validated_command_result(data).model_dump()
+
+
+def _validated_command_result(data: object) -> CommandObservation:
+    """Retain the validated observation until its journal output boundary."""
     from core.models.journal_records import CommandObservation
 
-    return CommandObservation.model_validate(data).model_dump()
+    return CommandObservation.model_validate(data)

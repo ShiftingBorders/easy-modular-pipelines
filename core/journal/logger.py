@@ -23,7 +23,7 @@ from core.journal.events import (
     SCHEMA_VERSION,
     LoggingStateError,
     LoggingStorageError,
-    validate_command_result,
+    _validated_command_result,
     validate_context,
 )
 from core.journal.measurements import _validate_measurement
@@ -93,14 +93,19 @@ class OperationLogger:
                 from core.models.journal_settings import JournalConfiguration
 
                 # Reopening intentionally replaces the file's original create identity.
-                settings = JournalConfiguration.model_validate({
-                    **settings.model_dump(exclude={"filtered_refresh_interval_seconds"}),
-                    "open_mode": "existing",
-                    "expected_journal": {
-                        name: self._journal_info[name]
-                        for name in ("journal_id", "generation")
-                    },
-                })
+                settings = JournalConfiguration.model_validate(
+                    {
+                        "db_path": settings.db_path,
+                        "busy_timeout_seconds": settings.busy_timeout_seconds,
+                        "max_event_bytes": settings.max_event_bytes,
+                        "min_free_bytes": settings.min_free_bytes,
+                        "open_mode": "existing",
+                        "expected_journal": {
+                            name: self._journal_info[name]
+                            for name in ("journal_id", "generation")
+                        },
+                    }
+                )
             store = SQLiteEventStore._from_settings(settings, context, self._read_only)
             producer_instance_id = uuid4().hex
             expected_identity = (
@@ -513,7 +518,7 @@ class OperationLogger:
         context: JsonObject | None = None,
     ) -> str:
         """Return the persisted observation ID; identical responses reuse an earlier ID."""
-        payload = validate_command_result(
+        payload = _validated_command_result(
             {
                 "request_id": request_id,
                 "author": author,
@@ -534,7 +539,7 @@ class OperationLogger:
             event_context["request_id"] = request_id
             return self._append(
                 "command.result",
-                payload,
+                payload.model_dump(),
                 event_context,
                 operation_id,
                 persist=self._store.append_command_result,
@@ -625,8 +630,20 @@ class OperationLogger:
         measurements = copy_json_object(resources, "resources")
         if not measurements:
             raise ValueError("resources must contain at least one measurement.")
-        for name, measurement in measurements.items():
-            _validate_measurement(name, measurement, operation)
+        validated = {
+            name: _validate_measurement(name, measurement, operation)
+            for name, measurement in measurements.items()
+        }
+        # Update the original ordered objects only when constructing event data.
+        for name, measurement in validated.items():
+            excluded = (
+                {"attributes"}
+                if "attributes" not in measurement.model_fields_set
+                else set()
+            )
+            original = measurements[name]
+            if isinstance(original, dict):
+                original.update(measurement.model_dump(exclude=excluded))
         return self._record(
             "resources.recorded",
             {"resources": measurements},

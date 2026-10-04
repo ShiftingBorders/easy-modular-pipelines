@@ -8,8 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core.journal.events import LoggingStateError
+from core.journal.events import (
+    LoggingStateError,
+    _validated_command_result,
+    validate_command_result,
+)
 from core.journal.logger import OperationLogger
+from core.journal.measurements import _validate_measurement
+from core.models.journal_records import CommandObservation, JournalMeasurement
 from tests.helpers.logging_fixtures import (
     BASE_CONTEXT,
     TEMPLATE_YAML,
@@ -19,6 +25,52 @@ from tests.helpers.logging_process import SCRATCH_ROOT, cleanup_directory, read_
 
 
 class OperationLoggerRecordsTests(unittest.TestCase):
+    def test_measurement_model_defaults_preserve_original_event_key_order(self):
+        original = {"unit": "bytes", "scope": "host"}
+        measurement = _validate_measurement("memory", original, None)
+        self.assertIsInstance(measurement, JournalMeasurement)
+        self.assertIsNone(measurement.value)
+        self.assertNotIn("attributes", measurement.model_fields_set)
+        self.assertEqual(original, {"unit": "bytes", "scope": "host"})
+        self.logger.record_resources({"memory": original})
+        resources = read_database(self.db_path)[0]["data"]["resources"]
+        self.assertEqual(
+            list(resources["memory"]),
+            [
+                "unit",
+                "scope",
+                "value",
+                "kind",
+                "estimated",
+            ],
+        )
+        self.assertEqual(
+            resources["memory"],
+            {
+                "unit": "bytes",
+                "scope": "host",
+                "value": None,
+                "kind": "delta",
+                "estimated": False,
+            },
+        )
+
+    def test_command_observation_retains_model_before_public_json_facade(self):
+        document = {
+            "request_id": "request",
+            "author": "runner",
+            "outcome": "succeeded",
+            "response": {"result": "success", "data": {"values": [True, 1, 1.0]}},
+            "ignored": None,
+            "supersedes": [],
+        }
+        observation = _validated_command_result(document)
+        self.assertIsInstance(observation, CommandObservation)
+        published = validate_command_result(document)
+        self.assertEqual(published, document)
+        published["response"]["data"]["values"].append("external")
+        self.assertEqual(observation.response["data"]["values"], [True, 1, 1.0])
+
     def test_yaml_is_required_and_invalid_values_leave_the_client_usable(self):
         """B4/B5: missing or invalid YAML never produces a partial parameters event."""
         with self.assertRaises(TypeError):
