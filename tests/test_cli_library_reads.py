@@ -16,6 +16,7 @@ import yaml
 
 from core.experiments.assembler import ExperimentAssembler
 from core.journal.events import LoggingStorageError
+from core.models.server_commands import ControllerCommand
 from core.server.experiment_controller import ExperimentController
 from core.server.maintenance_controller import MaintenanceController
 from core.storage.errors import (
@@ -515,6 +516,7 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                 )
                 requests.put(commands[3])
                 await asyncio.wait_for(entered.wait(), 2)
+                self.assertIsInstance(controller._current_command, ControllerCommand)
                 requests.put(
                     {
                         "api_version": 1,
@@ -588,8 +590,8 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
         original = controller._execute
 
         async def execute(command):
-            if command["command"] != "stats.state":
-                started.append(command["command_id"])
+            if command.command != "stats.state":
+                started.append(command.command_id)
                 await release.wait()
             return await original(command)
 
@@ -846,14 +848,16 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
         controller._read_request = AsyncMock(side_effect=failure)
         for name in ("stats.artifacts", "stats.artifact"):
             response = await controller._execute_command(
-                {
-                    "api_version": 1,
-                    "command_id": str(uuid4()),
-                    "command": name,
-                    "args": {"experiment_id": "old"},
-                }
+                ControllerCommand.model_validate(
+                    {
+                        "api_version": 1,
+                        "command_id": str(uuid4()),
+                        "command": name,
+                        "args": {"experiment_id": "old"},
+                    }
+                )
             )
-            self.assertEqual(response["error"]["code"], "journal_unavailable")
+            self.assertEqual(response.error["code"], "journal_unavailable")
             self.assertEqual(runner.get_state()["experiment_id"], "active")
         runner._fail.assert_not_awaited()
 
@@ -880,8 +884,10 @@ class ControllerReadTests(unittest.IsolatedAsyncioTestCase):
                 {"name": reference["name"], "version": reference["version"]},
             ),
         ):
-            request = {"command_id": str(uuid4()), "command": name, "args": args}
+            request = ControllerCommand(
+                api_version=1, command_id=str(uuid4()), command=name, args=args
+            )
             expected = await run._read_request(request)
             response = await maintenance._execute(request)
-            self.assertEqual(response["result"], "success")
-            self.assertEqual(response["data"], expected)
+            self.assertEqual(response.result, "success")
+            self.assertEqual(response.data, expected)

@@ -5,6 +5,11 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from core.models.server_commands import (
+    ControllerCommand,
+    ControllerOutcome,
+    ControllerRejection,
+)
 from tests.helpers.dag import DagSession, DagWorkspace, process_running, wait_until
 
 
@@ -26,6 +31,65 @@ class ExperimentControllerTests(unittest.IsolatedAsyncioTestCase):
             else []
         )
 
+    async def test_command_models_survive_admission_and_public_state_is_detached_json(
+        self,
+    ):
+        controller = self.session.controller
+        request = ControllerCommand(
+            api_version=1,
+            command_id="11111111-1111-4111-8111-111111111111",
+            command="pause",
+            args={"nested": [1]},
+        )
+        batch = await controller._admit_command(request)
+        self.assertIs(batch[0], request)
+        controller._current_command = request
+        try:
+            state = await controller._read_request(
+                ControllerCommand(
+                    api_version=1,
+                    command_id="22222222-2222-4222-8222-222222222222",
+                    command="stats.state",
+                )
+            )
+            self.assertEqual(
+                state["current_command"], request.model_dump(exclude_unset=True)
+            )
+            state["current_command"]["args"]["nested"].append(2)
+            self.assertEqual(request.args, {"nested": [1]})
+            response = controller._failure(request, "command_cancelled", "Stopped.")
+            self.assertIsInstance(response, ControllerOutcome)
+            await controller._publish_response(response)
+            self.assertIs(await controller._outbox.get(), response)
+        finally:
+            controller._current_command = None
+
+    async def test_rejected_intake_keeps_missing_and_invalid_ids_in_public_errors(self):
+        controller = self.session.controller
+        for metadata in ({}, {"command_id": "invalid", "chain_id": None}):
+            with self.subTest(metadata=metadata):
+                response = controller._failure(metadata, "invalid_request", "Invalid.")
+                self.assertIsInstance(response, ControllerRejection)
+                document = response.model_dump(exclude_unset=True)
+                self.assertEqual(document["command_id"], metadata.get("command_id"))
+                self.assertEqual(document["chain_id"], metadata.get("chain_id"))
+                self.assertEqual(document["error"]["code"], "invalid_request")
+                received = len(self.session.received)
+                self.session.requests.put_nowait(
+                    {
+                        "api_version": 1,
+                        "command": "pause",
+                        **metadata,
+                    }
+                )
+                await wait_until(
+                    lambda received=received: len(self.session.received) > received
+                )
+                published = self.session.received[-1]
+                self.assertIsInstance(published, dict)
+                self.assertEqual(published["command_id"], metadata.get("command_id"))
+                self.assertEqual(published["error"]["code"], "invalid_request")
+
     async def test_three_stages_two_cycles_forward_inputs_in_serial_order(self):
         """C2/C5: real stage start/finish facts prove order and per-cycle inputs."""
         async with asyncio.timeout(30):
@@ -40,7 +104,8 @@ class ExperimentControllerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(
                 lambda: (
                     self.session.runner.get_state()["phase"] in ("completed", "failed")
-                )
+                ),
+                timeout=20,
             )
             state = self.session.runner.get_state()
             self.assertEqual(state["phase"], "completed", state)

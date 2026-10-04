@@ -17,7 +17,11 @@ from core.models.server_arguments import (
     ModuleSource,
     StateQueryArguments,
 )
-from core.models.server_commands import ControllerChain, ControllerCommand
+from core.models.server_commands import (
+    ControllerChain,
+    ControllerCommand,
+    ControllerOutcome,
+)
 from core.modules.manager import ModuleManager
 from core.modules.manifest import read_module_manifest
 from core.primitives.json_values import JsonObject, copy_json_object
@@ -46,14 +50,16 @@ class MaintenanceController:
         self._shutdown_requested = shutdown_requested
         self._recovery_required = recovery_required
         self._incoming: asyncio.Queue = asyncio.Queue()
-        self._commands: asyncio.Queue = asyncio.Queue()
-        self._read_commands: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._commands: asyncio.Queue[list[ControllerCommand]] = asyncio.Queue()
+        self._read_commands: asyncio.Queue[ControllerCommand] = asyncio.Queue(
+            maxsize=64
+        )
         self._read_tasks: list[asyncio.Task] = []
         self._intake_stop = threading.Event()
         self._intake_thread: threading.Thread | None = None
         self._tasks: list[asyncio.Task] = []
         self._active_task: asyncio.Task | None = None
-        self._current_command: JsonObject | None = None
+        self._current_command: ControllerCommand | None = None
         self._closing = False
         self._idle = asyncio.Event()
         self._idle.set()
@@ -99,7 +105,7 @@ class MaintenanceController:
             request = copy_json_object(request, "request")
             if "commands" in request:
                 chain = ControllerChain.model_validate(request)
-                commands = [command.model_dump(exclude_unset=True) for command in chain.commands]
+                commands = chain.commands
             else:
                 command = ControllerCommand.model_validate(request)
                 if command.command == "server.shutdown":
@@ -108,17 +114,16 @@ class MaintenanceController:
                 if command.command.startswith(("stats.", "logs.")):
                     await self._admit_command_read(command)
                     continue
-                commands = [command.model_dump(exclude_unset=True)]
+                commands = [command]
             await self._commands.put(commands)
 
     async def _admit_command_read(self, command: ControllerCommand) -> None:
-        document = command.model_dump(exclude_unset=True)
         if command.command == "stats.state":
-            await self._publish(await self._execute(document))
+            await self._publish(await self._execute(command))
         else:
-            await self._admit_read(document)
+            await self._admit_read(command)
 
-    async def _admit_read(self, request: JsonObject) -> None:
+    async def _admit_read(self, request: ControllerCommand) -> None:
         try:
             self._read_commands.put_nowait(request)
         except asyncio.QueueFull:
@@ -152,7 +157,7 @@ class MaintenanceController:
                 try:
                     response = await self._active_task
                     await self._publish(response)
-                    failed = response["result"] == "fail"
+                    failed = response.result == "fail"
                 finally:
                     self._active_task = None
                     self._current_command = None
@@ -166,13 +171,13 @@ class MaintenanceController:
             await self._publish(await self._execute(command))
         return
 
-    async def _execute(self, command: JsonObject) -> JsonObject:
+    async def _execute(self, command: ControllerCommand) -> ControllerOutcome:
         try:
             invocation = MaintenanceInvocation.model_validate(
                 {
-                    "command": command.get("command"),
-                    "args": command.get("args", {}),
-                    "target": command.get("target", {}),
+                    "command": command.command,
+                    "args": command.args,
+                    "target": command.target,
                 }
             )
             return await self._execute_request(command, invocation)
@@ -193,15 +198,15 @@ class MaintenanceController:
             if not isinstance(error, LoggingError):
                 try:
                     self._logger.record_error(
-                        error, context={"command_id": command["command_id"]}
+                        error, context={"command_id": command.command_id}
                     )
                 except Exception as logging_error:  # noqa: BLE001 - Preserve both failures.
                     error.add_note(f"Logging the failure also failed: {logging_error}")
             return self._failure(command, code, str(error), error)
 
     async def _execute_request(
-        self, command: JsonObject, invocation: MaintenanceInvocation
-    ) -> JsonObject:
+        self, command: ControllerCommand, invocation: MaintenanceInvocation
+    ) -> ControllerOutcome:
         name, args = invocation.command, invocation.args
         if name in (
             "stats.experiments",
@@ -211,7 +216,9 @@ class MaintenanceController:
             "stats.artifacts",
             "stats.artifact",
         ):
-            data = await asyncio.to_thread(self._experiment_reader.read, name, args, None)
+            data = await asyncio.to_thread(
+                self._experiment_reader.read, name, args, None
+            )
         elif name in ("stats.modules", "stats.module", "stats.template"):
             arguments = _validate_module_read_args(name, args)
             if name == "stats.modules":
@@ -227,36 +234,46 @@ class MaintenanceController:
             data = {
                 "server_mode": "maintenance",
                 "experiment_id": None,
-                "current_command": self._current_command,
+                "current_command": None
+                if self._current_command is None
+                else self._current_command.model_dump(exclude_unset=True),
                 "recovery_required": self._recovery_required,
             }
         elif name in ("module.add", "module.validate", "module.remove"):
             if name != "module.validate" and self._recovery_required:
                 return self._failure(
-                    command, "invalid_state",
+                    command,
+                    "invalid_state",
                     "Recover and stop unfinished experiments in run mode before changing modules: "
                     + ", ".join(self._recovery_required),
                 )
             data = await self._execute_module_command(command, name, args)
         else:
             return self._failure(
-                command, "invalid_mode",
+                command,
+                "invalid_mode",
                 "This command is unavailable in maintenance mode. Restart with --mode run.",
             )
-        return {
-            "command_id": command["command_id"],
-            "chain_id": command.get("chain_id"),
-            "experiment_id": None,
-            "state": "succeeded",
-            "result": "success",
-            "data": data,
-            "error": None,
-        }
+        return ControllerOutcome.model_validate(
+            {
+                "command_id": command.command_id,
+                "chain_id": command.chain_id,
+                "experiment_id": None,
+                "state": "succeeded",
+                "result": "success",
+                "data": data,
+                "error": None,
+            }
+        )
 
     async def _execute_module_command(
-        self, command: JsonObject, name: str, args: JsonObject
+        self, command: ControllerCommand, name: str, args: JsonObject
     ) -> JsonObject:
-        self._logger.record_event("module.command_started", {"command": command})
+        self._logger.record_event(
+            "module.command_started",
+            {"command": command.model_dump(exclude_unset=True)},
+        )
+        data: JsonObject
         if name == "module.add":
             arguments = ModuleSource.model_validate(args)
             data = await self._manager.register_and_install_module_async(
@@ -265,7 +282,8 @@ class MaintenanceController:
         elif name == "module.validate" and "folder" in args:
             arguments = ModuleSource.model_validate(args)
             manifest = await asyncio.to_thread(
-                read_module_manifest, arguments.folder,
+                read_module_manifest,
+                arguments.folder,
             )
             data = {"scope": "source", "valid": True, "manifest": manifest}
         else:
@@ -283,7 +301,7 @@ class MaintenanceController:
         self._logger.record_event(
             "module.command_completed",
             {
-                "command_id": command["command_id"],
+                "command_id": command.command_id,
                 "data": data,
             },
         )
@@ -291,31 +309,34 @@ class MaintenanceController:
 
     def _failure(
         self,
-        command: JsonObject,
+        command: ControllerCommand,
         code: str,
         message: str,
         error: Exception | None = None,
-    ) -> JsonObject:
-        return {
-            "command_id": command.get("command_id"),
-            "chain_id": command.get("chain_id"),
-            "experiment_id": None,
-            "state": "cancelled" if code == "command_cancelled" else "failed",
-            "result": "fail",
-            "data": None,
-            "error": {
-                "code": code,
-                "message": message,
-                "details": {
-                    "notes": list(getattr(error, "__notes__", [])),
+    ) -> ControllerOutcome:
+        return ControllerOutcome.model_validate(
+            {
+                "command_id": command.command_id,
+                "chain_id": command.chain_id,
+                "experiment_id": None,
+                "state": "cancelled" if code == "command_cancelled" else "failed",
+                "result": "fail",
+                "data": None,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "details": {
+                        "notes": list(getattr(error, "__notes__", [])),
+                    },
                 },
-            },
-        }
+            }
+        )
 
-    async def _publish(self, response: JsonObject) -> None:
+    async def _publish(self, response: ControllerOutcome) -> None:
+        document = response.model_dump(exclude_unset=True)
         while not self._closing:
             try:
-                await asyncio.to_thread(self._responses.put, response, True, 0.1)
+                await asyncio.to_thread(self._responses.put, document, True, 0.1)
                 return
             except Full:
                 parent = multiprocessing.parent_process()

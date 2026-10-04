@@ -31,7 +31,12 @@ from core.models.server_arguments import (
     StateQueryArguments,
     TemplateArguments,
 )
-from core.models.server_commands import ControllerChain, ControllerCommand
+from core.models.server_commands import (
+    ControllerChain,
+    ControllerCommand,
+    ControllerOutcome,
+    ControllerRejection,
+)
 from core.modules.manager import ModuleManager
 from core.primitives.json_values import JsonObject, copy_json_object
 from core.primitives.paths import repository_root
@@ -66,14 +71,16 @@ class ExperimentController:
         self._module_manager = module_manager
         self._requests = requests
         self._responses = responses
-        self._control_queue: asyncio.Queue[list[JsonObject]] = asyncio.Queue()
+        self._control_queue: asyncio.Queue[list[ControllerCommand]] = asyncio.Queue()
         self._incoming: asyncio.Queue[object] = asyncio.Queue()
         self._intake_stop = threading.Event()
         self._intake_thread: threading.Thread | None = None
         self._intake_error: Exception | None = None
-        self._outbox: asyncio.Queue[JsonObject] = asyncio.Queue()
-        self._current_command = None
-        self._active_tail: list[JsonObject] = []
+        self._outbox: asyncio.Queue[ControllerOutcome | ControllerRejection] = (
+            asyncio.Queue()
+        )
+        self._current_command: ControllerCommand | None = None
+        self._active_tail: list[ControllerCommand] = []
         self._active_task = None
         self._loops: list[asyncio.Task] = []
         self._reads: set[asyncio.Task] = set()
@@ -161,22 +168,21 @@ class ExperimentController:
                     self._failure(command, "invalid_request", str(error))
                 )
 
-    def _read_chain(self, request: JsonObject) -> list[JsonObject]:
+    def _read_chain(self, request: JsonObject) -> list[ControllerCommand]:
         chain = ControllerChain.model_validate(request)
-        return [command.model_dump(exclude_unset=True) for command in chain.commands]
+        return chain.commands
 
     async def _admit_command(
         self, command: ControllerCommand
-    ) -> list[JsonObject] | None:
-        document = command.model_dump(exclude_unset=True)
+    ) -> list[ControllerCommand] | None:
         if command.command.startswith(("stats.", "logs.")):
-            task = asyncio.create_task(self._answer_read(document))
+            task = asyncio.create_task(self._answer_read(command))
             self._reads.add(task)
             task.add_done_callback(self._reads.discard)
             return None
         if command.command == "stop":
             await self._cancel_queued_commands()
-        return [document]
+        return [command]
 
     async def _cancel_queued_commands(self) -> None:
         cancelled = list(self._active_tail)
@@ -201,7 +207,7 @@ class ExperimentController:
                 command = self._active_tail.pop(0)
                 response = await self._execute_queued_command(command)
                 await self._publish_response(response)
-                if response["result"] == "fail":
+                if response.result == "fail":
                     cancelled, self._active_tail = self._active_tail, []
                     for remaining in cancelled:
                         await self._publish_response(
@@ -212,7 +218,9 @@ class ExperimentController:
                             )
                         )
 
-    async def _execute_queued_command(self, command: JsonObject) -> JsonObject:
+    async def _execute_queued_command(
+        self, command: ControllerCommand
+    ) -> ControllerOutcome | ControllerRejection:
         self._current_command = command
         self._active_task = asyncio.create_task(self._execute_command(command))
         try:
@@ -228,12 +236,12 @@ class ExperimentController:
             self._current_command = None
         return response
 
-    async def _execute_command(self, command: JsonObject) -> JsonObject:
-        name = ""
+    async def _execute_command(
+        self, command: ControllerCommand
+    ) -> ControllerOutcome | ControllerRejection:
+        name = command.command
         try:
-            validated = ControllerCommand.model_validate(command)
-            name = validated.command
-            return await self._perform_command(validated)
+            return await self._perform_command(command)
         except LoggingError as error:
             if (
                 name not in ("stats.artifacts", "stats.artifact")
@@ -243,9 +251,7 @@ class ExperimentController:
                     or getattr(error, "journal_failed", False)
                 )
             ):
-                await self._runner._fail(
-                    error, {"command_id": command.get("command_id")}
-                )
+                await self._runner._fail(error, {"command_id": command.command_id})
             return self._failure(command, "journal_unavailable", str(error), error)
         except NotImplementedError as error:
             return self._failure(command, "unsupported_feature", str(error))
@@ -277,21 +283,28 @@ class ExperimentController:
                 command, "operation_failed", f"{type(error).__name__}: {error}", error
             )
 
-    async def _perform_command(self, command: ControllerCommand) -> JsonObject:
+    async def _perform_command(self, command: ControllerCommand) -> ControllerOutcome:
         name = command.command
-        document = command.model_dump(exclude_unset=True)
         if name.startswith(("stats.", "logs.")):
-            data = await self._read_request(document)
+            data = await self._read_request(command)
         else:
-            if self._recovery_required and name not in ("recover", "stop", "archive.inspect"):
+            if self._recovery_required and name not in (
+                "recover",
+                "stop",
+                "archive.inspect",
+            ):
                 raise RuntimeError(
                     "Recover unfinished experiments before issuing control commands: "
                     f"{sorted(self._recovery_required)}"
                 )
-            data = await self._execute_control_command(name, command.args, document)
+            data = await self._execute_control_command(name, command.args, command)
             if name == "recover":
                 self._recovery_required.discard(command.args["experiment_id"])
-            if name == "stop" and isinstance(data, dict) and data.get("termination_confirmed"):
+            if (
+                name == "stop"
+                and isinstance(data, dict)
+                and data.get("termination_confirmed")
+            ):
                 identifier = data.get("experiment_id")
                 if isinstance(identifier, str):
                     # Confirmed shutdown permits rollback after an incomplete restoration.
@@ -301,21 +314,23 @@ class ExperimentController:
                         self._recovery_required.discard(identifier)
             if data is None:
                 data = {}
-        return {
-            "command_id": command.command_id,
-            "chain_id": command.chain_id,
-            "state": "succeeded",
-            "result": "success",
-            "experiment_id": self._runner.get_state()["experiment_id"],
-            "data": data,
-            "error": None,
-        }
+        return ControllerOutcome.model_validate(
+            {
+                "command_id": command.command_id,
+                "chain_id": command.chain_id,
+                "state": "succeeded",
+                "result": "success",
+                "experiment_id": self._runner.get_state()["experiment_id"],
+                "data": data,
+                "error": None,
+            }
+        )
 
     async def _execute_control_command(
-        self, name: str, args: JsonObject, command: JsonObject
+        self, name: str, args: JsonObject, command: ControllerCommand
     ) -> JsonObject | None:
         invocation = ControlInvocation.model_validate(
-            {"command": name, "args": args, "target": command.get("target", {})}
+            {"command": name, "args": args, "target": command.target}
         )
         args = invocation.arguments()
         handlers = {
@@ -346,8 +361,8 @@ class ExperimentController:
         if model is not None:
             args = model.model_validate(args).model_dump(exclude_unset=True)
         self._runner._command_context = {
-            "command_id": command["command_id"],
-            "command_chain_id": command.get("chain_id"),
+            "command_id": command.command_id,
+            "command_chain_id": command.chain_id,
         }
         try:
             data = handler(**args)
@@ -357,9 +372,9 @@ class ExperimentController:
             self._runner._command_context = {}
         return data
 
-    async def _read_request(self, request: JsonObject) -> JsonObject:
-        args = copy_json_object(request.get("args", {}), "args")
-        name = request["command"]
+    async def _read_request(self, request: ControllerCommand) -> JsonObject:
+        args = request.args
+        name = request.command
         if name in ("stats.modules", "stats.module", "stats.template"):
             if self._module_manager is None:
                 raise RuntimeError("Module manager is not configured for reads.")
@@ -367,12 +382,12 @@ class ExperimentController:
             if name == "stats.modules":
                 return self._module_manager.list_modules()
             if name == "stats.module":
-                return await self._module_manager.inspect_module(**arguments.model_dump())
+                return await self._module_manager.inspect_module(
+                    **arguments.model_dump()
+                )
             assembler = ExperimentAssembler(self._project_root, self._module_manager)
-            return await assembler.validate_template(
-                arguments.template_path
-            )
-        if request["command"] in (
+            return await assembler.validate_template(arguments.template_path)
+        if name in (
             "stats.experiments",
             "stats.experiment",
             "stats.snapshots",
@@ -382,17 +397,19 @@ class ExperimentController:
         ):
             return await asyncio.to_thread(
                 self._experiment_reader.read,
-                request["command"],
+                name,
                 args,
                 self._runner.get_state()["experiment_id"],
             )
-        if request["command"] == "stats.resources":
+        if name == "stats.resources":
             NoArguments.model_validate(args)
             return self.resources.get_status()
-        if request["command"] == "stats.resources.history":
+        if name == "stats.resources.history":
             arguments = ResourceHistoryArguments.model_validate(args)
-            return self.resources.read_history(**arguments.model_dump(exclude_unset=True))
-        if request["command"] == "stats.state":
+            return self.resources.read_history(
+                **arguments.model_dump(exclude_unset=True)
+            )
+        if name == "stats.state":
             arguments = StateQueryArguments.model_validate(args)
             state = self._runner.get_state()
             if arguments.experiment_id not in (None, state["experiment_id"]):
@@ -401,12 +418,14 @@ class ExperimentController:
                 {
                     **state,
                     "server_mode": "run",
-                    "current_command": self._current_command,
+                    "current_command": None
+                    if self._current_command is None
+                    else self._current_command.model_dump(exclude_unset=True),
                     "recovery_required": sorted(self._recovery_required),
                 },
                 "controller state",
             )
-        if request["command"] == "logs.read":
+        if name == "logs.read":
             arguments = EventReadArguments.model_validate(args)
             return await self._runner.read_events(
                 arguments.experiment_id, arguments.cursor, limit=arguments.limit
@@ -415,32 +434,39 @@ class ExperimentController:
             "The initial read API provides stats.state and logs.read."
         )
 
-    async def _answer_read(self, command: JsonObject) -> None:
+    async def _answer_read(self, command: ControllerCommand) -> None:
         await self._publish_response(await self._execute_command(command))
 
-    async def _publish_response(self, response: JsonObject) -> None:
-        self._outbox.put_nowait(copy_json_object(response, "response"))
+    async def _publish_response(
+        self, response: ControllerOutcome | ControllerRejection
+    ) -> None:
+        self._outbox.put_nowait(response)
 
     async def _write_responses(self) -> None:
         while not self._closing:
             response = await self._outbox.get()
+            document = response.model_dump(exclude_unset=True)
             while not self._closing:
                 try:
-                    await asyncio.to_thread(self._responses.put, response, True, 0.1)
+                    await asyncio.to_thread(self._responses.put, document, True, 0.1)
                     break
                 except Full:
                     continue
 
     def _failure(
         self,
-        command: JsonObject,
+        command: ControllerCommand | JsonObject,
         code: str,
         message: str,
         error: Exception | None = None,
-    ) -> JsonObject:
-        return {
-            "command_id": command.get("command_id"),
-            "chain_id": command.get("chain_id"),
+    ) -> ControllerOutcome | ControllerRejection:
+        document = {
+            "command_id": command.command_id
+            if isinstance(command, ControllerCommand)
+            else command.get("command_id"),
+            "chain_id": command.chain_id
+            if isinstance(command, ControllerCommand)
+            else command.get("chain_id"),
             "state": "cancelled" if code == "command_cancelled" else "failed",
             "result": "fail",
             "experiment_id": self._runner.get_state()["experiment_id"],
@@ -453,6 +479,12 @@ class ExperimentController:
                 else {},
             },
         }
+        # Rejected intake can lack even a valid command ID; keep its error reply.
+        return (
+            ControllerOutcome.model_validate(document)
+            if isinstance(command, ControllerCommand)
+            else ControllerRejection.model_validate(document)
+        )
 
     async def close(self) -> None:
         if self._closing:

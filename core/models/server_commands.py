@@ -166,3 +166,15 @@ class ControllerOutcome(CommandStatus):
     result: Literal["success", "fail"]
     data: JsonValue = None
     error: JsonValue = None
+
+
+class ControllerRejection(_Document):
+    """Intake errors can lack a valid command ID, unlike admitted outcomes."""
+
+    model_config = ConfigDict(extra="allow")
+
+    command_id: JsonValue
+    state: Literal["failed", "cancelled"]
+    result: Literal["fail"]
+    data: JsonValue = None
+    error: JsonValue = None

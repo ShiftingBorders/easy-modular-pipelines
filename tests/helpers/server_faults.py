@@ -8,6 +8,7 @@ from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from unittest.mock import patch
 
+from core.models.server_commands import ControllerOutcome
 from core.primitives.json_files import write_json
 from core.primitives.processes import process_identity
 
@@ -55,27 +56,31 @@ def fault_controller(settings, requests, responses, instance_id):
     build = ExperimentSnapshots._build_snapshot
 
     async def execute_command(controller, command):
-        name = command["command"]
+        name = command.command
         if not name.startswith("fixture."):
             return await execute(controller, command)
         if name == "fixture.wait":
             (control / "command.entered").touch()
             while not (control / "command.release").exists():
                 await asyncio.sleep(0.025)
-        args = command.get("args", {})
-        return {
-            "command_id": command["command_id"],
-            "chain_id": command.get("chain_id"),
-            "state": "succeeded",
-            "result": "success",
-            "experiment_id": None,
-            "data": {
-                "args": args,
-                "target": command.get("target"),
-                "blob": "x" * args.get("bytes", 0),
-            },
-            "error": None,
-        }
+        args = command.args
+        return ControllerOutcome.model_validate(
+            {
+                "command_id": command.command_id,
+                "chain_id": command.chain_id,
+                "state": "succeeded",
+                "result": "success",
+                "experiment_id": None,
+                "data": {
+                    "args": args,
+                    "target": command.target
+                    if "target" in command.model_fields_set
+                    else None,
+                    "blob": "x" * args.get("bytes", 0),
+                },
+                "error": None,
+            }
+        )
 
     async def close_controller(controller):
         if (control / "hold-shutdown").exists():
