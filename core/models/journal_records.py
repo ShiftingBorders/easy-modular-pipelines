@@ -81,6 +81,28 @@ class JournalCheckpoint(JournalIdentity):
         return {**identity, "position": document[key]}
 
 
+class JournalReadBoundary(BaseModel):
+    """Observed SQL boundary; identity is validated before reading its counters."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    schema_version: Literal[2]
+    journal_id: str
+    generation: str
+    cursor: int
+    event_count: int
+    change_cursor: int
+
+    def checkpoint(
+        self, key: Literal["cursor", "change_cursor"], position: int
+    ) -> JsonObject:
+        return {
+            "journal_id": self.journal_id,
+            "generation": self.generation,
+            key: position,
+        }
+
+
 class JournalEvent(_Document):
     schema_version: Annotated[int, Field(strict=True, ge=2, le=2)]
     event_id: Text
@@ -132,6 +154,30 @@ class JournalEntry(BaseModel):
             document["effective_author"] = self.effective_author
         if "provisional" in self.model_fields_set:
             document["provisional"] = self.provisional
+        return document
+
+
+class JournalEventPage(BaseModel):
+    """Typed page operations serialize original event representations at output."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    events: list[JournalEntry]
+    boundary: JournalReadBoundary
+    after: int | None = None
+
+    def document(self) -> JsonObject:
+        document: JsonObject = {
+            "events": [entry.document() for entry in self.events],
+            "boundary": self.boundary.model_dump(),
+        }
+        if self.after is not None:
+            document = {
+                "events": document["events"],
+                "checkpoint": self.boundary.checkpoint("cursor", self.after),
+                "boundary": document["boundary"],
+                "has_more": self.after < self.boundary.cursor,
+            }
         return document
 
 

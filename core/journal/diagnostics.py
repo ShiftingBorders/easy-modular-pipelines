@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         CommandObservation,
         JournalEntry,
         JournalEvent,
+        JournalReadBoundary,
     )
 
 
@@ -375,18 +376,21 @@ def _merge_diagnostic_command(
 
 
 def _diagnostic_manifest(
-    roots: list[str], boundary: JsonObject, records_sha256: str,
-    event_count: int, command_count: int,
+    roots: list[str],
+    boundary: JournalReadBoundary,
+    records_sha256: str,
+    event_count: int,
+    command_count: int,
 ) -> JsonObject:
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "kind": "journal.diagnostics",
         "diagnostics_id": uuid4().hex,
-        "journal_id": boundary["journal_id"],
-        "generation": boundary["generation"],
+        "journal_id": boundary.journal_id,
+        "generation": boundary.generation,
         "operation_ids": roots,
-        "cursor": boundary["cursor"],
-        "change_cursor": boundary["change_cursor"],
+        "cursor": boundary.cursor,
+        "change_cursor": boundary.change_cursor,
         "created_at": datetime.now(UTC).isoformat(timespec="microseconds"),
         "records": "records.jsonl",
         "records_sha256": records_sha256,

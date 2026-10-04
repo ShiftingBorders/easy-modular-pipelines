@@ -15,7 +15,14 @@ from core.journal.events import (
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
-from core.models.journal_records import JournalContext, JournalEntry, JournalEvent
+from core.journal.records import _read_boundary
+from core.models.journal_records import (
+    JournalContext,
+    JournalEntry,
+    JournalEvent,
+    JournalEventPage,
+    JournalReadBoundary,
+)
 from tests.helpers.logging_fixtures import context_event, write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -69,6 +76,28 @@ class JournalReadingTests(unittest.TestCase):
         raw["event"]["data"]["b"].append("external")
         self.assertEqual(entry.event.data["b"], [True, 1, 1.0])
         self.assertEqual(entry.document()["event"], reordered)
+
+    def test_typed_boundary_and_page_preserve_empty_and_populated_public_shapes(self):
+        store = self.logger._store
+        with store._lock:
+            boundary = _read_boundary(store._connection)
+        self.assertIsInstance(boundary, JournalReadBoundary)
+        empty = JournalEventPage(events=[], boundary=boundary, after=0)
+        self.assertEqual(empty.document(), self.logger.read_events())
+        identifier = self.logger.record_event("page", {"values": [True, 1.0]})
+        with store._lock:
+            boundary = _read_boundary(store._connection)
+            entry = store._event_entry(identifier, store._connection)
+        page = JournalEventPage(events=[entry], boundary=boundary, after=entry.cursor)
+        self.assertEqual(page.document(), self.logger.read_events())
+        batch = JournalEventPage(events=[entry], boundary=boundary)
+        self.assertEqual(batch.document(), self.logger.read_event_batch([identifier]))
+        self.assertNotIn("checkpoint", batch.document())
+        published = page.document()
+        published["boundary"]["cursor"] = -1
+        published["events"][0]["event"]["data"]["values"].append("external")
+        self.assertEqual(boundary.cursor, entry.cursor)
+        self.assertEqual(entry.event.data["values"], [True, 1.0])
 
     def test_create_existing_and_unknown_files_are_not_adopted(self):
         """A4/A5: neither create nor existing may invent a replacement journal."""

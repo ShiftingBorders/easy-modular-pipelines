@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         CommandObservation,
         JournalCheckpoint,
         JournalEntry,
+        JournalReadBoundary,
     )
 
 
@@ -62,16 +63,12 @@ def _decode_row(row: tuple) -> JournalEntry:
     return JournalEntry(cursor=cursor, event=event, encoded_event=encoded)
 
 
-def _checkpoint(info: JsonObject, key: str, position: int) -> JsonObject:
-    return {
-        "journal_id": info["journal_id"],
-        "generation": info["generation"],
-        key: position,
-    }
+def _checkpoint(info: JournalReadBoundary, key: str, position: int) -> JsonObject:
+    return {"journal_id": info.journal_id, "generation": info.generation, key: position}
 
 
 def _checkpoint_position(
-    checkpoint: JournalCheckpoint | None, boundary: JsonObject, key: str
+    checkpoint: JournalCheckpoint | None, boundary: JournalReadBoundary, key: str
 ) -> int:
     if checkpoint is None:
         return 0
@@ -79,10 +76,10 @@ def _checkpoint_position(
         "journal_id": checkpoint.journal_id,
         "generation": checkpoint.generation,
     }
-    actual = {name: boundary[name] for name in expected}
+    actual = {"journal_id": boundary.journal_id, "generation": boundary.generation}
     if expected != actual:
         raise JournalGenerationChanged(expected, actual)
-    if checkpoint.position > boundary[key]:
+    if checkpoint.position > getattr(boundary, key):
         raise LoggingStateError("Checkpoint is beyond the committed journal boundary.")
     return checkpoint.position
 
@@ -95,7 +92,9 @@ def _ignored_reason(result: CommandObservation) -> str:
     }.get(result.outcome, "runner_result_precedence")
 
 
-def _read_boundary(connection: sqlite3.Connection) -> JsonObject:
+def _read_boundary(connection: sqlite3.Connection) -> JournalReadBoundary:
+    from core.models.journal_records import JournalReadBoundary
+
     info = _read_journal_info(connection)
     cursor = connection.execute(
         "SELECT COALESCE(MAX(cursor), 0) FROM events"
@@ -104,7 +103,9 @@ def _read_boundary(connection: sqlite3.Connection) -> JsonObject:
     change = connection.execute(
         "SELECT COALESCE(MAX(change_cursor), 0) FROM journal_changes"
     ).fetchone()[0]
-    return {**info, "cursor": cursor, "event_count": count, "change_cursor": change}
+    return JournalReadBoundary(
+        **info, cursor=cursor, event_count=count, change_cursor=change
+    )
 
 
 def _validate_result_precedence(result: dict, row: tuple) -> None:

@@ -73,7 +73,11 @@ if TYPE_CHECKING:
         DiagnosticManifest,
         JournalSnapshotManifest,
     )
-    from core.models.journal_records import JournalContext, JournalEntry
+    from core.models.journal_records import (
+        JournalContext,
+        JournalEntry,
+        JournalReadBoundary,
+    )
     from core.models.journal_settings import JournalConfiguration
 
 
@@ -537,12 +541,11 @@ class SQLiteEventStore:
                     rows.close()
                 self._connection.execute("COMMIT")
                 self._check_health()
-                return {
-                    "events": [entry.document() for entry in result],
-                    "checkpoint": _checkpoint(boundary, "cursor", after),
-                    "boundary": boundary,
-                    "has_more": after < boundary["cursor"],
-                }
+                from core.models.journal_records import JournalEventPage
+
+                return JournalEventPage(
+                    events=result, boundary=boundary, after=after
+                ).document()
             except LoggingStateError as error:
                 self._rollback(self._connection, error)
                 raise
@@ -615,10 +618,9 @@ class SQLiteEventStore:
                     rows.close()
                 self._connection.execute("COMMIT")
                 self._check_health()
-                return {
-                    "events": [entry.document() for entry in entries],
-                    "boundary": boundary,
-                }
+                from core.models.journal_records import JournalEventPage
+
+                return JournalEventPage(events=entries, boundary=boundary).document()
             except LoggingStateError as error:
                 self._rollback(self._connection, error)
                 raise
@@ -630,7 +632,7 @@ class SQLiteEventStore:
         self,
         event_ids: list[str] | None,
         before: int | None,
-        boundary: JsonObject,
+        boundary: JournalReadBoundary,
         limit: int,
     ) -> sqlite3.Cursor:
         columns = "cursor, event_id, producer_instance_id, sequence_number, event_json"
@@ -644,7 +646,7 @@ class SQLiteEventStore:
             rows = self._connection.execute(
                 f"SELECT {columns} FROM events WHERE cursor < ? ORDER BY cursor DESC LIMIT ?",
                 (
-                    before if before is not None else boundary["cursor"] + 1,
+                    before if before is not None else boundary.cursor + 1,
                     limit,
                 ),
             )
@@ -871,8 +873,8 @@ class SQLiteEventStore:
                 return {
                     "changes": result,
                     "checkpoint": _checkpoint(boundary, "change_cursor", after),
-                    "boundary": boundary,
-                    "has_more": after < boundary["change_cursor"],
+                    "boundary": boundary.model_dump(),
+                    "has_more": after < boundary.change_cursor,
                 }
             except LoggingStateError as error:
                 self._rollback(self._connection, error)
@@ -1167,7 +1169,7 @@ class SQLiteEventStore:
                 try:
                     self._validate_snapshot_source(reader)
                     digest = _content_digest(reader)
-                    change_cursor = _read_boundary(reader)["change_cursor"]
+                    change_cursor = _read_boundary(reader).change_cursor
                 except BaseException as error:  # noqa: BLE001 - Source failure is critical.
                     raise self._storage_failure(error, "validate snapshot source")
                 temporary_database = target / "journal.sqlite.part"
@@ -1301,18 +1303,24 @@ class SQLiteEventStore:
                 reader.execute("BEGIN")
                 boundary = _read_boundary(reader)
                 if (
-                    boundary["generation"] != self._generation
-                    or boundary["journal_id"] != self._journal_id
+                    boundary.generation != self._generation
+                    or boundary.journal_id != self._journal_id
                 ):
                     raise LoggingStorageError("Diagnostic source changed.")
                 self._validate_snapshot_source(reader)
                 read_event = lambda event_id: self._event_entry(event_id, reader)
-                read_result = lambda request_id: self._load_command_result(request_id, connection=reader)
-                metadata, starts, selected_operations, selected = _diagnostic_operation_events(
-                    reader, roots, self._decode_row
+                read_result = lambda request_id: self._load_command_result(
+                    request_id, connection=reader
                 )
-                _add_diagnostic_observer_events(reader, selected_operations, selected, read_result)
-                requests = _diagnostic_dependencies(metadata, starts, selected, read_event, read_result)
+                metadata, starts, selected_operations, selected = (
+                    _diagnostic_operation_events(reader, roots, self._decode_row)
+                )
+                _add_diagnostic_observer_events(
+                    reader, selected_operations, selected, read_result
+                )
+                requests = _diagnostic_dependencies(
+                    metadata, starts, selected, read_event, read_result
+                )
                 source_phase = False
                 target.mkdir()
                 records_sha256 = _write_diagnostic_records(
@@ -1541,7 +1549,7 @@ class SQLiteEventStore:
             (new_generation,),
         )
         result = {
-            **_read_boundary(connection),
+            **_read_boundary(connection).model_dump(),
             "restoration_id": restoration_id,
             "snapshot_id": manifest.snapshot_id,
             "imported_events": len(inserted),
@@ -1598,7 +1606,7 @@ class SQLiteEventStore:
         self._validate_snapshot_source(connection)
         boundary = _read_boundary(connection)
         if any(
-            boundary[key] != getattr(manifest, key)
+            getattr(boundary, key) != getattr(manifest, key)
             for key in ("cursor", "event_count", "change_cursor")
         ):
             raise ValueError("Restored journal does not match the snapshot boundary.")

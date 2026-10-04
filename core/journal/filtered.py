@@ -232,17 +232,17 @@ class FilteredJournal:
                     "journal_id": store._journal_id,
                     "generation": store._generation,
                 }
-                actual = {key: boundary[key] for key in expected}
+                actual = {key: getattr(boundary, key) for key in expected}
                 if expected != actual:
                     raise JournalGenerationChanged(expected, actual)
                 rebuild = (
                     self._last_error is not None
                     or previous is None
                     or any(
-                        getattr(previous, key) != boundary[key]
+                        getattr(previous, key) != getattr(boundary, key)
                         for key in ("journal_id", "generation")
                     )
-                    or previous.change_cursor > boundary["change_cursor"]
+                    or previous.change_cursor > boundary.change_cursor
                 )
                 phase = "view"
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -283,10 +283,10 @@ class FilteredJournal:
                 source.close()
                 source = None
                 store._check_health()
-                changed = rebuild or previous.change_cursor != boundary["change_cursor"]
+                changed = rebuild or previous.change_cursor != boundary.change_cursor
                 publication = FilteredPublication.model_validate(
                     {
-                        **boundary,
+                        **boundary.model_dump(),
                         "publication_id": uuid4().hex
                         if changed
                         else previous.publication_id,
