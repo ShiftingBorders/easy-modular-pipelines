@@ -35,6 +35,8 @@ from core.models.runner_state import (
     PendingRebuild,
     ServiceFailure,
     ServiceFailureDetails,
+    ServiceRequest,
+    WorkingServiceRequest,
 )
 from core.models.updates import _update_model
 from core.participants.protocol import error_details
@@ -146,6 +148,61 @@ class RunnerStateTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ServiceFailure.model_validate(failure.model_dump())
+
+    def test_service_request_replacements_and_presence_survive_restore(self):
+        _, service = self._add_path_participants()
+        request_id = str(uuid4())
+        request = WorkingServiceRequest.model_validate(
+            {
+                "owner": "service",
+                "request_id": request_id,
+                "command": "echo",
+                "args": {"nested": [1]},
+                "queued_monotonic": 1,
+                "sent_monotonic": None,
+                "timed_out": False,
+                "compatibility": {"value": None},
+            }
+        )
+        service.pending_requests = [request]
+        self.state.used_request_ids.add(request_id)
+        document = state_to_document(self.state)
+        self.store.save(self.state)
+        restored = self.store.load(self.root)
+        pending = restored.services[service.service_id].pending_requests[0]
+        self.assertIsInstance(pending, WorkingServiceRequest)
+        self.assertNotIn("deadline_monotonic", pending.model_fields_set)
+        self.assertNotIn("service_instance_id", pending.model_fields_set)
+        self.assertEqual(state_to_document(restored), document)
+        sent = _update_model(
+            request,
+            service_instance_id=service.service_instance_id,
+            sent_monotonic=2,
+            sent_at="now",
+        )
+        self.assertIsNone(request.sent_monotonic)
+        self.assertEqual(sent.sent_monotonic, 2)
+        self.assertEqual(sent.model_extra["compatibility"], {"value": None})
+        with self.assertRaises(ValueError):
+            _update_model(request, request_id="invalid")
+        self.assertEqual(request.request_id, request_id)
+
+    def test_live_request_keeps_saved_deadline_constraint_separate(self):
+        request = WorkingServiceRequest.model_validate(
+            {
+                "owner": "service",
+                "request_id": str(uuid4()),
+                "command": "echo",
+                "args": {},
+                "queued_monotonic": 1,
+                "deadline_monotonic": -1,
+                "sent_monotonic": None,
+                "timed_out": False,
+            }
+        )
+        self.assertEqual(request.deadline_monotonic, -1)
+        with self.assertRaises(ValueError):
+            ServiceRequest.model_validate(request.model_dump(exclude_unset=True))
 
     def _add_path_participants(self):
         stage_id = str(uuid4())

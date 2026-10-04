@@ -23,7 +23,9 @@ from core.models.runner_state import (
     SavedService,
     ServiceFailureDetails,
     ServiceParameters,
+    ServiceRequest,
     StateParameters,
+    WorkingServiceRequest,
 )
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -125,8 +127,8 @@ class ServiceInstance:
     started_at: str | None
     last_status: JsonObject | None
     restart_count: int
-    pending_requests: list[JsonObject]
-    active_request: JsonObject | None
+    pending_requests: list[WorkingServiceRequest]
+    active_request: WorkingServiceRequest | None
 
     def __init__(
         self,
@@ -349,6 +351,15 @@ def state_to_document(state: RunnerState) -> JsonObject:
     for service_id, instance in state.services.items():
         saved = dict(vars(instance))
         saved["definition"] = instance.definition.model_dump(exclude_unset=True)
+        saved["pending_requests"] = [
+            request.model_dump(exclude_unset=True)
+            for request in instance.pending_requests
+        ]
+        saved["active_request"] = (
+            None
+            if instance.active_request is None
+            else instance.active_request.model_dump(exclude_unset=True)
+        )
         saved["failure"] = (
             None
             if instance.failure is None
@@ -466,12 +477,12 @@ def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
     instance.last_status = document.last_status
     instance.restart_count = document.restart_count
     instance.pending_requests = [
-        request.model_dump(exclude_unset=True) for request in document.pending_requests
+        _restore_request(request) for request in document.pending_requests
     ]
     instance.active_request = (
         None
         if document.active_request is None
-        else document.active_request.model_dump(exclude_unset=True)
+        else _restore_request(document.active_request)
     )
     instance.start_deadline = document.start_deadline
     instance.ever_ready = document.ever_ready
@@ -495,6 +506,13 @@ def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
     )
     instance.implementation = document.implementation
     return instance
+
+
+def _restore_request(document: ServiceRequest) -> WorkingServiceRequest:
+    values: dict[str, object] = dict(document.model_extra or {})
+    for name in document.model_fields_set & ServiceRequest.model_fields.keys():
+        values[name] = getattr(document, name)
+    return WorkingServiceRequest.model_validate(values)
 
 
 def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:

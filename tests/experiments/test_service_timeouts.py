@@ -96,8 +96,8 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 w.manager.request(w.state, sid, "echo", {"n": 2})
             )
             await wait_for(lambda: original.active_request is not None)
-            request_id = original.active_request["request_id"]
-            sent = original.active_request["sent_monotonic"]
+            request_id = original.active_request.request_id
+            sent = original.active_request.sent_monotonic
             await wait_for(
                 lambda: w.journal.client.read_command_result(request_id), timeout=40
             )

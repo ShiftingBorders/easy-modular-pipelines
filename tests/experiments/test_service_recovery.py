@@ -181,8 +181,8 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     row["event"] == "work_started" for row in w.trace(definition)
                 )
             )
-            active_id = w.state.services[sid].active_request["request_id"]
-            pending_id = w.state.services[sid].pending_requests[0]["request_id"]
+            active_id = w.state.services[sid].active_request.request_id
+            pending_id = w.state.services[sid].pending_requests[0].request_id
             w.store.save(w.state)
             await w.manager.close()
             await asyncio.gather(*calls, return_exceptions=True)
@@ -230,14 +230,14 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     for row in w.trace(definition)
                 )
             )
-            request_id = w.state.services[sid].active_request["request_id"]
+            request_id = w.state.services[sid].active_request.request_id
             w.store.save(w.state)
             await w.manager.close()
             await asyncio.gather(call, return_exceptions=True)
             w.state = w.store.load(w.experiment)
             self.assertEqual(await w.replacement_manager().recover(w.state), "ready")
             self.assertEqual(
-                w.state.services[sid].active_request["request_id"], request_id
+                w.state.services[sid].active_request.request_id, request_id
             )
             self.assertIsNone(w.journal.client.read_command_result(request_id))
             self.assertEqual(
@@ -278,7 +278,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             recovered_at = time.monotonic()
             self.assertEqual(await manager.recover(w.state), "ready")
             self.assertEqual(
-                w.state.services[sid].active_request["sent_monotonic"],
+                w.state.services[sid].active_request.sent_monotonic,
                 entry["sent_monotonic"],
             )
             self.assertEqual(await manager.monitor(w.state), "pause")

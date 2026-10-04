@@ -115,7 +115,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
                     row["event"] == "work_started" for row in w.trace(definition)
                 )
             )
-            request_id = w.state.services[sid].active_request["request_id"]
+            request_id = w.state.services[sid].active_request.request_id
             working.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await working

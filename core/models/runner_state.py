@@ -175,6 +175,27 @@ class ServiceRequest(_Document):
     timed_out: Boolean
 
 
+class WorkingServiceRequest(_Input):
+    """Live queue record; persisted constraints remain with ServiceRequest.
+
+    Admission does not impose the saved nonnegative deadline constraint. Keep
+    that validation at state publication, preserving expired deadline handling.
+    Compatibility metadata remains in extras and is serialized with the record.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    owner: Literal["caller", "service"]
+    request_id: UUIDText
+    command: Text
+    args: JsonObject
+    queued_monotonic: int | float
+    deadline_monotonic: int | float | bool | None = None
+    sent_monotonic: int | float | None
+    service_instance_id: str | None = None
+    timed_out: Boolean
+
+
 class SavedService(_Document):
     service_id: UUIDText
     service_instance_id: UUIDText

@@ -68,6 +68,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service(retries=0)
             definition["errors"]["on_exhausted"] = "stop"
+            w.publish_service_definitions()
             w.store.save(w.state)
             sid = definition["service_id"]
             (w.controls[sid] / "hold-start").touch()

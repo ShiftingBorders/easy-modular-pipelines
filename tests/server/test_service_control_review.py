@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.models.updates import _update_model
 from core.server.runtime import ServerError
 from tests.helpers.dag import process_running, terminate_owned
 from tests.helpers.http_runtime import ServerTestCase
@@ -103,6 +104,7 @@ class ServiceControlReviewTests(unittest.IsolatedAsyncioTestCase):
         definition["errors"]["retry_delay_seconds"] = delay
         manager, state = workspace.manager, workspace.state
         service_id = definition["service_id"]
+        workspace.publish_service_definitions()
         await manager.start_all(state)
         instance = state.services[service_id]
         waiter = manager.enqueue(
@@ -116,7 +118,7 @@ class ServiceControlReviewTests(unittest.IsolatedAsyncioTestCase):
         await wait_for(lambda: instance.active_request is not None)
         manager._monitor_task.cancel()
         await asyncio.gather(manager._monitor_task, return_exceptions=True)
-        instance.active_request["timed_out"] = True
+        instance.active_request = _update_model(instance.active_request, timed_out=True)
         entered, release = asyncio.Event(), asyncio.Event()
         sleep = asyncio.sleep
 

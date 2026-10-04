@@ -337,9 +337,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         await wait_for(lambda: len(runner._state.services[sid].pending_requests) == 1)
         instance = runner._state.services[sid]
-        active_id = instance.active_request["request_id"]
-        queued_id = instance.pending_requests[0]["request_id"]
-        sent_at = instance.active_request["sent_monotonic"]
+        active_id = instance.active_request.request_id
+        queued_id = instance.pending_requests[0].request_id
+        sent_at = instance.active_request.sent_monotonic
         experiment_id = runner._state.experiment_id
         await runner.close()
         await asyncio.gather(request, queued, return_exceptions=True)
@@ -347,9 +347,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await runner.recover(experiment_id)
         recovered = runner._state.services[sid]
         self.assertEqual(recovered.service_instance_id, instance.service_instance_id)
-        self.assertEqual(recovered.active_request["request_id"], active_id)
-        self.assertEqual(recovered.active_request["sent_monotonic"], sent_at)
-        self.assertEqual(recovered.pending_requests[0]["request_id"], queued_id)
+        self.assertEqual(recovered.active_request.request_id, active_id)
+        self.assertEqual(recovered.active_request.sent_monotonic, sent_at)
+        self.assertEqual(recovered.pending_requests[0].request_id, queued_id)
         gate.touch()
         await wait_for(
             lambda: recovered.active_request is None and not recovered.pending_requests,

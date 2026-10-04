@@ -40,7 +40,8 @@ from core.models.participant_observations import (
     ServiceObservation,
     ServiceStateExport,
 )
-from core.models.runner_state import ServiceFailureDetails
+from core.models.runner_state import ServiceFailureDetails, WorkingServiceRequest
+from core.models.updates import _update_model
 from core.participants.connection import ParticipantConnection
 from core.participants.protocol import PROTOCOL_VERSION
 from core.primitives.json_files import read_json, write_json
@@ -315,7 +316,7 @@ class ServiceManager:
     ) -> None:
         instance.restart_count = old.restart_count
         for entry in old.pending_requests:
-            if entry.get("expected_instance") is not None:
+            if (entry.model_extra or {}).get("expected_instance") is not None:
                 self._finish_request(
                     state,
                     old,
@@ -588,13 +589,13 @@ class ServiceManager:
                 active = instance.active_request
                 if (
                     active is not None
-                    and active.get("owner") != "caller"
-                    and not active["timed_out"]
-                    and time.monotonic() - active["sent_monotonic"]
+                    and active.owner != "caller"
+                    and not active.timed_out
+                    and time.monotonic() - active.sent_monotonic
                     >= instance.definition.command_timeout_seconds
                 ):
                     action = await self._handle_timeout(
-                        state, service_id, active["request_id"]
+                        state, service_id, active.request_id
                     )
                     if action in ("wait", "stop"):
                         self._pending_action = None
@@ -706,12 +707,12 @@ class ServiceManager:
         retry = (
             retry
             if retry is not None
-            and retry["timed_out"]
-            and retry.get("owner") != "caller"
+            and retry.timed_out
+            and retry.owner != "caller"
             and instance.definition.on_command_timeout == "restart"
             else None
         )
-        waiter = None if retry is None else self._waiters.pop(retry["request_id"], None)
+        waiter = None if retry is None else self._waiters.pop(retry.request_id, None)
         while not self._closed:
             policy = instance.definition.errors
             exhausted = (
@@ -779,14 +780,14 @@ class ServiceManager:
         service_id: str,
         instance: ServiceInstance,
         policy: ErrorPolicy,
-        retry: JsonObject | None,
+        retry: WorkingServiceRequest | None,
         waiter: asyncio.Future | None,
     ) -> ServiceAction:
         instance.blocked_action = policy.on_exhausted
         if waiter is not None and not waiter.done():
             waiter.set_result(
                 {
-                    "request_id": retry["request_id"],
+                    "request_id": retry.request_id,
                     "result": "fail",
                     "data": {"reason": "command_timeout"},
                 }
@@ -809,27 +810,27 @@ class ServiceManager:
         state: RunnerState,
         service_id: str,
         instance: ServiceInstance,
-        retry: JsonObject,
+        retry: WorkingServiceRequest,
         waiter: asyncio.Future | None,
     ) -> None:
-        replacement = {
-            **retry,
-            "request_id": str(uuid4()),
-            "sent_monotonic": None,
-            "sent_at": None,
-            "service_instance_id": None,
-            "timed_out": False,
-            "retry_of": retry["request_id"],
-        }
-        if replacement["request_id"] in state.used_request_ids:
+        replacement = _update_model(
+            retry,
+            request_id=str(uuid4()),
+            sent_monotonic=None,
+            sent_at=None,
+            service_instance_id=None,
+            timed_out=False,
+            retry_of=retry.request_id,
+        )
+        if replacement.request_id in state.used_request_ids:
             raise RuntimeError("Request ID collision.")
-        state.used_request_ids.add(replacement["request_id"])
+        state.used_request_ids.add(replacement.request_id)
         instance.pending_requests.insert(0, replacement)
         if waiter is not None:
-            self._waiters[replacement["request_id"]] = waiter
+            self._waiters[replacement.request_id] = waiter
         self._journal.client.record_event(
             "service.request_queued",
-            replacement,
+            replacement.model_dump(exclude_unset=True),
             context={
                 "experiment_id": state.experiment_id,
                 "run_id": state.run_id,
@@ -871,8 +872,8 @@ class ServiceManager:
         while instance.pending_requests:
             entry = instance.pending_requests[0]
             if (
-                entry.get("deadline_monotonic") is None
-                or time.monotonic() < entry["deadline_monotonic"]
+                entry.deadline_monotonic is None
+                or time.monotonic() < entry.deadline_monotonic
             ):
                 break
             instance.pending_requests.pop(0)
@@ -889,26 +890,33 @@ class ServiceManager:
         entry = instance.pending_requests[0]
         context = _context(state, service_id, instance.service_instance_id)
         self._journal.client.record_event(
-            "control.intent", {"action": "service_request", **entry}, context=context
+            "control.intent",
+            {"action": "service_request", **entry.model_dump(exclude_unset=True)},
+            context=context,
+        )
+        entry = _update_model(
+            entry,
+            service_instance_id=instance.service_instance_id,
+            sent_at=datetime.now(UTC).isoformat(),
+            sent_monotonic=time.monotonic(),
         )
         instance.pending_requests.pop(0)
         instance.active_request = entry
-        entry["service_instance_id"] = instance.service_instance_id
-        entry["sent_at"] = datetime.now(UTC).isoformat()
-        entry["sent_monotonic"] = time.monotonic()
         self._save(state)
         self._journal.client.record_event(
-            "service.send_started", entry, context=context
+            "service.send_started",
+            entry.model_dump(exclude_unset=True),
+            context=context,
         )
-        self._sends[entry["request_id"]] = (
+        self._sends[entry.request_id] = (
             service_id,
             asyncio.create_task(
                 self._exchange(
                     service_id,
-                    entry["request_id"],
-                    entry["command"],
-                    entry["args"],
-                    deadline=entry.get("deadline_monotonic"),
+                    entry.request_id,
+                    entry.command,
+                    entry.args,
+                    deadline=entry.deadline_monotonic,
                 )
             ),
         )
@@ -968,7 +976,7 @@ class ServiceManager:
         message = observation.model_dump(exclude_unset=True)
         request_id = observation.request_id
         active = instance.active_request
-        if active is None or active["request_id"] != request_id:
+        if active is None or active.request_id != request_id:
             self._journal.client.record_event(
                 "service.message_ignored",
                 {"ignored": "retired_or_unknown_request", "message": message},
@@ -980,13 +988,16 @@ class ServiceManager:
             exclude={"protocol_version", "message_type", "request_id", "command"},
         )
         if (
-            active.get("owner") != "caller"
-            and not active["timed_out"]
-            and time.monotonic() - active["sent_monotonic"]
+            active.owner != "caller"
+            and not active.timed_out
+            and time.monotonic() - active.sent_monotonic
             >= instance.definition.command_timeout_seconds
         ):
             await self._handle_timeout(state, service_id, request_id)
-        if active["timed_out"]:
+            active = instance.active_request
+            if active is None:
+                return False
+        if active.timed_out:
             self._journal.client.record_event(
                 "service.message_ignored",
                 {"ignored": "command_timeout", "message": message},
@@ -994,7 +1005,7 @@ class ServiceManager:
             )
             # A late result releases actual work, never changes its timed-out outcome.
             if (
-                active.get("owner") != "caller"
+                active.owner != "caller"
                 and instance.definition.on_command_timeout == "restart"
             ):
                 instance.failure = ServiceFailureDetails(
@@ -1082,10 +1093,10 @@ class ServiceManager:
     ) -> Literal["wait", "restart", "stop"]:
         instance = state.services[service_id]
         active = instance.active_request
-        if active is None or active["request_id"] != request_id:
+        if active is None or active.request_id != request_id:
             raise ValueError("Timeout does not match the active service request.")
         action = instance.definition.on_command_timeout
-        if not active["timed_out"]:
+        if not active.timed_out:
             response = {"result": "fail", "data": {"reason": "command_timeout"}}
             self._journal.client.record_command_result(
                 request_id,
@@ -1101,7 +1112,7 @@ class ServiceManager:
                     "participant_instance_id": instance.service_instance_id,
                 },
             )
-            active["timed_out"] = True
+            instance.active_request = _update_model(active, timed_out=True)
             if action != "restart":
                 instance.blocked_action = "pause" if action == "pause" else "stop"
                 self._pending_action = instance.blocked_action
@@ -1317,7 +1328,7 @@ class ServiceManager:
         # A failed optional state write can leave an already sent request queued.
         # Consult the mandatory send record before the monitor can dispatch it.
         pending_ids = {
-            entry["request_id"]
+            entry.request_id
             for instance in state.services.values()
             for entry in instance.pending_requests
         }
@@ -1344,15 +1355,15 @@ class ServiceManager:
                 break
         for instance in state.services.values():
             for entry in list(instance.pending_requests):
-                if entry["request_id"] not in sent_ids:
+                if entry.request_id not in sent_ids:
                     continue
                 recorded = read_result(
                     self._journal.client,
-                    entry["request_id"],
+                    entry.request_id,
                     expected={
                         "experiment_id": state.experiment_id,
                         "participant_id": instance.service_id,
-                        "participant_instance_id": entry.get(
+                        "participant_instance_id": (entry.model_extra or {}).get(
                             "expected_instance", instance.service_instance_id
                         ),
                     },
@@ -1509,7 +1520,7 @@ class ServiceManager:
         if observed.current is not None:
             participant_work.append(observed.current)
         if any(
-            active is None or item.request_id != active["request_id"]
+            active is None or item.request_id != active.request_id
             for item in participant_work
         ):
             instance.failure = ServiceFailureDetails(
@@ -1547,7 +1558,7 @@ class ServiceManager:
                     (
                         instance.blocked_action is not None
                         or instance.active_request is not None
-                        and instance.active_request["timed_out"]
+                        and instance.active_request.timed_out
                     )
                     for instance in state.services.values()
                 ):
@@ -1680,7 +1691,7 @@ class ServiceManager:
             if (
                 not instance.ready
                 or instance.active_request is not None
-                and instance.active_request["timed_out"]
+                and instance.active_request.timed_out
             ):
                 raise RuntimeError("Service write resumption cannot be confirmed.")
             reply = await self.request(
@@ -1942,8 +1953,11 @@ class ServiceManager:
         return error_message
 
     def _cancel_service_stop_requests(
-        self, state: RunnerState, instance: ServiceInstance,
-        preserve_pending: bool, error_message: str | None,
+        self,
+        state: RunnerState,
+        instance: ServiceInstance,
+        preserve_pending: bool,
+        error_message: str | None,
     ) -> str | None:
         cancelled = [] if preserve_pending else instance.pending_requests[:]
         if not preserve_pending:
@@ -1958,7 +1972,7 @@ class ServiceManager:
                     instance,
                     entry,
                     {"result": "fail", "data": {"reason": "service_stopped"}},
-                    "cancelled" if entry["sent_monotonic"] is None else "failed",
+                    "cancelled" if entry.sent_monotonic is None else "failed",
                 )
             except LoggingError as error:
                 error_message = str(error)
@@ -2126,28 +2140,28 @@ class ServiceManager:
         self,
         state: RunnerState,
         instance: ServiceInstance,
-        entry: JsonObject,
+        entry: WorkingServiceRequest,
         response: JsonObject,
         outcome: str,
     ) -> None:
         context = _context(state, instance.service_id, instance.service_instance_id)
-        if entry.get("owner") != "caller" and not entry["timed_out"]:
+        if entry.owner != "caller" and not entry.timed_out:
             self._journal.client.record_command_result(
-                entry["request_id"],
+                entry.request_id,
                 response,
                 author="runner",
                 outcome=outcome,
                 context=context,
             )
-        elif entry.get("owner") == "caller":
+        elif entry.owner == "caller":
             self._journal.client.record_event(
                 "service.request_retired",
-                {"request_id": entry["request_id"], "response": response},
+                {"request_id": entry.request_id, "response": response},
                 context=context,
             )
-        future = self._waiters.pop(entry["request_id"], None)
+        future = self._waiters.pop(entry.request_id, None)
         if future is not None and not future.done():
-            future.set_result({"request_id": entry["request_id"], **response})
+            future.set_result({"request_id": entry.request_id, **response})
         self._changed.set()
 
     def enqueue(
@@ -2171,7 +2185,7 @@ class ServiceManager:
             raise RuntimeError("Working requests require an active service.")
         self._validate_enqueue(state, command, args, request_id, owner)
         state.used_request_ids.add(request_id)
-        entry = {
+        values = {
             "request_id": request_id,
             "command": command,
             "args": copy_json_object(args, "args"),
@@ -2189,10 +2203,11 @@ class ServiceManager:
             "unfreeze_writes",
             "load_state",
         ):
-            entry["expected_instance"] = instance.service_instance_id
+            values["expected_instance"] = instance.service_instance_id
+        entry = WorkingServiceRequest.model_validate(values)
         self._journal.client.record_event(
             "service.request_queued",
-            entry,
+            entry.model_dump(exclude_unset=True),
             context=_context(state, service_id, instance.service_instance_id),
         )
         instance.pending_requests.append(entry)
@@ -2225,7 +2240,7 @@ class ServiceManager:
         if request_id in state.used_request_ids:
             raise ValueError("Request ID was already allocated.")
         if request_id in self._waiters or any(
-            entry["request_id"] == request_id
+            entry.request_id == request_id
             for item in state.services.values()
             for entry in [
                 *item.pending_requests,
@@ -2244,7 +2259,7 @@ class ServiceManager:
     ) -> bool:
         instance = state.services[service_id]
         for entry in list(instance.pending_requests):
-            if entry["request_id"] == request_id:
+            if entry.request_id == request_id:
                 instance.pending_requests.remove(entry)
                 self._finish_request(
                     state,
@@ -2256,9 +2271,9 @@ class ServiceManager:
                 self._save(state)
                 return True
         active = instance.active_request
-        if active is None or active["request_id"] != request_id:
+        if active is None or active.request_id != request_id:
             return True
-        active["timed_out"] = True
+        instance.active_request = _update_model(active, timed_out=True)
         future = self._waiters.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
@@ -2312,7 +2327,7 @@ class ServiceManager:
             return
         record = read_result(
             self._journal.client,
-            active["request_id"],
+            active.request_id,
             expected={
                 "experiment_id": state.experiment_id,
                 "participant_id": service_id,
@@ -2323,8 +2338,8 @@ class ServiceManager:
             return
         if (
             record["author"] == "runner"
-            and not active["timed_out"]
-            and active.get("owner") != "caller"
+            and not active.timed_out
+            and active.owner != "caller"
         ):
             self._finish_request(
                 state, instance, active, record["response"], record["outcome"]
@@ -2347,8 +2362,8 @@ class ServiceManager:
                 {
                     "protocol_version": PROTOCOL_VERSION,
                     "message_type": "response",
-                    "command": active["command"],
-                    "request_id": active["request_id"],
+                    "command": active.command,
+                    "request_id": active.request_id,
                     **participant["event"]["data"]["response"],
                 },
             )

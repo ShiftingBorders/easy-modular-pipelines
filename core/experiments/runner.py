@@ -815,7 +815,7 @@ class ExperimentRunner:
             if instance.active_request is not None:
                 requests.append(instance.active_request)
             for request in requests:
-                record = self._journal.client.read_command_result(request["request_id"])
+                record = self._journal.client.read_command_result(request.request_id)
                 if record is None or record["author"] != "runner":
                     continue
                 if request is instance.active_request:
@@ -2392,13 +2392,13 @@ class ExperimentRunner:
         if instance.active_request is not None:
             requests.append(instance.active_request)
         for request in requests:
-            accepted = self._journal.client.read_command_result(request["request_id"])
+            accepted = self._journal.client.read_command_result(request.request_id)
             if accepted is None or accepted["author"] != "runner":
                 continue
             context = accepted["event"]["context"]
             expected_instance = (
-                request["service_instance_id"]
-                or request.get("expected_instance")
+                request.service_instance_id
+                or (request.model_extra or {}).get("expected_instance")
                 or instance.service_instance_id
             )
             if (
@@ -2417,7 +2417,7 @@ class ExperimentRunner:
                 "control.reconciled",
                 {
                     "action": "retire_rebuild_request",
-                    "request_id": request["request_id"],
+                    "request_id": request.request_id,
                     "result_event_id": accepted["event_id"],
                     "outcome": accepted["outcome"],
                 },

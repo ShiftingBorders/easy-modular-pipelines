@@ -254,6 +254,10 @@ def _service_state(
         "last_status": None if instance is None else instance.last_status,
         "active_request": None
         if active is None
-        else {key: active[key] for key in ("request_id", "command", "timed_out")},
+        else {
+            "request_id": active.request_id,
+            "command": active.command,
+            "timed_out": active.timed_out,
+        },
         "pending_requests": 0 if instance is None else len(instance.pending_requests),
     }
