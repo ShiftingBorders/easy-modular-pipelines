@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.experiments.state import _process_identity_pid
 from core.models.updates import _update_model
 from core.server.runtime import ServerError
 from tests.helpers.dag import process_running, terminate_owned
@@ -78,7 +79,9 @@ class ServiceControlReviewTests(unittest.IsolatedAsyncioTestCase):
                     shutdowns,
                 )
                 self.assertIs(state.services[second["service_id"]], unrelated)
-                self.assertTrue(process_running(unrelated.process_identity["pid"]))
+                self.assertTrue(
+                    process_running(_process_identity_pid(unrelated.process_identity))
+                )
                 self.assertEqual(workspace.stage_trace(), [])
             finally:
                 release.set()

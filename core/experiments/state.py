@@ -70,7 +70,7 @@ class StageAttempt:
     artifacts_directory: Path
     input_data: JsonValue
     effective_settings: JsonObject
-    process_identity: JsonObject | None
+    process_identity: ProcessIdentity | JsonObject | None
     started_at: str | None
     timeout_seconds: float | None
     result_request_id: str | None
@@ -131,7 +131,7 @@ class ServiceInstance:
     service_id: str
     service_instance_id: str
     definition: ServiceDefinition
-    process_identity: JsonObject | None
+    process_identity: ProcessIdentity | None
     endpoint_path: Path | None
     ready: bool
     started_at: str | None
@@ -333,6 +333,20 @@ def _relative_state_path(path: Path, root: Path) -> Path:
     return path.relative_to(root)
 
 
+def _process_identity_document(
+    identity: ProcessIdentity | JsonObject | None,
+) -> JsonObject | None:
+    """Serialize identities at JSON output or OS identity-comparison boundaries."""
+    if isinstance(identity, ProcessIdentity):
+        return identity.model_dump()
+    return None if identity is None else dict(identity)
+
+
+def _process_identity_pid(identity: ProcessIdentity | JsonObject) -> int | JsonValue:
+    """Read a live identity or a historical partial attempt record unchanged."""
+    return identity.pid if isinstance(identity, ProcessIdentity) else identity["pid"]
+
+
 def _executor_status_document(status: ExecutorStatus | JsonValue) -> JsonValue:
     """Serialize a retained observation at state or public-output boundaries."""
     if isinstance(
@@ -399,6 +413,9 @@ def state_to_document(state: RunnerState) -> JsonObject:
     document["services"] = {}
     for service_id, instance in state.services.items():
         saved = dict(vars(instance))
+        saved["process_identity"] = _process_identity_document(
+            instance.process_identity
+        )
         saved["definition"] = instance.definition.model_dump(exclude_unset=True)
         saved["last_status"] = (
             None
@@ -429,6 +446,9 @@ def state_to_document(state: RunnerState) -> JsonObject:
         document["services"][service_id] = saved
     if state.active_attempt is not None:
         attempt = dict(vars(state.active_attempt))
+        attempt["process_identity"] = _process_identity_document(
+            state.active_attempt.process_identity
+        )
         participant = state.active_attempt.participant
         attempt["participant"] = (
             None if participant is None else participant.model_dump(exclude_unset=True)
@@ -523,11 +543,7 @@ def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
     instance.service_id = document.service_id
     instance.service_instance_id = document.service_instance_id
     instance.definition = document.definition
-    instance.process_identity = (
-        None
-        if document.process_identity is None
-        else document.process_identity.model_dump(exclude_unset=True)
-    )
+    instance.process_identity = document.process_identity
     instance.endpoint_path = (
         None
         if document.endpoint_path is None

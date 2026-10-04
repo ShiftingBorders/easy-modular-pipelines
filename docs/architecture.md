@@ -72,6 +72,9 @@ state files and public status responses serialize them. Recovery also accepts
 historical partial or opaque executor metadata without strengthening its schema.
 Attempt participant identities remain models through recovery and result
 association; logging contexts and saved state retain their JSON formats.
+Service process identities also remain models through readiness, recovery and
+shutdown. OS ownership checks compare their complete document with the actual
+process identity; process files and resource/status responses still contain JSON.
 
 Server command, chain and target models normalize admission payloads. Controller
 argument models check supported control operations before invoking public runner

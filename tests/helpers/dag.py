@@ -22,6 +22,7 @@ import httpx
 import yaml
 
 from core.experiments.runner import ExperimentRunner
+from core.models.process_identity import ProcessIdentity
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json
 from core.primitives.processes import process_identity
@@ -64,7 +65,9 @@ def process_running(pid: int) -> bool:
         return False
 
 
-def terminate_owned(identity: dict) -> None:
+def terminate_owned(identity: ProcessIdentity | dict) -> None:
+    if isinstance(identity, ProcessIdentity):
+        identity = identity.model_dump()
     pid = identity["pid"]
     if not process_running(pid) or process_identity(pid) != identity:
         return

@@ -5,6 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from core.experiments.state import _process_identity_pid
 from tests.helpers.dag import process_running
 from tests.helpers.services import ServiceWorkspace, wait_for
 
@@ -163,7 +164,9 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
                 result = await w.manager.stop_all(w.state)
                 self.assertGreaterEqual(time.monotonic() - began, 30)
                 self.assertFalse(result[sid]["stopped"])
-                self.assertTrue(process_running(instance.process_identity["pid"]))
+                self.assertTrue(
+                    process_running(_process_identity_pid(instance.process_identity))
+                )
                 self.assertEqual(
                     await w.manager.restart(w.state, sid, automatic=False), "stop"
                 )

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import process_running
 from tests.helpers.reload import candidate, events, version, workspace
@@ -36,7 +37,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         record = read_json(process_file)
         launcher = runner._services._processes[sid]
-        self.assertNotEqual(launcher.pid, instance.process_identity["pid"])
+        self.assertNotEqual(
+            launcher.pid, _process_identity_pid(instance.process_identity)
+        )
         await runner.close()
         legacy = copy.deepcopy(record)
         legacy.pop("launcher_process")
@@ -289,7 +292,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 launcher = runner._services._processes[sid]
                 child = state.services[sid].process_identity
-                self.assertNotEqual(launcher.pid, child["pid"])
+                self.assertNotEqual(launcher.pid, _process_identity_pid(child))
                 peer_identity = copy.deepcopy(state.services[peer].process_identity)
                 peer_instance = state.services[peer].service_instance_id
                 controls = work.files.files.controls[sid]
@@ -343,7 +346,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                         await wait_for(
                             (controls / "launcher-cleanup-started.json").exists
                         )
-                        self.assertFalse(process_running(child["pid"]))
+                        self.assertFalse(process_running(_process_identity_pid(child)))
                         self.assertIsNone(launcher.poll())
                         start = time.monotonic()
                         await wait_for(
@@ -729,7 +732,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(
                     runner._state.services[sid].service_instance_id, old_instance
                 )
-                self.assertFalse(process_running(old_process["pid"]))
+                self.assertFalse(process_running(_process_identity_pid(old_process)))
                 self.assertEqual(
                     runner._state.services[peer].service_instance_id, peer_instance
                 )
@@ -811,7 +814,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         process = runner._state.services[added["service_id"]].process_identity
         await runner.reload_template(work.files.write_template(document))
-        self.assertFalse(process_running(process["pid"]))
+        self.assertFalse(process_running(_process_identity_pid(process)))
         self.assertEqual(
             {sid: s.service_instance_id for sid, s in runner._state.services.items()},
             old_instances,

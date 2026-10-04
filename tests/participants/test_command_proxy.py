@@ -3,6 +3,7 @@
 import shutil
 import unittest
 
+from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import read_json
 from tests.helpers.dag import REPOSITORY, process_running
 from tests.helpers.services import ServiceWorkspace
@@ -45,4 +46,6 @@ class CommandProxyTests(unittest.IsolatedAsyncioTestCase):
         result = await workspace.manager.stop_all(workspace.state)
         self.assertTrue(result[instance.service_id]["stopped"], result)
         self.assertFalse(resource.exists())
-        self.assertFalse(process_running(instance.process_identity["pid"]))
+        self.assertFalse(
+            process_running(_process_identity_pid(instance.process_identity))
+        )

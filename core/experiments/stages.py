@@ -28,6 +28,8 @@ from core.experiments.state import (
     StageAttempt,
     StageOutcome,
     _attempt_result_identity,
+    _process_identity_document,
+    _process_identity_pid,
     state_to_document,
 )
 from core.journal.events import LoggingError
@@ -886,12 +888,13 @@ class StageRunner:
                     self._connection = None
             if attempt.process_identity is not None:
                 try:
-                    if (
-                        process_identity(attempt.process_identity["pid"])
-                        != attempt.process_identity
-                    ):
+                    if process_identity(
+                        _process_identity_pid(attempt.process_identity)
+                    ) != _process_identity_document(attempt.process_identity):
                         return True
-                    psutil.Process(attempt.process_identity["pid"]).wait(timeout=0)
+                    psutil.Process(
+                        _process_identity_pid(attempt.process_identity)
+                    ).wait(timeout=0)
                     return True
                 except psutil.TimeoutExpired:
                     pass
@@ -1057,9 +1060,11 @@ class StageRunner:
         if identity is None:
             return False
         try:
-            if process_identity(identity["pid"]) != identity:
+            if process_identity(
+                _process_identity_pid(identity)
+            ) != _process_identity_document(identity):
                 return True
-            psutil.Process(identity["pid"]).wait(timeout=0)
+            psutil.Process(_process_identity_pid(identity)).wait(timeout=0)
             return True
         except psutil.TimeoutExpired:
             return False

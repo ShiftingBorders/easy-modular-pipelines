@@ -269,7 +269,7 @@ class TemplateReloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
         path = instance.artifacts_directory / "process.json"
         record = read_json(path)
         launcher = record["launcher_process"]
-        self.assertEqual(launcher, instance.process_identity)
+        self.assertEqual(launcher, instance.process_identity.model_dump())
         stopped = await runner._services.stop_all(state)
         self.assertTrue(
             all(item["stopped"] and not item["error"] for item in stopped.values())
@@ -435,7 +435,7 @@ os.waitpid(pid, 0)
             finished_task = runner._task
             self.assertTrue(finished_task.done())
             identities = {
-                sid: copy.deepcopy(service.process_identity)
+                sid: service.process_identity.model_dump()
                 for sid, service in state.services.items()
             }
             self.assertTrue(
@@ -641,8 +641,8 @@ os.waitpid(pid, 0)
 
         async def stop_launcher(state, **kwargs):
             instance = state.services[work.socket["service_id"]]
-            observed.append(instance.process_identity)
-            self.assertEqual(instance.process_identity, launched)
+            observed.append(instance.process_identity.model_dump())
+            self.assertEqual(instance.process_identity.model_dump(), launched)
             self.assertFalse(instance.stopped)
             self.assertTrue(process_running(launched["pid"]))
             return {
@@ -775,7 +775,7 @@ os.waitpid(pid, 0)
 
             async def verify_launcher_stopped(state, *args, **kwargs):
                 instance = state.services[work.socket["service_id"]]
-                self.assertEqual(instance.process_identity, identity)
+                self.assertEqual(instance.process_identity.model_dump(), identity)
                 self.assertTrue(instance.stopped)
                 return await restore(state, *args, **kwargs)
 
@@ -810,7 +810,9 @@ os.waitpid(pid, 0)
         self.assertEqual(runner._state.template.model_dump(exclude_unset=True), new)
         self.assertIsNone(runner._state.pending_rebuild)
         self.assertEqual(runner._state.services[sid].service_instance_id, current_id)
-        self.assertEqual(runner._state.services[sid].process_identity, current_process)
+        self.assertEqual(
+            runner._state.services[sid].process_identity.model_dump(), current_process
+        )
         self.assertEqual(await work.value(), 39)
         self.assertTrue(runner._state.stage_result_ids)
         started = [

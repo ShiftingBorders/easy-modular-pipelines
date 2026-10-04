@@ -5,6 +5,7 @@ import os
 import unittest
 from pathlib import Path
 
+from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import read_json
 from tests.helpers.dag import process_running, terminate_owned
 from tests.helpers.services import ServiceWorkspace, wait_for
@@ -24,7 +25,9 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             w.publish_service_definitions()
             self.assertEqual(await w.manager.start_all(w.state), "ready")
             instance = w.state.services[sid]
-            self.assertNotEqual(instance.process_identity["pid"], os.getpid())
+            self.assertNotEqual(
+                _process_identity_pid(instance.process_identity), os.getpid()
+            )
             context = read_json(instance.artifacts_directory / "received-context.json")
             self.assertEqual(context["settings"]["nested"], {"keep": 1, "replace": [2]})
             self.assertIsNone(context["settings"]["nullable"])
@@ -40,7 +43,9 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reply["data"], {"value": 42})
             result = await w.manager.stop_all(w.state)
             self.assertTrue(result[sid]["stopped"], result)
-            self.assertFalse(process_running(instance.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
 
     async def test_start_order_and_independent_work_queues(self):
         """A/B/C: ordered readiness and independent services while one request waits."""
@@ -106,7 +111,9 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["result"], "fail")
             self.assertIs(w.state.services[instance.service_id], instance)
             self.assertEqual(instance.restart_count, 0)
-            self.assertTrue(process_running(instance.process_identity["pid"]))
+            self.assertTrue(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
             accepted = w.journal.client.read_command_result(result["request_id"])
             self.assertEqual(accepted["author"], "runner")
             self.assertEqual(accepted["outcome"], "failed")
@@ -162,7 +169,9 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 w.state.services[sid].service_instance_id, old.service_instance_id
             )
             self.assertEqual(w.state.services[sid].restart_count, 1)
-            self.assertFalse(process_running(old.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(old.process_identity))
+            )
             self.assertFalse(
                 any(row["event"] == "duplicate" for row in w.trace(definition))
             )

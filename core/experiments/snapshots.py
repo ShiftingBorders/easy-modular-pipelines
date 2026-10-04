@@ -35,6 +35,7 @@ from core.experiments.state import (
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
+from core.models.process_identity import ProcessIdentity
 from core.models.snapshot_documents import (
     STAGE_CONTROL_FILES,
     RestoreTransaction,
@@ -1041,7 +1042,9 @@ class ExperimentSnapshots:
             ) or recorded.get("process") != announced.get("process"):
                 raise RuntimeError("Restored service ownership cannot be verified.")
             instance = ServiceInstance(service_id, instance_id, definition)
-            instance.process_identity = recorded["process"]
+            instance.process_identity = ProcessIdentity.model_validate(
+                recorded["process"]
+            )
             instance.endpoint_path = endpoint
             instance.artifacts_directory = artifacts
             metadata = self._assembler.read_module(

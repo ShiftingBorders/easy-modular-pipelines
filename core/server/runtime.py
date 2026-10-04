@@ -314,7 +314,12 @@ def _needs_recovery(state: RunnerState, root: Path, local: JsonObject) -> bool:
     ):
         identities = [
             None if state.owner_identity is None else state.owner_identity.model_dump(),
-            *(instance.process_identity for instance in state.services.values()),
+            *(
+                None
+                if instance.process_identity is None
+                else instance.process_identity.model_dump()
+                for instance in state.services.values()
+            ),
         ]
         lock = root / "executor.lock.json"
         if lock.exists():

@@ -225,7 +225,7 @@ class ExperimentArchiver:
             ):
                 raise RuntimeError("Service shutdown has not been confirmed.")
             if instance.process_identity is not None:
-                self._assert_exited(instance.process_identity)
+                self._assert_exited(instance.process_identity.model_dump())
         lock = _path(root / "executor.lock.json")
         if lock.exists():
             self._assert_exited(

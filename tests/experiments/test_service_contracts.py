@@ -12,7 +12,11 @@ from uuid import uuid4
 
 import yaml
 
-from core.experiments.state import state_from_document, state_to_document
+from core.experiments.state import (
+    _process_identity_pid,
+    state_from_document,
+    state_to_document,
+)
 from core.journal.events import LoggingError
 from core.participants.connection import ParticipantConnection
 from tests.helpers.dag import process_running
@@ -162,7 +166,9 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                 await w.manager.start_all(w.state)
             instance = w.state.services[first["service_id"]]
             self.assertTrue(instance.stopped)
-            self.assertFalse(process_running(instance.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
             self.assertEqual(w.trace(invalid), [])
 
     async def test_logger_failure_during_stop_still_attempts_all_owned_services(self):
@@ -189,7 +195,9 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                     ).exists()
                 )
                 self.assertFalse(
-                    process_running(w.state.services[sid].process_identity["pid"])
+                    process_running(
+                        _process_identity_pid(w.state.services[sid].process_identity)
+                    )
                 )
 
     async def test_state_write_failure_is_reported_without_rejecting_service_work(self):
@@ -255,7 +263,9 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises((ValueError, EOFError, OSError)):
                 await connection.connect(timeout_seconds=30)
             await connection.close()
-            self.assertTrue(process_running(instance.process_identity["pid"]))
+            self.assertTrue(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
 
     async def test_live_queue_roundtrip_and_invalid_saved_requests(self):
         """E: active and pending real requests roundtrip without tasks, paths escaping, or replay IDs."""

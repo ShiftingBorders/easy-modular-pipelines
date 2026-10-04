@@ -46,6 +46,7 @@ from core.experiments.state import (
     _apply_recovered_attempt_context,
     _attempt_from_launch,
     _executor_status_document,
+    _process_identity_document,
     state_from_document,
 )
 from core.journal.events import LoggingError, encode_event
@@ -2527,23 +2528,25 @@ class ExperimentRunner:
                 or record.get("participant_instance_id") != instance.service_instance_id
             ):
                 raise RuntimeError("Rebuild participant ownership cannot be verified.")
-            instance.process_identity = record["process"]
+            instance.process_identity = ProcessIdentity.model_validate(
+                record["process"]
+            )
         if (
             announced is not None
             and announced.get("participant_instance_id") == instance.service_instance_id
-            and announced.get("process") != instance.process_identity
+            and announced.get("process")
+            != _process_identity_document(instance.process_identity)
         ):
             await self._recover_service_child(
                 state, sid, instance, process_file, announced, record
             )
         if instance.process_identity is not None:
             try:
-                instance.stopped = (
-                    process_identity(instance.process_identity["pid"])
-                    != instance.process_identity
-                )
+                instance.stopped = process_identity(
+                    instance.process_identity.pid
+                ) != _process_identity_document(instance.process_identity)
                 if not instance.stopped:
-                    process = psutil.Process(instance.process_identity["pid"])
+                    process = psutil.Process(instance.process_identity.pid)
                     instance.stopped = process.status() == psutil.STATUS_ZOMBIE
                     if not instance.stopped:
                         try:
@@ -2621,8 +2624,8 @@ class ExperimentRunner:
         # launcher identity so its shutdown is still required.
         if child_alive:
             if (
-                launched["pid"] not in {p.pid for p in ancestors}
-                or process_identity(launched["pid"]) != launched
+                launched.pid not in {p.pid for p in ancestors}
+                or process_identity(launched.pid) != launched.model_dump()
             ):
                 raise RuntimeError(
                     "Rebuild endpoint is not owned by the launched process."
@@ -2636,16 +2639,16 @@ class ExperimentRunner:
                     **(record or announced),
                     "process": declared,
                     "launcher_process": (record or {}).get(
-                        "launcher_process", launched
+                        "launcher_process", launched.model_dump()
                     ),
                 },
             )
-            instance.process_identity = declared
+            instance.process_identity = ProcessIdentity.model_validate(declared)
             self._journal.client.record_event(
                 "control.reconciled",
                 {
                     "action": "rebuild_service_process",
-                    "launched_process": launched,
+                    "launched_process": _process_identity_document(launched),
                     "participant_process": declared,
                 },
                 context={
@@ -2829,7 +2832,7 @@ class ExperimentRunner:
             targets.append(
                 {
                     "series_id": attempt.attempt_id,
-                    "identity": dict(attempt.process_identity),
+                    "identity": _process_identity_document(attempt.process_identity),
                     "context": {
                         **context,
                         "stage_id": attempt.stage_id,
@@ -2849,7 +2852,7 @@ class ExperimentRunner:
             targets.append(
                 {
                     "series_id": instance.service_instance_id,
-                    "identity": dict(instance.process_identity),
+                    "identity": instance.process_identity.model_dump(),
                     "context": {
                         **context,
                         "service_id": instance.service_id,

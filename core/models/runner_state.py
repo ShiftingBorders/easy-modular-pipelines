@@ -206,7 +206,7 @@ class ServiceCallExecutorStatus(_Input):
 
     participant: ParticipantIdentity | None
     request_id: UUIDText
-    process: Object | None
+    process: ProcessIdentity | None
     finished: Boolean
     current: WorkingServiceRequest | None
     pending: list[CommandWork] = Field(default_factory=list)

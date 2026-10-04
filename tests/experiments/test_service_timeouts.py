@@ -4,6 +4,7 @@ import asyncio
 import time
 import unittest
 
+from core.experiments.state import _process_identity_pid
 from tests.helpers.dag import process_running
 from tests.helpers.services import ServiceWorkspace, wait_for
 
@@ -77,7 +78,9 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 timeout=50,
             )
             self.assertGreaterEqual(time.monotonic() - before, 10)
-            self.assertFalse(process_running(original.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(original.process_identity))
+            )
             self.assertEqual(w.state.services[sid].restart_count, 1)
 
     async def check_work_timeout(self, policy):
@@ -118,13 +121,17 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 reply = await first
                 self.assertEqual(reply["result"], "success")
                 self.assertNotEqual(reply["request_id"], request_id)
-                self.assertFalse(process_running(original.process_identity["pid"]))
+                self.assertFalse(
+                    process_running(_process_identity_pid(original.process_identity))
+                )
                 self.assertEqual((await second)["data"], {"n": 2})
             elif policy == "pause":
                 self.assertEqual((await first)["result"], "fail")
                 self.assertEqual(original.blocked_action, "pause")
                 self.assertFalse(second.done())
-                self.assertTrue(process_running(original.process_identity["pid"]))
+                self.assertTrue(
+                    process_running(_process_identity_pid(original.process_identity))
+                )
                 observer = asyncio.create_task(w.manager.monitor(w.state))
                 gate.touch()
                 self.assertEqual((await second)["result"], "success")
@@ -146,7 +153,9 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 result = await w.manager.stop_all(w.state)
                 self.assertTrue(result[sid]["stopped"], result)
                 self.assertEqual((await second)["result"], "fail")
-                self.assertFalse(process_running(original.process_identity["pid"]))
+                self.assertFalse(
+                    process_running(_process_identity_pid(original.process_identity))
+                )
             self.assertFalse(
                 any(row["event"] == "duplicate" for row in w.trace(definition))
             )
@@ -192,5 +201,7 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 timeout=60,
             )
-            self.assertFalse(process_running(instance.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
             self.assertEqual(w.state.services[sid].restart_count, 1)

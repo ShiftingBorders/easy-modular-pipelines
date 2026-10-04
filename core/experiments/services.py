@@ -25,6 +25,7 @@ from core.experiments.state import (
     RunnerState,
     RunnerStateStore,
     ServiceInstance,
+    _process_identity_document,
     state_to_document,
 )
 from core.journal.events import LoggingError
@@ -41,6 +42,7 @@ from core.models.participant_observations import (
     ServiceObservation,
     ServiceStateExport,
 )
+from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import ServiceFailureDetails, WorkingServiceRequest
 from core.models.updates import _update_model
 from core.participants.connection import ParticipantConnection
@@ -247,7 +249,7 @@ class ServiceManager:
                     self._processes[service_id] = process
                     self._launch_processes.append(process)
                     instance.process_identity = (
-                        process_identity(process.pid)
+                        ProcessIdentity.model_validate(process_identity(process.pid))
                         if process.poll() is None
                         else None
                     )
@@ -256,7 +258,9 @@ class ServiceManager:
             self._launch_processes.append(process)
             instance.started_at = datetime.now(UTC).isoformat()
             instance.process_identity = (
-                process_identity(process.pid) if process.poll() is None else None
+                ProcessIdentity.model_validate(process_identity(process.pid))
+                if process.poll() is None
+                else None
             )
             launcher_identity = instance.process_identity
             self._write_service_process(directory, instance, context, launcher_identity)
@@ -361,14 +365,14 @@ class ServiceManager:
         directory: Path,
         instance: ServiceInstance,
         context: JsonObject,
-        launcher_identity: JsonObject | None,
+        launcher_identity: ProcessIdentity | None,
     ) -> None:
         write_json(
             directory / "process.json",
             {
                 **context,
-                "process": instance.process_identity,
-                "launcher_process": launcher_identity,
+                "process": _process_identity_document(instance.process_identity),
+                "launcher_process": _process_identity_document(launcher_identity),
                 "started_at": instance.started_at,
             },
         )
@@ -379,14 +383,14 @@ class ServiceManager:
         directory: Path,
         instance: ServiceInstance,
         context: JsonObject,
-        launcher_identity: JsonObject | None,
+        launcher_identity: ProcessIdentity | None,
     ) -> None:
         self._write_service_process(directory, instance, context, launcher_identity)
         self._journal.client.record_event(
             "service.started",
             {
-                "process": instance.process_identity,
-                "launcher_process": launcher_identity,
+                "process": _process_identity_document(instance.process_identity),
+                "launcher_process": _process_identity_document(launcher_identity),
                 "implementation": instance.implementation,
             },
             context=context,
@@ -414,7 +418,7 @@ class ServiceManager:
                 await asyncio.sleep(0.05)
                 continue
             declared = endpoint["process"]
-            if declared != instance.process_identity:
+            if declared != _process_identity_document(instance.process_identity):
                 ancestors = await asyncio.to_thread(
                     psutil.Process(declared["pid"]).parents
                 )
@@ -429,7 +433,7 @@ class ServiceManager:
             remaining = max(0.001, instance.start_deadline - time.monotonic())
             await connection.connect(timeout_seconds=remaining)
             remaining = max(0.001, instance.start_deadline - time.monotonic())
-            instance.process_identity = declared
+            instance.process_identity = ProcessIdentity.model_validate(declared)
             request_id = str(uuid4())
             state.used_request_ids.add(request_id)
             self._probes[service_id] = {
@@ -572,7 +576,7 @@ class ServiceManager:
                 if (
                     process is not None
                     and instance.process_identity is not None
-                    and process.pid == instance.process_identity["pid"]
+                    and process.pid == instance.process_identity.pid
                     and process.poll() is not None
                 ):
                     instance.failure = ServiceFailureDetails(
@@ -1443,14 +1447,14 @@ class ServiceManager:
                     instance.blocked_action = self._pending_action = "stop"
                     return True, "stop"
         try:
-            actual = process_identity(instance.process_identity["pid"])
+            actual = process_identity(instance.process_identity.pid)
         except OSError as error:
             if not isinstance(
                 error, (FileNotFoundError, ProcessLookupError)
             ) and getattr(error, "winerror", None) not in (87, 1168):
                 raise
             actual = None
-        if actual != instance.process_identity:
+        if actual != _process_identity_document(instance.process_identity):
             instance.failure = ServiceFailureDetails(
                 code="service_failure",
                 message="Previous service process no longer exists.",
@@ -1754,7 +1758,7 @@ class ServiceManager:
         if (
             owned_process is not None
             and instance.process_identity is not None
-            and owned_process.pid == instance.process_identity["pid"]
+            and owned_process.pid == instance.process_identity.pid
             and owned_process.poll() is not None
         ):
             instance.stopped = True
@@ -1904,15 +1908,18 @@ class ServiceManager:
         return shutdown_response, error_message
 
     async def _confirm_service_exit(
-        self, instance: ServiceInstance, process: subprocess.Popen | None,
-        deadline: float, error_message: str | None,
+        self,
+        instance: ServiceInstance,
+        process: subprocess.Popen | None,
+        deadline: float,
+        error_message: str | None,
     ) -> str | None:
         while not instance.stopped:
             try:
                 if (
                     process is not None
                     and instance.process_identity is not None
-                    and process.pid == instance.process_identity["pid"]
+                    and process.pid == instance.process_identity.pid
                     and process.poll() is not None
                 ):
                     instance.stopped = True
@@ -1921,8 +1928,10 @@ class ServiceManager:
                         process is not None and process.poll() is not None
                     )
                 else:
-                    observed = process_identity(instance.process_identity["pid"])
-                    instance.stopped = observed != instance.process_identity
+                    observed = process_identity(instance.process_identity.pid)
+                    instance.stopped = observed != _process_identity_document(
+                        instance.process_identity
+                    )
                     if not instance.stopped:
                         participant = psutil.Process(observed["pid"])
                         instance.stopped = participant.status() == psutil.STATUS_ZOMBIE
@@ -1948,7 +1957,7 @@ class ServiceManager:
             not instance.stopped
             and process is not None
             and instance.process_identity is not None
-            and process.pid == instance.process_identity["pid"]
+            and process.pid == instance.process_identity.pid
         ):
             # The owned handle cannot target a reused PID. Do not grant another
             # command timeout or claim that an asynchronous kill has completed.

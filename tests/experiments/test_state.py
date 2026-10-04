@@ -356,6 +356,29 @@ class RunnerStateTests(unittest.TestCase):
         document["active_attempt"]["executor_status"]["progress"]["detail"]["value"] = 9
         self.assertEqual(full.progress.model_extra["detail"]["value"], 1)
 
+    def test_service_process_identity_remains_a_model_after_persistence(self):
+        attempt, service = self._add_path_participants()
+        identity = ProcessIdentity.model_validate(process_identity(os.getpid()))
+        service.process_identity = identity
+        attempt.process_identity = identity
+        self.store.save(self.state)
+        restored = self.store.load(self.root)
+        self.assertIsInstance(
+            restored.services[service.service_id].process_identity, ProcessIdentity
+        )
+        self.assertEqual(
+            restored.services[service.service_id].process_identity, identity
+        )
+        self.assertEqual(state_to_document(restored), state_to_document(self.state))
+        document = state_to_document(restored)
+        self.assertEqual(
+            document["active_attempt"]["process_identity"], identity.model_dump()
+        )
+        document["services"][service.service_id]["process_identity"]["pid"] += 1
+        self.assertEqual(
+            restored.services[service.service_id].process_identity.pid, os.getpid()
+        )
+
     def test_attempt_identity_retains_extras_and_detaches_saved_json(self):
         attempt, _ = self._add_path_participants()
         attempt.participant = _update_model(

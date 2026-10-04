@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import psutil
 
+from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 from tests.helpers.services import wait_for
@@ -28,8 +29,10 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
             runner = await workspace.launch()
             step = asyncio.create_task(runner.step())
             await wait_for(
-                lambda: runner._state.active_attempt is not None
-                and runner._state.active_attempt.process_identity is not None
+                lambda: (
+                    runner._state.active_attempt is not None
+                    and runner._state.active_attempt.process_identity is not None
+                )
             )
             original_attempt = runner._state.active_attempt
             request_id = original_attempt.request_id
@@ -43,7 +46,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
             async def finish_before_connect(attempt, timeout):
                 self.assertEqual(attempt.request_id, request_id)
-                self.assertIsNone(runner._journal.client.read_command_result(request_id))
+                self.assertIsNone(
+                    runner._journal.client.read_command_result(request_id)
+                )
                 gate.touch()
                 record = await wait_for(
                     lambda: runner._journal.client.read_command_result(request_id),
@@ -62,11 +67,15 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(runner._stages, "_connect", new=finish_before_connect):
                 await runner.recover(experiment_id)
                 await wait_for(
-                    lambda: runner._state.active_attempt is None
-                    or runner._state.unknown_state_recovery_count > 0
+                    lambda: (
+                        runner._state.active_attempt is None
+                        or runner._state.unknown_state_recovery_count > 0
+                    )
                 )
 
-            self.assertTrue(connection_errors, "The real endpoint connection must fail.")
+            self.assertTrue(
+                connection_errors, "The real endpoint connection must fail."
+            )
             state = runner._state
             self.assertIsNone(state.active_attempt, runner.get_state())
             self.assertEqual(state.unknown_state_recovery_count, 0)
@@ -79,11 +88,15 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state.stage_attempt_numbers[original_attempt.stage_id], 1)
             trace = state.experiment_directory / "shared_data/trace.jsonl"
             entries = [
-                json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
+                json.loads(line)
+                for line in trace.read_text(encoding="utf-8").splitlines()
             ]
             starts = [entry for entry in entries if entry["event"] == "start"]
             self.assertEqual(len(starts), 1)
-            self.assertEqual(starts[0]["pid"], original_attempt.process_identity["pid"])
+            self.assertEqual(
+                starts[0]["pid"],
+                _process_identity_pid(original_attempt.process_identity),
+            )
 
     async def test_partially_stopped_services_stay_paused_with_remaining_peer_observed(
         self,
@@ -109,7 +122,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         recovered = runner._state.services[socket_id]
         await wait_for(lambda: recovered.last_status.observed_monotonic > before, 5)
         self.assertEqual(recovered.service_instance_id, socket.service_instance_id)
-        self.assertTrue(process_running(recovered.process_identity["pid"]))
+        self.assertTrue(
+            process_running(_process_identity_pid(recovered.process_identity))
+        )
         self.assertTrue(runner._state.services[commands_id].stopped)
         self.assertEqual(runner.get_state()["mode"], "paused")
         with self.assertRaises(RuntimeError):
@@ -239,7 +254,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         runner = w.replacement()
         await runner.recover(experiment_id)
         self.assertEqual(runner._state.active_attempt.attempt_id, attempt["attempt_id"])
-        self.assertEqual(runner._state.active_attempt.process_identity["pid"], pid)
+        self.assertEqual(
+            _process_identity_pid(runner._state.active_attempt.process_identity), pid
+        )
         self.assertEqual(runner._state.mode, "paused")
         gate.touch()
         await wait_for(lambda runner=runner: runner._state.active_attempt is None, 30)
@@ -510,5 +527,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         runner._state.stage_attempt_numbers[original.stage_id],
                         2 if action == "rerun" else 1,
                     )
-                    self.assertFalse(process_running(original.process_identity["pid"]))
+                    self.assertFalse(
+                        process_running(
+                            _process_identity_pid(original.process_identity)
+                        )
+                    )
                 await w.close()

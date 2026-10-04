@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.experiments.state import _process_identity_pid
 from core.models.experiment_template import ExperimentTemplate
 from core.models.updates import _update_model
 from core.participants.connection import ParticipantConnection
@@ -62,7 +63,9 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await w.replacement_manager().recover(w.state), "stop")
             await asyncio.sleep(definition["heartbeat"]["interval_seconds"] + 0.2)
             self.assertIs(w.state.services[sid], instance)
-            self.assertTrue(process_running(instance.process_identity["pid"]))
+            self.assertTrue(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
             self.assertEqual(
                 len(
                     [
@@ -92,7 +95,9 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(time.monotonic() - began, 30)
             self.assertFalse(result[sid]["stopped"])
             self.assertTrue(result[second["service_id"]]["stopped"])
-            self.assertTrue(process_running(original.process_identity["pid"]))
+            self.assertTrue(
+                process_running(_process_identity_pid(original.process_identity))
+            )
             self.assertEqual(
                 len([row for row in w.trace(first) if row["event"] == "started"]), 1
             )
@@ -157,7 +162,9 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             for definition in (first, second):
                 instance = w.state.services[definition["service_id"]]
                 self.assertTrue(instance.stopped)
-                self.assertFalse(process_running(instance.process_identity["pid"]))
+                self.assertFalse(
+                    process_running(_process_identity_pid(instance.process_identity))
+                )
             self.assertTrue(w.state.services[survivor["service_id"]].ready)
 
     async def test_close_detaches_and_recovery_preserves_live_work_and_pending_ids(
@@ -186,7 +193,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w.store.save(w.state)
             await w.manager.close()
             await asyncio.gather(*calls, return_exceptions=True)
-            self.assertTrue(process_running(identity["pid"]))
+            self.assertTrue(process_running(_process_identity_pid(identity)))
             w.state = w.store.load(w.experiment)
             manager = w.replacement_manager()
             self.assertEqual(await manager.recover(w.state), "ready")
@@ -211,7 +218,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 )
             stopped = await manager.stop_all(w.state)
             self.assertTrue(stopped[sid]["stopped"], stopped)
-            self.assertFalse(process_running(identity["pid"]))
+            self.assertFalse(process_running(_process_identity_pid(identity)))
 
     async def test_unreported_result_does_not_become_a_replayed_request(self):
         """E: absence from current/pending is not proof that the old request was never executed."""
@@ -340,7 +347,9 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(old[first["service_id"]].stopped)
             self.assertTrue(
-                process_running(old[second["service_id"]].process_identity["pid"])
+                process_running(
+                    _process_identity_pid(old[second["service_id"]].process_identity)
+                )
             )
             w.state.template = ExperimentTemplate.model_validate(template)
             self.assertEqual(
@@ -378,7 +387,11 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await w.manager.reconcile(w.state, w.state.template), "ready"
             )
             self.assertNotIn(removed["service_id"], w.state.services)
-            self.assertFalse(process_running(removed_instance.process_identity["pid"]))
+            self.assertFalse(
+                process_running(
+                    _process_identity_pid(removed_instance.process_identity)
+                )
+            )
             self.assertIs(w.state.services[survivor["service_id"]], survivor_instance)
             self.assertTrue(w.state.services[added["service_id"]].ready)
 
@@ -419,7 +432,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await w.manager.close()
             w.state.services[sid].process_identity = None
             self.assertEqual(await w.replacement_manager().recover(w.state), "stop")
-            self.assertTrue(process_running(identity["pid"]))
+            self.assertTrue(process_running(_process_identity_pid(identity)))
             self.assertEqual(
                 len([row for row in w.trace(definition) if row["event"] == "started"]),
                 1,

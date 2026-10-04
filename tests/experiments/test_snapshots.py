@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from core.experiments.state import _process_identity_pid
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.primitives.json_files import read_json
@@ -166,7 +167,9 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(
                 runner._journal.client.read_command_result(runner._state.last_result_id)
             )
-            self.assertFalse(process_running(old.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(old.process_identity))
+            )
             self.assertNotEqual(
                 runner._state.services[old.service_id].service_instance_id,
                 old.service_instance_id,
@@ -342,7 +345,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 and runner._state.active_attempt.process_identity is not None
             )
         )
-        pid = runner._state.active_attempt.process_identity["pid"]
+        pid = _process_identity_pid(runner._state.active_attempt.process_identity)
         with self.assertRaises(RuntimeError):
             await runner.snapshot()
         self.assertTrue(process_running(pid))

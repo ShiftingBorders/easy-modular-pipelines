@@ -5,6 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from core.experiments.state import _process_identity_pid
 from core.journal.events import LoggingStorageError
 from core.journal.logger import OperationLogger
 from core.primitives.json_files import read_json, write_json
@@ -131,7 +132,9 @@ class SnapshotFailureTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises((RuntimeError, ConnectionError)):
                     await asyncio.wait_for(runner.snapshot(), 100)
                 self.assertEqual(w.manifests(), [])
-                self.assertFalse(process_running(instance.process_identity["pid"]))
+                self.assertFalse(
+                    process_running(_process_identity_pid(instance.process_identity))
+                )
                 self.assertEqual(runner.get_state()["phase"], "failed")
                 await w.close()
 

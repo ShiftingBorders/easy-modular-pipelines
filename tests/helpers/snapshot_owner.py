@@ -69,7 +69,7 @@ async def run_owner(options):
                 and instance.service_instance_id
                 == document.get("participant_instance_id")
                 and instance.process_identity is not None
-                and instance.process_identity != document.get("process")
+                and instance.process_identity.model_dump() != document.get("process")
                 for instance in runner._state.services.values()
             )
         ):

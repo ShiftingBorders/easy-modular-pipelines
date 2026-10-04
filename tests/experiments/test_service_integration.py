@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import write_json
 from core.primitives.processes import process_identity
 from tests.helpers.dag import DagSession, process_running, terminate_owned
@@ -39,7 +40,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(time.monotonic() - began, 30)
                 self.assertEqual(response["result"], "fail", response)
                 self.assertFalse(runner.get_state()["termination_confirmed"])
-                self.assertTrue(process_running(original.process_identity["pid"]))
+                self.assertTrue(
+                    process_running(_process_identity_pid(original.process_identity))
+                )
                 denied = await w.session.send(
                     "run", {"template_path": str(w.write_template(w.template()))}
                 )
@@ -47,7 +50,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list((w.root / "experiments").iterdir())), 1)
             ignore.unlink()
             self.assertEqual((await w.session.post("stop"))["result"], "success")
-            self.assertFalse(process_running(original.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(original.process_identity))
+            )
 
     async def test_stage_error_policies_keep_or_stop_services_with_the_experiment(self):
         """C3/D4: a stage pause preserves services; fatal and skipped final runs shut them down."""
@@ -71,7 +76,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                     instance = runner._state.services[definition["service_id"]]
                     self.assertEqual(
-                        process_running(instance.process_identity["pid"]),
+                        process_running(
+                            _process_identity_pid(instance.process_identity)
+                        ),
                         action == "pause",
                     )
                     self.assertEqual(instance.stopped, action != "pause")
@@ -161,7 +168,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             for item in runner._state.services.values():
                 if item.implementation == "full":
-                    self.assertFalse(process_running(item.process_identity["pid"]))
+                    self.assertFalse(
+                        process_running(_process_identity_pid(item.process_identity))
+                    )
             await wait_for(
                 lambda: (
                     w.files.controls[commands["service_id"]] / "action-stop.json"
@@ -360,8 +369,12 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await wait_for(lambda: runner.get_state()["phase"] == "failed", timeout=90)
             self.assertGreaterEqual(time.monotonic() - began, 10)
             self.assertFalse(process_running(stage["pid"]))
-            self.assertFalse(process_running(original.process_identity["pid"]))
-            self.assertFalse(process_running(other.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(original.process_identity))
+            )
+            self.assertFalse(
+                process_running(_process_identity_pid(other.process_identity))
+            )
 
     async def test_priority_stop_cancels_manual_retry_during_readiness(self):
         """D4: a pending manual restart cannot obstruct standalone stop or leave its spawned copy."""
@@ -384,7 +397,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             stopped = await w.session.post("stop")
             self.assertEqual(stopped["result"], "success", stopped)
             self.assertEqual((await retry)["error"]["code"], "command_cancelled")
-            self.assertFalse(process_running(replacement.process_identity["pid"]))
+            self.assertFalse(
+                process_running(_process_identity_pid(replacement.process_identity))
+            )
             self.assertFalse(runner._service_retrying)
 
     async def test_retry_counters_and_invalid_commands_preserve_pause(self):
@@ -439,7 +454,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             service = runner._state.services[definition["service_id"]]
             await runner.close()
             self.assertTrue(process_running(stage["pid"]))
-            self.assertTrue(process_running(service.process_identity["pid"]))
+            self.assertTrue(
+                process_running(_process_identity_pid(service.process_identity))
+            )
             self.assertIsNone(runner._service_task)
             self.assertFalse(runner.get_state()["fresh"])
 
@@ -474,7 +491,8 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             _, stage = await w.session.ready_attempt()
             identities = [
-                item.process_identity for item in runner._state.services.values()
+                item.process_identity.model_dump()
+                for item in runner._state.services.values()
             ]
             lock = sqlite3.connect(
                 runner._state.experiment_directory / "journals/events.sqlite"
@@ -516,7 +534,10 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             state["services"][0]["process"]["pid"] = 0
             state["services"][0]["module"]["name"] = "changed"
             self.assertNotEqual(
-                runner._state.services[service["service_id"]].process_identity["pid"], 0
+                _process_identity_pid(
+                    runner._state.services[service["service_id"]].process_identity
+                ),
+                0,
             )
             self.assertNotEqual(
                 runner._state.services[service["service_id"]].definition.module.name,

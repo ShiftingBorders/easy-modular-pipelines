@@ -19,6 +19,7 @@ import psutil
 import yaml
 
 from core.experiments.runner import ExperimentRunner
+from core.experiments.state import _process_identity_document, _process_identity_pid
 from core.primitives.json_files import read_json
 from core.primitives.processes import process_identity
 from tests.helpers.archives import ArchiveWorkspace, inventory
@@ -141,7 +142,7 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(instance.stopped for instance in state.services.values()))
         self.assertTrue(
             all(
-                not process_running(instance.process_identity["pid"])
+                not process_running(_process_identity_pid(instance.process_identity))
                 for instance in state.services.values()
             )
         )
@@ -182,7 +183,9 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(lambda: self.runner.get_state()["phase"] == "stage_running")
         await asyncio.wait_for(self.runner.pause(), 70)
         self.assertEqual(self.runner.get_state()["mode"], "paused")
-        self.assertTrue(process_running(instance.process_identity["pid"]))
+        self.assertTrue(
+            process_running(_process_identity_pid(instance.process_identity))
+        )
         self.assertEqual((await self.runner.step())["result"]["result"], "success")
         self.assertIs(self.runner._state.services[self.sid], instance)
         await self.finish()
@@ -256,7 +259,9 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
             23,
             (self.w.root / "weather-owner.log").read_text(encoding="utf-8"),
         )
-        self.assertTrue(process_running(instance.process_identity["pid"]))
+        self.assertTrue(
+            process_running(_process_identity_pid(instance.process_identity))
+        )
         self.runner = self.new_runner()
         try:
             await self.runner.recover(experiment_id)
@@ -273,7 +278,9 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         except Exception as failure:
             # Capture before fixture cleanup stops participants and removes the journal.
             destination = (
-                REPOSITORY / ".artifacts/ci-failures" / f"weather-recovery-{uuid4()}.json"
+                REPOSITORY
+                / ".artifacts/ci-failures"
+                / f"weather-recovery-{uuid4()}.json"
             )
             report = {
                 "test": self.id(),
@@ -302,10 +309,11 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
                 for expected in identities:
                     if expected is None:
                         continue
-                    observation = {"expected": expected}
+                    observation = {"expected": _process_identity_document(expected)}
                     try:
-                        observation["actual"] = process_identity(expected["pid"])
-                        process = psutil.Process(expected["pid"])
+                        pid = _process_identity_pid(expected)
+                        observation["actual"] = process_identity(pid)
+                        process = psutil.Process(pid)
                         observation["status"] = process.status()
                         observation["command"] = process.cmdline()
                     except (OSError, psutil.Error) as error:
@@ -318,7 +326,9 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
                 checkpoint = None
                 deadline = time.monotonic() + 5
                 for _page in range(20):
-                    page = self.runner._journal.client.read_events(checkpoint, limit=1000)
+                    page = self.runner._journal.client.read_events(
+                        checkpoint, limit=1000
+                    )
                     events.extend(row["event"] for row in page["events"])
                     checkpoint = page["checkpoint"]
                     if not page["has_more"] or time.monotonic() >= deadline:
@@ -333,25 +343,36 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
                 with (self.w.root / "weather-owner.log").open("rb") as stream:
                     stream.seek(0, 2)
                     stream.seek(max(0, stream.tell() - 128 * 1024))
-                    report["owner_output_tail"] = stream.read().decode("utf-8", "replace")
+                    report["owner_output_tail"] = stream.read().decode(
+                        "utf-8", "replace"
+                    )
             except OSError as error:
                 report["diagnostic_errors"].append(f"owner output: {error!r}")
             try:
                 limit = 10 * 1024 * 1024
-                encoded = json.dumps(report, ensure_ascii=True, default=str).encode("utf-8")
+                encoded = json.dumps(report, ensure_ascii=True, default=str).encode(
+                    "utf-8"
+                )
                 while len(encoded) > limit and report["events"]:
                     report["events"].pop(0)
                     report["journal_events_trimmed"] = True
-                    encoded = json.dumps(report, ensure_ascii=True, default=str).encode("utf-8")
+                    encoded = json.dumps(report, ensure_ascii=True, default=str).encode(
+                        "utf-8"
+                    )
                 if len(encoded) > limit:
                     encoded = json.dumps(
-                        {"test": self.id(), "diagnostic_error": "Report exceeded 10 MiB."}
+                        {
+                            "test": self.id(),
+                            "diagnostic_error": "Report exceeded 10 MiB.",
+                        }
                     ).encode("utf-8")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(encoded)
                 failure.add_note(f"Weather recovery diagnostics: {destination}")
             except Exception as error:  # noqa: BLE001 - Reporting must never hide the test failure.
-                failure.add_note(f"Could not save weather recovery diagnostics: {error!r}")
+                failure.add_note(
+                    f"Could not save weather recovery diagnostics: {error!r}"
+                )
             raise
 
     async def test_stop_while_waiting_terminates_module_and_service(self):
@@ -367,8 +388,12 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         )
         attempt = self.runner._state.active_attempt
         await self.runner.stop()
-        self.assertFalse(process_running(instance.process_identity["pid"]))
-        self.assertFalse(process_running(attempt.process_identity["pid"]))
+        self.assertFalse(
+            process_running(_process_identity_pid(instance.process_identity))
+        )
+        self.assertFalse(
+            process_running(_process_identity_pid(attempt.process_identity))
+        )
         self.assertEqual(
             list(self.runner._state.experiment_directory.rglob("weather.txt")), []
         )

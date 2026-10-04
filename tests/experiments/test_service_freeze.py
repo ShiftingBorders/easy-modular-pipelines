@@ -7,6 +7,7 @@ import time
 import unittest
 from uuid import uuid4
 
+from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 from tests.helpers.services import ServiceWorkspace, wait_for
@@ -374,7 +375,9 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             operation = asyncio.create_task(w.manager.unfreeze(w.state, snapshot))
         await wait_for(lambda: (controls / "fault-entered.json").exists())
         if fault == "hang":
-            self.assertTrue(process_running(instance.process_identity["pid"]))
+            self.assertTrue(
+                process_running(_process_identity_pid(instance.process_identity))
+            )
         with self.assertRaises(RuntimeError):
             await operation
         self.assertEqual(w.state.mode, "paused")
