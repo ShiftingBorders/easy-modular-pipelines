@@ -40,6 +40,7 @@ from core.models.experiment_template import (
     StageDefinition,
 )
 from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_launch import PreparedLaunch
 from core.models.participant_observations import (
     ExecutorCommandState,
     ExecutorCommandStateResponse,
@@ -366,7 +367,7 @@ class StageRunner:
         attempt: StageAttempt,
         definition: StageDefinition | ServiceCallDefinition,
         module: ModuleReference,
-    ) -> tuple[JsonObject, JsonObject]:
+    ) -> tuple[PreparedLaunch, JsonObject]:
         context = {
             **self._context(state, attempt),
             "template_revision_id": state.template_revision_id,
@@ -374,24 +375,27 @@ class StageRunner:
             "module_version": module.version,
             "module_hash": module.hash,
         }
-        launch = self._launcher.prepare(
-            state,
-            definition.model_dump(exclude_unset=True),
-            context,
-            attempt.artifacts_directory,
-            attempt.input_data,
+        launch = PreparedLaunch.model_validate(
+            self._launcher.prepare(
+                state,
+                definition.model_dump(exclude_unset=True),
+                context,
+                attempt.artifacts_directory,
+                attempt.input_data,
+            )
         )
-        attempt.endpoint_path = Path(launch["endpoint_path"])
-        attempt.effective_settings = launch["effective_settings"]
-        launch["runtime_context"].update(
-            {
-                "queued_at": attempt.queued_at,
-                "queued_monotonic": attempt.queued_monotonic,
-                "service_id": attempt.service_id,
-            }
+        attempt.endpoint_path = launch.endpoint_path
+        attempt.effective_settings = launch.effective_settings
+        runtime_context = _update_model(
+            launch.runtime_context,
+            queued_at=attempt.queued_at,
+            queued_monotonic=attempt.queued_monotonic,
+            service_id=attempt.service_id,
         )
+        launch = _update_model(launch, runtime_context=runtime_context)
         write_json(
-            attempt.artifacts_directory / "context.json", launch["runtime_context"]
+            attempt.artifacts_directory / "context.json",
+            runtime_context.model_dump(mode="json", exclude_unset=True),
         )
         return launch, context
 
@@ -400,7 +404,7 @@ class StageRunner:
         state: RunnerState,
         attempt: StageAttempt,
         instance: ServiceInstance | None,
-        launch: JsonObject,
+        launch: PreparedLaunch,
         context: JsonObject,
     ) -> None:
         state.active_attempt = attempt
@@ -426,7 +430,7 @@ class StageRunner:
             "control.intent",
             {
                 "action": "start_stage",
-                "argv": None if instance is not None else launch["argv"],
+                "argv": None if instance is not None else launch.argv,
                 "service_id": attempt.service_id,
                 "queued_monotonic": attempt.queued_monotonic,
                 "queued_at": attempt.queued_at,
@@ -440,7 +444,7 @@ class StageRunner:
         state: RunnerState,
         attempt: StageAttempt,
         instance: ServiceInstance,
-        launch: JsonObject,
+        launch: PreparedLaunch,
         deadline: float | None,
     ) -> StageAttempt:
         if self._services is None:
@@ -452,7 +456,7 @@ class StageRunner:
             instance.service_id,
             attempt.request_id,
             "execute",
-            launch["call"],
+            launch.call.model_dump(mode="json", exclude_unset=True),
             deadline=deadline,
         )
         self._unstarted_attempt_id = None
@@ -463,11 +467,11 @@ class StageRunner:
         attempt: StageAttempt,
         attempt_id: str,
         directory: Path,
-        launch: JsonObject,
+        launch: PreparedLaunch,
         deadline: float | None,
     ) -> StageAttempt:
         launch_path = directory / "launch.json"
-        write_json(launch_path, launch)
+        write_json(launch_path, launch.model_dump(mode="json", exclude_unset=True))
         await self._spawn_executor(attempt, attempt_id, launch_path)
         return await self._wait_executor_startup(attempt, attempt_id, launch, deadline)
 
@@ -511,10 +515,13 @@ class StageRunner:
         self._executor_processes.append((self._process, attempt.request_id))
 
     async def _wait_executor_startup(
-        self, attempt: StageAttempt, attempt_id: str,
-        launch: JsonObject, deadline: float | None,
+        self,
+        attempt: StageAttempt,
+        attempt_id: str,
+        launch: PreparedLaunch,
+        deadline: float | None,
     ) -> StageAttempt:
-        startup_deadline = time.monotonic() + launch["control_timeout_seconds"]
+        startup_deadline = time.monotonic() + launch.control_timeout_seconds
         if deadline is not None:
             startup_deadline = min(startup_deadline, deadline)
         while time.monotonic() < startup_deadline:
@@ -533,7 +540,7 @@ class StageRunner:
                         self._connection.request(
                             attempt.request_id,
                             "execute",
-                            launch["call"],
+                            launch.call.model_dump(mode="json", exclude_unset=True),
                             deadline_monotonic=deadline,
                         )
                     )
@@ -554,7 +561,6 @@ class StageRunner:
         if deadline is not None and time.monotonic() >= deadline:
             return attempt
         raise TimeoutError("Executor startup deadline expired.")
-
 
     def _deadline(self, attempt: StageAttempt) -> float | None:
         return (

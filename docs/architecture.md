@@ -66,6 +66,9 @@ Internal preparation retains a PreparedLaunch with its manifest, execution call,
 identity and native paths. Public prepare and context files still contain JSON.
 Prepared service-call contexts allow an absent module logger; ModuleContext keeps
 its required logger path, and StageLaunch independently checks executor admission.
+Stage and service owners call the public preparation hook, validate its JSON
+result into PreparedLaunch, and retain that model until file/subprocess/RPC
+boundaries. Compatible hook metadata survives the resulting launch document.
 
 Recovery validates command-state observations before updating executor records
 or reconciling service work. Service exports validate their relative path before

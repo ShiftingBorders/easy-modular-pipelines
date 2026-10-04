@@ -143,7 +143,7 @@ class PreparedModuleContext(ExecutionCall):
 class PreparedLaunch(BaseModel):
     """Internal preparation result; executor admission remains StageLaunch's job."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_config = ConfigDict(extra="allow", strict=True, frozen=True)
 
     argv: list[Text]
     code_directory: AbsolutePath

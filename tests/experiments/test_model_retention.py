@@ -4,6 +4,7 @@ import asyncio
 import copy
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 import yaml
@@ -291,3 +292,33 @@ class ModelRetentionTests(unittest.TestCase):
         self.assertIsNone(document["executor_logging_config"])
         self.assertEqual(document["service_id"], service["service_id"])
         self.assertEqual(document["context"], identity.model_dump())
+
+    def test_service_consumer_calls_public_prepare_hook_and_retains_launch(self):
+        workspace = ServiceWorkspace()
+        self.addCleanup(lambda: asyncio.run(workspace.close()))
+        workspace.service()
+        definition = workspace.state.template.services[0]
+        original = workspace.launcher.prepare
+        captured = []
+
+        def prepare(*args, **kwargs):
+            self.assertIsInstance(args[1], dict)
+            self.assertIsInstance(args[2], dict)
+            document = original(*args, **kwargs)
+            document["callback_metadata"] = {"value": [1, None]}
+            captured.append(document)
+            return document
+
+        with patch.object(workspace.launcher, "prepare", prepare):
+            instance, directory, launch, context = (
+                workspace.manager._prepare_service_start(workspace.state, definition)
+            )
+        self.assertEqual(len(captured), 1)
+        self.assertIsInstance(launch, PreparedLaunch)
+        self.assertEqual(launch.model_extra["callback_metadata"], {"value": [1, None]})
+        self.assertEqual(instance.endpoint_path, launch.endpoint_path)
+        self.assertEqual(instance.artifacts_directory, directory)
+        self.assertEqual(launch.context.experiment_id, context["experiment_id"])
+        self.assertEqual(
+            launch.model_dump(mode="json", exclude_unset=True), captured[0]
+        )

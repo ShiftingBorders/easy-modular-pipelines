@@ -35,6 +35,7 @@ from core.models.experiment_template import (
     ServiceCallDefinition,
     ServiceDefinition,
 )
+from core.models.participant_launch import PreparedLaunch
 from core.models.participant_observations import (
     CommandState,
     CommandStateResponse,
@@ -229,12 +230,12 @@ class ServiceManager:
                 (directory / "stdout.log").open("ab") as stdout,
                 (directory / "stderr.log").open("ab") as stderr,
             ):
-                argv, environment = module_process_arguments(launch["argv"])
+                argv, environment = module_process_arguments(launch.argv)
                 spawn = asyncio.create_task(
                     asyncio.to_thread(
                         subprocess.Popen,
                         argv,
-                        cwd=launch["code_directory"],
+                        cwd=launch.code_directory,
                         env=environment,
                         stdin=subprocess.DEVNULL,
                         stdout=stdout,
@@ -289,7 +290,7 @@ class ServiceManager:
 
     def _prepare_service_start(
         self, state: RunnerState, definition: ServiceDefinition
-    ) -> tuple[ServiceInstance, Path, JsonObject, JsonObject]:
+    ) -> tuple[ServiceInstance, Path, PreparedLaunch, JsonObject]:
         service_id = require_text(definition.service_id, "service_id")
         old = state.services.get(service_id)
         if old is not None and not old.stopped:
@@ -304,13 +305,19 @@ class ServiceManager:
             / service_id
             / instance_id
         )
-        launch = self._launcher.prepare(
-            state, definition.model_dump(exclude_unset=True), context, directory, None
+        launch = PreparedLaunch.model_validate(
+            self._launcher.prepare(
+                state,
+                definition.model_dump(exclude_unset=True),
+                context,
+                directory,
+                None,
+            )
         )
         instance = ServiceInstance(service_id, instance_id, definition)
-        instance.implementation = launch["module"]["implementation"]
+        instance.implementation = launch.module.implementation
         instance.artifacts_directory = directory
-        instance.endpoint_path = Path(launch["endpoint_path"])
+        instance.endpoint_path = launch.endpoint_path
         if old is not None:
             self._inherit_service_requests(state, old, instance)
         state.services[service_id] = instance
@@ -339,21 +346,21 @@ class ServiceManager:
         self,
         state: RunnerState,
         definition: ServiceDefinition,
-        launch: JsonObject,
+        launch: PreparedLaunch,
         context: JsonObject,
     ) -> None:
         self._journal.client.record_event(
             "service.parameters",
             {
                 "definition": definition.model_dump(exclude_unset=True),
-                "effective_settings": launch["effective_settings"],
+                "effective_settings": launch.effective_settings,
                 "template_revision_id": state.template_revision_id,
             },
             context=context,
         )
         self._journal.client.record_event(
             "control.intent",
-            {"action": "start_service", "argv": launch["argv"]},
+            {"action": "start_service", "argv": launch.argv},
             context=context,
         )
         if state.pending_rebuild is not None:
