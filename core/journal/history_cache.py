@@ -38,6 +38,7 @@ from core.models.journal_cache import (
     HistoryCacheRefresh,
     JournalBoundary,
 )
+from core.models.updates import _update_model
 from core.primitives.file_lock import _lock_open_stream
 
 
@@ -119,7 +120,7 @@ class JournalHistoryCache:
     def _configure(self, parameters: HistoryCacheParameters) -> None:
         self.path = parameters.path
         self.config_path = parameters.config_path
-        self.identity = parameters.identity.model_dump()
+        self.identity = parameters.identity
         self.file_key = parameters.file_key
         self.experiment_id = parameters.experiment_id
         self.window_events = parameters.window_events
@@ -141,15 +142,17 @@ class JournalHistoryCache:
                         "The disposable cache must not alias the source journal."
                     )
             info = source.get_journal_info()
-            if any(info[key] != self.identity[key] for key in self.identity):
+            if any(info[key] != value for key, value in self.identity):
                 raise LoggingStateError("Journal changed before cache initialization.")
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            expected = CacheSource.model_validate({
-                "version": self.SCHEMA_VERSION,
-                "identity": self.identity,
-                "file_key": list(self.file_key),
-                "experiment_id": self.experiment_id,
-            }).model_dump()
+            expected = CacheSource.model_validate(
+                {
+                    "version": self.SCHEMA_VERSION,
+                    "identity": self.identity,
+                    "file_key": list(self.file_key),
+                    "experiment_id": self.experiment_id,
+                }
+            )
             with closing(sqlite3.connect(self.path)) as db, db:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute(
@@ -159,7 +162,7 @@ class JournalHistoryCache:
                     "SELECT value FROM metadata WHERE key='source'"
                 ).fetchone()
                 recorded = self._decode_source(row[0]) if row else None
-                if recorded is not None and recorded.model_dump() == expected:
+                if recorded is not None and recorded == expected:
                     self._opened = True
                     return
                 if row:
@@ -218,9 +221,11 @@ class JournalHistoryCache:
                 """)
                 db.execute(
                     "INSERT OR REPLACE INTO metadata VALUES ('source', ?)",
-                    (json.dumps(expected),),
+                    (json.dumps(expected.model_dump()),),
                 )
-                empty = json.dumps({**self.identity, "cursor": 0, "change_cursor": 0})
+                empty = json.dumps(
+                    {**dict(self.identity), "cursor": 0, "change_cursor": 0}
+                )
                 for key in ("cached_through", "ingested_through"):
                     db.execute(
                         "INSERT OR IGNORE INTO metadata VALUES (?, ?)", (key, empty)
@@ -266,13 +271,16 @@ class JournalHistoryCache:
                 "target": target,
                 "window": window,
                 "reader_context": {**reader_context, "state": state}
-                if reader_context is not None else None,
+                if reader_context is not None
+                else None,
             }
         )
         with self._lock:
             writer = acquire_cache_writer(self.path)
             try:
-                return self._refresh_owned(request, compact, project)
+                return self._refresh_owned(request, compact, project).model_dump(
+                    exclude_unset=True
+                )
             finally:
                 writer.close()
 
@@ -281,7 +289,7 @@ class JournalHistoryCache:
         request: HistoryCacheRefresh,
         compact: Callable,
         project: Callable,
-    ) -> dict:
+    ) -> CachePublication:
         if not self._opened:
             self.open()
         with (
@@ -289,10 +297,13 @@ class JournalHistoryCache:
             closing(sqlite3.connect(self.path)) as db,
         ):
             target = (
-                request.target.model_dump() if request.target is not None
-                else source.read_event_batch([])["boundary"]
+                request.target
+                if request.target is not None
+                else JournalBoundary.model_validate(
+                    source.read_event_batch([])["boundary"]
+                )
             )
-            if any(target[key] != self.identity[key] for key in self.identity):
+            if any(getattr(target, key) != value for key, value in self.identity):
                 raise LoggingStateError(
                     "The precache target belongs to replaced history."
                 )
@@ -305,7 +316,7 @@ class JournalHistoryCache:
             if request.window:
                 self._refresh_window(source, changed)
             result = self._publication(db, page, bool(changed) or projected)
-            return {**result, "target_boundary": target}
+            return _update_model(result, target_boundary=target)
 
     def _read_changes(
         self,
@@ -313,29 +324,30 @@ class JournalHistoryCache:
         source: OperationLogger,
         compact: Callable,
         deadline: float,
-        target: dict,
+        target: JournalBoundary,
     ) -> tuple[dict, list[dict]]:
         row = db.execute("SELECT value FROM metadata WHERE key='checkpoint'").fetchone()
         checkpoint = (
-            CacheChangeCheckpoint.model_validate(json.loads(row[0])).model_dump()
-            if row else None
+            CacheChangeCheckpoint.model_validate(json.loads(row[0])) if row else None
         )
         changed = []
         while True:
-            if checkpoint and checkpoint["change_cursor"] >= target["change_cursor"]:
+            if checkpoint and checkpoint.change_cursor >= target.change_cursor:
                 cursor, count = db.execute(
                     "SELECT COALESCE(MAX(cursor),0), COUNT(*) FROM facts"
                 ).fetchone()
-                if cursor < target["cursor"] or count < target["event_count"]:
+                if cursor < target.cursor or count < target.event_count:
                     raise LoggingStateError(
                         "Cached checkpoint skips source events; rebuild the disposable cache."
                     )
                 return {
-                    "checkpoint": checkpoint,
-                    "boundary": target,
+                    "checkpoint": checkpoint.model_dump(),
+                    "boundary": target.model_dump(),
                     "has_more": False,
                 }, changed
-            page = source.read_changes(checkpoint, limit=1000)
+            page = source.read_changes(
+                checkpoint.model_dump() if checkpoint is not None else None, limit=1000
+            )
             with db:
                 for change in page["changes"]:
                     changed.extend(self._apply_change(db, source, change, compact))
@@ -344,10 +356,10 @@ class JournalHistoryCache:
                         "INSERT INTO metadata VALUES ('version','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1"
                     )
                     db.execute("INSERT OR REPLACE INTO metadata VALUES ('ready','0')")
-                checkpoint = page["checkpoint"]
+                checkpoint = CacheChangeCheckpoint.model_validate(page["checkpoint"])
                 db.execute(
                     "INSERT OR REPLACE INTO metadata VALUES ('checkpoint', ?)",
-                    (json.dumps(checkpoint),),
+                    (json.dumps(checkpoint.model_dump()),),
                 )
                 db.execute(
                     "INSERT OR REPLACE INTO metadata VALUES ('boundary', ?)",
@@ -356,17 +368,19 @@ class JournalHistoryCache:
                 event_cursor = db.execute(
                     "SELECT COALESCE(MAX(cursor),0) FROM facts"
                 ).fetchone()[0]
-                ingested = {
-                    **self.identity,
-                    "cursor": event_cursor,
-                    "change_cursor": checkpoint["change_cursor"],
-                }
+                ingested = CacheCheckpoint.model_validate(
+                    {
+                        **dict(self.identity),
+                        "cursor": event_cursor,
+                        "change_cursor": checkpoint.change_cursor,
+                    }
+                )
                 db.execute(
                     "INSERT OR REPLACE INTO metadata VALUES ('ingested_through', ?)",
-                    (json.dumps(ingested),),
+                    (json.dumps(ingested.model_dump()),),
                 )
-            if checkpoint["change_cursor"] >= target["change_cursor"]:
-                page = {**page, "boundary": target, "has_more": False}
+            if checkpoint.change_cursor >= target.change_cursor:
+                page = {**page, "boundary": target.model_dump(), "has_more": False}
             changed = sorted(
                 {item["event"]["event_id"]: item for item in changed}.values(),
                 key=lambda item: item["cursor"],
@@ -525,7 +539,9 @@ class JournalHistoryCache:
             remaining -= len(tail["events"])
             before = min(item["cursor"] for item in tail["events"])
 
-    def _publication(self, db: sqlite3.Connection, page: dict, changed: bool) -> dict:
+    def _publication(
+        self, db: sqlite3.Connection, page: dict, changed: bool
+    ) -> CachePublication:
         complete = (
             not page["has_more"]
             and db.execute("SELECT 1 FROM dirty LIMIT 1").fetchone() is None
@@ -554,120 +570,136 @@ class JournalHistoryCache:
         cached_row = db.execute(
             "SELECT value FROM metadata WHERE key='cached_through'"
         ).fetchone()
-        return CachePublication.model_validate({
-            "complete": complete,
-            "version": version,
-            "observed_at": latest[0] if latest else None,
-            "boundary": page["boundary"],
-            "window_count": len(self.window),
-            "cached_through": json.loads(cached_row[0]),
-        }).model_dump(exclude_unset=True)
+        return CachePublication.model_validate(
+            {
+                "complete": complete,
+                "version": version,
+                "observed_at": latest[0] if latest else None,
+                "boundary": page["boundary"],
+                "window_count": len(self.window),
+                "cached_through": json.loads(cached_row[0]),
+            }
+        )
 
     def _publish_cached_boundary(self, db: sqlite3.Connection) -> None:
         checkpoint = db.execute(
             "SELECT value FROM metadata WHERE key='checkpoint'"
         ).fetchone()
         cursor = db.execute("SELECT COALESCE(MAX(cursor),0) FROM facts").fetchone()[0]
-        cached = {
-            **self.identity,
-            "cursor": cursor,
-            "change_cursor": CacheChangeCheckpoint.model_validate(
-                json.loads(checkpoint[0])
-            ).change_cursor
-            if checkpoint
-            else 0,
-        }
+        cached = CacheCheckpoint.model_validate(
+            {
+                **dict(self.identity),
+                "cursor": cursor,
+                "change_cursor": CacheChangeCheckpoint.model_validate(
+                    json.loads(checkpoint[0])
+                ).change_cursor
+                if checkpoint
+                else 0,
+            }
+        )
         db.execute(
             "INSERT OR REPLACE INTO metadata VALUES ('cached_through', ?)",
-            (json.dumps(cached),),
+            (json.dumps(cached.model_dump()),),
         )
 
     def observe(self, target: dict | None = None) -> dict:
         """Read worker-owned projections and reconstruct the latest source window."""
-        target_model = JournalBoundary.model_validate(target) if target is not None else None
-        return self._observe(target_model)
+        target_model = (
+            JournalBoundary.model_validate(target) if target is not None else None
+        )
+        return self._observe(target_model).model_dump(exclude_unset=True)
 
-    def _observe(self, target_model: JournalBoundary | None) -> dict:
-        target = target_model.model_dump() if target_model is not None else None
+    def _observe(self, target: JournalBoundary | None) -> CachePublication:
         with self._lock, OperationLogger(self.config_path, read_only=True) as source:
             boundary = source.read_event_batch([])["boundary"]
             if target and any(
-                target[key] != self.identity[key] for key in self.identity
+                getattr(target, key) != value for key, value in self.identity
             ):
                 raise LoggingStateError(
                     "The requested read boundary belongs to replaced history."
                 )
-            latest = next(reversed(self.window.values()), None)
-            last_cursor = latest["entry"]["cursor"] if latest else None
-            if (
-                last_cursor is not None
-                and 0 < boundary["cursor"] - last_cursor <= self.window_events
-            ):
-                checkpoint = {**self.identity, "cursor": last_cursor}
-                while checkpoint["cursor"] < boundary["cursor"]:
-                    page = source.read_events(
-                        checkpoint, limit=min(self.window_events, 1000)
-                    )
-                    if not page["events"]:
-                        raise LoggingStateError(
-                            "The source window could not reach its captured boundary."
-                        )
-                    for entry in page["events"]:
-                        if entry["cursor"] > boundary["cursor"]:
-                            break
-                        self._remember(entry)
-                    checkpoint = page["checkpoint"]
-            elif last_cursor != boundary["cursor"]:
-                self.window.clear()
-                self._window_bytes = 0
-                before, remaining = boundary["cursor"] + 1, self.window_events
-                self._load_window_tail(source, before, remaining)
+            self._observe_window(source, boundary)
             publication = self._observed_publication(boundary, target)
-            cached = publication["cached_through"]
+            cached = publication.cached_through
             if (
-                cached["cursor"] > boundary["cursor"]
-                or cached["change_cursor"] > boundary["change_cursor"]
+                cached.cursor > boundary["cursor"]
+                or cached.change_cursor > boundary["change_cursor"]
             ):
                 # A worker may have ingested appends made while the RAM tail was read.
                 current = source.read_event_batch([])["boundary"]
                 if (
-                    cached["cursor"] > current["cursor"]
-                    or cached["change_cursor"] > current["change_cursor"]
+                    cached.cursor > current["cursor"]
+                    or cached.change_cursor > current["change_cursor"]
                 ):
                     raise LoggingStateError(
                         "The cached boundary exceeds the source journal."
                     )
             first = next(iter(self.window.values()), None)
             start = first["entry"]["cursor"] if first else None
-            end = publication["cached_through"]["cursor"]
+            end = publication.cached_through.cursor
             gap = None
             predecessor = None
             if start is not None and end < start:
-                checkpoint = {**self.identity, "cursor": end}
+                checkpoint = {**dict(self.identity), "cursor": end}
                 missing = source.read_events(checkpoint, limit=1)["events"]
                 if missing and missing[0]["cursor"] < start:
                     gap = {"after": end, "before": start}
                     preceding = source.read_event_batch(before=start, limit=1)["events"]
                     predecessor = preceding[0]["cursor"] if preceding else 0
-            return CachePublication.model_validate({
-                **publication,
-                "boundary": boundary,
-                "window_count": len(self.window),
-                "window_start_cursor": start,
-                "window_predecessor_cursor": predecessor,
-                "gap": gap,
-                "complete": publication["complete"] and gap is None,
-                "target_boundary": target or boundary,
-            }).model_dump(exclude_unset=True)
+            return _update_model(
+                publication,
+                boundary=boundary,
+                window_count=len(self.window),
+                window_start_cursor=start,
+                window_predecessor_cursor=predecessor,
+                gap=gap,
+                complete=publication.complete and gap is None,
+                target_boundary=target or boundary,
+            )
 
-    def _observed_publication(self, boundary: dict, target: dict | None = None) -> dict:
-        empty = {
-            "complete": False,
-            "version": 0,
-            "observed_at": None,
-            "cache_available": False,
-            "cached_through": {**self.identity, "cursor": 0, "change_cursor": 0},
-        }
+    def _observe_window(self, source: OperationLogger, boundary: dict) -> None:
+        """Extend a nearby RAM window or rebuild its tail at the captured boundary."""
+        latest = next(reversed(self.window.values()), None)
+        last_cursor = latest["entry"]["cursor"] if latest else None
+        if (
+            last_cursor is not None
+            and 0 < boundary["cursor"] - last_cursor <= self.window_events
+        ):
+            checkpoint = {**dict(self.identity), "cursor": last_cursor}
+            while checkpoint["cursor"] < boundary["cursor"]:
+                page = source.read_events(
+                    checkpoint, limit=min(self.window_events, 1000)
+                )
+                if not page["events"]:
+                    raise LoggingStateError(
+                        "The source window could not reach its captured boundary."
+                    )
+                for entry in page["events"]:
+                    if entry["cursor"] > boundary["cursor"]:
+                        break
+                    self._remember(entry)
+                checkpoint = page["checkpoint"]
+        elif last_cursor != boundary["cursor"]:
+            self.window.clear()
+            self._window_bytes = 0
+            self._load_window_tail(source, boundary["cursor"] + 1, self.window_events)
+
+    def _observed_publication(
+        self, boundary: dict, target: JournalBoundary | None = None
+    ) -> CachePublication:
+        empty = CachePublication.model_validate(
+            {
+                "complete": False,
+                "version": 0,
+                "observed_at": None,
+                "cache_available": False,
+                "cached_through": {
+                    **dict(self.identity),
+                    "cursor": 0,
+                    "change_cursor": 0,
+                },
+            }
+        )
         if not self.path.exists():
             return empty
         try:
@@ -682,40 +714,48 @@ class JournalHistoryCache:
                 latest = db.execute(
                     "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
                 ).fetchone()
-                requested = target or boundary
+                requested = (
+                    target
+                    if target is not None
+                    else JournalBoundary.model_validate(boundary)
+                )
                 complete = (
                     metadata.get("ready") == "1"
-                    and cached["cursor"] >= requested["cursor"]
-                    and cached["change_cursor"] >= requested["change_cursor"]
+                    and cached.cursor >= requested.cursor
+                    and cached.change_cursor >= requested.change_cursor
                 )
-                return {
-                    "complete": complete,
-                    "version": int(metadata.get("version", 0)),
-                    "observed_at": latest[0] if latest else None,
-                    "cached_through": cached,
-                    "cache_available": True,
-                }
+                return CachePublication.model_validate(
+                    {
+                        "complete": complete,
+                        "version": int(metadata.get("version", 0)),
+                        "observed_at": latest[0] if latest else None,
+                        "cached_through": cached,
+                        "cache_available": True,
+                    }
+                )
         except sqlite3.OperationalError as error:
             if "no such table" not in str(error):
                 raise
             return empty
 
     def _decode_cached_boundary(
-        self, metadata: dict, empty: dict
-    ) -> tuple[bool, dict | None]:
+        self, metadata: dict, empty: CachePublication
+    ) -> tuple[bool, CacheCheckpoint | None]:
         recorded = self._decode_source(metadata.get("source", "{}"))
         if (
             recorded is None
-            or recorded.identity.model_dump() != self.identity
+            or recorded.identity != self.identity
             or recorded.file_key != list(self.file_key)
         ):
             return False, None
         if "checkpoint" not in metadata:
             return False, None
         cached = json.loads(
-            metadata.get("cached_through", json.dumps(empty["cached_through"]))
+            metadata.get(
+                "cached_through", json.dumps(empty.cached_through.model_dump())
+            )
         )
-        return True, CacheCheckpoint.model_validate(cached).model_dump()
+        return True, CacheCheckpoint.model_validate(cached)
 
     def _decode_source(self, encoded: str) -> CacheSource | None:
         document = json.loads(encoded)
@@ -741,9 +781,10 @@ class JournalHistoryCache:
             )
             recorded = (
                 self._decode_source(metadata["source"])
-                if int(metadata.get("version", -1)) == version else None
+                if int(metadata.get("version", -1)) == version
+                else None
             )
-            if recorded is None or recorded.identity.model_dump() != self.identity:
+            if recorded is None or recorded.identity != self.identity:
                 raise HistoryCacheChanged(
                     "The cache publication changed; refresh the selection."
                 )
@@ -921,7 +962,7 @@ class JournalHistoryCache:
         """One read-only source connection, indexed lookups and bounded payloads."""
         with self._lock, OperationLogger(self.config_path, read_only=True) as source:
             info = source.get_journal_info()
-            if any(info[key] != self.identity[key] for key in self.identity):
+            if any(info[key] != value for key, value in self.identity):
                 raise HistoryCacheChanged(
                     "The journal changed before loading source details."
                 )
@@ -958,7 +999,7 @@ class JournalHistoryCache:
                         **json.loads(metadata.get(identifier, "{}")),
                     }
             info = source.get_journal_info()
-            if any(info[key] != self.identity[key] for key in self.identity):
+            if any(info[key] != value for key, value in self.identity):
                 raise HistoryCacheChanged(
                     "The journal changed while loading source details."
                 )

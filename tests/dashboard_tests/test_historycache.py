@@ -19,6 +19,13 @@ from core.journal.history_cache import (
     acquire_cache_writer,
 )
 from core.journal.logger import OperationLogger
+from core.models.journal_cache import (
+    CacheCheckpoint,
+    CacheIdentity,
+    CachePublication,
+    CacheSource,
+    JournalBoundary,
+)
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
@@ -31,6 +38,45 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace
 
 
 class HistoryCacheTests(unittest.TestCase):
+    def test_private_publication_keeps_models_and_public_observe_is_detached_json(self):
+        dataset = self.build()
+        cache = dataset["cache"]
+        self.assertIsInstance(cache.identity, CacheIdentity)
+        target = JournalBoundary.model_validate(dataset["target_boundary"])
+        publication = cache._observe(target)
+        self.assertIsInstance(publication, CachePublication)
+        self.assertIsInstance(publication.cached_through, CacheCheckpoint)
+        self.assertIsInstance(publication.target_boundary, JournalBoundary)
+        published = cache.observe(dataset["target_boundary"])
+        self.assertEqual(published, publication.model_dump(exclude_unset=True))
+        published["cached_through"]["cursor"] = -1
+        self.assertGreaterEqual(publication.cached_through.cursor, 0)
+        with closing(sqlite3.connect(cache.path)) as database:
+            encoded = database.execute(
+                "SELECT value FROM metadata WHERE key='source'"
+            ).fetchone()[0]
+        source = cache._decode_source(encoded)
+        self.assertIsInstance(source, CacheSource)
+        self.assertEqual(source.identity, cache.identity)
+
+    def test_typed_cache_source_preserves_uuid_spelling_and_copies_json_fields(self):
+        cache = self.build()["cache"]
+        identity = CacheIdentity(
+            journal_id=cache.identity.journal_id.upper(),
+            generation=cache.identity.generation.upper(),
+        )
+        file_key = list(cache.file_key)
+        source = CacheSource(
+            version=1,
+            identity=identity,
+            file_key=file_key,
+            experiment_id=cache.experiment_id,
+        )
+        self.assertIs(source.identity, identity)
+        self.assertEqual(source.model_dump()["identity"], identity.model_dump())
+        file_key[0] = 0
+        self.assertEqual(source.file_key, list(cache.file_key))
+
     def test_replaced_reader_configuration_cannot_reuse_an_old_ram_event(self):
         """T005/T031/T071: detail identity is checked even when the payload is in RAM."""
         dataset = self.build()

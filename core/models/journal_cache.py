@@ -51,6 +51,23 @@ class CacheSource(_Document):
     file_key: Annotated[list[NonnegativeInteger], Field(min_length=2, max_length=2)]
     experiment_id: Text
 
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> dict[str, object]:
+        if type(document) is dict and type(document.get("identity")) is CacheIdentity:
+            identity = document["identity"]
+            values = dict(document)
+            values["identity"] = {
+                "journal_id": identity.journal_id,
+                "generation": identity.generation,
+            }
+            detached: dict[str, object] = dict(
+                copy_json_object(values, "journal document")
+            )
+            detached["identity"] = identity
+            return detached
+        return dict(copy_json_object(document, "journal document"))
+
 
 class CacheChangeCheckpoint(CacheIdentity):
     change_cursor: SQLitePosition
@@ -82,6 +99,28 @@ class CachePublication(_Document):
     window_predecessor_cursor: SQLitePosition | None = None
     gap: CacheGap | None = None
     target_boundary: JournalBoundary | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> dict[str, object]:
+        if type(document) is not dict:
+            return dict(copy_json_object(document, "journal document"))
+        values = dict(document)
+        retained = {}
+        expected = {
+            "cached_through": CacheCheckpoint,
+            "boundary": JournalBoundary,
+            "target_boundary": JournalBoundary,
+            "gap": CacheGap,
+        }
+        for name, model in expected.items():
+            if type(values.get(name)) is model:
+                value = values[name]
+                values[name] = dict(value)
+                retained[name] = value
+        detached: dict[str, object] = dict(copy_json_object(values, "journal document"))
+        detached.update(retained)
+        return detached
 
 
 class FilteredPublication(JournalBoundary):
