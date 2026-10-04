@@ -88,7 +88,7 @@ class StageClient:
         context = self._runtime_context
         self._logger = OperationLogger(context.logging_config_path)
         self._connection = ParticipantConnection(
-            context.endpoint_path, context.context.model_dump(), role="module"
+            context.endpoint_path, context.context, role="module"
         )
         try:
             self._logger.open()
@@ -102,8 +102,8 @@ class StageClient:
                 self._cancelled.set()
             self._ready.set()
             while True:
-                message = await self._connection.receive_message()
-                if message.get("command") != "cancel":
+                message = await self._connection._receive_notification()
+                if message.command != "cancel":
                     raise ValueError("Unknown executor notification.")
                 self._cancelled.set()
         except asyncio.CancelledError:

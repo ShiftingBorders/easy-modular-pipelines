@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from core.journal.logger import OperationLogger
+from core.models.participant_protocol import ParticipantResponse
 from core.participants.connection import ParticipantConnection
 from core.participants.server import ParticipantServer
 from core.primitives.json_files import read_json, write_json
@@ -60,6 +61,21 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.entered.set()
             await self.release.wait()
         return {"result": "success", "data": request["args"]}
+
+    async def test_internal_request_retains_model_and_public_result_stays_json(self):
+        data = {"unicode": "данные", "nested": [None, False, 1, 1.5]}
+        response = await self.connection._request(
+            str(uuid4()), "echo", data, timeout_seconds=2
+        )
+        self.assertIsInstance(response, ParticipantResponse)
+        self.assertEqual(response.result, "success")
+        self.assertEqual(response.data, data)
+        public = await self.connection.request(
+            str(uuid4()), "echo", data, timeout_seconds=2
+        )
+        self.assertIsInstance(public, dict)
+        self.assertEqual(public["data"], response.data)
+        self.assertEqual(public.keys(), response.model_dump(exclude_unset=True).keys())
 
     async def test_long_work_keeps_controls_responsive_and_late_result_is_durable(self):
         identifier = str(uuid4())

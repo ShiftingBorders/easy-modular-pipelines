@@ -6,16 +6,18 @@ import asyncio
 from pathlib import Path
 from uuid import UUID
 
+from core.models.participant_identity import ParticipantIdentity
 from core.models.participant_protocol import (
     ParticipantEndpoint,
     ParticipantHelloReply,
     ParticipantNotification,
     ParticipantReply,
+    ParticipantResponse,
 )
 from core.participants.protocol import (
     PROTOCOL_VERSION,
+    _participant_identity,
     encode_frame,
-    participant_identity,
     read_frame,
 )
 from core.primitives.json_files import read_json
@@ -27,14 +29,14 @@ class ParticipantConnection:
     def __init__(
         self,
         endpoint_path: Path,
-        expected_identity: JsonObject,
+        expected_identity: ParticipantIdentity | JsonObject,
         *,
         role: str = "runner",
     ) -> None:
         self._endpoint_path = Path(endpoint_path)
         if not self._endpoint_path.is_absolute():
             raise ValueError("endpoint_path must be absolute.")
-        self._identity = participant_identity(expected_identity)
+        self._identity = _participant_identity(expected_identity)
         if role not in ("runner", "module"):
             raise ValueError("Client role must be runner or module.")
         self._role = role
@@ -42,9 +44,11 @@ class ParticipantConnection:
         self._writer = None
         self._receive_task: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
-        self._pending: dict[str, asyncio.Future] = {}
+        self._pending: dict[str, asyncio.Future[ParticipantResponse]] = {}
         self._used_ids: set[str] = set()
-        self._notifications: asyncio.Queue = asyncio.Queue()
+        self._notifications: asyncio.Queue[
+            ParticipantNotification | ConnectionError
+        ] = asyncio.Queue()
 
     async def connect(self, *, timeout_seconds: float) -> None:
         await self.close()
@@ -54,13 +58,15 @@ class ParticipantConnection:
                 await asyncio.to_thread(read_json, self._endpoint_path)
             )
             if any(
-                getattr(endpoint, name) != value
-                for name, value in self._identity.items()
+                getattr(endpoint, name) != getattr(self._identity, name)
+                for name in (
+                    "experiment_id",
+                    "participant_id",
+                    "participant_instance_id",
+                )
             ):
                 raise ValueError("Participant endpoint identity mismatch.")
-            actual = await asyncio.to_thread(
-                process_identity, endpoint.process.pid
-            )
+            actual = await asyncio.to_thread(process_identity, endpoint.process.pid)
             if actual != endpoint.process.model_dump():
                 raise ValueError("Participant OS identity differs from its endpoint.")
             address = endpoint.endpoint
@@ -76,7 +82,7 @@ class ParticipantConnection:
                     {
                         "protocol_version": PROTOCOL_VERSION,
                         "message_type": "hello",
-                        "identity": self._identity,
+                        "identity": self._identity.model_dump(),
                         "role": self._role,
                         "token": token,
                     }
@@ -84,7 +90,7 @@ class ParticipantConnection:
                 reply = ParticipantHelloReply.model_validate(
                     await read_frame(self._reader)
                 )
-                if reply.data != self._identity:
+                if reply.data != self._identity.model_dump():
                     raise ValueError("Participant handshake failed.")
                 self._receive_task = asyncio.create_task(self._receive_loop())
             except BaseException:
@@ -103,12 +109,12 @@ class ParticipantConnection:
                         raise ValueError(
                             "Unexpected notification on the runner channel."
                         )
-                    await self._notifications.put(message.model_dump(exclude_unset=True))
+                    await self._notifications.put(message)
                     continue
                 request_id = str(UUID(message.request_id))
                 future = self._pending.get(request_id)
                 if future is not None and not future.done():
-                    future.set_result(message.model_dump(exclude_unset=True))
+                    future.set_result(message)
                 # A late reply never becomes the result of another request.
         except asyncio.CancelledError:
             pass
@@ -124,6 +130,9 @@ class ParticipantConnection:
 
     async def receive_message(self) -> JsonObject:
         """Receive a notification; replies belong to their request waiter."""
+        return (await self._receive_notification()).model_dump(exclude_unset=True)
+
+    async def _receive_notification(self) -> ParticipantNotification:
         message = await self._notifications.get()
         if isinstance(message, Exception):
             raise message
@@ -145,11 +154,31 @@ class ParticipantConnection:
         timeout_seconds: float | None = None,
         deadline_monotonic: float | None = None,
     ) -> JsonObject:
+        response = await self._request(
+            request_id,
+            command,
+            args,
+            timeout_seconds=timeout_seconds,
+            deadline_monotonic=deadline_monotonic,
+        )
+        return response.model_dump(exclude_unset=True)
+
+    async def _request(
+        self,
+        request_id: str,
+        command: str,
+        args: JsonObject,
+        *,
+        timeout_seconds: float | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> ParticipantResponse:
         request_id = str(UUID(require_text(request_id, "request_id")))
         if request_id in self._used_ids:
             raise ValueError("A request_id cannot be sent twice.")
         self._used_ids.add(request_id)
-        future = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[ParticipantResponse] = (
+            asyncio.get_running_loop().create_future()
+        )
         self._pending[request_id] = future
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -157,7 +186,7 @@ class ParticipantConnection:
                     {
                         "protocol_version": PROTOCOL_VERSION,
                         "message_type": "request",
-                        **self._identity,
+                        **self._identity.model_dump(),
                         "request_id": request_id,
                         "command": command,
                         "args": copy_json_object(args, "request arguments"),

@@ -24,8 +24,21 @@ def error_details(code: str, message: object | None) -> JsonObject | None:
 
 
 def participant_identity(context: JsonObject) -> JsonObject:
-    identity = {name: context[name] for name in IDENTITY_FIELDS}
-    return ParticipantIdentity.model_validate(identity).model_dump()
+    return _participant_identity(context).model_dump()
+
+
+def _participant_identity(
+    context: ParticipantIdentity | JsonObject,
+) -> ParticipantIdentity:
+    if isinstance(context, ParticipantIdentity):
+        return ParticipantIdentity(
+            experiment_id=context.experiment_id,
+            participant_id=context.participant_id,
+            participant_instance_id=context.participant_instance_id,
+        )
+    return ParticipantIdentity.model_validate(
+        {name: context[name] for name in IDENTITY_FIELDS}
+    )
 
 
 def validate_response(response: JsonObject, *, envelope: bool = False) -> JsonObject:
