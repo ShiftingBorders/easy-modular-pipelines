@@ -12,16 +12,22 @@ from core.models.experiment_template import (
     ServiceDefinition,
     StageDefinition,
 )
-from core.models.participant_observations import RetainedServiceStatus
+from core.models.participant_observations import (
+    ExecutorCommandState,
+    RetainedExecutorStatus,
+    RetainedServiceStatus,
+)
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     AttemptParameters,
+    ExecutorStatus,
     LastDecision,
     PendingInput,
     PendingRebuild,
     SavedAttempt,
     SavedRunnerState,
     SavedService,
+    ServiceCallExecutorStatus,
     ServiceFailureDetails,
     ServiceParameters,
     ServiceRequest,
@@ -107,7 +113,8 @@ class StageAttempt:
         self.started_at = None
         self.result_request_id = None
         self.outcome = None
-        self.executor_status: JsonObject | None = None
+        # Non-object legacy values remain readable, as in SavedAttempt.
+        self.executor_status: ExecutorStatus | JsonValue = None
         self.request_id = parameters.attempt_id
         self.participant: JsonObject | None = None
         self.endpoint_path: Path | None = None
@@ -324,6 +331,30 @@ def _relative_state_path(path: Path, root: Path) -> Path:
     return path.relative_to(root)
 
 
+def _executor_status_document(status: ExecutorStatus | JsonValue) -> JsonValue:
+    """Serialize a retained observation at state or public-output boundaries."""
+    if isinstance(
+        status,
+        (ExecutorCommandState, RetainedExecutorStatus, ServiceCallExecutorStatus),
+    ):
+        return status.model_dump(exclude_unset=True)
+    return status
+
+
+def _restore_executor_status(status: JsonValue) -> ExecutorStatus | JsonValue:
+    if not isinstance(status, dict):
+        return status
+    try:
+        return ExecutorCommandState.model_validate(status)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return ServiceCallExecutorStatus.model_validate(status)
+    except (ValueError, TypeError):
+        # The saved field has always accepted partial and opaque JSON metadata.
+        return RetainedExecutorStatus.model_validate(status)
+
+
 def state_to_document(state: RunnerState) -> JsonObject:
     """Serialize known public records, never live tasks or control queues."""
     root = state.experiment_directory.resolve()
@@ -381,6 +412,9 @@ def state_to_document(state: RunnerState) -> JsonObject:
         document["services"][service_id] = saved
     if state.active_attempt is not None:
         attempt = dict(vars(state.active_attempt))
+        attempt["executor_status"] = _executor_status_document(
+            state.active_attempt.executor_status
+        )
         attempt["artifacts_directory"] = _relative_state_path(
             state.active_attempt.artifacts_directory.resolve(), root
         ).as_posix()
@@ -542,7 +576,7 @@ def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
     attempt.started_at = document.started_at
     attempt.result_request_id = document.result_request_id
     attempt.outcome = document.outcome
-    attempt.executor_status = document.executor_status
+    attempt.executor_status = _restore_executor_status(document.executor_status)
     attempt.request_id = document.request_id
     attempt.participant = document.participant.model_dump(exclude_unset=True)
     attempt.endpoint_path = (

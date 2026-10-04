@@ -15,6 +15,7 @@ from core.experiments.assembler import ExperimentAssembler
 from core.experiments.journal import RunnerJournal
 from core.experiments.launch import ModuleLauncher
 from core.journal.events import LoggingStorageError
+from core.models.participant_observations import ExecutorCommandState
 from core.participants.connection import ParticipantConnection
 from core.participants.protocol import read_frame
 from core.primitives.json_files import read_json, write_json
@@ -172,6 +173,22 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(step.done())
             self.assertTrue(process_running(ready["pid"]))
+            attempt = self.session.runner._state.active_attempt
+            status = await wait_until(
+                lambda: (
+                    attempt.executor_status
+                    if isinstance(attempt.executor_status, ExecutorCommandState)
+                    and attempt.executor_status.process is not None
+                    else None
+                )
+            )
+            self.assertEqual(status.process.pid, ready["pid"])
+            self.assertEqual(
+                self.session.runner.get_state()["executor"],
+                status.model_dump(exclude_unset=True),
+            )
+            targets = self.session.runner.get_resource_snapshot()["targets"]
+            self.assertEqual(targets[0]["identity"]["pid"], ready["pid"])
             gate.touch()
             reply = await step
             self.assertEqual(reply["result"], "success", reply)

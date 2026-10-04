@@ -93,6 +93,20 @@ class ExecutorCommandStateResponse(CommandStateResponse):
     data: ExecutorCommandState
 
 
+class RetainedExecutorStatus(_Observation):
+    """Partial execution metadata retains the historical saved-state contract.
+
+    RPC observations use ExecutorCommandState. Accepted results and older state
+    files can omit its fields or contain opaque execution metadata instead.
+    """
+
+    process: JsonValue = None
+    started_at: JsonValue = None
+    finished: JsonValue = False
+    current: JsonValue = None
+    pending: JsonValue = None
+
+
 class ServiceStateExport(_Observation):
     state_path: Text | None = None
 

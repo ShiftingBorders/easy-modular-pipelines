@@ -45,6 +45,7 @@ from core.experiments.state import (
     StageOutcome,
     _apply_recovered_attempt_context,
     _attempt_from_launch,
+    _executor_status_document,
     state_from_document,
 )
 from core.journal.events import LoggingError, encode_event
@@ -54,12 +55,17 @@ from core.models.experiment_template import (
     ExperimentTemplate,
     ServiceDefinition,
 )
+from core.models.participant_observations import (
+    ExecutorCommandState,
+    RetainedExecutorStatus,
+)
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     DagDecision,
     LastDecision,
     PendingInput,
     PendingRebuild,
+    ServiceCallExecutorStatus,
 )
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
@@ -2801,7 +2807,18 @@ class ExperimentRunner:
             attempt is not None
             and attempt.service_id is None
             and attempt.process_identity is not None
-            and not (attempt.executor_status or {}).get("finished", False)
+            and not (
+                attempt.executor_status.finished
+                if isinstance(
+                    attempt.executor_status,
+                    (
+                        ExecutorCommandState,
+                        RetainedExecutorStatus,
+                        ServiceCallExecutorStatus,
+                    ),
+                )
+                else (attempt.executor_status or {}).get("finished", False)
+            )
         ):
             definition = next(
                 item
@@ -2897,7 +2914,9 @@ class ExperimentRunner:
             if state is None or state.last_dag_decision is None
             else state.last_dag_decision.model_dump(exclude_unset=True),
             "attempt_id": None if attempt is None else attempt.attempt_id,
-            "executor": None if attempt is None else attempt.executor_status,
+            "executor": None
+            if attempt is None
+            else _executor_status_document(attempt.executor_status),
             "result": None if state is None else state.last_result,
             "error": self._error,
             "source": "runner",

@@ -35,8 +35,17 @@ from core.models.experiment_template import (
     ServiceCallDefinition,
     StageDefinition,
 )
-from core.models.participant_observations import ExecutorCommandStateResponse
-from core.models.runner_state import PendingInput
+from core.models.participant_observations import (
+    ExecutorCommandState,
+    ExecutorCommandStateResponse,
+    RetainedExecutorStatus,
+)
+from core.models.runner_state import (
+    ExecutorStatus,
+    PendingInput,
+    ServiceCallExecutorStatus,
+)
+from core.models.updates import _update_model
 from core.participants.connection import ParticipantConnection
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, JsonValue
@@ -53,6 +62,22 @@ def _record_runner_checkpoint(logger: OperationLogger, state: RunnerState) -> No
         state_to_document(state),
         context={"experiment_id": state.experiment_id, "run_id": state.run_id},
     )
+
+
+def _finish_executor_status(status: ExecutorStatus | JsonValue) -> ExecutorStatus:
+    if isinstance(
+        status,
+        (ExecutorCommandState, RetainedExecutorStatus, ServiceCallExecutorStatus),
+    ):
+        return _update_model(status, finished=True, current=None, pending=[])
+    if isinstance(status, dict):
+        values = dict(status)
+    elif not status:
+        values = {}
+    else:
+        raise TypeError("Executor status must be an object to accept a result.")
+    values.update(finished=True, current=None, pending=[])
+    return RetainedExecutorStatus.model_validate(values)
 
 
 class StageRunner:
@@ -558,15 +583,10 @@ class StageRunner:
         attempt.outcome = outcome
         execution = response.get("execution", {})
         if execution:
-            attempt.executor_status = execution
+            attempt.executor_status = RetainedExecutorStatus.model_validate(execution)
             attempt.process_identity = execution.get("process")
             attempt.started_at = execution.get("started_at")
-        attempt.executor_status = {
-            **(attempt.executor_status or {}),
-            "finished": True,
-            "current": None,
-            "pending": [],
-        }
+        attempt.executor_status = _finish_executor_status(attempt.executor_status)
         self._save_state(state)
         if self._notify_resources is not None:
             self._notify_resources()
@@ -641,12 +661,7 @@ class StageRunner:
                     attempt.result_request_id = attempt.request_id
                     attempt.outcome = record["outcome"]
                     execution = record["response"].get("execution", {})
-                    attempt.executor_status = {
-                        **execution,
-                        "finished": True,
-                        "current": None,
-                        "pending": [],
-                    }
+                    attempt.executor_status = _finish_executor_status(execution)
                     if execution:
                         attempt.process_identity = execution.get("process")
                         attempt.started_at = execution.get("started_at")
@@ -702,15 +717,13 @@ class StageRunner:
                             "invalidated",
                         )
                     attempt.process_identity = instance.process_identity
-                    attempt.executor_status = {
-                        "participant": attempt.participant,
-                        "request_id": attempt.request_id,
-                        "process": instance.process_identity,
-                        "finished": False,
-                        "current": None
-                        if instance.active_request is None
-                        else instance.active_request.model_dump(exclude_unset=True),
-                    }
+                    attempt.executor_status = ServiceCallExecutorStatus(
+                        participant=attempt.participant,
+                        request_id=attempt.request_id,
+                        process=instance.process_identity,
+                        finished=False,
+                        current=instance.active_request,
+                    )
                     if (
                         self._call_future is not None
                         and self._call_future.done()
@@ -762,7 +775,7 @@ class StageRunner:
             first_observation = (
                 attempt.process_identity is None and reply.data.process is not None
             )
-            attempt.executor_status = reply.data.model_dump(exclude_unset=True)
+            attempt.executor_status = reply.data
             attempt.process_identity = (
                 None if reply.data.process is None else reply.data.process.model_dump()
             )

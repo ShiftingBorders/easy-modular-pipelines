@@ -64,6 +64,9 @@ Recovery validates command-state observations before updating executor records
 or reconciling service work. Service exports validate their relative path before
 the owner checks actual filesystem confinement. Conditional result models check
 decision structure; the runner retains current DAG membership and payload policy.
+Attempts retain validated executor observations and service-call status models;
+state files and public status responses serialize them. Recovery also accepts
+historical partial or opaque executor metadata without strengthening its schema.
 
 Server command, chain and target models normalize admission payloads. Controller
 argument models check supported control operations before invoking public runner

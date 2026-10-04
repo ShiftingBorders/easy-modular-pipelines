@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import yaml
 
+from core.experiments.stages import _finish_executor_status
 from core.experiments.state import (
     RunnerState,
     RunnerStateStore,
@@ -28,6 +29,8 @@ from core.models.experiment_template import (
     ServiceDefinition,
 )
 from core.models.participant_observations import (
+    ExecutorCommandState,
+    RetainedExecutorStatus,
     RetainedServiceStatus,
     ServiceObservation,
 )
@@ -37,6 +40,7 @@ from core.models.runner_state import (
     LastDecision,
     PendingInput,
     PendingRebuild,
+    ServiceCallExecutorStatus,
     ServiceFailure,
     ServiceFailureDetails,
     ServiceRequest,
@@ -281,6 +285,116 @@ class RunnerStateTests(unittest.TestCase):
         service.endpoint_path = self.root / "service-endpoint.json"
         self.state.services[service_id] = service
         return attempt, service
+
+    def test_executor_status_models_survive_json_publication_and_recovery(self):
+        attempt, _ = self._add_path_participants()
+        identity = process_identity(os.getpid())
+        request = WorkingServiceRequest(
+            owner="caller",
+            request_id=attempt.request_id,
+            command="execute",
+            args={"value": [1, None]},
+            queued_monotonic=1,
+            sent_monotonic=None,
+            timed_out=False,
+        )
+        full = ExecutorCommandState.model_validate(
+            {
+                "current": {"request_id": attempt.request_id, "command": "execute"},
+                "pending": [],
+                "process": identity,
+                "started_at": "started",
+                "started_monotonic": 1,
+                "finished": False,
+                "exit_code": None,
+                "progress": {"value": 0.5, "detail": {"value": 1}},
+                "module_state": {"working": True},
+                "extra": [1, 1.0, True],
+            }
+        )
+        service = ServiceCallExecutorStatus(
+            participant=attempt.participant,
+            request_id=attempt.request_id,
+            process=identity,
+            finished=False,
+            current=request,
+        )
+        self.assertIs(service.current, request)
+        for status in (
+            full,
+            service,
+            RetainedExecutorStatus.model_validate({}),
+            RetainedExecutorStatus.model_validate(
+                {"finished": "historical", "process": {}, "unknown": None}
+            ),
+        ):
+            with self.subTest(status=type(status).__name__):
+                attempt.executor_status = status
+                document = state_to_document(self.state)
+                expected = status.model_dump(exclude_unset=True)
+                self.assertEqual(
+                    document["active_attempt"]["executor_status"], expected
+                )
+                json.dumps(document, allow_nan=False)
+                restored = state_from_document(self.root, document)
+                self.assertIsInstance(
+                    restored.active_attempt.executor_status, type(status)
+                )
+                self.assertEqual(state_to_document(restored), document)
+                finished = _finish_executor_status(status)
+                self.assertEqual(
+                    finished.model_dump(exclude_unset=True),
+                    {**expected, "finished": True, "current": None, "pending": []},
+                )
+                self.assertEqual(status.model_dump(exclude_unset=True), expected)
+        attempt.executor_status = full
+        document = state_to_document(self.state)
+        document["active_attempt"]["executor_status"]["progress"]["detail"]["value"] = 9
+        self.assertEqual(full.progress.model_extra["detail"]["value"], 1)
+
+    def test_recovery_keeps_non_object_legacy_executor_status_values(self):
+        attempt, _ = self._add_path_participants()
+        for value in (None, False, 1, "historical", [], ["legacy"]):
+            with self.subTest(value=value):
+                attempt.executor_status = value
+                document = state_to_document(self.state)
+                restored = state_from_document(self.root, document)
+                self.assertEqual(restored.active_attempt.executor_status, value)
+                self.assertEqual(state_to_document(restored), document)
+                if not value:
+                    self.assertEqual(
+                        _finish_executor_status(value).model_dump(exclude_unset=True),
+                        {"finished": True, "current": None, "pending": []},
+                    )
+                else:
+                    with self.assertRaises(TypeError):
+                        _finish_executor_status(value)
+
+    def test_finishing_executor_status_preserves_metadata_and_original_observation(
+        self,
+    ):
+        status = ExecutorCommandState.model_validate(
+            {
+                "current": {"request_id": str(uuid4()), "command": "execute"},
+                "pending": [{"request_id": str(uuid4()), "command": "next"}],
+                "process": process_identity(os.getpid()),
+                "started_at": "started",
+                "started_monotonic": 1,
+                "finished": False,
+                "exit_code": None,
+                "progress": {"value": 0.5},
+                "module_state": {"working": True},
+                "extra": {"kept": True},
+            }
+        )
+        original = status.model_dump(exclude_unset=True)
+        finished = _finish_executor_status(status)
+        self.assertIsInstance(finished, ExecutorCommandState)
+        self.assertEqual(
+            finished.model_dump(exclude_unset=True),
+            {**original, "finished": True, "current": None, "pending": []},
+        )
+        self.assertEqual(status.model_dump(exclude_unset=True), original)
 
     @unittest.skipUnless(os.name == "nt", "Windows realpath namespace race")
     def test_disappearing_stage_and_service_endpoints_survive_state_round_trip(self):

@@ -13,6 +13,11 @@ from pydantic import (
 
 from core.models.experiment_template import ExperimentTemplate, ServiceDefinition
 from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_observations import (
+    CommandWork,
+    ExecutorCommandState,
+    RetainedExecutorStatus,
+)
 from core.models.process_identity import ProcessIdentity
 from core.models.values import (
     AbsolutePath,
@@ -194,6 +199,22 @@ class WorkingServiceRequest(_Input):
     sent_monotonic: int | float | None
     service_instance_id: str | None = None
     timed_out: Boolean
+
+
+class ServiceCallExecutorStatus(_Input):
+    """Runner observation of service work, with the live request retained."""
+
+    participant: Object | None
+    request_id: UUIDText
+    process: Object | None
+    finished: Boolean
+    current: WorkingServiceRequest | None
+    pending: list[CommandWork] = Field(default_factory=list)
+
+
+type ExecutorStatus = (
+    ExecutorCommandState | RetainedExecutorStatus | ServiceCallExecutorStatus
+)
 
 
 class SavedService(_Document):
