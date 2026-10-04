@@ -24,6 +24,7 @@ from core.models.client_settings import (
 )
 from core.models.server_commands import ServerChain, ServerCommand
 from core.models.server_receipts import ChainReceipt, CommandReceipt
+from core.models.updates import _update_model
 from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
@@ -359,9 +360,10 @@ class APIClient:
             ) from error
 
     async def wait(self, receipt: JsonObject, timeout: float) -> JsonObject:
-        return await self._wait(_command_receipt(receipt), timeout)
+        result = await self._wait(_command_receipt(receipt), timeout)
+        return result.model_dump(exclude_unset=True)
 
-    async def _wait(self, receipt: CommandReceipt, timeout: float) -> JsonObject:
+    async def _wait(self, receipt: CommandReceipt, timeout: float) -> CommandReceipt:
         identifier = receipt.command_id
         instance = receipt.server_instance_id
         deadline = time.monotonic() + timeout
@@ -407,7 +409,7 @@ class APIClient:
                     code="invalid_response",
                     details={"command_id": identifier},
                 )
-        return result.model_dump(exclude_unset=True)
+        return result
 
 
 def execution_options(
@@ -710,6 +712,10 @@ def _rerun_arguments(options: argparse.Namespace) -> JsonObject:
 
 
 def command_document(options: argparse.Namespace) -> JsonObject:
+    return _command_model(options).model_dump(exclude_none=True)
+
+
+def _command_model(options: argparse.Namespace) -> ServerCommand:
     name = options.action
     args: JsonObject = {}
     target: JsonObject | None = None
@@ -773,7 +779,7 @@ def command_document(options: argparse.Namespace) -> JsonObject:
     }
     if target is not None:
         document["target"] = target
-    return ServerCommand.model_validate(document).model_dump(exclude_none=True)
+    return ServerCommand.model_validate(document)
 
 
 def display(document: JsonObject, *, as_json: bool, streaming: bool = False) -> None:
@@ -806,10 +812,12 @@ def display(document: JsonObject, *, as_json: bool, streaming: bool = False) -> 
     )
 
 
-def outcome_code(document: JsonObject) -> int:
-    if document.get("state") in ("unknown", "unavailable"):
+def outcome_code(document: JsonObject | CommandReceipt) -> int:
+    state = document.state if isinstance(document, CommandReceipt) else document.get("state")
+    result = document.result if isinstance(document, CommandReceipt) else document.get("result")
+    if state in ("unknown", "unavailable"):
         return 3
-    return 1 if document.get("result") == "fail" else 0
+    return 1 if result == "fail" else 0
 
 
 async def execute(
@@ -991,9 +999,10 @@ async def _read_journal(
 
 
 async def _send_submission(
-    client: APIClient, path: str, document: JsonObject,
+    client: APIClient, path: str, submission: ServerCommand | ServerChain,
     identifiers: list[str], timeout: float, *, wait_for_shutdown: bool,
 ) -> JsonObject:
+    document = submission.model_dump(exclude_none=True)
     try:
         if wait_for_shutdown:
             return await client.request(
@@ -1019,23 +1028,22 @@ async def _execute_submission(
 ) -> int:
     action = options.action
     if action == "chain":
-        chain = _chain_document(options.file, options.chain_id)
-        document = chain.model_dump(exclude_none=True)
-        identifiers = [item.command_id for item in chain.commands]
+        submission = _chain_document(options.file, options.chain_id)
+        identifiers = [item.command_id for item in submission.commands]
         path = "/chains"
     else:
-        document = command_document(options)
-        identifiers = [require_text(document["command_id"], "command_id")]
+        submission = _command_model(options)
+        identifiers = [submission.command_id]
         path = "/commands"
     print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
-    wait_for_shutdown = document.get("command") == "server.shutdown" and wait
-    receipt = await _send_submission(
-        client, path, document, identifiers, timeout,
+    wait_for_shutdown = isinstance(submission, ServerCommand) and submission.command == "server.shutdown" and wait
+    received = await _send_submission(
+        client, path, submission, identifiers, timeout,
         wait_for_shutdown=wait_for_shutdown,
     )
-    if action != "chain":
-        receipt = command_receipt(receipt)
-        if receipt["command_id"] != identifiers[0]:
+    if isinstance(submission, ServerCommand):
+        receipt = _command_receipt(received)
+        if receipt.command_id != identifiers[0]:
             raise ClientError(
                 "Server returned a receipt for another command.",
                 code="invalid_response",
@@ -1043,26 +1051,30 @@ async def _execute_submission(
             )
     else:
         receipt = _chain_receipt(
-            receipt, document["chain_id"], identifiers
-        ).model_dump(exclude_unset=True)
+            received, submission.chain_id, identifiers
+        )
     if not wait:
-        display(receipt, as_json=as_json)
-        if action == "chain":
+        display(receipt.model_dump(exclude_unset=True), as_json=as_json)
+        if isinstance(receipt, ChainReceipt):
             return max(
-                (outcome_code(item) for item in receipt["commands"]),
+                (outcome_code(item) for item in receipt.commands),
                 default=0,
             )
         return outcome_code(receipt)
-    if action != "chain":
-        result = await client.wait(receipt, timeout)
-        display(result, as_json=as_json)
+    if isinstance(receipt, CommandReceipt):
+        result = _command_receipt(await client.wait(
+            receipt.model_dump(exclude_unset=True), timeout
+        ))
+        display(result.model_dump(exclude_unset=True), as_json=as_json)
         return outcome_code(result)
     results = []
     deadline = time.monotonic() + timeout
-    for ticket in receipt["commands"]:
-        results.append(await client.wait(ticket, max(0, deadline - time.monotonic())))
-    receipt["commands"] = copy_json_object({"items": results}, "chain results")["items"]
-    display(receipt, as_json=as_json)
+    for ticket in receipt.commands:
+        results.append(_command_receipt(await client.wait(
+            ticket.model_dump(exclude_unset=True), max(0, deadline - time.monotonic())
+        )))
+    receipt = _update_model(receipt, commands=results)
+    display(receipt.model_dump(exclude_unset=True), as_json=as_json)
     return max((outcome_code(result) for result in results), default=0)
 
 

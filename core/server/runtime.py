@@ -27,12 +27,14 @@ from uuid import UUID, uuid4
 from core.models.server_arguments import CommandListArguments
 from core.models.server_commands import (
     ControllerOutcome,
+    RuntimeCommandOutcome,
     RuntimeReady,
     RuntimeStopped,
     ServerChain,
     ServerCommand,
 )
 from core.models.server_receipts import ChainReceipt, CommandReceipt
+from core.models.updates import _update_model
 from core.primitives.file_lock import _lock_open_stream
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -561,17 +563,21 @@ def controller_process(
 
 
 class CommandRecord:
-    def __init__(self, command: JsonObject) -> None:
+    def __init__(self, command: ServerCommand, chain_id: str | None = None) -> None:
+        self.request = command
+        document = command.model_dump(exclude_none=True)
+        if chain_id is not None:
+            document["chain_id"] = chain_id
         encoded = json.dumps(
-            command, sort_keys=True, ensure_ascii=False, allow_nan=False
+            document, sort_keys=True, ensure_ascii=False, allow_nan=False
         ).encode("utf-8")
         self.fingerprint = hashlib.sha256(encoded).hexdigest()
-        self.chain_id = command.get("chain_id")
-        self.command = command["command"]
-        self.is_stop = command["command"] == "stop" and self.chain_id is None
+        self.chain_id = chain_id
+        self.command = command.command
+        self.is_stop = command.command == "stop" and self.chain_id is None
         self.submitted_at = datetime.now(UTC).isoformat()
         self.finished_at: float | None = None
-        self.response: JsonObject | None = None
+        self.response: ControllerOutcome | RuntimeCommandOutcome | None = None
         self.size = 0
 
 
@@ -595,7 +601,9 @@ class ServerRuntime:
         self._ready: asyncio.Future | None = None
         self._records: OrderedDict[str, CommandRecord] = OrderedDict()
         self._chains: dict[str, list[str]] = {}
-        self._reads: dict[str, asyncio.Future[JsonObject]] = {}
+        self._reads: dict[
+            str, asyncio.Future[ControllerOutcome | RuntimeCommandOutcome]
+        ] = {}
         self._cache_bytes = 0
         self._state = "new"
         self._error: str | None = None
@@ -605,11 +613,11 @@ class ServerRuntime:
         self._storage: JsonObject | None = None
         self._runtime_id = str(uuid4())
         self._restart_task: asyncio.Task | None = None
-        self._restart_command: JsonObject | None = None
+        self._restart_command: ServerCommand | None = None
         self._restart_blocked: str | None = None
         self._http_closing = False
 
-    async def start(self, *, restart_command: JsonObject | None = None) -> None:
+    async def start(self, *, restart_command: ServerCommand | None = None) -> None:
         if restart_command is not None:
             return await self._run_lifecycle_command(restart_command)
         if self._state != "new":
@@ -650,52 +658,33 @@ class ServerRuntime:
                 error.add_note(f"Runtime cleanup also failed: {cleanup_error}")
             raise
 
-    async def _run_lifecycle_command(self, restart_command: JsonObject) -> None:
+    async def _run_lifecycle_command(self, restart_command: ServerCommand) -> None:
         if restart_command is not self._restart_command:
             raise RuntimeError("Admit server lifecycle commands through submit first.")
         previous_id = self._runtime_id
-        shutdown_requested = restart_command["command"] == "server.shutdown"
-        mode = restart_command["args"].get("mode", self.settings.server_mode)
-        response = {
-            "command_id": restart_command["command_id"],
-            "chain_id": None,
-            "experiment_id": None,
-            "state": "succeeded",
-            "result": "success",
-            "data": None,
-            "error": None,
-        }
+        shutdown_requested = restart_command.command == "server.shutdown"
+        mode = restart_command.args.get("mode", self.settings.server_mode)
+        response = ControllerOutcome.model_validate(
+            {
+                "command_id": restart_command.command_id,
+                "chain_id": None,
+                "experiment_id": None,
+                "state": "succeeded",
+                "result": "success",
+                "data": None,
+                "error": None,
+            }
+        )
         try:
             unchanged = (
-                restart_command["command"] == "server.mode"
+                restart_command.command == "server.mode"
                 and mode == self.settings.server_mode
                 and self._state == "ready"
                 and self._process is not None
                 and self._process.is_alive()
             )
             if not unchanged:
-                # Finish shutdown even if the HTTP owner is itself stopping.
-                # Replacing queues before a confirmed exit risks two owners.
-                shutdown = asyncio.create_task(self.close(restarting=True))
-                cancelled = False
-                try:
-                    while True:
-                        try:
-                            await asyncio.shield(shutdown)
-                            break
-                        except asyncio.CancelledError:
-                            cancelled = True
-                            if shutdown.cancelled():
-                                raise
-                except Exception as error:
-                    self._restart_blocked = (
-                        self._restart_blocked
-                        or f"Runtime shutdown was not confirmed: {error}"
-                    )
-                    raise
-                finally:
-                    if cancelled:
-                        raise asyncio.CancelledError
+                await self._close_for_lifecycle()
                 if self._http_closing:
                     raise asyncio.CancelledError
                 if shutdown_requested:
@@ -705,36 +694,30 @@ class ServerRuntime:
                     self._http_closing = True
                 else:
                     self.settings.server_mode = mode
-                    self._runtime_id = str(uuid4())
-                    self._reader_stop = threading.Event()
-                    self._reader_thread = None
-                    self._watcher = None
-                    self._ready = None
-                    self._identity = None
-                    self._storage = None
-                    self._last_response_at = None
-                    self._error = None
-                    self._closing = False
-                    self._state = "new"
-                    await self.start()
-            response["data"] = (
-                {
-                    "runtime_id": self._runtime_id,
-                    "runtime_stopped": True,
-                    "http_shutdown_requested": True,
-                }
-                if shutdown_requested
-                else {
-                    "previous_runtime_id": previous_id,
-                    "runtime_id": self._runtime_id,
-                    "server_mode": self.settings.server_mode,
-                    "changed": not unchanged,
-                    "controller": self._identity,
-                }
+                    await self._start_replacement_runtime()
+            response = _update_model(
+                response,
+                data=(
+                    {
+                        "runtime_id": self._runtime_id,
+                        "runtime_stopped": True,
+                        "http_shutdown_requested": True,
+                    }
+                    if shutdown_requested
+                    else {
+                        "previous_runtime_id": previous_id,
+                        "runtime_id": self._runtime_id,
+                        "server_mode": self.settings.server_mode,
+                        "changed": not unchanged,
+                        "controller": self._identity,
+                    }
+                ),
             )
         except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - Lifecycle failures are retained command outcomes.
             cancelled = isinstance(error, asyncio.CancelledError)
-            response.update(
+            error_message = "HTTP server is stopping." if cancelled else str(error)
+            response = _update_model(
+                response,
                 state="cancelled" if cancelled else "failed",
                 result="fail",
                 error={
@@ -745,19 +728,56 @@ class ServerRuntime:
                         if shutdown_requested
                         else "runtime_restart_failed"
                     ),
-                    "message": "HTTP server is stopping." if cancelled else str(error),
+                    "message": error_message,
                     "details": {"notes": list(getattr(error, "__notes__", []))},
                 },
             )
-            self._error = response["error"]["message"]
+            self._error = error_message
         finally:
             # A closed controller must not hide the HTTP-owned receipt.
             if self._state == "closed":
                 self._state = "unavailable"
             self._accept_response(response)
             self._restart_command = None
-            if shutdown_requested and response["state"] == "succeeded":
+            if shutdown_requested and response.state == "succeeded":
                 self._state = "closed"
+
+    async def _close_for_lifecycle(self) -> None:
+        """Confirm shutdown before replacing queues, even when the owner is cancelled."""
+        shutdown = asyncio.create_task(self.close(restarting=True))
+        cancelled = False
+        try:
+            while True:
+                try:
+                    await asyncio.shield(shutdown)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if shutdown.cancelled():
+                        raise
+        except Exception as error:
+            self._restart_blocked = (
+                self._restart_blocked or f"Runtime shutdown was not confirmed: {error}"
+            )
+            raise
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _start_replacement_runtime(self) -> None:
+        """Open a new runtime only after the previous owner has confirmed exit."""
+        self._runtime_id = str(uuid4())
+        self._reader_stop = threading.Event()
+        self._reader_thread = None
+        self._watcher = None
+        self._ready = None
+        self._identity = None
+        self._storage = None
+        self._last_response_at = None
+        self._error = None
+        self._closing = False
+        self._state = "new"
+        await self.start()
 
     def health(self) -> JsonObject:
         alive = self._process is not None and self._process.is_alive()
@@ -768,7 +788,7 @@ class ServerRuntime:
             "storage_initialization": self._storage,
             "state": (
                 "shutting_down"
-                if self._restart_command["command"] == "server.shutdown"
+                if self._restart_command.command == "server.shutdown"
                 else "restarting"
             )
             if self._restart_command is not None
@@ -813,7 +833,8 @@ class ServerRuntime:
     def submit(self, document: object, *, chain: bool = False) -> JsonObject:
         """Validate and enqueue without awaiting: disconnect cannot split admission."""
         self._prune()
-        chain_id, commands, message = self._normalize_submission(document, chain)
+        chain_id, commands, submission = self._normalize_submission(document, chain)
+        message = self._submission_document(submission)
         if (
             len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
             > self.settings.max_request_bytes
@@ -823,9 +844,46 @@ class ServerRuntime:
                 "Command envelope exceeds its configured limit.",
                 413,
             )
-        identifiers = [
-            require_text(command["command_id"], "command_id") for command in commands
-        ]
+        identifiers = [command.command_id for command in commands]
+        self._check_submission_identifiers(identifiers, chain_id)
+        records = [CommandRecord(command, chain_id) for command in commands]
+        if self._is_retained_submission(identifiers, records):
+            return self._receipt(identifiers, chain_id)
+        self._check_submission_mode(commands)
+        lifecycle = not chain and commands[0].command in (
+            "server.restart",
+            "server.mode",
+            "server.shutdown",
+        )
+        if lifecycle:
+            self._admit_lifecycle_command(commands)
+        else:
+            requests = self._require_ready()
+        priority_stop = not chain and commands[0].command == "stop"
+        self._check_submission_capacity(
+            len(commands), chain_id, priority_stop, lifecycle
+        )
+        if not lifecycle:
+            try:
+                requests.put_nowait(message)
+            except Full as error:
+                raise ServerError(
+                    "queue_full", "Controller request queue is full.", 429
+                ) from error
+        for identifier, record in zip(identifiers, records, strict=True):
+            self._records[identifier] = record
+        if chain_id is not None:
+            self._chains[chain_id] = identifiers
+        if lifecycle:
+            self._restart_command = commands[0]
+            self._restart_task = asyncio.create_task(
+                self.start(restart_command=commands[0])
+            )
+        return self._receipt(identifiers, chain_id)
+
+    def _check_submission_identifiers(
+        self, identifiers: list[str], chain_id: str | None
+    ) -> None:
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("Command IDs in a chain must be distinct.")
         if any(identifier in self._reads for identifier in identifiers):
@@ -844,7 +902,10 @@ class ServerRuntime:
                 "The retained chain ID has a different command order or membership.",
                 409,
             )
-        records = [CommandRecord(command) for command in commands]
+
+    def _is_retained_submission(
+        self, identifiers: list[str], records: list[CommandRecord]
+    ) -> bool:
         existing = [identifier in self._records for identifier in identifiers]
         if any(existing):
             if not all(existing) or any(
@@ -856,11 +917,14 @@ class ServerRuntime:
                     "A retained command ID has a different request.",
                     409,
                 )
-            return self._receipt(identifiers, chain_id)
+            return True
+        return False
+
+    def _check_submission_mode(self, commands: list[ServerCommand]) -> None:
         # Replaying a retained request retrieves its receipt across mode changes;
         # only new work is subject to the current runtime's admission policy.
         for command in commands:
-            name = command["command"]
+            name = command.command
             if (
                 name in ("service.start", "service.stop", "reload_template")
                 and self.settings.server_mode != "run"
@@ -877,15 +941,10 @@ class ServerRuntime:
                 raise ServerError(
                     "invalid_mode", "Module commands require --mode maintenance.", 409
                 )
-        lifecycle = not chain and commands[0]["command"] in (
-            "server.restart",
-            "server.mode",
-            "server.shutdown",
-        )
-        if lifecycle:
-            self._admit_lifecycle_command(commands)
-        else:
-            requests = self._require_ready()
+
+    def _check_submission_capacity(
+        self, count: int, chain_id: str | None, priority_stop: bool, lifecycle: bool
+    ) -> None:
         if chain_id is not None and chain_id in self._chains:
             raise ServerError(
                 "chain_id_conflict",
@@ -895,12 +954,11 @@ class ServerRuntime:
         pending = [
             record for record in self._records.values() if record.response is None
         ]
-        priority_stop = not chain and commands[0]["command"] == "stop"
         if priority_stop and any(record.is_stop for record in pending):
             raise ServerError(
                 "stop_pending", "A standalone stop is already pending.", 409
             )
-        if len(pending) + len(commands) > self.settings.max_pending + int(
+        if len(pending) + count > self.settings.max_pending + int(
             priority_stop or lifecycle
         ):
             raise ServerError(
@@ -908,55 +966,58 @@ class ServerRuntime:
                 "Too many pending commands; a standalone stop remains available.",
                 429,
             )
-        self._prune(required=len(commands))
-        if len(self._records) + len(commands) > self.settings.max_records:
+        self._prune(required=count)
+        if len(self._records) + count > self.settings.max_records:
             raise ServerError(
                 "queue_full", "The command record limit has been reached.", 429
             )
-        if not lifecycle:
-            try:
-                requests.put_nowait(message)
-            except Full as error:
-                raise ServerError(
-                    "queue_full", "Controller request queue is full.", 429
-                ) from error
-        for identifier, record in zip(identifiers, records, strict=True):
-            self._records[identifier] = record
-        if chain_id is not None:
-            self._chains[chain_id] = identifiers
-        if lifecycle:
-            self._restart_command = message
-            self._restart_task = asyncio.create_task(
-                self.start(restart_command=message)
-            )
-        return self._receipt(identifiers, chain_id)
 
     def _normalize_submission(
         self, document: object, chain: bool
-    ) -> tuple[str | None, list[JsonObject], JsonObject]:
+    ) -> tuple[str | None, list[ServerCommand], ServerChain | ServerCommand]:
         chain_id = None
         if chain:
-            validated = ServerChain.model_validate(document)
+            validated = (
+                document.model_copy(deep=True)
+                if isinstance(document, ServerChain)
+                else ServerChain.model_validate(document)
+            )
             chain_id = validated.chain_id
-            commands = [
-                self._command_document(item, chain_id) for item in validated.commands
-            ]
-            message = {"api_version": 1, "chain_id": chain_id, "commands": commands}
+            commands = validated.commands
         else:
-            message = self._command(document)
-            commands = [message]
-        return chain_id, commands, message
+            validated = (
+                document.model_copy(deep=True)
+                if isinstance(document, ServerCommand)
+                else ServerCommand.model_validate(document)
+            )
+            commands = [validated]
+        return chain_id, commands, validated
 
-    def _admit_lifecycle_command(self, commands: list[JsonObject]) -> None:
+    def _submission_document(
+        self, submission: ServerChain | ServerCommand
+    ) -> JsonObject:
+        """Materialize the original wire shape for size checks and IPC."""
+        if isinstance(submission, ServerChain):
+            return {
+                "api_version": 1,
+                "chain_id": submission.chain_id,
+                "commands": [
+                    self._command_document(item, submission.chain_id)
+                    for item in submission.commands
+                ],
+            }
+        return self._command_document(submission, None)
+
+    def _admit_lifecycle_command(self, commands: list[ServerCommand]) -> None:
         if self._restart_command is not None:
             raise ServerError(
                 "shutdown_pending"
-                if self._restart_command["command"] == "server.shutdown"
+                if self._restart_command.command == "server.shutdown"
                 else "restart_pending",
                 "A server lifecycle operation is already pending.",
                 409,
             )
-        if commands[0]["command"] == "server.shutdown" and self._stop_http is None:
+        if commands[0].command == "server.shutdown" and self._stop_http is None:
             raise ServerError(
                 "unsupported_feature",
                 "This HTTP owner does not support remote shutdown.",
@@ -972,17 +1033,20 @@ class ServerRuntime:
     def _receipt(self, identifiers: list[str], chain_id: str | None) -> JsonObject:
         if chain_id is None:
             return self.result(identifiers[0])
-        document = copy_json_object(
+        receipt = ChainReceipt.model_validate(
             {
                 "server_instance_id": self.instance_id,
                 "chain_id": chain_id,
-                "commands": [self.result(key) for key in identifiers],
+                "commands": [self._result(key) for key in identifiers],
             },
-            "receipt",
         )
-        return ChainReceipt.model_validate(document).model_dump(exclude_unset=True)
+        # Runtime chain output historically also checked the whole JSON depth.
+        return copy_json_object(receipt.model_dump(exclude_unset=True), "receipt")
 
     def result(self, command_id: str) -> JsonObject:
+        return self._result(command_id).model_dump(exclude_unset=True)
+
+    def _result(self, command_id: str) -> CommandReceipt:
         identifier = str(UUID(command_id))
         self._prune()
         record = self._records.get(identifier)
@@ -992,20 +1056,24 @@ class ServerRuntime:
                 "Command is unknown or expired in this server instance; do not infer that it never executed.",
                 404,
             )
-        response = record.response or {
-            "command_id": identifier,
-            "chain_id": record.chain_id,
-            "state": "pending",
-            "result": None,
-            "experiment_id": None,
-            "data": None,
-            "error": None,
-        }
-        return CommandReceipt.model_validate({
-            **response,
-            "server_instance_id": self.instance_id,
-            "submitted_at": record.submitted_at,
-        }).model_dump(exclude_unset=True)
+        response = record.response or RuntimeCommandOutcome.model_validate(
+            {
+                "command_id": identifier,
+                "chain_id": record.chain_id,
+                "state": "pending",
+                "result": None,
+                "experiment_id": None,
+                "data": None,
+                "error": None,
+            }
+        )
+        values: dict[str, object] = dict(response.model_extra or {})
+        for name in response.model_fields_set & type(response).model_fields.keys():
+            values[name] = getattr(response, name)
+        values.update(
+            server_instance_id=self.instance_id, submitted_at=record.submitted_at
+        )
+        return CommandReceipt.model_validate(values)
 
     def list_commands(
         self,
@@ -1034,8 +1102,8 @@ class ServerRuntime:
             entries = entries[identifiers.index(arguments.after) + 1 :]
         items = []
         for identifier, record in entries:
-            response = record.response or {}
-            current_state = response.get("state", "pending")
+            response = record.response
+            current_state = "pending" if response is None else response.state
             if arguments.state is not None and current_state != arguments.state:
                 continue
             if arguments.command is not None and record.command != arguments.command:
@@ -1047,13 +1115,15 @@ class ServerRuntime:
                     "state": current_state,
                     "chain_id": record.chain_id,
                     "submitted_at": record.submitted_at,
-                    "experiment_id": response.get("experiment_id"),
+                    "experiment_id": None
+                    if response is None
+                    else (response.model_extra or {}).get("experiment_id"),
                 }
             )
             if len(items) > arguments.limit:
                 break
         has_more = len(items) > arguments.limit
-        items = items[:arguments.limit]
+        items = items[: arguments.limit]
         return {
             "items": items,
             "has_more": has_more,
@@ -1083,9 +1153,10 @@ class ServerRuntime:
                     "args": args or {},
                 }
             )
-            return await asyncio.wait_for(
+            response = await asyncio.wait_for(
                 asyncio.shield(future), self.settings.read_timeout
             )
+            return response.model_dump(exclude_unset=True)
         except Full as error:
             raise ServerError(
                 "queue_full", "Controller request queue is full.", 429
@@ -1142,12 +1213,16 @@ class ServerRuntime:
         ):
             return
         try:
-            response = copy_json_object(message, "controller response")
-            self._last_response_at = datetime.now(UTC).isoformat()
-            kind = response.get("_runtime")
-            if self._accept_runtime_response(response, kind):
-                return
-            outcome = ControllerOutcome.model_validate(response)
+            if isinstance(message, ControllerOutcome):
+                outcome = message
+                self._last_response_at = datetime.now(UTC).isoformat()
+            else:
+                response = copy_json_object(message, "controller response")
+                self._last_response_at = datetime.now(UTC).isoformat()
+                kind = response.get("_runtime")
+                if self._accept_runtime_response(response, kind):
+                    return
+                outcome = ControllerOutcome.model_validate(response)
             self._accept_command_response(outcome)
         except Exception as error:  # noqa: BLE001 - Do not leave a failed response consumer reporting readiness.
             self._unavailable(f"Invalid controller response: {error}")
@@ -1159,7 +1234,7 @@ class ServerRuntime:
             return
         record = self._records.get(identifier)
         if record is not None and (
-            record.response is None or record.response.get("state") == "unknown"
+            record.response is None or record.response.state == "unknown"
         ):
             # A complete queued reply is stronger evidence than an earlier
             # process-exit observation. Never replace an already known outcome.
@@ -1172,13 +1247,13 @@ class ServerRuntime:
 
     def _bounded_response(
         self, outcome: ControllerOutcome, identifier: str
-    ) -> tuple[JsonObject, int]:
+    ) -> tuple[ControllerOutcome | RuntimeCommandOutcome, int]:
         response = outcome.model_dump(exclude_unset=True)
         encoded_size = len(
             json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
         )
         if encoded_size <= self.settings.max_response_bytes:
-            return response, encoded_size
+            return outcome, encoded_size
         response = {
             "command_id": identifier,
             "chain_id": response.get("chain_id"),
@@ -1194,7 +1269,9 @@ class ServerRuntime:
                 },
             },
         }
-        return response, len(json.dumps(response).encode("utf-8"))
+        return RuntimeCommandOutcome.model_validate(response), len(
+            json.dumps(response).encode("utf-8")
+        )
 
     def _accept_runtime_response(self, response: JsonObject, kind: object) -> bool:
         if kind == "ready":
@@ -1217,7 +1294,9 @@ class ServerRuntime:
         if self._ready is not None and not self._ready.done():
             self._ready.set_result(None)
 
-    def _accept_read_response(self, identifier: str, response: JsonObject) -> bool:
+    def _accept_read_response(
+        self, identifier: str, response: ControllerOutcome | RuntimeCommandOutcome
+    ) -> bool:
         waiter = self._reads.get(identifier)
         if waiter is not None and not waiter.done():
             waiter.set_result(response)
@@ -1239,11 +1318,11 @@ class ServerRuntime:
         for identifier, record in self._records.items():
             if (
                 self._restart_command is not None
-                and identifier == self._restart_command["command_id"]
+                and identifier == self._restart_command.command_id
             ):
                 continue
             if record.response is None:
-                record.response = {
+                response = {
                     "command_id": identifier,
                     "chain_id": record.chain_id,
                     "state": "unknown",
@@ -1255,8 +1334,9 @@ class ServerRuntime:
                         "details": {},
                     },
                 }
+                record.response = RuntimeCommandOutcome.model_validate(response)
                 record.finished_at = time.monotonic()
-                record.size = len(json.dumps(record.response).encode("utf-8"))
+                record.size = len(json.dumps(response).encode("utf-8"))
                 self._cache_bytes += record.size
         self._prune()
 

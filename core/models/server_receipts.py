@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.models.server_commands import CommandStatus
 from core.models.values import UUIDText
-from core.primitives.json_values import JsonObject, copy_json_object
+from core.primitives.json_values import copy_json_object
 
 
 class CommandReceipt(CommandStatus):
@@ -28,13 +28,15 @@ class ChainReceipt(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def detach(cls, document: object) -> JsonObject:
+    def detach(cls, document: object) -> dict[str, object]:
         if type(document) is not dict:
             raise TypeError("A chain receipt must be a JSON object.")
         # Each command has its own validated JSON envelope and depth allowance.
-        header = copy_json_object(
-            {key: value for key, value in document.items() if key != "commands"},
-            "chain receipt",
+        header: dict[str, object] = dict(
+            copy_json_object(
+                {key: value for key, value in document.items() if key != "commands"},
+                "chain receipt",
+            )
         )
         if "commands" in document:
             header["commands"] = document["commands"]

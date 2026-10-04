@@ -178,3 +178,13 @@ class ControllerRejection(_Document):
     result: Literal["fail"]
     data: JsonValue = None
     error: JsonValue = None
+
+
+class RuntimeCommandOutcome(CommandStatus):
+    """Runtime-generated pending, unknown and oversized-response observations."""
+
+    model_config = ConfigDict(extra="allow")
+
+    command_id: UUIDText
+    data: JsonValue = None
+    error: JsonValue = None

@@ -4,9 +4,11 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import cli
+from core.models.server_receipts import CommandReceipt
 from core.primitives.json_files import write_json
 from tests.helpers.dag import wait_until
 from tests.helpers.http_runtime import ServerTestCase
@@ -120,6 +122,38 @@ class CliArgumentsTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 cli.command_document(parser.parse_args(arguments))
+
+
+class CliReceiptModelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_wait_retains_receipt_and_public_wait_returns_detached_json(
+        self,
+    ):
+        client = cli.APIClient(cli._load_settings(None, {}))
+        client.interval = 0
+        pending = {
+            "command_id": str(uuid4()),
+            "server_instance_id": str(uuid4()),
+            "state": "pending",
+            "result": None,
+        }
+        completed = {
+            **pending,
+            "state": "succeeded",
+            "result": "success",
+            "data": {"values": [True, 1, 1.0]},
+            "error": None,
+            "extension": {"kept": True},
+        }
+        client.request = AsyncMock(return_value=completed)
+        result = await client._wait(CommandReceipt.model_validate(pending), 1)
+        self.assertIsInstance(result, CommandReceipt)
+        self.assertEqual(result.model_dump(exclude_unset=True), completed)
+        self.assertEqual(cli.outcome_code(result), cli.outcome_code(completed))
+        published = await client.wait(completed, 1)
+        self.assertEqual(published, completed)
+        published["data"]["values"].append("external")
+        self.assertEqual(result.model_dump(exclude_unset=True), completed)
+        self.assertIsInstance(published, dict)
 
 
 class CliProtocolTests(ServerTestCase):

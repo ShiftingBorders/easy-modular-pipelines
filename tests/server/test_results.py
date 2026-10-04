@@ -1,12 +1,20 @@
 """Approved C/D/E: deterministic RAM limits plus real HTTP priority and archive work."""
 
 import asyncio
+import hashlib
+import json
 import unittest
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.models.server_commands import (
+    ControllerOutcome,
+    RuntimeCommandOutcome,
+    ServerChain,
+    ServerCommand,
+)
 from core.server.runtime import ServerError, ServerRuntime
 from core.server.settings import load_server_settings
 from tests.helpers.dag import REPOSITORY, wait_until
@@ -45,6 +53,157 @@ class ResultCacheTests(unittest.IsolatedAsyncioTestCase):
 
     def submit(self, name="pause"):
         return self.runtime.submit({"command": name})["command_id"]
+
+    async def test_admitted_model_keeps_generated_id_and_detaches_request_data(self):
+        command = ServerCommand(command="pause", args={"values": [True, 1, 1.0, None]})
+        original = command.model_dump(exclude_none=True)
+        receipt = self.runtime.submit(command)
+        self.assertEqual(receipt["command_id"], command.command_id)
+        record = self.runtime._records[command.command_id]
+        self.assertIsInstance(record.request, ServerCommand)
+        self.assertIsNot(record.request, command)
+        command.args["values"].append("caller mutation")
+        self.assertEqual(record.request.model_dump(exclude_none=True), original)
+        self.assertEqual(self.runtime._requests.get_nowait(), original)
+        expected = hashlib.sha256(
+            json.dumps(
+                original, sort_keys=True, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(record.fingerprint, expected)
+
+    async def test_retained_outcome_preserves_optional_fields_extras_and_byte_size(
+        self,
+    ):
+        for optional in ({}, {"error": None, "chain_id": None}):
+            identifier = self.submit()
+            document = {
+                "command_id": identifier,
+                "state": "succeeded",
+                "result": "success",
+                "data": {"values": [True, 1, 1.0]},
+                "extension": {"kept": [None]},
+                **optional,
+            }
+            with self.subTest(optional=optional):
+                self.runtime._accept_response(document)
+                record = self.runtime._records[identifier]
+                self.assertIsInstance(record.response, ControllerOutcome)
+                self.assertEqual(
+                    record.response.model_dump(exclude_unset=True), document
+                )
+                self.assertEqual(
+                    record.size,
+                    len(
+                        json.dumps(
+                            document, ensure_ascii=False, allow_nan=False
+                        ).encode("utf-8")
+                    ),
+                )
+                published = self.runtime.result(identifier)
+                self.assertEqual(
+                    published,
+                    {
+                        **document,
+                        "server_instance_id": self.runtime.instance_id,
+                        "submitted_at": record.submitted_at,
+                    },
+                )
+                published["data"]["values"].append("external")
+                document["extension"]["kept"].append("external")
+                self.assertEqual(record.response.data, {"values": [True, 1, 1.0]})
+                self.assertEqual(
+                    record.response.model_dump(exclude_unset=True)["extension"],
+                    {"kept": [None]},
+                )
+
+    async def test_unknown_and_oversized_results_remain_models_with_original_accounting(
+        self,
+    ):
+        identifier = self.submit()
+        self.runtime._unavailable("owner stopped")
+        record = self.runtime._records[identifier]
+        self.assertIsInstance(record.response, RuntimeCommandOutcome)
+        self.assertEqual(record.response.state, "unknown")
+        self.assertEqual(
+            record.size,
+            len(
+                json.dumps(record.response.model_dump(exclude_unset=True)).encode(
+                    "utf-8"
+                )
+            ),
+        )
+        self.runtime.settings.max_response_bytes = 1
+        self.reply(identifier, blob="oversized")
+        record = self.runtime._records[identifier]
+        self.assertIsInstance(record.response, RuntimeCommandOutcome)
+        self.assertEqual(record.response.state, "unavailable")
+        self.assertEqual(
+            self.runtime.result(identifier)["error"]["code"], "response_too_large"
+        )
+
+    async def test_replay_fingerprints_distinguish_boolean_integer_and_float(self):
+        for original, alternatives in ((True, (1, 1.0)), (1, (1.0,))):
+            identifier = str(uuid4())
+            request = {
+                "command": "pause",
+                "command_id": identifier,
+                "args": {"n": original},
+            }
+            first = self.runtime.submit(request)
+            self.assertEqual(self.runtime.submit(request), first)
+            for alternative in alternatives:
+                with self.subTest(original=original, alternative=alternative):
+                    with self.assertRaises(ServerError) as conflict:
+                        self.runtime.submit({**request, "args": {"n": alternative}})
+                    self.assertEqual(conflict.exception.code, "command_id_conflict")
+
+    async def test_generated_chain_ids_and_child_wire_metadata_are_preserved(self):
+        chain = ServerChain.model_validate({"commands": [{"command": "pause"}]})
+        receipt = self.runtime.submit(chain, chain=True)
+        identifier = chain.commands[0].command_id
+        self.assertEqual(receipt["chain_id"], chain.chain_id)
+        self.assertEqual(receipt["commands"][0]["command_id"], identifier)
+        message = self.runtime._requests.get_nowait()
+        self.assertEqual(
+            message,
+            {
+                "api_version": 1,
+                "chain_id": chain.chain_id,
+                "commands": [
+                    {
+                        **chain.commands[0].model_dump(exclude_none=True),
+                        "chain_id": chain.chain_id,
+                    }
+                ],
+            },
+        )
+        chain.commands[0].args["external"] = True
+        self.assertEqual(self.runtime._records[identifier].request.args, {})
+
+    async def test_chain_output_preserves_whole_document_depth_limit(self):
+        receipt = self.runtime.submit({"commands": [{"command": "pause"}]}, chain=True)
+        identifier = receipt["commands"][0]["command_id"]
+        payload = None
+        for _ in range(31):
+            payload = {"nested": payload}
+        self.runtime._accept_response(
+            {
+                "command_id": identifier,
+                "state": "succeeded",
+                "result": "success",
+                "data": payload,
+            }
+        )
+        self.assertEqual(self.runtime.result(identifier)["data"], payload)
+        with self.assertRaises(ValueError):
+            self.runtime.submit(
+                {
+                    "chain_id": receipt["chain_id"],
+                    "commands": [{"command": "pause", "command_id": identifier}],
+                },
+                chain=True,
+            )
 
     async def test_eviction_uses_completion_order_and_preserves_pending(self):
         first, second = self.submit(), self.submit()
