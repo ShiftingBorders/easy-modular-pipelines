@@ -15,6 +15,7 @@ from core.journal.logger import OperationLogger
 from core.journal.streams import capture_stream
 from core.models.participant_launch import StageLaunch
 from core.models.participant_protocol import ModuleProgress, StageResult
+from core.models.process_identity import ProcessIdentity
 from core.participants.server import ParticipantServer
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object
@@ -27,14 +28,14 @@ class StageExecutor:
         if not self._launch_path.is_absolute():
             raise ValueError("launch_path must be absolute.")
         self._process = None
-        self._process_identity = None
+        self._process_identity: ProcessIdentity | None = None
         self._reason = None
         self._started_at = None
         self._started_monotonic = None
         self._started = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._stop_lock = asyncio.Lock()
-        self._progress = None
+        self._progress: ModuleProgress | None = None
         self._module_state = {}
         self._finished = False
 
@@ -44,12 +45,12 @@ class StageExecutor:
 
     async def _run(self, launch: StageLaunch) -> None:
         self._launch = launch
-        self._context = launch.context.model_dump()
+        self._context = launch.context
         self._directory = self._launch_path.parent
         self._logger = OperationLogger(launch.executor_logging_config)
         self._server = ParticipantServer(
             launch.endpoint_path,
-            self._context,
+            self._context.model_dump(),
             self._logger,
             self._handle_request,
             module_handler=self._handle_module,
@@ -62,7 +63,7 @@ class StageExecutor:
             write_json(
                 self._directory / "process.json",
                 {
-                    **self._context,
+                    **self._context.model_dump(),
                     "executor": process_identity(os.getpid()),
                     "stage": None,
                     "started_at": None,
@@ -89,11 +90,7 @@ class StageExecutor:
                 timeout=launch.control_timeout_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if (
-                not done
-                or stopped in done
-                and not self._server.has_call(request_id)
-            ):
+            if not done or stopped in done and not self._server.has_call(request_id):
                 self._logger.record_command_result(
                     request_id,
                     {
@@ -102,7 +99,7 @@ class StageExecutor:
                     },
                     author="participant",
                     outcome="failed",
-                    context=self._context,
+                    context=self._context.model_dump(),
                 )
                 return
             await completed
@@ -110,18 +107,24 @@ class StageExecutor:
             for task in (completed, started, stopped):
                 task.cancel()
             await asyncio.gather(
-                completed, started, stopped,
+                completed,
+                started,
+                stopped,
                 return_exceptions=True,
             )
 
     def _describe(self) -> JsonObject:
         return {
-            "process": self._process_identity,
+            "process": None
+            if self._process_identity is None
+            else self._process_identity.model_dump(),
             "started_at": self._started_at,
             "started_monotonic": self._started_monotonic,
             "finished": self._finished,
             "exit_code": None if self._process is None else self._process.returncode,
-            "progress": self._progress,
+            "progress": None
+            if self._progress is None
+            else self._progress.model_dump(exclude_unset=True),
             "module_state": self._module_state,
         }
 
@@ -133,9 +136,7 @@ class StageExecutor:
                 "data": {"cancel_requested": self._reason is not None},
             }
         if command == "report_progress":
-            self._progress = ModuleProgress.model_validate(data).model_dump(
-                exclude_unset=True
-            )
+            self._progress = ModuleProgress.model_validate(data)
         elif command == "report_state":
             self._module_state = copy_json_object(data, "module state")
         else:
@@ -148,7 +149,7 @@ class StageExecutor:
             return {"result": "success", "data": self._describe()}
         if command in ("interrupt", "shutdown"):
             target = request["args"].get("request_id")
-            if target is not None and target != self._context["request_id"]:
+            if target is not None and target != self._context.request_id:
                 return {"result": "fail", "data": {"code": "different_call"}}
             await self._interrupt(request["args"].get("reason", "stopped"))
             self._stop_requested.set()
@@ -159,12 +160,13 @@ class StageExecutor:
                     or self._process.returncode is not None
                 },
             }
-        if command != "execute" or request["request_id"] != self._context["request_id"]:
+        if command != "execute" or request["request_id"] != self._context.request_id:
             return {"result": "fail", "data": {"code": "unsupported_executor_call"}}
         if self._started.is_set():
             raise RuntimeError("This executor already started its assigned call.")
         if json.dumps(request["args"], sort_keys=True) != json.dumps(
-            self._launch.call.model_dump(mode="json", exclude_unset=True), sort_keys=True
+            self._launch.call.model_dump(mode="json", exclude_unset=True),
+            sort_keys=True,
         ):
             raise ValueError("Execute arguments differ from the fixed attempt context.")
         self._started.set()
@@ -182,10 +184,17 @@ class StageExecutor:
             streams = asyncio.gather(
                 self._process.wait(),
                 capture_stream(
-                    self._process.stdout, "stdout", self._logger, self._context, output
+                    self._process.stdout,
+                    "stdout",
+                    self._logger,
+                    self._context.model_dump(),
+                    output,
                 ),
                 capture_stream(
-                    self._process.stderr, "stderr", self._logger, self._context
+                    self._process.stderr,
+                    "stderr",
+                    self._logger,
+                    self._context.model_dump(),
                 ),
             )
             deadline = request.get("deadline_monotonic")
@@ -197,9 +206,7 @@ class StageExecutor:
             except TimeoutError:
                 await self._interrupt("timeout")
                 await streams
-            response = StageResult.model_validate(
-                json.loads(output.decode("utf-8"))
-            ).model_dump(exclude_unset=True)
+            response = StageResult.model_validate(json.loads(output.decode("utf-8")))
         except asyncio.CancelledError:
             await self._interrupt("interrupted")
         except Exception as failure:  # noqa: BLE001 - Every execution failure becomes a durable failed call.
@@ -226,7 +233,7 @@ class StageExecutor:
                 "data": {"error": error, "reason": self._reason},
                 "execution": execution,
             }
-        return {**response, "execution": execution}
+        return {**response.model_dump(exclude_unset=True), "execution": execution}
 
     async def _start_process(self) -> None:
         argv, environment = module_process_arguments(self._launch.argv)
@@ -249,22 +256,28 @@ class StageExecutor:
         self._started_at = datetime.now(UTC).isoformat()
         self._started_monotonic = time.monotonic()
         try:
-            self._process_identity = process_identity(self._process.pid)
+            self._process_identity = ProcessIdentity.model_validate(
+                process_identity(self._process.pid)
+            )
         except OSError:
             if self._process.returncode is None:
                 raise
         write_json(
             self._directory / "process.json",
             {
-                **self._context,
+                **self._context.model_dump(),
                 "executor": process_identity(os.getpid()),
-                "stage": self._process_identity,
+                "stage": None
+                if self._process_identity is None
+                else self._process_identity.model_dump(),
                 "started_at": self._started_at,
                 "started_monotonic": self._started_monotonic,
             },
         )
         self._logger.record_event(
-            "stage.process_started", self._describe(), context=self._context
+            "stage.process_started",
+            self._describe(),
+            context=self._context.model_dump(),
         )
 
     async def _interrupt(self, reason: str) -> None:
