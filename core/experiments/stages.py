@@ -27,6 +27,7 @@ from core.experiments.state import (
     ServiceInstance,
     StageAttempt,
     StageOutcome,
+    _attempt_result_identity,
     state_to_document,
 )
 from core.journal.events import LoggingError
@@ -35,6 +36,7 @@ from core.models.experiment_template import (
     ServiceCallDefinition,
     StageDefinition,
 )
+from core.models.participant_identity import ParticipantIdentity
 from core.models.participant_observations import (
     ExecutorCommandState,
     ExecutorCommandStateResponse,
@@ -257,14 +259,18 @@ class StageRunner:
             "service_id": attempt.service_id,
             "service_instance_id": None
             if attempt.service_id is None
-            else attempt.participant["participant_instance_id"],
+            else attempt.participant.participant_instance_id,
             "cycle_number": attempt.cycle_number,
             "attempt_number": attempt.attempt_number,
             "module_name": module.name,
             "module_version": module.version,
             "module_hash": module.hash,
             "template_revision_id": state.template_revision_id,
-            **(attempt.participant or {}),
+            **(
+                {}
+                if attempt.participant is None
+                else attempt.participant.model_dump(exclude_unset=True)
+            ),
         }
 
     async def _start_attempt(
@@ -339,13 +345,13 @@ class StageRunner:
         instance = (
             None if attempt.service_id is None else state.services[attempt.service_id]
         )
-        attempt.participant = {
-            "experiment_id": state.experiment_id,
-            "participant_id": stage_id if instance is None else instance.service_id,
-            "participant_instance_id": attempt_id
+        attempt.participant = ParticipantIdentity(
+            experiment_id=state.experiment_id,
+            participant_id=stage_id if instance is None else instance.service_id,
+            participant_instance_id=attempt_id
             if instance is None
             else instance.service_instance_id,
-        }
+        )
         attempt.queued_at = datetime.now(UTC).isoformat()
         attempt.queued_monotonic = time.monotonic()
         return attempt, instance
@@ -651,11 +657,7 @@ class StageRunner:
                 record = read_result(
                     self._journal.client,
                     attempt.request_id,
-                    expected={
-                        **attempt.participant,
-                        "stage_id": attempt.stage_id,
-                        "attempt_id": attempt.attempt_id,
-                    },
+                    expected=_attempt_result_identity(attempt),
                 )
                 if record is not None and record["author"] == "runner":
                     attempt.result_request_id = attempt.request_id
@@ -705,7 +707,7 @@ class StageRunner:
                         instance is None
                         or instance.stopped
                         or instance.service_instance_id
-                        != attempt.participant["participant_instance_id"]
+                        != attempt.participant.participant_instance_id
                     ):
                         return self._accept(
                             state,
@@ -827,7 +829,7 @@ class StageRunner:
             if (
                 instance.stopped
                 or instance.service_instance_id
-                != attempt.participant["participant_instance_id"]
+                != attempt.participant.participant_instance_id
             ):
                 return True
             return await self._services.cancel_request(
@@ -1049,7 +1051,7 @@ class StageRunner:
             return instance is not None and (
                 instance.stopped
                 or instance.service_instance_id
-                != attempt.participant["participant_instance_id"]
+                != attempt.participant.participant_instance_id
             )
         identity = attempt.process_identity
         if identity is None:

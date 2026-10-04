@@ -19,3 +19,10 @@ class ParticipantIdentity(BaseModel):
     @classmethod
     def detach(cls, document: object) -> JsonObject:
         return copy_json_object(document, "participant identity")
+
+
+class AttemptResultIdentity(ParticipantIdentity):
+    """Journal association for one attempt, including its participant identity."""
+
+    stage_id: UUIDText
+    attempt_id: UUIDText

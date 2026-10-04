@@ -204,7 +204,7 @@ class WorkingServiceRequest(_Input):
 class ServiceCallExecutorStatus(_Input):
     """Runner observation of service work, with the live request retained."""
 
-    participant: Object | None
+    participant: ParticipantIdentity | None
     request_id: UUIDText
     process: Object | None
     finished: Boolean

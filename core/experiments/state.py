@@ -12,6 +12,7 @@ from core.models.experiment_template import (
     ServiceDefinition,
     StageDefinition,
 )
+from core.models.participant_identity import AttemptResultIdentity, ParticipantIdentity
 from core.models.participant_observations import (
     ExecutorCommandState,
     RetainedExecutorStatus,
@@ -34,6 +35,7 @@ from core.models.runner_state import (
     StateParameters,
     WorkingServiceRequest,
 )
+from core.participants.protocol import _participant_identity
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
     JsonObject,
@@ -116,7 +118,7 @@ class StageAttempt:
         # Non-object legacy values remain readable, as in SavedAttempt.
         self.executor_status: ExecutorStatus | JsonValue = None
         self.request_id = parameters.attempt_id
-        self.participant: JsonObject | None = None
+        self.participant: ParticipantIdentity | None = None
         self.endpoint_path: Path | None = None
         self.service_id: str | None = None
         self.queued_monotonic: float | None = None
@@ -355,6 +357,21 @@ def _restore_executor_status(status: JsonValue) -> ExecutorStatus | JsonValue:
         return RetainedExecutorStatus.model_validate(status)
 
 
+def _attempt_result_identity(attempt: StageAttempt) -> AttemptResultIdentity:
+    participant = attempt.participant
+    if participant is None:
+        raise TypeError("Attempt has no participant identity for journal association.")
+    values: dict[str, object] = dict(participant.model_extra or {})
+    values.update(
+        experiment_id=participant.experiment_id,
+        participant_id=participant.participant_id,
+        participant_instance_id=participant.participant_instance_id,
+        stage_id=attempt.stage_id,
+        attempt_id=attempt.attempt_id,
+    )
+    return AttemptResultIdentity.model_validate(values)
+
+
 def state_to_document(state: RunnerState) -> JsonObject:
     """Serialize known public records, never live tasks or control queues."""
     root = state.experiment_directory.resolve()
@@ -412,6 +429,10 @@ def state_to_document(state: RunnerState) -> JsonObject:
         document["services"][service_id] = saved
     if state.active_attempt is not None:
         attempt = dict(vars(state.active_attempt))
+        participant = state.active_attempt.participant
+        attempt["participant"] = (
+            None if participant is None else participant.model_dump(exclude_unset=True)
+        )
         attempt["executor_status"] = _executor_status_document(
             state.active_attempt.executor_status
         )
@@ -578,7 +599,7 @@ def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
     attempt.outcome = document.outcome
     attempt.executor_status = _restore_executor_status(document.executor_status)
     attempt.request_id = document.request_id
-    attempt.participant = document.participant.model_dump(exclude_unset=True)
+    attempt.participant = document.participant
     attempt.endpoint_path = (
         None
         if document.endpoint_path is None
@@ -610,14 +631,7 @@ def _attempt_from_launch(
     # Bind ownership before optional files are read so failure
     # handling still has to confirm this attempt's termination.
     attempt.request_id = launched["request_id"]
-    attempt.participant = {
-        key: launched[key]
-        for key in (
-            "experiment_id",
-            "participant_id",
-            "participant_instance_id",
-        )
-    }
+    attempt.participant = _participant_identity(launched)
     attempt.service_id = (
         definition.service_id if isinstance(definition, ServiceCallDefinition) else None
     )
@@ -631,18 +645,13 @@ def _attempt_from_launch(
     return attempt
 
 
-def _apply_recovered_attempt_context(attempt: StageAttempt, context: JsonObject) -> None:
+def _apply_recovered_attempt_context(
+    attempt: StageAttempt, context: JsonObject
+) -> None:
     attempt.input_data = context["input_data"]
     attempt.effective_settings = context["settings"]
     attempt.request_id = context["context"]["request_id"]
-    attempt.participant = {
-        key: context["context"][key]
-        for key in (
-            "experiment_id",
-            "participant_id",
-            "participant_instance_id",
-        )
-    }
+    attempt.participant = _participant_identity(context["context"])
     attempt.endpoint_path = Path(context["endpoint_path"])
     attempt.service_id = context["service_id"]
     attempt.queued_at = context["queued_at"]

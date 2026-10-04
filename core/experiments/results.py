@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from core.models.conditional_result import ConditionalDecision
 from core.models.experiment_template import ExperimentTemplate, StageDefinition
+from core.models.participant_identity import ParticipantIdentity
 from core.participants.protocol import validate_response
 from core.primitives.json_values import JsonObject, JsonValue
 
@@ -65,13 +66,18 @@ def _apply_conditional_decision(
 
 
 def read_result(
-    reader, request_id: str, *, expected: JsonObject, accepted: bool = False
+    reader,
+    request_id: str,
+    *,
+    expected: ParticipantIdentity | JsonObject,
+    accepted: bool = False,
 ) -> JsonObject | None:
     record = reader.read_command_result(request_id)
     if record is None:
         return None
     context = record["event"]["context"]
-    for name, value in expected.items():
+    fields = expected if isinstance(expected, ParticipantIdentity) else expected.items()
+    for name, value in fields:
         if context.get(name) != value:
             raise ValueError(f"Journal result identity mismatch: {name}.")
     validate_response(record["response"])

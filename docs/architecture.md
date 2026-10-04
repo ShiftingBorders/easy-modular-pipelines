@@ -70,6 +70,8 @@ decision structure; the runner retains current DAG membership and payload policy
 Attempts retain validated executor observations and service-call status models;
 state files and public status responses serialize them. Recovery also accepts
 historical partial or opaque executor metadata without strengthening its schema.
+Attempt participant identities remain models through recovery and result
+association; logging contexts and saved state retain their JSON formats.
 
 Server command, chain and target models normalize admission payloads. Controller
 argument models check supported control operations before invoking public runner

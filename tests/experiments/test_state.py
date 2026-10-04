@@ -8,17 +8,19 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import yaml
 
+from core.experiments.results import read_result
 from core.experiments.stages import _finish_executor_status
 from core.experiments.state import (
     RunnerState,
     RunnerStateStore,
     ServiceInstance,
     StageAttempt,
+    _attempt_result_identity,
     _relative_state_path,
     state_from_document,
     state_to_document,
@@ -28,6 +30,7 @@ from core.models.experiment_template import (
     HeartbeatPolicy,
     ServiceDefinition,
 )
+from core.models.participant_identity import ParticipantIdentity
 from core.models.participant_observations import (
     ExecutorCommandState,
     RetainedExecutorStatus,
@@ -260,11 +263,11 @@ class RunnerStateTests(unittest.TestCase):
             {},
             None,
         )
-        attempt.participant = {
-            "experiment_id": self.state.experiment_id,
-            "participant_id": stage_id,
-            "participant_instance_id": attempt.attempt_id,
-        }
+        attempt.participant = ParticipantIdentity(
+            experiment_id=self.state.experiment_id,
+            participant_id=stage_id,
+            participant_instance_id=attempt.attempt_id,
+        )
         attempt.endpoint_path = self.root / "stage-endpoint.json"
         self.state.active_attempt = attempt
         self.state.used_request_ids.add(attempt.request_id)
@@ -320,6 +323,7 @@ class RunnerStateTests(unittest.TestCase):
             current=request,
         )
         self.assertIs(service.current, request)
+        self.assertIs(service.participant, attempt.participant)
         for status in (
             full,
             service,
@@ -351,6 +355,59 @@ class RunnerStateTests(unittest.TestCase):
         document = state_to_document(self.state)
         document["active_attempt"]["executor_status"]["progress"]["detail"]["value"] = 9
         self.assertEqual(full.progress.model_extra["detail"]["value"], 1)
+
+    def test_attempt_identity_retains_extras_and_detaches_saved_json(self):
+        attempt, _ = self._add_path_participants()
+        attempt.participant = _update_model(
+            attempt.participant, historical={"values": [1, 1.0, True, None]}
+        )
+        document = state_to_document(self.state)
+        restored = state_from_document(self.root, document)
+        self.assertIsInstance(restored.active_attempt.participant, ParticipantIdentity)
+        self.assertEqual(
+            restored.active_attempt.participant.participant_instance_id,
+            attempt.participant.participant_instance_id,
+        )
+        self.assertEqual(state_to_document(restored), document)
+        document["active_attempt"]["participant"]["historical"]["values"].append(
+            "external"
+        )
+        self.assertNotIn(
+            "external",
+            restored.active_attempt.participant.model_extra["historical"]["values"],
+        )
+
+    def test_journal_result_checks_model_identity_and_current_attempt_coordinates(self):
+        attempt, _ = self._add_path_participants()
+        attempt.participant = _update_model(
+            attempt.participant,
+            stage_id="historical-stage",
+            attempt_id="historical-attempt",
+            historical={"version": 1},
+        )
+        expected = _attempt_result_identity(attempt)
+        self.assertEqual(expected.stage_id, attempt.stage_id)
+        self.assertEqual(expected.attempt_id, attempt.attempt_id)
+        self.assertEqual(expected.model_extra["historical"], {"version": 1})
+        context = expected.model_dump(exclude_unset=True)
+        record = {
+            "event": {"context": context},
+            "response": {"result": "success", "data": None},
+            "author": "runner",
+        }
+        reader = Mock()
+        reader.read_command_result.return_value = record
+        for identity in (expected, context):
+            with self.subTest(identity=type(identity).__name__):
+                self.assertIs(
+                    read_result(
+                        reader, attempt.request_id, expected=identity, accepted=True
+                    ),
+                    record,
+                )
+        context["stage_id"] = str(uuid4())
+        with self.assertRaisesRegex(ValueError, "identity mismatch: stage_id"):
+            read_result(reader, attempt.request_id, expected=expected)
 
     def test_recovery_keeps_non_object_legacy_executor_status_values(self):
         attempt, _ = self._add_path_participants()
@@ -514,11 +571,11 @@ class RunnerStateTests(unittest.TestCase):
             None,
         )
         self.state.active_attempt.result_request_id = request_id
-        self.state.active_attempt.participant = {
-            "experiment_id": self.state.experiment_id,
-            "participant_id": stage_id,
-            "participant_instance_id": self.state.active_attempt.attempt_id,
-        }
+        self.state.active_attempt.participant = ParticipantIdentity(
+            experiment_id=self.state.experiment_id,
+            participant_id=stage_id,
+            participant_instance_id=self.state.active_attempt.attempt_id,
+        )
         self.state.active_attempt.endpoint_path = (
             self.root / "attempt/executor.lock.json"
         )
