@@ -64,6 +64,32 @@ class ExperimentControllerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             controller._current_command = None
 
+    async def test_argument_binding_preserves_named_kwargs_and_omitted_defaults(self):
+        controller = self.session.controller
+        request = ControllerCommand(
+            api_version=1,
+            command_id="11111111-1111-4111-8111-111111111111",
+            command="stats.resources.history",
+            args={"after": 2},
+        )
+        with patch.object(
+            controller.resources, "read_history", return_value={}
+        ) as read:
+            await controller._read_request(request)
+        read.assert_called_once_with(after=2)
+        request = ControllerCommand(
+            api_version=1,
+            command_id=request.command_id,
+            command="move",
+            args={"position": 2},
+        )
+        with patch.object(
+            self.session.runner, "move", new=AsyncMock(return_value={})
+        ) as move:
+            response = await controller._execute_command(request)
+        self.assertEqual(response.result, "success")
+        move.assert_awaited_once_with(position=2)
+
     async def test_rejected_intake_keeps_missing_and_invalid_ids_in_public_errors(self):
         controller = self.session.controller
         for metadata in ({}, {"command_id": "invalid", "chain_id": None}):

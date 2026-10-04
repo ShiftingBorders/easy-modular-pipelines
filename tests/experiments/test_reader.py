@@ -15,6 +15,7 @@ from core.experiments.reader import ExperimentReader
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
+from core.models.runner_state import SavedStateMetadata
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import DagWorkspace
 from tests.helpers.logging_fixtures import BASE_CONTEXT, write_context_settings
@@ -56,6 +57,30 @@ class ExperimentReaderTests(unittest.TestCase):
             "created_at": "2026-09-24T00:00:00+00:00",
         }
         write_json(self.manifest_path, self.manifest)
+
+    def test_saved_metadata_remains_model_and_public_state_is_detached(self):
+        metadata = self.reader._read_saved_state(self.directory, "saved")
+        self.assertIsInstance(metadata, SavedStateMetadata)
+        self.assertEqual(metadata.template, self.state["template"])
+        published = self.reader.inspect_experiment("saved")
+        self.assertEqual(published["state"], self.state)
+        published["state"]["template"]["name"] = "external"
+        self.assertEqual(metadata.template, self.state["template"])
+        self.assertEqual(read_json(self.state_path), self.state)
+
+    def test_saved_metadata_keeps_sparse_and_opaque_header_values(self):
+        for extra in ({}, {"phase": False, "mode": [1], "template": None}):
+            document = {"schema_version": 3, "experiment_id": "saved", **extra}
+            with self.subTest(extra=extra):
+                write_json(self.state_path, document)
+                self.assertEqual(
+                    self.reader.inspect_experiment("saved")["state"], document
+                )
+                metadata = self.reader._read_saved_state(self.directory, "saved")
+                self.assertEqual(metadata.model_dump(exclude_unset=True), document)
+                self.assertFalse(
+                    self.reader.list_experiments()["items"][0]["available"]
+                )
 
     def test_registry_absence_and_corruption_q2_01(self):
         registry = self.root / "experiments.json"

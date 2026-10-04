@@ -345,6 +345,9 @@ class SavedStateMetadata(_Document):
 
     schema_version: Annotated[int, Field(ge=3, le=4)]
     experiment_id: Text
+    phase: JsonValue = None
+    mode: JsonValue = None
+    template: JsonValue = None
 
 
 class SavedRunnerState(_Document):

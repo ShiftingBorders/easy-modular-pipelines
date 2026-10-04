@@ -197,10 +197,18 @@ async def command_result(command_id: str, request: Request) -> JsonObject:
 
 
 async def read_controller(
-    request: Request, command: str, args: JsonObject | None = None
+    request: Request,
+    command: str,
+    args: JsonObject | EventQuery | ResourceHistoryArguments | None = None,
 ) -> JSONResponse:
     runtime = runtime_for(request)
-    result = await runtime.read(command, args)
+    # The public runtime read hook still receives its original JSON arguments.
+    parameters = (
+        args.model_dump()
+        if isinstance(args, (EventQuery, ResourceHistoryArguments))
+        else args
+    )
+    result = await runtime.read(command, parameters)
     if result.get("result") != "success":
         error = copy_json_object(result.get("error", {}), "controller error")
         status = {
@@ -357,7 +365,7 @@ async def resource_history(
             400,
         ) from error
     return await read_controller(
-        request, "stats.resources.history", arguments.model_dump()
+        request, "stats.resources.history", arguments
     )
 
 
@@ -375,7 +383,7 @@ async def events(
     return await read_controller(
         request,
         "logs.read",
-        arguments.model_dump(),
+        arguments,
     )
 
 

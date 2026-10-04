@@ -56,7 +56,7 @@ class ExperimentReader:
             "experiment_id": experiment_id,
             "directory": str(directory),
             "source": "saved_state",
-            "state": state,
+            "state": state.model_dump(exclude_unset=True),
         }
 
     def list_experiments(self) -> JsonObject:
@@ -67,12 +67,12 @@ class ExperimentReader:
             try:
                 directory = self._directory(identifier, registry)
                 state = self._read_saved_state(directory, identifier)
-                template = copy_json_object(state.get("template"), "saved template")
+                template = copy_json_object(state.template, "saved template")
                 item.update(
                     directory=str(directory),
                     name=template.get("name"),
-                    phase=state.get("phase"),
-                    mode=state.get("mode"),
+                    phase=state.phase,
+                    mode=state.mode,
                     available=True,
                     error=None,
                 )
@@ -81,11 +81,13 @@ class ExperimentReader:
             items.append(item)
         return {"items": items}
 
-    def _read_saved_state(self, directory: Path, experiment_id: str) -> JsonObject:
+    def _read_saved_state(
+        self, directory: Path, experiment_id: str
+    ) -> SavedStateMetadata:
         state = read_json(self._path(directory, "runner/state.json"))
         if state.get("experiment_id") != experiment_id:
             raise ValueError("Saved state belongs to another experiment.")
-        return SavedStateMetadata.model_validate(state).model_dump(exclude_unset=True)
+        return SavedStateMetadata.model_validate(state)
 
     def inspect_snapshot(self, experiment_id: str, snapshot_id: str) -> JsonObject:
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
@@ -256,7 +258,12 @@ class ExperimentReader:
         if command in ("stats.snapshots", "stats.snapshot"):
             args.setdefault("experiment_id", selected_id)
         arguments = model.model_validate(args)
-        result = handler(**arguments.model_dump(exclude_unset=True))
+        parameters = {
+            name: getattr(arguments, name)
+            for name in type(arguments).model_fields
+            if name in arguments.model_fields_set
+        }
+        result = handler(**parameters)
         if command == "stats.experiments":
             for item in result["items"]:
                 item["selected"] = item["experiment_id"] == selected_id

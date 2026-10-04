@@ -15,6 +15,7 @@ from core.models.server_arguments import (
     MaintenanceInvocation,
     ModuleCoordinates,
     ModuleSource,
+    NoArguments,
     StateQueryArguments,
 )
 from core.models.server_commands import (
@@ -221,10 +222,12 @@ class MaintenanceController:
             )
         elif name in ("stats.modules", "stats.module", "stats.template"):
             arguments = _validate_module_read_args(name, args)
-            if name == "stats.modules":
+            if isinstance(arguments, NoArguments):
                 data = self._manager.list_modules()
-            elif name == "stats.module":
-                data = await self._manager.inspect_module(**arguments.model_dump())
+            elif isinstance(arguments, ModuleCoordinates):
+                data = await self._manager.inspect_module(
+                    name=arguments.name, version=arguments.version
+                )
             else:
                 data = await self._assembler.validate_template(arguments.template_path)
         elif name == "stats.state":

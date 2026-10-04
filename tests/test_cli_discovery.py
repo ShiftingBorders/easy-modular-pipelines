@@ -15,6 +15,8 @@ import httpx
 
 import cli
 import webserver
+from core.models.http_queries import EventQuery
+from core.models.server_arguments import ResourceHistoryArguments
 from core.server.runtime import ServerRuntime
 from core.server.settings import load_server_settings
 from tests.helpers.dag import DagWorkspace
@@ -228,6 +230,35 @@ class DiscoveryAPITests(unittest.IsolatedAsyncioTestCase):
             context = patch.object(webserver.app.state, name, value, create=True)
             context.start()
             self.addCleanup(context.stop)
+
+    async def test_validated_queries_reach_read_forwarding_as_models(self):
+        with patch.object(
+            webserver, "read_controller", wraps=webserver.read_controller
+        ) as forward:
+            response = await self.request("GET", "/api/resources/history?after=3")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(forward.call_args.args[2], ResourceHistoryArguments)
+        self.runtime.read.assert_awaited_once_with(
+            "stats.resources.history", {"after": 3, "limit": 100}
+        )
+        self.runtime.read.reset_mock()
+        cursor = {"position": [1, "x", "y"]}
+        with patch.object(
+            webserver, "read_controller", wraps=webserver.read_controller
+        ) as forward:
+            response = await self.request(
+                "GET",
+                "/api/experiments/saved/events",
+                params={
+                    "cursor": json.dumps(cursor),
+                    "limit": 4,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(forward.call_args.args[2], EventQuery)
+        self.runtime.read.assert_awaited_once_with(
+            "logs.read", {"experiment_id": "saved", "cursor": cursor, "limit": 4}
+        )
 
     async def request(self, method, path, **kwargs):
         headers = kwargs.pop("headers", {"Authorization": "Bearer test-token"})

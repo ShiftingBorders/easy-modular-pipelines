@@ -20,6 +20,7 @@ from core.models.server_arguments import (
     ControlInvocation,
     EventReadArguments,
     ExperimentReference,
+    ModuleCoordinates,
     NoArguments,
     PositionArguments,
     RerunArguments,
@@ -359,7 +360,12 @@ class ExperimentController:
         handler, model = handlers[name]
         # Replacement is currently unsupported and has no effect to validate.
         if model is not None:
-            args = model.model_validate(args).model_dump(exclude_unset=True)
+            arguments = model.model_validate(args)
+            args = {
+                name: getattr(arguments, name)
+                for name in type(arguments).model_fields
+                if name in arguments.model_fields_set
+            }
         self._runner._command_context = {
             "command_id": command.command_id,
             "command_chain_id": command.chain_id,
@@ -379,11 +385,11 @@ class ExperimentController:
             if self._module_manager is None:
                 raise RuntimeError("Module manager is not configured for reads.")
             arguments = _validate_module_read_args(name, args)
-            if name == "stats.modules":
+            if isinstance(arguments, NoArguments):
                 return self._module_manager.list_modules()
-            if name == "stats.module":
+            if isinstance(arguments, ModuleCoordinates):
                 return await self._module_manager.inspect_module(
-                    **arguments.model_dump()
+                    name=arguments.name, version=arguments.version
                 )
             assembler = ExperimentAssembler(self._project_root, self._module_manager)
             return await assembler.validate_template(arguments.template_path)
@@ -407,7 +413,11 @@ class ExperimentController:
         if name == "stats.resources.history":
             arguments = ResourceHistoryArguments.model_validate(args)
             return self.resources.read_history(
-                **arguments.model_dump(exclude_unset=True)
+                **{
+                    name: getattr(arguments, name)
+                    for name in type(arguments).model_fields
+                    if name in arguments.model_fields_set
+                }
             )
         if name == "stats.state":
             arguments = StateQueryArguments.model_validate(args)

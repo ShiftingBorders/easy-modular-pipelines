@@ -157,7 +157,7 @@ class ControlInvocation(_Arguments):
             if self.command in ("retry", "service.start", "service.stop"):
                 result["position"] = self.target.position
             else:
-                result.update(self.target.model_dump())
+                result.update(kind=self.target.kind, position=self.target.position)
         if self.command == "run" and "continue" in result:
             result["continue_run"] = result.pop("continue")
         return result
