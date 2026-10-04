@@ -333,6 +333,18 @@ def _relative_state_path(path: Path, root: Path) -> Path:
     return path.relative_to(root)
 
 
+def _retain_process_identity(
+    identity: ProcessIdentity | JsonObject | None,
+) -> ProcessIdentity | JsonObject | None:
+    """Retain full checked identities without tightening historical JSON records."""
+    if identity is None or isinstance(identity, ProcessIdentity):
+        return identity
+    try:
+        return ProcessIdentity.model_validate(identity)
+    except (TypeError, ValueError):
+        return identity
+
+
 def _process_identity_document(
     identity: ProcessIdentity | JsonObject | None,
 ) -> JsonObject | None:
@@ -609,7 +621,7 @@ def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
     attempt.input_data = document.input_data
     attempt.effective_settings = document.effective_settings
     attempt.timeout_seconds = document.timeout_seconds
-    attempt.process_identity = document.process_identity
+    attempt.process_identity = _retain_process_identity(document.process_identity)
     attempt.started_at = document.started_at
     attempt.result_request_id = document.result_request_id
     attempt.outcome = document.outcome

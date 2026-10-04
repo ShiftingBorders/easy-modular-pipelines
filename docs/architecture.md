@@ -75,6 +75,8 @@ association; logging contexts and saved state retain their JSON formats.
 Service process identities also remain models through readiness, recovery and
 shutdown. OS ownership checks compare their complete document with the actual
 process identity; process files and resource/status responses still contain JSON.
+Stage attempts and accepted-executor tracking retain full process identities as
+models too. Historical partial attempt/process records keep their JSON contract.
 
 Server command, chain and target models normalize admission payloads. Controller
 argument models check supported control operations before invoking public runner

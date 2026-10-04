@@ -183,6 +183,7 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertEqual(status.process.pid, ready["pid"])
+            self.assertIs(attempt.process_identity, status.process)
             self.assertEqual(
                 self.session.runner.get_state()["executor"],
                 status.model_dump(exclude_unset=True),

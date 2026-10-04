@@ -30,6 +30,7 @@ from core.experiments.state import (
     _attempt_result_identity,
     _process_identity_document,
     _process_identity_pid,
+    _retain_process_identity,
     state_to_document,
 )
 from core.journal.events import LoggingError
@@ -44,6 +45,7 @@ from core.models.participant_observations import (
     ExecutorCommandStateResponse,
     RetainedExecutorStatus,
 )
+from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     ExecutorStatus,
     PendingInput,
@@ -104,7 +106,7 @@ class StageRunner:
         self._process_attempt_id = None
         self._unstarted_attempt_id = None
         self._executor_processes = []
-        self._executor_identities = {}
+        self._executor_identities: dict[str, ProcessIdentity | JsonObject | None] = {}
         self._notify_resources = notify_resources
 
     def bind_services(self, services) -> None:
@@ -592,7 +594,9 @@ class StageRunner:
         execution = response.get("execution", {})
         if execution:
             attempt.executor_status = RetainedExecutorStatus.model_validate(execution)
-            attempt.process_identity = execution.get("process")
+            attempt.process_identity = _retain_process_identity(
+                execution.get("process")
+            )
             attempt.started_at = execution.get("started_at")
         attempt.executor_status = _finish_executor_status(attempt.executor_status)
         self._save_state(state)
@@ -667,7 +671,9 @@ class StageRunner:
                     execution = record["response"].get("execution", {})
                     attempt.executor_status = _finish_executor_status(execution)
                     if execution:
-                        attempt.process_identity = execution.get("process")
+                        attempt.process_identity = _retain_process_identity(
+                            execution.get("process")
+                        )
                         attempt.started_at = execution.get("started_at")
                     finished = any(
                         item["author"] == "participant"
@@ -780,9 +786,7 @@ class StageRunner:
                 attempt.process_identity is None and reply.data.process is not None
             )
             attempt.executor_status = reply.data
-            attempt.process_identity = (
-                None if reply.data.process is None else reply.data.process.model_dump()
-            )
+            attempt.process_identity = reply.data.process
             attempt.started_at = reply.data.started_at
             self._save_state(state, checkpoint=first_observation)
             if first_observation and self._notify_resources is not None:
@@ -842,9 +846,11 @@ class StageRunner:
             saved = read_json(process_path)
             if saved.get("attempt_id") != attempt.attempt_id:
                 raise ValueError("Process record belongs to another attempt.")
-            attempt.process_identity = saved.get("stage")
+            attempt.process_identity = _retain_process_identity(saved.get("stage"))
             if saved.get("executor") is not None:
-                self._executor_identities[attempt.request_id] = saved["executor"]
+                self._executor_identities[attempt.request_id] = (
+                    _retain_process_identity(saved["executor"])
+                )
         deadline = time.monotonic() + state.template.unknown_state.timeout_seconds
         while time.monotonic() < deadline:
             try:
@@ -1142,12 +1148,16 @@ class StageRunner:
             if process_path.is_file():
                 process_record = read_json(process_path)
                 if process_record.get("experiment_id") == state.experiment_id:
-                    self._executor_identities[request_id] = process_record["executor"]
+                    self._executor_identities[request_id] = _retain_process_identity(
+                        process_record["executor"]
+                    )
         for request_id, identity in list(self._executor_identities.items()):
             try:
-                if process_identity(identity["pid"]) == identity:
+                if process_identity(
+                    _process_identity_pid(identity)
+                ) == _process_identity_document(identity):
                     await asyncio.to_thread(
-                        psutil.Process(identity["pid"]).wait,
+                        psutil.Process(_process_identity_pid(identity)).wait,
                         state.template.start_timeout,
                     )
             except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):

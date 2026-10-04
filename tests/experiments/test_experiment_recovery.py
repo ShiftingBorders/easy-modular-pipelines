@@ -326,7 +326,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         runner = w.replacement()
         await runner.recover(experiment_id)
         self.assertEqual(runner._state.active_attempt.attempt_id, record["attempt_id"])
-        self.assertEqual(runner._state.active_attempt.process_identity, record["stage"])
+        self.assertEqual(
+            runner._state.active_attempt.process_identity.model_dump(), record["stage"]
+        )
         gate.touch()
         await wait_for(lambda: runner._state.active_attempt is None, 30)
         self.assertEqual(runner._state.last_result["trail"], ["A"])

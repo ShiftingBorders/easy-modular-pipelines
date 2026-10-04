@@ -47,6 +47,7 @@ from core.experiments.state import (
     _attempt_from_launch,
     _executor_status_document,
     _process_identity_document,
+    _retain_process_identity,
     state_from_document,
 )
 from core.journal.events import LoggingError, encode_event
@@ -2469,7 +2470,7 @@ class ExperimentRunner:
                 raise ValueError(
                     "Saved process record has a different attempt identity."
                 )
-            attempt.process_identity = record["stage"]
+            attempt.process_identity = _retain_process_identity(record["stage"])
             attempt.started_at = record["started_at"]
         state.active_attempt = attempt
         state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number

@@ -366,6 +366,7 @@ class RunnerStateTests(unittest.TestCase):
         self.assertIsInstance(
             restored.services[service.service_id].process_identity, ProcessIdentity
         )
+        self.assertIsInstance(restored.active_attempt.process_identity, ProcessIdentity)
         self.assertEqual(
             restored.services[service.service_id].process_identity, identity
         )
@@ -399,6 +400,22 @@ class RunnerStateTests(unittest.TestCase):
             "external",
             restored.active_attempt.participant.model_extra["historical"]["values"],
         )
+
+    def test_partial_attempt_process_identity_keeps_historical_document_contract(self):
+        attempt, _ = self._add_path_participants()
+        for identity in (
+            None,
+            {},
+            {"pid": os.getpid()},
+            {"pid": True, "historical": {"value": [1, None]}},
+            {**process_identity(os.getpid()), "historical": "kept"},
+        ):
+            with self.subTest(identity=identity):
+                attempt.process_identity = identity
+                document = state_to_document(self.state)
+                restored = state_from_document(self.root, document)
+                self.assertEqual(restored.active_attempt.process_identity, identity)
+                self.assertEqual(state_to_document(restored), document)
 
     def test_journal_result_checks_model_identity_and_current_attempt_coordinates(self):
         attempt, _ = self._add_path_participants()
