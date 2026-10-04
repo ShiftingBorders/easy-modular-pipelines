@@ -17,6 +17,9 @@ from core.journal.events import (
 from core.journal.logger import OperationLogger
 from core.journal.records import _read_boundary
 from core.models.journal_records import (
+    JournalChangeData,
+    JournalChangeEntry,
+    JournalChangePage,
     JournalContext,
     JournalEntry,
     JournalEvent,
@@ -98,6 +101,37 @@ class JournalReadingTests(unittest.TestCase):
         published["events"][0]["event"]["data"]["values"].append("external")
         self.assertEqual(boundary.cursor, entry.cursor)
         self.assertEqual(entry.event.data["values"], [True, 1.0])
+
+    def test_sql_changes_keep_models_until_public_page_and_original_key_order(self):
+        identifier = self.logger.record_event("change", {"values": [True, 1, 1.0]})
+        store = self.logger._store
+        with store._lock:
+            row = store._connection.execute(
+                "SELECT change_cursor, event_id, change_json FROM journal_changes "
+                "WHERE event_id=?",
+                (identifier,),
+            ).fetchone()
+            original = json.loads(row[2])
+            reordered = {name: original[name] for name in reversed(original)}
+            encoded = json.dumps(reordered)
+            store._connection.execute(
+                "UPDATE journal_changes SET change_json=? WHERE change_cursor=?",
+                (encoded, row[0]),
+            )
+            change = store._decode_change((row[0], row[1], encoded), store._connection)
+            boundary = _read_boundary(store._connection)
+        self.assertIsInstance(change, JournalChangeEntry)
+        self.assertIsInstance(change.change, JournalChangeData)
+        self.assertIsInstance(change.entry, JournalEntry)
+        self.assertEqual(change.encoded_change, encoded)
+        page = JournalChangePage(
+            changes=[change], boundary=boundary, after=change.change_cursor
+        )
+        published = self.logger.read_changes()
+        self.assertEqual(page.document(), published)
+        self.assertEqual(list(published["changes"][0])[2:-2], list(reordered))
+        published["changes"][0]["entry"]["event"]["data"]["values"].append("external")
+        self.assertEqual(change.entry.event.data["values"], [True, 1, 1.0])
 
     def test_create_existing_and_unknown_files_are_not_adopted(self):
         """A4/A5: neither create nor existing may invent a replacement journal."""

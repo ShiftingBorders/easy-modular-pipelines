@@ -35,7 +35,7 @@ _PAGE_BYTES = 16777216
 
 if TYPE_CHECKING:
     from core.models.journal_cache import FilteredCheckpoint, FilteredPublication
-    from core.models.journal_records import JournalEntry
+    from core.models.journal_records import JournalChangeEntry, JournalEntry
 
 
 class FilteredJournal:
@@ -334,24 +334,14 @@ class FilteredJournal:
                 self._last_error = None
             return publication
 
-    def _apply_view_change(self, change: JsonObject) -> None:
-        for event_id in change["related_event_ids"]:
-            if event_id != change["effective_event_id"]:
+    def _apply_view_change(self, change: JournalChangeEntry) -> None:
+        for event_id in change.change.related_event_ids:
+            if event_id != change.change.effective_event_id:
                 self._connection.execute(
                     "DELETE FROM filtered_events WHERE event_id=?",
                     (event_id,),
                 )
-        from core.models.journal_records import JournalEntry, JournalEvent
-
-        document = change["entry"]
-        entry = JournalEntry(
-            cursor=document["cursor"],
-            event=JournalEvent.model_validate(document["event"]),
-            encoded_event=json.dumps(document["event"], ensure_ascii=False),
-            effective_author=document["effective_author"],
-            provisional=document["provisional"],
-        )
-        self._write_entry(entry)
+        self._write_entry(change.entry)
 
     def _fallback(
         self, checkpoint: FilteredCheckpoint | None, limit: int

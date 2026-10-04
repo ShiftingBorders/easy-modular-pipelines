@@ -42,7 +42,6 @@ from core.journal.events import (
     validate_context,
 )
 from core.journal.records import (
-    _checkpoint,
     _checkpoint_position,
     _command_result_document,
     _decode_row,
@@ -61,6 +60,7 @@ from core.journal.streams import _write_stderr_best_effort
 from core.models.journal_options import JournalOptions, validate_journal_options
 from core.primitives.json_values import (
     JsonObject,
+    JsonValue,
     copy_json_object,
     require_text,
 )
@@ -74,6 +74,8 @@ if TYPE_CHECKING:
         JournalSnapshotManifest,
     )
     from core.models.journal_records import (
+        JournalChangeData,
+        JournalChangeEntry,
         JournalContext,
         JournalEntry,
         JournalReadBoundary,
@@ -726,88 +728,48 @@ class SQLiteEventStore:
             (event_id, json.dumps(change, ensure_ascii=True)),
         )
 
-    def _decode_change(self, row: tuple, connection: sqlite3.Connection) -> JsonObject:
+    def _decode_change(
+        self, row: tuple, connection: sqlite3.Connection
+    ) -> JournalChangeEntry:
+        from core.models.journal_records import JournalChangeData, JournalChangeEntry
+
         cursor, event_id, encoded = row
-        change = copy_json_object(json.loads(encoded), "journal change")
-        if change.keys() != {
-            "kind",
-            "request_id",
-            "effective_event_id",
-            "effective_author",
-            "provisional",
-            "result_changed",
-            "related_event_ids",
-            "recorded_at",
-            "observation",
-        }:
-            raise LoggingStorageError("Invalid journal change fields.")
-        for field in ("provisional", "result_changed"):
-            if type(change[field]) is not bool:
-                raise LoggingStorageError("Invalid change result state.")
-        timestamp = datetime.fromisoformat(change["recorded_at"])
-        if timestamp.utcoffset() != UTC.utcoffset(None):
-            raise LoggingStorageError("Change timestamp must be UTC.")
-        entry = self._event_entry(change["effective_event_id"], connection)
+        change = JournalChangeData.model_validate(json.loads(encoded))
+        entry = self._event_entry(change.effective_event_id, connection)
         observed = (
             entry
-            if event_id == change["effective_event_id"]
+            if event_id == change.effective_event_id
             else self._event_entry(event_id, connection)
         )
-        related = change["related_event_ids"]
-        if (
-            type(related) is not list
-            or not related
-            or len(set(related)) != len(related)
-        ):
-            raise LoggingStorageError("Invalid change event references.")
-        if event_id not in related or change["effective_event_id"] not in related:
+        related = change.related_event_ids
+        if event_id not in related or change.effective_event_id not in related:
             raise LoggingStorageError("Change is missing its event references.")
-        if change["kind"] == "event":
-            if (
-                change["request_id"] is not None
-                or change["effective_author"] is not None
-                or related != [event_id]
-                or change["provisional"]
-                or not change["result_changed"]
-                or change["observation"] is not None
-                or entry.event.event_type == "command.result"
-            ):
+        if change.kind == "event":
+            if related != [event_id] or entry.event.event_type == "command.result":
                 raise LoggingStorageError("Invalid ordinary event change.")
-        elif change["kind"] == "command.result":
-            self._validate_command_change(change, entry, connection, related)
         else:
-            raise LoggingStorageError("Unknown change kind.")
-        return {
-            "change_cursor": cursor,
-            "event_id": event_id,
-            **change,
-            "entry": {
-                **entry.document(),
-                "effective_author": change["effective_author"],
-                "provisional": change["provisional"],
-            },
-            "observed_event": observed.document()["event"],
-        }
+            self._validate_command_change(change, entry, connection, related)
+        return JournalChangeEntry(
+            change_cursor=cursor,
+            event_id=event_id,
+            change=change,
+            entry=entry._with_result(change.effective_author, change.provisional),
+            observed=observed,
+            encoded_change=encoded,
+        )
 
     def _validate_command_change(
         self,
-        change: JsonObject,
+        change: JournalChangeData,
         entry: JournalEntry,
         connection: sqlite3.Connection,
-        related: list[str],
+        related: list[JsonValue],
     ) -> None:
-        require_text(change["request_id"], "request_id")
-        if change["effective_author"] not in ("runner", "participant"):
-            raise LoggingStorageError("Invalid effective change author.")
-        if change["provisional"] != (change["effective_author"] == "participant"):
-            raise LoggingStorageError(
-                "Change confirmation state disagrees with author."
-            )
         for related_id in related:
             event = self._event_entry(related_id, connection).event
             if event.event_type != "command.result":
                 raise LoggingStorageError("Change refers to an unrelated event.")
-            if _validated_command_result(event.data).request_id != change["request_id"]:
+            if _validated_command_result(event.data).request_id != change.request_id:
                 raise LoggingStorageError("Change refers to another request.")
             if any(
                 event.context.root.get(key) != entry.event.context.root.get(key)
@@ -819,29 +781,9 @@ class SQLiteEventStore:
                 )
             ):
                 raise LoggingStorageError("Change mixes request owners.")
-        observation = change["observation"]
+        observation = change.observation
         if observation is not None:
-            if (
-                type(observation) is not dict
-                or observation.keys()
-                != {
-                    "author",
-                    "producer_instance_id",
-                    "occurred_at",
-                    "context",
-                    "operation_id",
-                }
-                or observation["author"] not in ("runner", "participant")
-            ):
-                raise LoggingStorageError("Invalid change observer.")
-            if observation["operation_id"] is not None:
-                require_text(observation["operation_id"], "operation_id")
-            require_text(observation["producer_instance_id"], "producer_instance_id")
-            if datetime.fromisoformat(
-                observation["occurred_at"]
-            ).utcoffset() != UTC.utcoffset(None):
-                raise LoggingStorageError("Change observation time must be UTC.")
-            context = validate_context(observation["context"])
+            context = observation.context.root
             if any(
                 context.get(key) != entry.event.context.root.get(key)
                 for key in (
@@ -870,12 +812,11 @@ class SQLiteEventStore:
                 result, after = self._read_change_page(after, limit)
                 self._connection.execute("COMMIT")
                 self._check_health()
-                return {
-                    "changes": result,
-                    "checkpoint": _checkpoint(boundary, "change_cursor", after),
-                    "boundary": boundary.model_dump(),
-                    "has_more": after < boundary.change_cursor,
-                }
+                from core.models.journal_records import JournalChangePage
+
+                return JournalChangePage(
+                    changes=result, boundary=boundary, after=after
+                ).document()
             except LoggingStateError as error:
                 self._rollback(self._connection, error)
                 raise
@@ -883,7 +824,9 @@ class SQLiteEventStore:
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read changes")
 
-    def _read_change_page(self, after: int, limit: int) -> tuple[list[JsonObject], int]:
+    def _read_change_page(
+        self, after: int, limit: int
+    ) -> tuple[list[JournalChangeEntry], int]:
         result = []
         size = 0
         for row in self._connection.execute(
@@ -892,7 +835,9 @@ class SQLiteEventStore:
             (after, limit),
         ):
             item = self._decode_change(row, self._connection)
-            item_size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+            item_size = len(
+                json.dumps(item.document(), ensure_ascii=False).encode("utf-8")
+            )
             if result and size + item_size > _PAGE_BYTES:
                 break
             result.append(item)

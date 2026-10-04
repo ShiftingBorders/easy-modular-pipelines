@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -20,7 +20,12 @@ from core.journal.events import (
     validate_journal_identity,
 )
 from core.models.values import Boolean, Number, PositiveInteger, Text
-from core.primitives.json_values import JsonObject, copy_json_object
+from core.primitives.json_values import (
+    JsonObject,
+    JsonValue,
+    copy_json_object,
+    require_text,
+)
 
 SQLitePosition = Annotated[int, Field(strict=True, ge=0, le=9223372036854775807)]
 SQLiteSequence = Annotated[PositiveInteger, Field(le=9223372036854775807)]
@@ -179,6 +184,87 @@ class JournalEventPage(BaseModel):
                 "has_more": self.after < self.boundary.cursor,
             }
         return document
+
+
+class ChangeObserver(_Document):
+    author: Literal["runner", "participant"]
+    producer_instance_id: Text
+    occurred_at: UTCText
+    context: JournalContext
+    operation_id: Text | None
+
+
+class JournalChangeData(_Document):
+    """Persisted change structure; actual SQL ownership stays with storage."""
+
+    kind: Literal["event", "command.result"]
+    request_id: JsonValue
+    effective_event_id: JsonValue
+    effective_author: Literal["runner", "participant"] | None
+    provisional: Boolean
+    result_changed: Boolean
+    related_event_ids: list[JsonValue]
+    recorded_at: UTCText
+    observation: ChangeObserver | None
+
+    @model_validator(mode="after")
+    def consistent_change(self) -> Self:
+        if not self.related_event_ids or len(set(self.related_event_ids)) != len(
+            self.related_event_ids
+        ):
+            raise ValueError("Invalid change event references.")
+        if self.kind == "event":
+            if (
+                self.request_id is not None
+                or self.effective_author is not None
+                or self.provisional
+                or not self.result_changed
+                or self.observation is not None
+            ):
+                raise ValueError("Invalid ordinary event change.")
+        else:
+            require_text(self.request_id, "request_id")
+            if self.effective_author is None:
+                raise ValueError("Invalid effective change author.")
+            if self.provisional != (self.effective_author == "participant"):
+                raise ValueError("Change confirmation state disagrees with author.")
+        return self
+
+
+class JournalChangeEntry(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    change_cursor: int
+    event_id: str
+    change: JournalChangeData
+    entry: JournalEntry
+    observed: JournalEntry
+    encoded_change: str = Field(exclude=True)
+
+    def document(self) -> JsonObject:
+        return {
+            "change_cursor": self.change_cursor,
+            "event_id": self.event_id,
+            **json.loads(self.encoded_change),
+            "entry": self.entry.document(),
+            "observed_event": self.observed.document()["event"],
+        }
+
+
+class JournalChangePage(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    changes: list[JournalChangeEntry]
+    boundary: JournalReadBoundary
+    after: int
+
+    def document(self) -> JsonObject:
+        return {
+            "changes": [change.document() for change in self.changes],
+            "checkpoint": self.boundary.checkpoint("change_cursor", self.after),
+            "boundary": self.boundary.model_dump(),
+            "has_more": self.after < self.boundary.change_cursor,
+        }
 
 
 class SupersededObservation(_Document):
