@@ -53,6 +53,9 @@ validate wire data at the receiving boundary. Connection operations use typed
 endpoints and replies; public protocol helpers and application handlers retain
 their JSON contracts. Authentication, live OS identity, request correlation,
 deadlines, and work ownership remain with the participant runtime.
+ParticipantServer retains its identity, command metadata, admitted requests, and
+working results as models. Application callback documents remain JSON, including
+the shared request document used by the callback's completion observer.
 
 Module preparation validates caller identity and input before writing runtime
 files. StageClient validates its context before starting its communication thread;

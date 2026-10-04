@@ -13,14 +13,18 @@ from pathlib import Path
 
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
-from core.models.participant_protocol import ParticipantHello, ParticipantRequest
+from core.models.participant_observations import CommandWork
+from core.models.participant_protocol import (
+    ParticipantHello,
+    ParticipantRequest,
+    ParticipantResult,
+)
 from core.participants.protocol import (
     PROTOCOL_VERSION,
+    _participant_identity,
     _validated_request,
     encode_frame,
-    participant_identity,
     read_frame,
-    validate_response,
 )
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_number
@@ -42,7 +46,7 @@ class ParticipantServer:
         self.endpoint_path = Path(endpoint_path)
         if not self.endpoint_path.is_absolute():
             raise ValueError("endpoint_path must be absolute.")
-        self.identity = participant_identity(context)
+        self.identity = _participant_identity(context)
         self._context = copy_json_object(context, "participant context")
         self._logger = logger
         self._handler = handler
@@ -55,8 +59,8 @@ class ParticipantServer:
         self._clients: dict[asyncio.StreamWriter, tuple[str, asyncio.Lock]] = {}
         self._client_tasks: set[asyncio.Task] = set()
         self._reply_commands: dict[asyncio.Task, str] = {}
-        self._work: dict[str, asyncio.Task] = {}
-        self._requests: dict[str, JsonObject] = {}
+        self._work: dict[str, asyncio.Task[ParticipantResult]] = {}
+        self._requests: dict[str, CommandWork] = {}
         self._seen: set[str] = set()
         self._current: str | None = None
         self._work_lock = asyncio.Lock()
@@ -64,7 +68,7 @@ class ParticipantServer:
         self._failure: BaseException | None = None
         self._stopping = False
         self._token_path = self.endpoint_path.with_name(
-            f"{self.endpoint_path.stem}.{self.identity['participant_instance_id']}.token"
+            f"{self.endpoint_path.stem}.{self.identity.participant_instance_id}.token"
         )
 
     async def start(self) -> None:
@@ -85,7 +89,7 @@ class ParticipantServer:
                 self.endpoint_path,
                 {
                     "protocol_version": PROTOCOL_VERSION,
-                    **self.identity,
+                    **self.identity.model_dump(),
                     "process": process_identity(os.getpid()),
                     "endpoint": {
                         "host": "127.0.0.1",
@@ -154,7 +158,7 @@ class ParticipantServer:
                 hello = ParticipantHello.model_validate(await read_frame(reader))
             role = hello.role
             if (
-                hello.identity != self.identity
+                hello.identity != self.identity.model_dump()
                 or role == "module"
                 and self._module_handler is None
                 or not hmac.compare_digest(hello.token, self._token)
@@ -167,7 +171,7 @@ class ParticipantServer:
                     "protocol_version": PROTOCOL_VERSION,
                     "message_type": "hello",
                     "result": "success",
-                    "data": self.identity,
+                    "data": self.identity.model_dump(),
                 },
             )
             while True:
@@ -203,43 +207,38 @@ class ParticipantServer:
             self._client_tasks.discard(task)
 
     async def _reply(self, writer, role: str, request: ParticipantRequest) -> None:
-        message = request.model_dump(exclude_unset=True)
         try:
             command = request.command
             if role == "module":
-                response = await self._module_handler(message)
+                response = ParticipantResult.model_validate(
+                    await self._module_handler(request.model_dump(exclude_unset=True))
+                )
             elif command == "command_state":
-                response = self._command_state()
+                response = ParticipantResult.model_validate(self._command_state())
             elif command == "heartbeat" and (
                 self._failure is not None or self._stopping
             ):
-                response = {
-                    "result": "fail",
-                    "data": {
+                response = ParticipantResult(
+                    result="fail",
+                    data={
                         "error": str(self._failure)
                         if self._failure is not None
                         else "stopping"
                     },
-                }
+                )
             elif command in ("heartbeat", "interrupt", "shutdown"):
-                response = await self._handle_control(message, command)
+                response = await self._handle_control(
+                    request.model_dump(exclude_unset=True), command
+                )
             else:
-                request_id = request.request_id
-                self._requests[request_id] = {
-                    "request_id": request_id,
-                    "command": command,
-                }
-                job = asyncio.create_task(self._run_work(message))
-                self._work[request_id] = job
-                job.add_done_callback(partial(self._observe_work, message))
-                response = await asyncio.shield(job)
+                response = await asyncio.shield(self._start_work(request))
             await self._send(
                 writer,
                 {
                     "protocol_version": PROTOCOL_VERSION,
                     "message_type": "response",
                     "request_id": request.request_id,
-                    **validate_response(response),
+                    **response.model_dump(exclude_unset=True),
                 },
             )
         except (OSError, TimeoutError):
@@ -262,6 +261,22 @@ class ParticipantServer:
             except OSError:
                 pass
 
+    def _start_work(
+        self, request: ParticipantRequest
+    ) -> asyncio.Task[ParticipantResult]:
+        """Bind queued metadata and its public callback document before execution."""
+        request_id = request.request_id
+        self._requests[request_id] = CommandWork(
+            request_id=request_id, command=request.command
+        )
+        # The handler and its completion observer share the same public
+        # document, including any edits made by the application handler.
+        message = request.model_dump(exclude_unset=True)
+        job = asyncio.create_task(self._run_work(request, message))
+        self._work[request_id] = job
+        job.add_done_callback(partial(self._observe_work, message))
+        return job
+
     def _command_state(self) -> JsonObject:
         response = {
             "result": "success",
@@ -269,9 +284,9 @@ class ParticipantServer:
                 **({} if self._describe is None else self._describe()),
                 "current": None
                 if self._current is None
-                else self._requests[self._current],
+                else self._requests[self._current].model_dump(exclude_unset=True),
                 "pending": [
-                    entry
+                    entry.model_dump(exclude_unset=True)
                     for key, entry in self._requests.items()
                     if key != self._current
                 ],
@@ -279,7 +294,9 @@ class ParticipantServer:
         }
         return response
 
-    async def _handle_control(self, request: JsonObject, command: str) -> JsonObject:
+    async def _handle_control(
+        self, request: JsonObject, command: str
+    ) -> ParticipantResult:
         if command == "shutdown":
             self._stopping = True
         response = await self._handler(request)
@@ -293,17 +310,20 @@ class ParticipantServer:
             for job in tasks:
                 job.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        result = ParticipantResult.model_validate(response)
         if command in ("interrupt", "shutdown"):
             self._logger.record_command_result(
                 request["request_id"],
-                validate_response(response),
+                result.model_dump(exclude_unset=True),
                 author="participant",
-                outcome="succeeded" if response["result"] == "success" else "failed",
+                outcome="succeeded" if result.result == "success" else "failed",
                 context={**self._context, "request_id": request["request_id"]},
             )
-        return response
+        return result
 
-    def _observe_work(self, request: JsonObject, task: asyncio.Task) -> None:
+    def _observe_work(
+        self, request: JsonObject, task: asyncio.Task[ParticipantResult]
+    ) -> None:
         request_id = request["request_id"]
         if task.cancelled():
             # A task cancelled before its first instruction never reaches finally.
@@ -338,16 +358,18 @@ class ParticipantServer:
         return {
             **self._context,
             **call_context,
-            **self.identity,
+            **self.identity.model_dump(),
             "request_id": request["request_id"],
         }
 
-    async def _run_work(self, request: JsonObject) -> JsonObject:
-        request_id = request["request_id"]
+    async def _run_work(
+        self, request: ParticipantRequest, handler_request: JsonObject
+    ) -> ParticipantResult:
+        request_id = request.request_id
         acquired = False
         try:
-            context = self._call_context(request)
-            deadline = request.get("deadline_monotonic")
+            context = self._call_context(handler_request)
+            deadline = request.deadline_monotonic
             remaining = (
                 None if deadline is None else max(0, deadline - time.monotonic())
             )
@@ -366,28 +388,34 @@ class ParticipantServer:
                     )
                 self._logger.record_event(
                     "call.started",
-                    {"request_id": request_id, "command": request["command"]},
+                    {"request_id": request_id, "command": request.command},
                     context=context,
                 )
                 # External work belongs to its handler; an expired waiter alone
                 # must not release this lock while that work is still running.
-                response = validate_response(await self._handler(request))
+                response = ParticipantResult.model_validate(
+                    await self._handler(handler_request)
+                )
             except TimeoutError:
-                response = {"result": "fail", "data": {"reason": "queue_timeout"}}
+                response = ParticipantResult(
+                    result="fail", data={"reason": "queue_timeout"}
+                )
             except asyncio.CancelledError:
-                response = {"result": "fail", "data": {"reason": "interrupted"}}
+                response = ParticipantResult(
+                    result="fail", data={"reason": "interrupted"}
+                )
             except LoggingError:
                 raise
             except Exception as error:  # noqa: BLE001 - Preserve the failure of an author-provided handler.
-                response = {
-                    "result": "fail",
-                    "data": {"code": "command_failed", "message": str(error)},
-                }
+                response = ParticipantResult(
+                    result="fail",
+                    data={"code": "command_failed", "message": str(error)},
+                )
             self._logger.record_command_result(
                 request_id,
-                response,
+                response.model_dump(exclude_unset=True),
                 author="participant",
-                outcome="succeeded" if response["result"] == "success" else "failed",
+                outcome="succeeded" if response.result == "success" else "failed",
                 context=context,
             )
             return response
@@ -438,7 +466,7 @@ class ParticipantServer:
         # A previous instance must not remove its replacement's endpoint.
         if (
             self.endpoint_path.is_file()
-            and participant_identity(read_json(self.endpoint_path)) == self.identity
+            and _participant_identity(read_json(self.endpoint_path)) == self.identity
         ):
             self.endpoint_path.unlink()
         self._token_path.unlink(missing_ok=True)

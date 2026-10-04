@@ -71,12 +71,17 @@ def validate_request(message: JsonObject, identity: JsonObject) -> None:
 
 
 def _validated_request(
-    message: JsonObject, identity: JsonObject
+    message: JsonObject, identity: ParticipantIdentity | JsonObject
 ) -> ParticipantRequest:
     request = ParticipantRequest.model_validate(message)
-    actual_identity = {
-        name: getattr(request, name) for name in IDENTITY_FIELDS
-    }
-    if actual_identity != identity:
+    if isinstance(identity, ParticipantIdentity):
+        matches = all(
+            getattr(request, name) == getattr(identity, name)
+            for name in IDENTITY_FIELDS
+        )
+    else:
+        actual_identity = {name: getattr(request, name) for name in IDENTITY_FIELDS}
+        matches = actual_identity == identity
+    if not matches:
         raise ValueError("Request belongs to a different participant.")
     return request

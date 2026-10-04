@@ -23,6 +23,7 @@ class CommandProxyTests(unittest.IsolatedAsyncioTestCase):
         workspace.hashes.remove_module_hash(service["module"]["name"], "1")
         workspace.hashes.add_module_hash(service["module"]["name"], "1", digest)
         service["module"]["hash"] = digest
+        workspace.publish_service_definitions()
         self.assertEqual(await workspace.manager.start_all(workspace.state), "ready")
         instance = workspace.state.services[service["service_id"]]
         context = read_json(instance.artifacts_directory / "context.json")

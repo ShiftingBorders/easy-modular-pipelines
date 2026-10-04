@@ -8,10 +8,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 from core.journal.logger import OperationLogger
-from core.models.participant_protocol import ParticipantResponse
+from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_observations import CommandWork
+from core.models.participant_protocol import ParticipantResponse, ParticipantResult
 from core.participants.connection import ParticipantConnection
 from core.participants.server import ParticipantServer
 from core.primitives.json_files import read_json, write_json
@@ -85,6 +88,9 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await self.entered.wait()
+        self.assertIsInstance(self.server.identity, ParticipantIdentity)
+        self.assertIsInstance(self.server._requests[identifier], CommandWork)
+        owned_job = self.server._work[identifier]
         heartbeat = await self.connection.request(
             str(uuid4()), "heartbeat", {}, timeout_seconds=1
         )
@@ -96,6 +102,9 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TimeoutError):
             await work
         self.release.set()
+        completed = await owned_job
+        self.assertIsInstance(completed, ParticipantResult)
+        self.assertEqual(completed.data, {"hold": True})
         await wait_until(lambda: self.logger.read_command_result(identifier))
         reply = await self.connection.request(
             str(uuid4()), "echo", {"n": 2}, timeout_seconds=1
@@ -151,6 +160,67 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
             record["event"]["context"]["participant_id"],
             self.identity["participant_id"],
         )
+
+    async def test_handler_receives_json_and_optional_result_fields_stay_present(self):
+        captured = []
+        expected = {
+            "result": "success",
+            "data": {"value": [1, 1.0, True, None]},
+            "error": None,
+            "execution": {"opaque": {"value": "данные"}},
+        }
+
+        async def handler(request):
+            captured.append(request)
+            self.assertIsInstance(request, dict)
+            return expected
+
+        identifier = str(uuid4())
+        with patch.object(self.server, "_handler", handler):
+            reply = await self.connection.request(
+                identifier, "echo", {"application": True}, timeout_seconds=2
+            )
+        self.assertEqual(captured[0]["request_id"], identifier)
+        self.assertEqual(captured[0]["args"], {"application": True})
+        self.assertEqual(
+            reply,
+            {
+                "protocol_version": 2,
+                "message_type": "response",
+                "request_id": identifier,
+                **expected,
+            },
+        )
+        self.assertEqual(
+            self.logger.read_command_result(identifier)["response"], expected
+        )
+
+    async def test_handler_existing_result_model_preserves_legacy_validation(self):
+        async def handler(request):
+            return ParticipantResult(result="success", data={"existing": True})
+
+        with patch.object(self.server, "_handler", handler):
+            reply = await self.connection.request(
+                str(uuid4()), "echo", {}, timeout_seconds=2
+            )
+        self.assertEqual(reply["result"], "success")
+        self.assertEqual(reply["data"], {"existing": True})
+
+    async def test_handler_request_edits_reach_completion_observer(self):
+        identifier, edited = str(uuid4()), str(uuid4())
+
+        async def handler(request):
+            request["request_id"] = edited
+            return {"result": "success", "data": {"edited": True}}
+
+        with patch.object(self.server, "_handler", handler):
+            reply = await self.connection.request(
+                identifier, "echo", {}, timeout_seconds=2
+            )
+        await asyncio.wait_for(self.server.wait_completed(edited), timeout=2)
+        self.assertEqual(reply["request_id"], identifier)
+        self.assertIsNotNone(self.logger.read_command_result(identifier))
+        self.assertIsNone(self.logger.read_command_result(edited))
 
     async def test_disconnect_does_not_cancel_work_and_reconnect_rejects_reused_id(
         self,
