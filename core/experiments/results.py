@@ -5,6 +5,8 @@ from __future__ import annotations
 from core.models.conditional_result import ConditionalDecision
 from core.models.experiment_template import ExperimentTemplate, StageDefinition
 from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_protocol import StageOutcomeResult
+from core.models.updates import _update_model
 from core.participants.protocol import validate_response
 from core.primitives.json_values import JsonObject, JsonValue
 
@@ -39,7 +41,41 @@ def _apply_conditional_decision(
     returns_data: bool,
     template: ExperimentTemplate | JsonObject,
 ) -> JsonObject:
-    control = {"command": decision.command}
+    control, output = _conditional_output(decision, input_data, returns_data, template)
+    return {
+        **response,
+        "data": output,
+        "execution": {**response.get("execution", {}), "dag_decision": control},
+    }
+
+
+def _normalize_conditional_result(
+    response: StageOutcomeResult,
+    input_data: JsonValue,
+    definition: StageDefinition,
+    template: ExperimentTemplate,
+) -> StageOutcomeResult:
+    """Keep the accepted envelope typed until its journal or public boundary."""
+    decision = ConditionalDecision.model_validate(response.data)
+    control, output = _conditional_output(
+        decision, input_data, definition.returns_data, template
+    )
+    execution = response.execution if "execution" in response.model_fields_set else {}
+    return _update_model(
+        response,
+        data=output,
+        execution={**execution, "dag_decision": control},
+    )
+
+
+def _conditional_output(
+    decision: ConditionalDecision,
+    input_data: JsonValue,
+    returns_data: bool,
+    template: ExperimentTemplate | JsonObject,
+) -> tuple[JsonObject, JsonValue]:
+    """Check the current DAG target and select the application output."""
+    control: JsonObject = {"command": decision.command}
     if decision.command == "move":
         identifiers = (
             {stage.stage_id for stage in template.stages}
@@ -58,11 +94,7 @@ def _apply_conditional_decision(
     output = input_data
     if decision.command is not None and returns_data:
         output = decision.data
-    return {
-        **response,
-        "data": output,
-        "execution": {**response.get("execution", {}), "dag_decision": control},
-    }
+    return control, output
 
 
 def read_result(

@@ -41,7 +41,7 @@ async def run_owner(options) -> None:
         if (
             options.boundary == "accepted"
             and attempt.stage_id == options.condition
-            and result["result"] == "success"
+            and result.result == "success"
         ):
             crash()
         return result

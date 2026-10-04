@@ -20,6 +20,7 @@ from core.experiments.state import (
     RunnerStateStore,
     ServiceInstance,
     StageAttempt,
+    StageOutcome,
     _apply_recovered_attempt_context,
     _attempt_from_launch,
     _attempt_result_identity,
@@ -39,6 +40,7 @@ from core.models.participant_observations import (
     RetainedServiceStatus,
     ServiceObservation,
 )
+from core.models.participant_protocol import StageOutcomeResult
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     DagDecision,
@@ -78,6 +80,50 @@ class RunnerStateTests(unittest.TestCase):
             "paused",
         )
         self.store = RunnerStateStore()
+
+    def test_stage_outcome_preserves_json_fields_and_detaches_published_results(self):
+        attempt, _ = self._add_path_participants()
+        for optional in ({}, {"error": None, "execution": None}):
+            document = {
+                "result": "success",
+                "data": {"values": [True, 1, 1.0, None]},
+                "extension": {"nested": ["original"]},
+                **optional,
+            }
+            with self.subTest(optional=optional):
+                outcome = StageOutcome(attempt, document, "advance")
+                self.assertIsInstance(outcome.result, StageOutcomeResult)
+                self.assertEqual(
+                    outcome.result.model_dump(exclude_unset=True), document
+                )
+                document["data"]["values"].append("caller mutation")
+                published = outcome.result.model_dump(exclude_unset=True)
+                published["data"]["values"].append("output mutation")
+                published["extension"]["nested"].append("output mutation")
+                self.assertEqual(outcome.result.data["values"], [True, 1, 1.0, None])
+                self.assertEqual(
+                    outcome.result.model_dump(exclude_unset=True)["extension"],
+                    {"nested": ["original"]},
+                )
+                self.assertIs(
+                    StageOutcome(attempt, outcome.result, "pause").result,
+                    outcome.result,
+                )
+
+    def test_stage_outcome_rejects_invalid_results_and_allows_no_result(self):
+        attempt, _ = self._add_path_participants()
+        self.assertIsNone(StageOutcome(attempt, None, "stop").result)
+        for document in (
+            {},
+            {"result": "success"},
+            {"result": "unknown", "data": None},
+            {"result": "success", "data": float("nan")},
+        ):
+            with (
+                self.subTest(document=document),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                StageOutcome(attempt, document, "advance")
 
     def test_state_round_trip_retains_models_and_detaches_public_json(self):
         _, service = self._add_path_participants()

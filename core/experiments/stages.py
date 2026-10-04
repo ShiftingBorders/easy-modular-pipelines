@@ -18,7 +18,7 @@ from core.experiments.journal import RunnerJournal
 from core.experiments.launch import ModuleLauncher
 from core.experiments.results import (
     MissingConditionalDataError,
-    normalize_conditional_result,
+    _normalize_conditional_result,
     read_result,
 )
 from core.experiments.state import (
@@ -46,6 +46,7 @@ from core.models.participant_observations import (
     ExecutorCommandStateResponse,
     RetainedExecutorStatus,
 )
+from core.models.participant_protocol import StageOutcomeResult
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     ExecutorStatus,
@@ -148,7 +149,7 @@ class StageRunner:
             self._journal.client.record_event(
                 "stage.finished",
                 {
-                    "result": response,
+                    "result": response.model_dump(exclude_unset=True),
                     "outcome": attempt.outcome,
                     "result_request_id": attempt.result_request_id,
                 },
@@ -157,7 +158,7 @@ class StageRunner:
             self._save_state(state)
             if attempt.outcome == "unknown":
                 return StageOutcome(attempt, response, "stop")
-            if response is not None and response["result"] == "success":
+            if response is not None and response.result == "success":
                 return StageOutcome(attempt, response, "advance")
             if state.pause_requested:
                 return StageOutcome(attempt, response, "pause")
@@ -181,14 +182,14 @@ class StageRunner:
     def _exhausted_action(
         self,
         definition: StageDefinition | ServiceCallDefinition,
-        response: JsonObject | None,
+        response: StageOutcomeResult | None,
     ) -> Literal["advance", "pause", "stop"]:
         """Select failure policy separately from attempt execution and retries."""
         if (
             isinstance(definition, StageDefinition)
             and definition.returns_data is True
             and response is not None
-            and (response.get("error") or {}).get("code") == "conditional_missing_data"
+            and (response.error or {}).get("code") == "conditional_missing_data"
         ):
             return "stop"
         action = definition.errors.on_exhausted
@@ -583,49 +584,49 @@ class StageRunner:
         attempt: StageAttempt,
         response: JsonObject,
         outcome: str,
-    ) -> JsonObject:
-        response, outcome = self._normalize_accepted_response(
-            state, attempt, response, outcome
+    ) -> StageOutcomeResult:
+        result, outcome = self._normalize_accepted_response(
+            state, attempt, StageOutcomeResult.model_validate(response), outcome
         )
         state.used_request_ids.add(attempt.request_id)
         self._journal.client.record_command_result(
             attempt.request_id,
-            response,
+            result.model_dump(exclude_unset=True),
             author="runner",
             outcome=outcome,
             context=self._context(state, attempt),
         )
         attempt.result_request_id = attempt.request_id
         attempt.outcome = outcome
-        execution = response.get("execution", {})
+        execution = result.execution if "execution" in result.model_fields_set else {}
         if execution:
             attempt.executor_status = RetainedExecutorStatus.model_validate(execution)
             attempt.process_identity = _retain_process_identity(
-                execution.get("process")
+                attempt.executor_status.process
             )
-            attempt.started_at = execution.get("started_at")
+            attempt.started_at = attempt.executor_status.started_at
         attempt.executor_status = _finish_executor_status(attempt.executor_status)
         self._save_state(state)
         if self._notify_resources is not None:
             self._notify_resources()
-        return response
+        return result
 
     def _normalize_accepted_response(
         self,
         state: RunnerState,
         attempt: StageAttempt,
-        response: JsonObject,
+        response: StageOutcomeResult,
         outcome: str,
-    ) -> tuple[JsonObject, str]:
+    ) -> tuple[StageOutcomeResult, str]:
         definition = state.template.stages[state.stage_position - 1]
         if (
             isinstance(definition, StageDefinition)
             and "returns_data" in definition.model_fields_set
-            and response["result"] == "success"
+            and response.result == "success"
         ):
-            decision = response["data"]
+            decision = response.data
             try:
-                response = normalize_conditional_result(
+                response = _normalize_conditional_result(
                     response, attempt.input_data, definition, state.template
                 )
             except (ValueError, TypeError) as error:
@@ -634,15 +635,15 @@ class StageRunner:
                     if isinstance(error, MissingConditionalDataError)
                     else "invalid_conditional_result"
                 )
-                response = {
-                    **response,
-                    "result": "fail",
-                    "data": {
+                response = _update_model(
+                    response,
+                    result="fail",
+                    data={
                         "reason": code,
                         "message": str(error),
                     },
-                    "error": {"code": code, "message": str(error)},
-                }
+                    error={"code": code, "message": str(error)},
+                )
                 outcome = "failed"
             else:
                 if (
@@ -662,7 +663,7 @@ class StageRunner:
 
     async def _collect_result(
         self, state: RunnerState, attempt: StageAttempt
-    ) -> JsonObject:
+    ) -> StageOutcomeResult:
         deadline = self._deadline(attempt)
         try:
             while True:
@@ -691,7 +692,7 @@ class StageRunner:
                         and not await self.interrupt(state, "recovery")
                     ):
                         attempt.outcome = "unknown"
-                    return record["response"]
+                    return StageOutcomeResult.model_validate(record["response"])
                 if deadline is not None and time.monotonic() >= deadline:
                     response = self._accept(
                         state,

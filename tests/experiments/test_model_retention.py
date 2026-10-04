@@ -9,6 +9,11 @@ from uuid import uuid4
 
 import yaml
 
+from core.experiments.results import (
+    MissingConditionalDataError,
+    _normalize_conditional_result,
+    normalize_conditional_result,
+)
 from core.models.dashboard_queries import PublicationCursor
 from core.models.experiment_template import (
     ExperimentTemplate,
@@ -28,6 +33,7 @@ from core.models.participant_launch import (
     StageExecutionIdentity,
     StageLaunch,
 )
+from core.models.participant_protocol import StageOutcomeResult
 from core.models.updates import _update_model
 from core.primitives.json_values import copy_json_object
 from tests.helpers.services import ServiceWorkspace
@@ -44,6 +50,62 @@ class ModelRetentionTests(unittest.TestCase):
             "errors": {"retries": 0, "retry_delay_seconds": 0, "on_exhausted": "stop"},
         }]
         self.template = ExperimentTemplate.model_validate(self.document)
+
+    def test_conditional_model_updates_preserve_public_json_and_original_result(self):
+        stage_id = str(uuid4())
+        input_data = {"values": [True, 1, 1.0]}
+        for returns_data in (False, True):
+            definition = _update_model(
+                self.template.stages[0], stage_id=stage_id, returns_data=returns_data
+            )
+            template = _update_model(self.template, stages=[definition])
+            for decision in (
+                {"data": None},
+                {"command": "pause", "data": None},
+                {"command": "stop", "data": {"value": False}},
+                {"command": "move", "stage_id": stage_id, "data": 0},
+            ):
+                for metadata in ({}, {"execution": {"elapsed": 1.0}, "error": None}):
+                    document = {"result": "success", "data": decision, **metadata}
+                    with self.subTest(returns_data=returns_data, document=document):
+                        original = copy.deepcopy(document)
+                        response = StageOutcomeResult.model_validate(document)
+                        normalized = _normalize_conditional_result(
+                            response, input_data, definition, template
+                        )
+                        expected = normalize_conditional_result(
+                            document, input_data, definition, template
+                        )
+                        self.assertEqual(
+                            normalized.model_dump(exclude_unset=True), expected
+                        )
+                        self.assertEqual(
+                            response.model_dump(exclude_unset=True), original
+                        )
+                        published = normalized.model_dump(exclude_unset=True)
+                        published["execution"]["dag_decision"]["command"] = "mutated"
+                        self.assertEqual(
+                            normalized.model_dump(exclude_unset=True), expected
+                        )
+
+    def test_conditional_model_updates_keep_existing_rejection_boundaries(self):
+        definition = _update_model(
+            self.template.stages[0], stage_id=str(uuid4()), returns_data=True
+        )
+        template = _update_model(self.template, stages=[definition])
+        for decision, metadata, error in (
+            ({}, {}, MissingConditionalDataError),
+            ({"command": "move", "stage_id": str(uuid4())}, {}, ValueError),
+            ({"command": "pause", "data": None}, {"execution": None}, TypeError),
+        ):
+            document = {"result": "success", "data": decision, **metadata}
+            response = StageOutcomeResult.model_validate(document)
+            with self.subTest(document=document):
+                with self.assertRaises(error):
+                    _normalize_conditional_result(response, None, definition, template)
+                with self.assertRaises(error):
+                    normalize_conditional_result(document, None, definition, template)
+                self.assertEqual(response.model_dump(exclude_unset=True), document)
 
     def test_checked_replacement_preserves_original_and_omitted_fields(self):
         original = self.template.model_dump(exclude_unset=True)

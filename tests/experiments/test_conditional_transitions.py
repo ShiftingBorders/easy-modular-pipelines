@@ -282,7 +282,7 @@ class ConditionalTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(await work.value(19), 19)
             for sid, identity in identities.items():
-                self.assertTrue(process_running(identity["pid"]))
+                self.assertTrue(process_running(identity.pid))
                 self.assertTrue(runner._state.services[sid].ready)
                 self.assertEqual(
                     runner._state.services[sid].service_instance_id, instances[sid]
@@ -295,7 +295,7 @@ class ConditionalTransitionTests(unittest.IsolatedAsyncioTestCase):
                 [condition["stage_id"], tail["stage_id"]],
             )
             for identity in identities.values():
-                self.assertFalse(process_running(identity["pid"]))
+                self.assertFalse(process_running(identity.pid))
 
     async def test_conditional_stop_finishes_step_only_after_service_shutdown(self):
         """A03: stop is successful control, with no successor or live services."""
@@ -317,7 +317,7 @@ class ConditionalTransitionTests(unittest.IsolatedAsyncioTestCase):
                 [item["stage_id"] for item in trace(runner)], [condition["stage_id"]]
             )
             for identity in identities:
-                self.assertFalse(process_running(identity["pid"]))
+                self.assertFalse(process_running(identity.pid))
 
     async def test_final_conditional_command_precedes_automatic_completion(self):
         """A03: final pause waits for resume/step; final stop stays stopped."""

@@ -18,6 +18,7 @@ from core.models.participant_observations import (
     RetainedExecutorStatus,
     RetainedServiceStatus,
 )
+from core.models.participant_protocol import StageOutcomeResult
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     AttemptParameters,
@@ -269,13 +270,13 @@ class StageOutcome:
     """Attempt outcome and requested DAG action; only the runner advances the DAG."""
 
     attempt: StageAttempt
-    result: JsonObject | None
+    result: StageOutcomeResult | None
     action: Literal["advance", "pause", "stop"]
 
     def __init__(
         self,
         attempt: StageAttempt,
-        result: JsonObject | None,
+        result: StageOutcomeResult | JsonObject | None,
         action: Literal["advance", "pause", "stop"],
     ) -> None:
         if not isinstance(attempt, StageAttempt):
@@ -284,13 +285,8 @@ class StageOutcome:
             raise ValueError("action must be advance, pause, or stop.")
         self.attempt = attempt
         self.result = (
-            None if result is None else copy_json_object(result, "stage result")
+            None if result is None else StageOutcomeResult.model_validate(result)
         )
-        if self.result is not None and (
-            self.result.get("result") not in ("success", "fail")
-            or "data" not in self.result
-        ):
-            raise ValueError("Stage result must contain result=success/fail and data.")
         self.action = action
 
 

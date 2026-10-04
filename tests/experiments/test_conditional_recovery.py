@@ -119,7 +119,7 @@ class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                                 active["attempt_id"],
                             )
                             self.assertEqual(
-                                runner._state.active_attempt.process_identity,
+                                runner._state.active_attempt.process_identity.model_dump(),
                                 active["process_identity"],
                             )
                         else:

@@ -61,6 +61,7 @@ from core.models.participant_observations import (
     ExecutorCommandState,
     RetainedExecutorStatus,
 )
+from core.models.participant_protocol import StageOutcomeResult
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import (
     DagDecision,
@@ -143,7 +144,7 @@ class ExperimentRunner:
         self._service_control_task: asyncio.Task | None = None
         self._step_future = None
         self._last_attempt = None
-        self._last_response = None
+        self._last_response: StageOutcomeResult | None = None
         self._last_snapshot = None
         self._error = None
         self._notify = notify
@@ -494,8 +495,11 @@ class ExperimentRunner:
             self._save_state()
 
     def _finish_stage_step(
-        self, state: RunnerState, outcome: StageOutcome,
-        response: JsonObject | None, final: bool,
+        self,
+        state: RunnerState,
+        outcome: StageOutcome,
+        response: StageOutcomeResult | None,
+        final: bool,
     ) -> None:
         # The final step also waits for confirmed service shutdown.
         if self._step_future is not None and not final:
@@ -505,15 +509,15 @@ class ExperimentRunner:
                     future.set_result(
                         {
                             "attempt_id": outcome.attempt.attempt_id,
-                            "result": response,
+                            "result": None
+                            if response is None
+                            else response.model_dump(exclude_unset=True),
                             "phase": state.phase,
                         }
                     )
                 else:
                     future.set_exception(
-                        RuntimeError(
-                            "Stage did not complete or skip under its policy."
-                        )
+                        RuntimeError("Stage did not complete or skip under its policy.")
                     )
 
     def _apply_readiness_result(self, state: RunnerState, action: str) -> bool:
@@ -560,7 +564,9 @@ class ExperimentRunner:
                         "attempt_id": None
                         if self._last_attempt is None
                         else self._last_attempt.attempt_id,
-                        "result": self._last_response,
+                        "result": None
+                        if self._last_response is None
+                        else self._last_response.model_dump(exclude_unset=True),
                         "phase": state.phase,
                     }
                 )
@@ -709,21 +715,21 @@ class ExperimentRunner:
         self._pending_advance = outcome.action == "advance"
         if outcome.action == "pause":
             state.mode = self._desired_mode = "paused"
-        if response is None or response["result"] != "success":
+        if response is None or response.result != "success":
             state.last_result = state.last_result_id = None
             state.stage_result_ids.pop(stage_id, None)
             state.stage_result_origins.pop(stage_id, None)
             return
         # Keep a transferred input while the cursor still names its target:
         # manual rerun must receive the same input even after successful output.
-        state.last_result = response["data"]
+        state.last_result = response.data
         state.last_result_id = outcome.attempt.result_request_id
         state.stage_result_ids[stage_id] = outcome.attempt.result_request_id
         state.stage_result_origins[stage_id] = state.experiment_id
         definition = state.template.stages[state.stage_position - 1]
         if "returns_data" not in definition.model_fields_set:
             return
-        decision = DagDecision.model_validate(response["execution"]["dag_decision"])
+        decision = DagDecision.model_validate(response.execution["dag_decision"])
         source = LastDecision.model_validate(
             {
                 "request_id": outcome.attempt.result_request_id,
@@ -733,7 +739,7 @@ class ExperimentRunner:
             }
         )
         state.last_dag_decision = source
-        self._retain_input_artifacts(response["data"])
+        self._retain_input_artifacts(response.data)
         command = decision.command
         if command == "pause":
             state.mode = self._desired_mode = "paused"
@@ -812,7 +818,9 @@ class ExperimentRunner:
                     "attempt_id": None
                     if self._last_attempt is None
                     else self._last_attempt.attempt_id,
-                    "result": self._last_response,
+                    "result": None
+                    if self._last_response is None
+                    else self._last_response.model_dump(exclude_unset=True),
                     "phase": self._state.phase,
                 }
             )

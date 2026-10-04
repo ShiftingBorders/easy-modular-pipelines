@@ -76,6 +76,22 @@ class ResultEnvelope(ParticipantResult):
     request_id: JsonValue = None
 
 
+class StageOutcomeResult(BaseModel):
+    """Accepted stage envelope; StageOutcome historically preserves extra fields."""
+
+    model_config = ConfigDict(extra="allow", strict=True, frozen=True)
+
+    result: Literal["success", "fail"]
+    data: JsonValue
+    error: JsonValue = None
+    execution: JsonValue = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        return copy_json_object(document, "stage result")
+
+
 class StageResult(ParticipantResult):
     """Stdout contains only the application result, without transport metadata."""
 
