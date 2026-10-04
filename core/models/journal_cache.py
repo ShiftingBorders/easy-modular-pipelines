@@ -12,7 +12,12 @@ from pydantic import (
     model_validator,
 )
 
-from core.models.journal_records import SQLitePosition, UTCText, _Document
+from core.models.journal_records import (
+    JournalCheckpoint,
+    SQLitePosition,
+    UTCText,
+    _Document,
+)
 from core.models.values import (
     AbsolutePath,
     Boolean,
@@ -126,6 +131,41 @@ class CachePublication(_Document):
 class FilteredPublication(JournalBoundary):
     publication_id: UUIDText
     published_at: UTCText
+
+
+class FilteredCheckpoint(_Document):
+    """Filtered cursor accepts UUID publications and synthetic source publications."""
+
+    journal_id: str
+    generation: str
+    cursor: SQLitePosition
+    publication_id: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        document = copy_json_object(document, "publication checkpoint")
+        if document.keys() != {"journal_id", "generation", "cursor", "publication_id"}:
+            raise ValueError("Publication checkpoint fields do not match.")
+        if (
+            type(document["publication_id"]) is not str
+            or not document["publication_id"]
+        ):
+            raise ValueError("publication_id must be a nonempty string.")
+        checkpoint = JournalCheckpoint.model_validate(
+            {
+                name: value
+                for name, value in document.items()
+                if name != "publication_id"
+            },
+            context={"key": "cursor"},
+        )
+        return {
+            "journal_id": checkpoint.journal_id,
+            "generation": checkpoint.generation,
+            "cursor": checkpoint.position,
+            "publication_id": document["publication_id"],
+        }
 
 
 class CacheReaderContext(BaseModel):

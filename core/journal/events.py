@@ -13,7 +13,7 @@ from core.primitives.json_values import (
 )
 
 if TYPE_CHECKING:
-    from core.models.journal_records import CommandObservation
+    from core.models.journal_records import CommandObservation, JournalCheckpoint
 
 SCHEMA_VERSION = 2
 RESERVED_EVENT_TYPES = frozenset(
@@ -113,16 +113,22 @@ def validate_journal_identity(value: object) -> JsonObject:
 
 
 def validate_checkpoint(value: object, key: str) -> JsonObject | None:
-    if value is None:
+    checkpoint = _validated_checkpoint(value, key)
+    if checkpoint is None:
         return None
-    from core.models.journal_records import JournalCheckpoint
-
-    checkpoint = JournalCheckpoint.model_validate(value, context={"key": key})
     return {
         "journal_id": checkpoint.journal_id,
         "generation": checkpoint.generation,
         key: checkpoint.position,
     }
+
+
+def _validated_checkpoint(value: object, key: str) -> JournalCheckpoint | None:
+    if value is None:
+        return None
+    from core.models.journal_records import JournalCheckpoint
+
+    return JournalCheckpoint.model_validate(value, context={"key": key})
 
 
 def validate_context(value: object) -> JsonObject:

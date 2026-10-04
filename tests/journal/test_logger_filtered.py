@@ -19,6 +19,7 @@ from core.journal.events import (
 )
 from core.journal.filtered import FilteredJournal
 from core.journal.logger import OperationLogger
+from core.models.journal_cache import FilteredCheckpoint, FilteredPublication
 from tests.helpers.logging_fixtures import write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -30,6 +31,46 @@ from tests.helpers.logging_process import (
 
 
 class FilteredJournalTests(unittest.TestCase):
+    def test_private_publication_and_checkpoint_models_keep_public_json_contract(self):
+        self.logger.record_event("sample", {"value": True})
+        published = self.view.refresh()
+        metadata = self.view._metadata()
+        self.assertIsInstance(metadata, FilteredPublication)
+        self.assertEqual(metadata.model_dump(), published)
+        checkpoint = self.view.read_events(limit=1)["checkpoint"]
+        retained = FilteredCheckpoint.model_validate(checkpoint)
+        self.assertEqual(retained.model_dump(), checkpoint)
+        self.assertEqual(self.view.read_events(checkpoint)["events"], [])
+        published["cursor"] = -1
+        self.assertGreaterEqual(metadata.cursor, 0)
+
+    def test_filtered_checkpoint_keeps_synthetic_and_nonempty_string_identifiers(self):
+        identity = self.logger.get_journal_info()
+        for identifier in ("source:generation:0", " ", "nul\x00value"):
+            with self.subTest(identifier=identifier):
+                checkpoint = FilteredCheckpoint.model_validate(
+                    {
+                        "journal_id": identity["journal_id"],
+                        "generation": identity["generation"],
+                        "cursor": 0,
+                        "publication_id": identifier,
+                    }
+                )
+                self.assertEqual(checkpoint.publication_id, identifier)
+        for identifier in ("", None, False, 1):
+            with (
+                self.subTest(identifier=identifier),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                FilteredCheckpoint.model_validate(
+                    {
+                        "journal_id": identity["journal_id"],
+                        "generation": identity["generation"],
+                        "cursor": 0,
+                        "publication_id": identifier,
+                    }
+                )
+
     def test_run_preserves_primary_failure_when_closing_also_fails(self):
         """G7/E6: worker cleanup cannot replace the original failure."""
         self.view.close()

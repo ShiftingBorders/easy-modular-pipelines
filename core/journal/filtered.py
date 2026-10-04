@@ -1,5 +1,7 @@
 """Explicitly scheduled, rebuildable projection of one local operation journal."""
 
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
@@ -8,6 +10,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from core.journal.diagnostics import _close_preserving_failure
@@ -16,7 +19,6 @@ from core.journal.events import (
     LoggingStateError,
     LoggingStorageError,
     encode_event,
-    validate_checkpoint,
 )
 from core.journal.logger import OperationLogger
 from core.journal.records import _read_boundary
@@ -27,9 +29,12 @@ from core.journal.view_schema import (
     _CREATE_INFO,
     _validate_view_schema,
 )
-from core.primitives.json_values import JsonObject, copy_json_object
+from core.primitives.json_values import JsonObject
 
 _PAGE_BYTES = 16777216
+
+if TYPE_CHECKING:
+    from core.models.journal_cache import FilteredCheckpoint, FilteredPublication
 
 
 class FilteredJournal:
@@ -147,7 +152,7 @@ class FilteredJournal:
             raise LoggingStorageError("The derived database file was replaced.")
         _validate_view_schema(self._connection)
 
-    def _metadata(self) -> JsonObject | None:
+    def _metadata(self) -> FilteredPublication | None:
         from core.models.journal_cache import FilteredPublication
 
         row = self._connection.execute(
@@ -155,7 +160,7 @@ class FilteredJournal:
         ).fetchone()
         if row is None:
             return None
-        return FilteredPublication.model_validate(json.loads(row[0])).model_dump()
+        return FilteredPublication.model_validate(json.loads(row[0]))
 
     def _write_entry(self, entry: JsonObject) -> None:
         event = entry["event"]
@@ -190,6 +195,12 @@ class FilteredJournal:
 
     def refresh(self) -> JsonObject | None:
         """Publish one consistent source view; derived failures preserve primary reads."""
+        publication = self._refresh()
+        return None if publication is None else publication.model_dump()
+
+    def _refresh(self) -> FilteredPublication | None:
+        from core.models.journal_cache import FilteredPublication
+
         self._check_process()
         with self._lock:
             self._require_open()
@@ -227,10 +238,10 @@ class FilteredJournal:
                     self._last_error is not None
                     or previous is None
                     or any(
-                        previous[key] != boundary[key]
+                        getattr(previous, key) != boundary[key]
                         for key in ("journal_id", "generation")
                     )
-                    or previous["change_cursor"] > boundary["change_cursor"]
+                    or previous.change_cursor > boundary["change_cursor"]
                 )
                 phase = "view"
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -254,7 +265,7 @@ class FilteredJournal:
                     rows = source.execute(
                         "SELECT change_cursor, event_id, change_json FROM journal_changes "
                         "WHERE change_cursor > ? ORDER BY change_cursor",
-                        (previous["change_cursor"],),
+                        (previous.change_cursor,),
                     )
                     while True:
                         phase = "source"
@@ -271,23 +282,23 @@ class FilteredJournal:
                 source.close()
                 source = None
                 store._check_health()
-                changed = (
-                    rebuild or previous["change_cursor"] != boundary["change_cursor"]
+                changed = rebuild or previous.change_cursor != boundary["change_cursor"]
+                publication = FilteredPublication.model_validate(
+                    {
+                        **boundary,
+                        "publication_id": uuid4().hex
+                        if changed
+                        else previous.publication_id,
+                        "published_at": datetime.now(UTC).isoformat(
+                            timespec="microseconds"
+                        ),
+                    }
                 )
-                publication = {
-                    **boundary,
-                    "publication_id": uuid4().hex
-                    if changed
-                    else previous["publication_id"],
-                    "published_at": datetime.now(UTC).isoformat(
-                        timespec="microseconds"
-                    ),
-                }
                 phase = "view"
                 self._connection.execute(
                     "INSERT INTO filtered_info VALUES (1, ?) ON CONFLICT(singleton) "
                     "DO UPDATE SET metadata_json=excluded.metadata_json",
-                    (json.dumps(publication),),
+                    (json.dumps(publication.model_dump()),),
                 )
                 self._check_view()
                 self._connection.execute("COMMIT")
@@ -331,20 +342,22 @@ class FilteredJournal:
                 )
         self._write_entry(change["entry"])
 
-    def _fallback(self, checkpoint: JsonObject | None, limit: int) -> JsonObject:
+    def _fallback(
+        self, checkpoint: FilteredCheckpoint | None, limit: int
+    ) -> JsonObject:
         base = (
             None
             if checkpoint is None
             else {
-                key: value
-                for key, value in checkpoint.items()
-                if key != "publication_id"
+                "journal_id": checkpoint.journal_id,
+                "generation": checkpoint.generation,
+                "cursor": checkpoint.cursor,
             }
         )
         page = self._logger.read_events(base, limit=limit, view="effective")
         boundary = page["boundary"]
         publication = f"source:{boundary['generation']}:{boundary['change_cursor']}"
-        if checkpoint is not None and checkpoint["publication_id"] != publication:
+        if checkpoint is not None and checkpoint.publication_id != publication:
             raise LoggingStateError(
                 "Publication changed; restart reading from the first page."
             )
@@ -366,40 +379,24 @@ class FilteredJournal:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer from 1 to 1000.")
         if checkpoint is not None:
-            checkpoint = copy_json_object(checkpoint, "publication checkpoint")
-            if checkpoint.keys() != {
-                "journal_id",
-                "generation",
-                "cursor",
-                "publication_id",
-            }:
-                raise ValueError("Publication checkpoint fields do not match.")
-            if (
-                type(checkpoint["publication_id"]) is not str
-                or not checkpoint["publication_id"]
-            ):
-                raise ValueError("publication_id must be a nonempty string.")
-            base = validate_checkpoint(
-                {
-                    key: value
-                    for key, value in checkpoint.items()
-                    if key != "publication_id"
-                },
-                "cursor",
-            )
-            checkpoint.update(base)
+            from core.models.journal_cache import FilteredCheckpoint
+
+            parsed = FilteredCheckpoint.model_validate(checkpoint)
+        else:
+            parsed = None
         with self._lock:
             self._require_open()
             current = self._logger.get_journal_info()
-            if checkpoint is not None:
+            if parsed is not None:
                 expected = {
-                    key: checkpoint[key] for key in ("journal_id", "generation")
+                    "journal_id": parsed.journal_id,
+                    "generation": parsed.generation,
                 }
                 actual = {key: current[key] for key in expected}
                 if expected != actual:
                     raise JournalGenerationChanged(expected, actual)
             if self._connection is None:
-                return self._fallback(checkpoint, limit)
+                return self._fallback(parsed, limit)
             try:
                 self._check_view()
                 self._connection.execute("BEGIN")
@@ -408,21 +405,21 @@ class FilteredJournal:
                     metadata is None
                     or self._last_error is not None
                     or any(
-                        metadata[key] != current[key]
+                        getattr(metadata, key) != current[key]
                         for key in ("journal_id", "generation")
                     )
                 ):
                     self._connection.execute("ROLLBACK")
                     raise LookupError("No current publication is available.")
                 if (
-                    checkpoint is not None
-                    and checkpoint["publication_id"] != metadata["publication_id"]
+                    parsed is not None
+                    and parsed.publication_id != metadata.publication_id
                 ):
                     raise LoggingStateError(
                         "Publication changed; restart reading from the first page."
                     )
-                after = 0 if checkpoint is None else checkpoint["cursor"]
-                if after > metadata["cursor"]:
+                after = 0 if parsed is None else parsed.cursor
+                if after > metadata.cursor:
                     raise LoggingStateError("Checkpoint is beyond this publication.")
                 entries, after, more = self._read_derived_page(after, limit, metadata)
                 self._connection.execute("COMMIT")
@@ -430,7 +427,7 @@ class FilteredJournal:
             except LookupError:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
-                return self._fallback(checkpoint, limit)
+                return self._fallback(parsed, limit)
             except LoggingStateError:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
@@ -445,25 +442,25 @@ class FilteredJournal:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
                 self._report_refresh_failure(error)
-                return self._fallback(checkpoint, limit)
+                return self._fallback(parsed, limit)
             self._logger.get_journal_info()
             return {
                 "events": entries,
                 "checkpoint": {
-                    key: metadata[key]
+                    key: getattr(metadata, key)
                     for key in ("journal_id", "generation", "publication_id")
                 }
                 | {"cursor": after},
-                "boundary": metadata,
+                "boundary": metadata.model_dump(),
                 "has_more": more,
                 "source": "filtered",
-                "published_at": metadata["published_at"],
-                "publication_id": metadata["publication_id"],
+                "published_at": metadata.published_at,
+                "publication_id": metadata.publication_id,
                 "refresh_error": None,
             }
 
     def _read_derived_page(
-        self, after: int, limit: int, metadata: JsonObject
+        self, after: int, limit: int, metadata: FilteredPublication
     ) -> tuple[list[JsonObject], int, bool]:
         entries, size = [], 0
         more = False
@@ -499,7 +496,7 @@ class FilteredJournal:
             size += item_size
             after = cursor
         if not more:
-            after = metadata["cursor"]
+            after = metadata.cursor
         return entries, after, more
 
     def run(self, stop_event: threading.Event) -> None:

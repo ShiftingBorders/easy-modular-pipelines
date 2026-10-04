@@ -36,9 +36,9 @@ from core.journal.events import (
     LoggingConfigurationError,
     LoggingStateError,
     LoggingStorageError,
+    _validated_checkpoint,
     _validated_command_result,
     encode_event,
-    validate_checkpoint,
     validate_context,
 )
 from core.journal.records import (
@@ -510,7 +510,7 @@ class SQLiteEventStore:
         view: str = "raw",
     ) -> JsonObject:
         self._check_process()
-        checkpoint = validate_checkpoint(checkpoint, "cursor")
+        parsed = _validated_checkpoint(checkpoint, "cursor")
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer from 1 to 1000.")
         if view not in ("raw", "effective"):
@@ -521,7 +521,7 @@ class SQLiteEventStore:
                 self._check_health()
                 self._connection.execute("BEGIN")
                 boundary = _read_boundary(self._connection)
-                after = _checkpoint_position(checkpoint, boundary, "cursor")
+                after = _checkpoint_position(parsed, boundary, "cursor")
                 rows = self._connection.execute(
                     "SELECT cursor, event_id, producer_instance_id, sequence_number, "
                     "event_json FROM events WHERE cursor > ? ORDER BY cursor LIMIT 1000",
@@ -857,7 +857,7 @@ class SQLiteEventStore:
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
     ) -> JsonObject:
         self._check_process()
-        checkpoint = validate_checkpoint(checkpoint, "change_cursor")
+        parsed = _validated_checkpoint(checkpoint, "change_cursor")
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer from 1 to 1000.")
         with self._lock:
@@ -866,7 +866,7 @@ class SQLiteEventStore:
                 self._check_health()
                 self._connection.execute("BEGIN")
                 boundary = _read_boundary(self._connection)
-                after = _checkpoint_position(checkpoint, boundary, "change_cursor")
+                after = _checkpoint_position(parsed, boundary, "change_cursor")
                 result, after = self._read_change_page(after, limit)
                 self._connection.execute("COMMIT")
                 self._check_health()

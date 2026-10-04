@@ -18,7 +18,7 @@ from core.journal.events import (
 from core.primitives.json_values import JsonObject
 
 if TYPE_CHECKING:
-    from core.models.journal_records import CommandObservation
+    from core.models.journal_records import CommandObservation, JournalCheckpoint
 
 
 def _read_journal_info(connection: sqlite3.Connection) -> JsonObject:
@@ -67,17 +67,20 @@ def _checkpoint(info: JsonObject, key: str, position: int) -> JsonObject:
 
 
 def _checkpoint_position(
-    checkpoint: JsonObject | None, boundary: JsonObject, key: str
+    checkpoint: JournalCheckpoint | None, boundary: JsonObject, key: str
 ) -> int:
     if checkpoint is None:
         return 0
-    expected = {name: checkpoint[name] for name in ("journal_id", "generation")}
+    expected = {
+        "journal_id": checkpoint.journal_id,
+        "generation": checkpoint.generation,
+    }
     actual = {name: boundary[name] for name in expected}
     if expected != actual:
         raise JournalGenerationChanged(expected, actual)
-    if checkpoint[key] > boundary[key]:
+    if checkpoint.position > boundary[key]:
         raise LoggingStateError("Checkpoint is beyond the committed journal boundary.")
-    return checkpoint[key]
+    return checkpoint.position
 
 
 def _ignored_reason(result: CommandObservation) -> str:
