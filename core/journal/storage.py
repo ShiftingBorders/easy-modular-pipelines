@@ -73,6 +73,7 @@ if TYPE_CHECKING:
         DiagnosticManifest,
         JournalSnapshotManifest,
     )
+    from core.models.journal_records import JournalContext
     from core.models.journal_settings import JournalConfiguration
 
 
@@ -107,7 +108,10 @@ class SQLiteEventStore:
 
     @classmethod
     def _from_settings(
-        cls, settings: JournalConfiguration, context: JsonObject, read_only: bool,
+        cls,
+        settings: JournalConfiguration,
+        context: JournalContext,
+        read_only: bool,
     ) -> SQLiteEventStore:
         """Use settings already validated at the configuration-file boundary."""
         store = cls.__new__(cls)
@@ -115,8 +119,10 @@ class SQLiteEventStore:
         return store
 
     def _configure(
-        self, settings: JournalConfiguration | JournalOptions,
-        diagnostic_context: JsonObject, read_only: bool,
+        self,
+        settings: JournalConfiguration | JournalOptions,
+        diagnostic_context: JournalContext | JsonObject,
+        read_only: bool,
     ) -> None:
         self._read_only = read_only
         self.db_path = settings.db_path
@@ -132,7 +138,11 @@ class SQLiteEventStore:
         self._file_identity: tuple[int, int] | None = None
         self._journal_id: str | None = None
         self._generation: str | None = None
-        self._diagnostic_context = dict(diagnostic_context)
+        self._diagnostic_context = (
+            dict(diagnostic_context)
+            if isinstance(diagnostic_context, dict)
+            else diagnostic_context
+        )
 
     def _check_process(self) -> None:
         if os.getpid() != self._process_id:
@@ -260,7 +270,11 @@ class SQLiteEventStore:
                 "operation_id": event.get("operation_id") if event else None,
                 "context": event.get("context", {})
                 if event
-                else self._diagnostic_context,
+                else (
+                    self._diagnostic_context
+                    if isinstance(self._diagnostic_context, dict)
+                    else self._diagnostic_context.model_dump()
+                ),
             }
             # ASCII escapes also preserve exception strings with malformed Unicode.
             with diagnostic_path.open("x", encoding="utf-8") as destination:

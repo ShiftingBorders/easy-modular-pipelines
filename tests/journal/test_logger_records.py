@@ -15,7 +15,11 @@ from core.journal.events import (
 )
 from core.journal.logger import OperationLogger
 from core.journal.measurements import _validate_measurement
-from core.models.journal_records import CommandObservation, JournalMeasurement
+from core.models.journal_records import (
+    CommandObservation,
+    JournalContext,
+    JournalMeasurement,
+)
 from tests.helpers.logging_fixtures import (
     BASE_CONTEXT,
     TEMPLATE_YAML,
@@ -25,6 +29,39 @@ from tests.helpers.logging_process import SCRATCH_ROOT, cleanup_directory, read_
 
 
 class OperationLoggerRecordsTests(unittest.TestCase):
+    def test_context_models_survive_operations_and_public_context_is_detached(self):
+        self.assertIsInstance(self.logger._context, JournalContext)
+        self.assertIs(self.logger._store._diagnostic_context, self.logger._context)
+        original = self.logger.get_context()
+        published = self.logger.get_context()
+        published["source"] = "external"
+        self.assertEqual(self.logger.get_context(), original)
+        with self.logger.operation("work", "parent") as operation:
+            self.assertIsInstance(operation._context, JournalContext)
+            child = operation.get_child_context()
+            self.assertEqual(child["parent_operation_id"], operation.get_operation_id())
+            child["source"] = "external"
+            self.logger.record_command_result(
+                "bound-request",
+                {"result": "success", "data": None},
+                author="runner",
+                outcome="succeeded",
+                operation=operation,
+            )
+            self.assertEqual(
+                operation._context.root.get("request_id"), original.get("request_id")
+            )
+            self.assertEqual(operation._context.root["source"], original["source"])
+        self.assertEqual(self.logger.get_context(), original)
+        event = next(
+            event
+            for event in read_database(self.db_path)
+            if event["event_type"] == "command.result"
+        )
+        self.assertEqual(event["context"]["request_id"], "bound-request")
+        self.assertEqual(event["context"]["host_name"], socket.gethostname())
+        self.assertEqual(event["context"]["process_id"], os.getpid())
+
     def test_measurement_model_defaults_preserve_original_event_key_order(self):
         original = {"unit": "bytes", "scope": "host"}
         measurement = _validate_measurement("memory", original, None)

@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from core.journal.events import LoggingConfigurationError, validate_context
+from core.journal.events import LoggingConfigurationError
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
 if TYPE_CHECKING:
+    from core.models.journal_records import JournalContext
     from core.models.journal_settings import LoggingConfiguration
 
 
@@ -19,12 +20,12 @@ def load_logging_settings(config_path: Path) -> tuple[JsonObject, JsonObject]:
     document = settings.model_dump()
     document["db_path"] = str(settings.db_path)
     document["busy_timeout_seconds"] = float(settings.busy_timeout_seconds)
-    return document, context
+    return document, context.model_dump()
 
 
 def _load_logging_settings(
     config_path: Path,
-) -> tuple[LoggingConfiguration, JsonObject]:
+) -> tuple[LoggingConfiguration, JournalContext]:
     """Read one file and validate once before the logger consumes typed settings."""
     try:
         if not config_path.is_absolute():
@@ -41,10 +42,11 @@ def _load_logging_settings(
                 raise ValueError("db_path must be absolute or relative to the config.")
             path = config_path.parent / path
         # Load models only after explicit file I/O; logger imports stay side-effect free.
+        from core.models.journal_records import JournalContext
         from core.models.journal_settings import LoggingConfiguration
 
         settings = LoggingConfiguration.model_validate({**values, "db_path": path})
-        context = validate_context(document.get("operation_context", {}))
+        context = JournalContext.model_validate(document.get("operation_context", {}))
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as error:
         raise LoggingConfigurationError(
             f"Cannot load logging configuration {config_path}: {error}"

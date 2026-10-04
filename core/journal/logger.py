@@ -15,7 +15,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import TYPE_CHECKING, Self
 from uuid import uuid4
 
 from core.journal.events import (
@@ -24,8 +24,10 @@ from core.journal.events import (
     LoggingStateError,
     LoggingStorageError,
     _validated_command_result,
-    validate_context,
 )
+
+if TYPE_CHECKING:
+    from core.models.journal_records import JournalContext
 from core.journal.measurements import _validate_measurement
 from core.journal.settings import _load_logging_settings
 from core.journal.storage import SQLiteEventStore
@@ -52,7 +54,7 @@ class OperationLogger:
             raise ValueError("config_path must be an absolute filesystem path.")
         self._config_path = path
         self._store: SQLiteEventStore | None = None
-        self._context: JsonObject = {}
+        self._context: JournalContext
         self._producer_instance_id: str | None = None
         self._sequence_number = 0
         self._failed = False
@@ -83,11 +85,14 @@ class OperationLogger:
                     "A read-only client requires an existing journal."
                 )
             db_path = settings.db_path
-            context.setdefault("source", "library")
+            from core.models.journal_records import JournalContext
+
+            values = dict(context.root)
+            values.setdefault("source", "library")
             # A context exported by a parent process must not identify this writer as it.
-            context["host_name"] = socket.gethostname()
-            context["process_id"] = self._process_id
-            context = validate_context(context)
+            values["host_name"] = socket.gethostname()
+            values["process_id"] = self._process_id
+            context = JournalContext.model_validate(values)
             reopening = db_path == self._journal_path
             if reopening and self._journal_info is not None:
                 from core.models.journal_settings import JournalConfiguration
@@ -199,15 +204,17 @@ class OperationLogger:
         self._check_process()
         with self._lock:
             self._require_open()
-            return dict(self._context)
+            return self._context.model_dump()
 
-    def _merge_context(self, context: JsonObject | None) -> JsonObject:
-        merged = dict(self._context)
+    def _merge_context(self, context: JsonObject | None) -> JournalContext:
+        from core.models.journal_records import JournalContext
+
+        merged = dict(self._context.root)
         if context is not None:
-            merged.update(validate_context(context))
-        merged["host_name"] = self._context["host_name"]
+            merged.update(JournalContext.model_validate(context).root)
+        merged["host_name"] = self._context.root["host_name"]
         merged["process_id"] = self._process_id
-        return validate_context(merged)
+        return JournalContext.model_validate(merged)
 
     def _check_operation(self, operation: Operation, state: str = "started") -> None:
         self._require_open()
@@ -224,7 +231,7 @@ class OperationLogger:
         self,
         event_type: str,
         data: JsonObject,
-        context: JsonObject,
+        context: JournalContext,
         operation_id: str | None,
         *,
         persist: Callable[[JsonObject], str | None] | None = None,
@@ -242,7 +249,7 @@ class OperationLogger:
             "sequence_number": sequence,
             "occurred_at": datetime.now(UTC).isoformat(timespec="microseconds"),
             "event_type": event_type,
-            "context": context,
+            "context": context.model_dump(),
             "operation_id": operation_id,
             "data": data,
         }
@@ -272,14 +279,14 @@ class OperationLogger:
 
     def _get_record_context(
         self, operation: Operation | None, context: JsonObject | None
-    ) -> tuple[JsonObject, str | None]:
+    ) -> tuple[JournalContext, str | None]:
         """Resolve explicit context while the caller holds the logger lock."""
         self._require_open()
         if operation is not None:
             self._check_operation(operation)
             if context is not None:
                 raise ValueError("An operation already owns its context; omit context.")
-            return dict(operation._context), operation._operation_id
+            return operation._context, operation._operation_id
         return self._merge_context(context), None
 
     def _record(
@@ -296,7 +303,7 @@ class OperationLogger:
             self._require_open()
             event_context, operation_id = self._get_record_context(operation, context)
             for name in required_context:
-                if event_context.get(name) is None:
+                if event_context.root.get(name) is None:
                     raise ValueError(f"This record requires context.{name}.")
             return self._append(event_type, data, event_context, operation_id)
 
@@ -333,7 +340,7 @@ class OperationLogger:
                     {
                         "operation_type": operation._operation_type,
                         "operation_name": operation._operation_name,
-                        "parent_operation_id": operation._context.get(
+                        "parent_operation_id": operation._context.root.get(
                             "parent_operation_id"
                         ),
                         "attributes": operation._attributes,
@@ -533,10 +540,12 @@ class OperationLogger:
             self._require_open()
             event_context, operation_id = self._get_record_context(operation, context)
             for name in ("experiment_id", "participant_id"):
-                require_text(event_context.get(name), f"context.{name}")
-            if event_context.get("request_id") not in (None, request_id):
+                require_text(event_context.root.get(name), f"context.{name}")
+            if event_context.root.get("request_id") not in (None, request_id):
                 raise ValueError("request_id disagrees with the supplied context.")
-            event_context["request_id"] = request_id
+            from core.models.updates import _update_model
+
+            event_context = _update_model(event_context, request_id=request_id)
             return self._append(
                 "command.result",
                 payload.model_dump(),
@@ -779,13 +788,15 @@ class Operation:
         logger: OperationLogger,
         operation_type: str,
         operation_name: str,
-        context: JsonObject,
+        context: JournalContext | JsonObject,
         attributes: JsonObject,
     ) -> None:
         self._logger = logger
         self._operation_type = require_text(operation_type, "operation_type")
         self._operation_name = require_text(operation_name, "operation_name")
-        self._context = validate_context(context)
+        from core.models.journal_records import JournalContext
+
+        self._context = JournalContext.model_validate(context)
         self._attributes = copy_json_object(attributes, "attributes")
         self._operation_id = uuid4().hex
         self._producer_instance_id = logger._producer_instance_id
@@ -801,7 +812,7 @@ class Operation:
         self._logger._check_process()
         with self._logger._lock:
             self._logger._check_operation(self)
-            context = dict(self._context)
+            context = self._context.model_dump()
             context["parent_operation_id"] = self._operation_id
             return context
 
