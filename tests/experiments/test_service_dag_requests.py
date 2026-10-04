@@ -15,6 +15,7 @@ class ServiceDagRequestTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.w.close)
         self.definition = self.w.service()
         self.sid = self.definition["service_id"]
+        self.w.publish_service_definitions()
         await self.w.manager.start_all(self.w.state)
 
     async def test_expired_unsent_request_has_no_effect_and_no_manager_accepted_result(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 from collections.abc import Awaitable, Callable, Coroutine
@@ -27,10 +26,12 @@ from core.experiments.launch import ModuleLauncher
 from core.experiments.reload import (
     ReloadApplication,
     _definition_change,
+    _definition_fingerprint,
     _prepare_reload_candidate,
     _reload_cursor,
     _reload_layout,
     _service_state,
+    _template_fingerprint,
 )
 from core.experiments.service_inputs import _service_definition
 from core.experiments.services import ServiceManager
@@ -49,6 +50,10 @@ from core.experiments.state import (
 from core.journal.events import LoggingError, encode_event
 from core.journal.logger import Operation, OperationLogger
 from core.models.experiment_registry import RegistryEntry
+from core.models.experiment_template import (
+    ExperimentTemplate,
+    ServiceDefinition,
+)
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import (
@@ -258,7 +263,7 @@ class ExperimentRunner:
             if state is None:
                 return
             wake_task = asyncio.create_task(self._wake.wait())
-            if state.template["services"]:
+            if state.template.services:
                 self._service_task = asyncio.create_task(self._services.monitor(state))
 
             while not self._stop_requested:
@@ -452,7 +457,7 @@ class ExperimentRunner:
     async def _snapshot_stage_boundary(
         self, state: RunnerState, outcome: StageOutcome, final: bool
     ) -> None:
-        mode = state.template["snapshots"]["mode"]
+        mode = state.template.snapshots.mode
         if (
             outcome.action == "advance"
             and not final
@@ -460,7 +465,7 @@ class ExperimentRunner:
                 mode == "after_stage"
                 or mode == "after_epoch"
                 and self._pending_advance
-                and state.stage_position == len(state.template["stages"])
+                and state.stage_position == len(state.template.stages)
             )
         ):
             self._maintenance = True
@@ -550,7 +555,7 @@ class ExperimentRunner:
         if self._pending_advance:
             state.pending_input = None
             state.stage_position += 1
-            if state.stage_position > len(state.template["stages"]):
+            if state.stage_position > len(state.template.stages):
                 state.cycle_number += 1
                 state.stage_position = 1
                 state.stage_result_ids.clear()
@@ -674,8 +679,8 @@ class ExperimentRunner:
         )
         return (
             self._pending_advance
-            and state.stage_position == len(state.template["stages"])
-            and state.cycle_number == state.template["cycles"]
+            and state.stage_position == len(state.template.stages)
+            and state.cycle_number == state.template.cycles
             and not conditional_pause
         )
 
@@ -700,8 +705,8 @@ class ExperimentRunner:
         state.last_result_id = outcome.attempt.result_request_id
         state.stage_result_ids[stage_id] = outcome.attempt.result_request_id
         state.stage_result_origins[stage_id] = state.experiment_id
-        definition = state.template["stages"][state.stage_position - 1]
-        if "returns_data" not in definition:
+        definition = state.template.stages[state.stage_position - 1]
+        if "returns_data" not in definition.model_fields_set:
             return
         decision = response["execution"]["dag_decision"]
         source = {
@@ -724,16 +729,16 @@ class ExperimentRunner:
     ) -> None:
         position = next(
             index
-            for index, item in enumerate(state.template["stages"], 1)
-            if item["stage_id"] == target
+            for index, item in enumerate(state.template.stages, 1)
+            if item.stage_id == target
         )
         # The source remains in the journal even when a backwards jump
         # invalidates its current result reference.
         state.pending_input = {**source, "stage_id": target}
-        for item in state.template["stages"][position - 1 :]:
-            state.stage_result_ids.pop(item["stage_id"], None)
-            state.stage_result_origins.pop(item["stage_id"], None)
-            state.stage_retry_counts.pop(item["stage_id"], None)
+        for item in state.template.stages[position - 1 :]:
+            state.stage_result_ids.pop(item.stage_id, None)
+            state.stage_result_origins.pop(item.stage_id, None)
+            state.stage_retry_counts.pop(item.stage_id, None)
         state.stage_position = position
         self._pending_advance = False
 
@@ -825,8 +830,8 @@ class ExperimentRunner:
         await self._ready.wait()
         state = self._require_active()
         if any(
-            definition["service_id"] not in state.services
-            for definition in state.template["services"]
+            definition.service_id not in state.services
+            for definition in state.template.services
         ):
             raise RuntimeError(
                 "Start all declared services before resuming the experiment."
@@ -879,8 +884,8 @@ class ExperimentRunner:
         if any(instance.manually_stopped for instance in state.services.values()):
             raise RuntimeError("Start manually stopped services before stepping.")
         if any(
-            definition["service_id"] not in state.services
-            for definition in state.template["services"]
+            definition.service_id not in state.services
+            for definition in state.template.services
         ):
             raise RuntimeError("Start all declared services before stepping.")
         if (
@@ -1078,7 +1083,7 @@ class ExperimentRunner:
             state,
             "service start requires an idle pause without another service or maintenance operation.",
         )
-        service_id = _service_definition(state, position)["service_id"]
+        service_id = _service_definition(state, position).service_id
         self._service_retrying = True
         self._service_control_task = asyncio.current_task()
         try:
@@ -1102,7 +1107,7 @@ class ExperimentRunner:
             "service stop requires an idle pause without another service or maintenance operation.",
         )
         definition = _service_definition(state, position)
-        service_id = definition["service_id"]
+        service_id = definition.service_id
         instance = state.services.get(service_id)
         if instance is None:
             instance = ServiceInstance(service_id, str(uuid4()), definition)
@@ -1147,7 +1152,7 @@ class ExperimentRunner:
                 "retry requires a paused experiment without another service retry."
             )
         definition = _service_definition(state, position)
-        service_id = definition["service_id"]
+        service_id = definition.service_id
         instance = state.services.get(service_id)
         if instance is None:
             raise RuntimeError(
@@ -1186,9 +1191,7 @@ class ExperimentRunner:
         state = self._require_active()
         if state.mode != "paused" or not self._idle.is_set():
             raise RuntimeError("move requires a paused experiment.")
-        if type(position) is not int or not 1 <= position <= len(
-            state.template["stages"]
-        ):
+        if type(position) is not int or not 1 <= position <= len(state.template.stages):
             raise ValueError("Position is outside the DAG.")
         state.stage_position = position
         state.pending_input = None
@@ -1214,10 +1217,10 @@ class ExperimentRunner:
                     "Wait for the service retry before resetting counters."
                 )
             if type(position) is not int or not 1 <= position <= len(
-                state.template["services"]
+                state.template.services
             ):
                 raise ValueError("Service position is outside the template.")
-            service_id = state.template["services"][position - 1]["service_id"]
+            service_id = state.template.services[position - 1].service_id
             instance = state.services.get(service_id)
             if instance is None:
                 raise ValueError("A started socket service is required.")
@@ -1226,10 +1229,10 @@ class ExperimentRunner:
             result_key, identifier = "service_id", service_id
         else:
             if type(position) is not int or not 1 <= position <= len(
-                state.template["stages"]
+                state.template.stages
             ):
                 raise ValueError("Position is outside the DAG.")
-            stage_id = state.template["stages"][position - 1]["stage_id"]
+            stage_id = state.template.stages[position - 1].stage_id
             old = state.stage_retry_counts.get(stage_id, 0)
             state.stage_retry_counts[stage_id] = 0
             result_key, identifier = "stage_id", stage_id
@@ -1309,8 +1312,14 @@ class ExperimentRunner:
                 )
             except yaml.YAMLError as error:
                 raise ValueError(f"Invalid template YAML: {error}") from error
-            _prepare_reload_candidate(state, template)
-            text = yaml.safe_dump(template, allow_unicode=True, sort_keys=False)
+            template = _prepare_reload_candidate(
+                state, ExperimentTemplate.model_validate(template)
+            )
+            text = yaml.safe_dump(
+                template.model_dump(exclude_unset=True),
+                allow_unicode=True,
+                sort_keys=False,
+            )
             result = await self._apply_template(text, template)
             if self._reload_operation is not None:
                 self._journal.client.finish_operation(operation, attributes=result)
@@ -1339,7 +1348,7 @@ class ExperimentRunner:
             self._maintenance_task = None
 
     async def _apply_template(
-        self, template_yaml: str, template: JsonObject
+        self, template_yaml: str, template: ExperimentTemplate
     ) -> JsonObject:
         state = self._require_active()
         operation = self._reload_operation
@@ -1352,8 +1361,8 @@ class ExperimentRunner:
             "previous_template_revision_id": previous_revision,
             "template_revision_id": previous_revision,
             "snapshot_id": None,
-            "changed": json.dumps(state.template, sort_keys=True)
-            != json.dumps(template, sort_keys=True),
+            "changed": _template_fingerprint(state.template)
+            != _template_fingerprint(template),
             "stage_position": state.stage_position,
             "pending_advance": self._pending_advance,
             "mode": "paused",
@@ -1382,37 +1391,76 @@ class ExperimentRunner:
             await self._cleanup_reload_application(state, application)
 
     async def _plan_reload_application(
-        self, state: RunnerState, template_yaml: str, template: JsonObject,
-        operation: Operation, result: JsonObject,
+        self,
+        state: RunnerState,
+        template_yaml: str,
+        template: ExperimentTemplate,
+        operation: Operation,
+        result: JsonObject,
     ) -> ReloadApplication:
-        layout = _reload_layout(state.template, template, state.stage_position, self._pending_advance)
+        layout = _reload_layout(
+            state.template, template, state.stage_position, self._pending_advance
+        )
         completed = await _read_reload_progress(
-            self._journal.client, state.experiment_id, state.template_revision_id,
-            state.cycle_number, set(state.stage_result_ids),
+            self._journal.client,
+            state.experiment_id,
+            state.template_revision_id,
+            state.cycle_number,
+            set(state.stage_result_ids),
         )
         cursor = _reload_cursor(layout, completed)
         return ReloadApplication(
-            template=template, template_yaml=template_yaml, previous=state.template,
-            layout=layout, cursor=cursor, completed=completed,
+            template=template,
+            template_yaml=template_yaml,
+            previous=state.template,
+            layout=layout,
+            cursor=cursor,
+            completed=completed,
             previous_revision=state.template_revision_id,
-            candidate_revision=str(uuid4()), candidate_run=f"{uuid4()}:{state.run_id}",
-            workspace=state.experiment_directory / "runner/rebuilds" / operation.get_operation_id(),
-            logger=self._journal.client, operation=operation, result=result,
-            prior_instances={sid: item.service_instance_id for sid, item in state.services.items()},
-            prior_service_retries={sid: item.restart_count for sid, item in state.services.items()},
+            candidate_revision=str(uuid4()),
+            candidate_run=f"{uuid4()}:{state.run_id}",
+            workspace=state.experiment_directory
+            / "runner/rebuilds"
+            / operation.get_operation_id(),
+            logger=self._journal.client,
+            operation=operation,
+            result=result,
+            prior_instances={
+                sid: item.service_instance_id for sid, item in state.services.items()
+            },
+            prior_service_retries={
+                sid: item.restart_count for sid, item in state.services.items()
+            },
         )
 
     def _audit_reload_definitions(self, application: ReloadApplication) -> None:
-        for role in ("stage", "service"):
+        for role, old_entries, new_entries in (
+            ("stage", application.previous.stages, application.template.stages),
+            ("service", application.previous.services, application.template.services),
+        ):
             before = {
-                s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(application.previous[f"{role}s"])
+                (s.service_id if isinstance(s, ServiceDefinition) else s.stage_id): (
+                    i + 1,
+                    s,
+                )
+                for i, s in enumerate(old_entries)
             }
             after = {
-                s[f"{role}_id"]: (i + 1, s) for i, s in enumerate(application.template[f"{role}s"])
+                (s.service_id if isinstance(s, ServiceDefinition) else s.stage_id): (
+                    i + 1,
+                    s,
+                )
+                for i, s in enumerate(new_entries)
             }
             for identity in dict.fromkeys([*before, *after]):
-                if json.dumps(before.get(identity), sort_keys=True) == json.dumps(
-                    after.get(identity), sort_keys=True
+                old = before.get(identity)
+                new = after.get(identity)
+                if (
+                    old is not None
+                    and new is not None
+                    and old[0] == new[0]
+                    and _definition_fingerprint(old[1])
+                    == _definition_fingerprint(new[1])
                 ):
                     continue
                 change = _definition_change(role, identity, before, after)
@@ -1427,7 +1475,9 @@ class ExperimentRunner:
                     }
                 )
 
-    def _audit_reload_candidate(self, state: RunnerState, application: ReloadApplication) -> None:
+    def _audit_reload_candidate(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         # Validate the dedicated full-template event before any filesystem/process effects.
         encode_event(
             {
@@ -1444,19 +1494,19 @@ class ExperimentRunner:
                     "previous_run_id": state.run_id,
                 },
                 "data": {
-                    "template": application.template,
+                    "template": application.template.model_dump(exclude_unset=True),
                     "template_yaml": application.template_yaml,
                     "template_revision_id": application.candidate_revision,
                     "previous_template_revision_id": application.previous_revision,
                     "reason": "reload_template",
                 },
             },
-            state.template["logging"]["max_event_bytes"],
+            state.template.logging.max_event_bytes,
         )
         application.logger.record_event(
             "reload.previous_template",
             {
-                "template": application.previous,
+                "template": application.previous.model_dump(exclude_unset=True),
                 "template_yaml": state.template_yaml,
             },
             operation=application.operation,
@@ -1464,7 +1514,7 @@ class ExperimentRunner:
         application.parameters = application.logger.record_event(
             "reload.candidate",
             {
-                "template": application.template,
+                "template": application.template.model_dump(exclude_unset=True),
                 "template_yaml": application.template_yaml,
                 "run_id": application.candidate_run,
                 "template_revision_id": application.candidate_revision,
@@ -1504,10 +1554,18 @@ class ExperimentRunner:
             operation=application.operation,
         )
 
-    async def _prepare_reload_snapshot(self, state: RunnerState, application: ReloadApplication) -> None:
-        await self._services.prepare_rebuild(state, application.template, validate_only=True)
+    async def _prepare_reload_snapshot(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
+        await self._services.prepare_rebuild(
+            state, application.template, validate_only=True
+        )
         await self._assembler.rebuild(
-            state, application.template_yaml, application.template, workspace=application.workspace, prepare_only=True
+            state,
+            application.template_yaml,
+            application.template.model_dump(exclude_unset=True),
+            workspace=application.workspace,
+            prepare_only=True,
         )
         if self._resource_observer is not None and self._suspend_resources is None:
             raise RuntimeError("Reload requires a resource restoration barrier.")
@@ -1542,28 +1600,29 @@ class ExperimentRunner:
         await self._services.prepare_rebuild(state, application.template)
         self._save_state()
 
-    def _isolate_reload_service_data(self, state: RunnerState, application: ReloadApplication) -> None:
+    def _isolate_reload_service_data(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         for sid, definition in application.layout.new_services.items():
             previous = application.layout.old_services.get(sid)
             application.logger.record_event(
                 "reload.service_plan",
                 {
                     "service_id": sid,
-                    "old_definition": previous,
-                    "new_definition": definition,
+                    "old_definition": None
+                    if previous is None
+                    else previous.model_dump(exclude_unset=True),
+                    "new_definition": definition.model_dump(exclude_unset=True),
                     "previous_instance_id": application.prior_instances.get(sid),
                     "transfer_state": previous is not None
                     and sid in application.layout.changed_services
-                    and previous["module"]["name"] == definition["module"]["name"],
+                    and previous.module.name == definition.module.name,
                 },
                 operation=application.operation,
             )
             # An absent definition cannot authorize reuse of files left by
             # a removed service, even when its stable ID is added again.
-            if (
-                previous is None
-                or previous["module"]["name"] != definition["module"]["name"]
-            ):
+            if previous is None or previous.module.name != definition.module.name:
                 data = state.experiment_directory / "module_data" / sid
                 if data.exists():
                     if (
@@ -1584,8 +1643,10 @@ class ExperimentRunner:
                             "action": "isolate_previous_module_data",
                             "previous_module": None
                             if previous is None
-                            else previous["module"],
-                            "new_module": definition["module"],
+                            else previous.module.model_dump(exclude_unset=True),
+                            "new_module": definition.module.model_dump(
+                                exclude_unset=True
+                            ),
                             "reason": "no_applied_service"
                             if previous is None
                             else "module_name_changed",
@@ -1593,9 +1654,14 @@ class ExperimentRunner:
                         operation=application.operation,
                     )
 
-    async def _publish_reload_dag(self, state: RunnerState, application: ReloadApplication) -> None:
+    async def _publish_reload_dag(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         await self._assembler.rebuild(
-            state, application.template_yaml, application.template, workspace=application.workspace
+            state,
+            application.template_yaml,
+            application.template.model_dump(exclude_unset=True),
+            workspace=application.workspace,
         )
         application.logger.record_event(
             "control.observed",
@@ -1608,25 +1674,36 @@ class ExperimentRunner:
         state.run_id = application.candidate_run
         state.template_revision_id = application.candidate_revision
         state.stage_result_ids = {
-            k: v for k, v in state.stage_result_ids.items() if k in application.cursor.preserved
+            k: v
+            for k, v in state.stage_result_ids.items()
+            if k in application.cursor.preserved
         }
         state.stage_result_origins = {
-            k: v for k, v in state.stage_result_origins.items() if k in application.cursor.preserved
+            k: v
+            for k, v in state.stage_result_origins.items()
+            if k in application.cursor.preserved
         }
         state.stage_retry_counts = {
-            k: v for k, v in state.stage_retry_counts.items() if k in application.cursor.preserved
+            k: v
+            for k, v in state.stage_retry_counts.items()
+            if k in application.cursor.preserved
         }
         state.stage_position = application.cursor.stage_position
-        self._pending_advance = state.pending_advance = application.cursor.pending_advance
+        self._pending_advance = state.pending_advance = (
+            application.cursor.pending_advance
+        )
         if state.pending_input is not None and (
             state.pending_input["source_stage_id"] not in application.cursor.preserved
             or state.pending_input["stage_id"] not in application.cursor.preserved
             or state.pending_input["stage_id"]
-            != application.layout.new_stages[application.cursor.stage_position - 1]["stage_id"]
+            != application.layout.new_stages[
+                application.cursor.stage_position - 1
+            ].stage_id
         ):
             state.pending_input = None
         if state.last_dag_decision is not None and (
-            state.last_dag_decision["source_stage_id"] not in application.cursor.preserved
+            state.last_dag_decision["source_stage_id"]
+            not in application.cursor.preserved
             or state.last_dag_decision["decision"].get("stage_id") is not None
             and state.pending_input is None
         ):
@@ -1635,7 +1712,7 @@ class ExperimentRunner:
         predecessor = application.cursor.next_position - 1
         if predecessor >= 0:
             request_id = state.stage_result_ids.get(
-                application.layout.new_stages[predecessor]["stage_id"]
+                application.layout.new_stages[predecessor].stage_id
             )
             if request_id is not None:
                 record = application.logger.read_command_result(request_id)
@@ -1647,7 +1724,9 @@ class ExperimentRunner:
                 state.last_result = record["response"]["data"]
         self._save_state()
 
-    async def _transfer_reload_services(self, state: RunnerState, application: ReloadApplication) -> None:
+    async def _transfer_reload_services(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         if await self._services.reconcile(state, application.template) != "ready":
             raise RuntimeError("Reloaded services did not become ready.")
         transfer = {
@@ -1655,7 +1734,8 @@ class ExperimentRunner:
             for sid, definition in application.layout.new_services.items()
             if sid in application.layout.old_services
             and sid in application.layout.changed_services
-            and definition["module"]["name"] == application.layout.old_services[sid]["module"]["name"]
+            and definition.module.name
+            == application.layout.old_services[sid].module.name
         }
         manifest = await asyncio.to_thread(
             self._snapshots._validate_snapshot,
@@ -1672,11 +1752,14 @@ class ExperimentRunner:
         await self._services.load_states(state, exports, service_ids=transfer)
         if any(
             state.services[sid].service_instance_id != application.prior_instances[sid]
-            for sid in application.layout.new_services.keys() & application.layout.old_services.keys()
+            for sid in application.layout.new_services.keys()
+            & application.layout.old_services.keys()
             if sid not in application.layout.changed_services
         ):
             raise RuntimeError("An unchanged service restarted during reload.")
-        for sid in dict.fromkeys([*application.layout.old_services, *application.layout.new_services]):
+        for sid in dict.fromkeys(
+            [*application.layout.old_services, *application.layout.new_services]
+        ):
             instance = state.services.get(sid)
             application.logger.record_event(
                 "reload.service",
@@ -1690,19 +1773,27 @@ class ExperimentRunner:
                     if instance is None
                     else instance.service_instance_id,
                     "previous_instance_id": application.prior_instances.get(sid),
-                    "previous_restart_count": application.prior_service_retries.get(sid),
+                    "previous_restart_count": application.prior_service_retries.get(
+                        sid
+                    ),
                     "restart_count": None
                     if instance is None
                     else instance.restart_count,
                     "ready": False if instance is None else instance.ready,
-                    "definition": application.layout.new_services.get(sid),
+                    "definition": None
+                    if sid not in application.layout.new_services
+                    else application.layout.new_services[sid].model_dump(
+                        exclude_unset=True
+                    ),
                 },
                 operation=application.operation,
             )
 
-    def _commit_reload(self, state: RunnerState, application: ReloadApplication) -> None:
+    def _commit_reload(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         application.logger.record_template_applied(
-            application.template,
+            application.template.model_dump(exclude_unset=True),
             template_yaml=application.template_yaml,
             template_revision_id=application.candidate_revision,
             previous_template_revision_id=application.previous_revision,
@@ -2179,13 +2270,13 @@ class ExperimentRunner:
         _, applied = self._assembler.load_template(
             state.template_path, template_yaml=state.template_yaml
         )
-        if applied != state.template:
+        if applied != state.template.model_dump(exclude_unset=True):
             raise ValueError("Saved template JSON differs from its applied YAML.")
         if (
             transaction is None
             and state.pending_rebuild is None
             and set(state.services)
-            != {item["service_id"] for item in state.template["services"]}
+            != {item.service_id for item in state.template.services}
         ):
             raise RuntimeError(
                 "Saved service ownership is incomplete; recover participant metadata before continuing."
@@ -2332,20 +2423,21 @@ class ExperimentRunner:
     def _recover_launched_attempt(
         self, state: RunnerState, root: Path, launched: JsonObject
     ) -> None:
-        if state.active_attempt is not None and state.active_attempt.attempt_id == launched["attempt_id"]:
+        if (
+            state.active_attempt is not None
+            and state.active_attempt.attempt_id == launched["attempt_id"]
+        ):
             return
         definition = next(
             item
-            for item in state.template["stages"]
-            if item["stage_id"] == launched["stage_id"]
+            for item in state.template.stages
+            if item.stage_id == launched["stage_id"]
         )
         directory = (
             root
             / "shared_artifacts"
             / f"epoch_{launched['cycle_number']}"
-            / self._assembler.module_reference(
-                state.template, definition
-            )["name"]
+            / self._assembler._module_reference(state.template, definition).name
             / launched["stage_id"]
             / f"attempt_{launched['attempt_number']}"
         )
@@ -2353,9 +2445,7 @@ class ExperimentRunner:
         state.active_attempt = attempt
         context = read_json(directory / "context.json")
         if context["context"]["attempt_id"] != launched["attempt_id"]:
-            raise ValueError(
-                "Saved launch context has a different attempt identity."
-            )
+            raise ValueError("Saved launch context has a different attempt identity.")
         _apply_recovered_attempt_context(attempt, context)
         record_path = directory / "process.json"
         if record_path.exists():
@@ -2367,9 +2457,7 @@ class ExperimentRunner:
             attempt.process_identity = record["stage"]
             attempt.started_at = record["started_at"]
         state.active_attempt = attempt
-        state.stage_attempt_numbers[attempt.stage_id] = (
-            attempt.attempt_number
-        )
+        state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number
 
     async def _start_recovered_dag(self, state: RunnerState, experiment_id: str) -> None:
         self._pending_advance = state.pending_advance
@@ -2707,10 +2795,10 @@ class ExperimentRunner:
         ):
             definition = next(
                 item
-                for item in state.template["stages"]
-                if item["stage_id"] == attempt.stage_id
+                for item in state.template.stages
+                if item.stage_id == attempt.stage_id
             )
-            module = definition["module"]
+            module = self._assembler._module_reference(state.template, definition)
             targets.append(
                 {
                     "series_id": attempt.attempt_id,
@@ -2721,16 +2809,16 @@ class ExperimentRunner:
                         "stage_execution_id": attempt.stage_execution_id,
                         "attempt_id": attempt.attempt_id,
                         "attempt_number": attempt.attempt_number,
-                        "module_name": module["name"],
-                        "module_version": module["version"],
-                        "module_hash": module["hash"],
+                        "module_name": module.name,
+                        "module_version": module.version,
+                        "module_hash": module.hash,
                     },
                 }
             )
         for instance in state.services.values():
             if instance.stopped or instance.process_identity is None:
                 continue
-            module = instance.definition["module"]
+            module = instance.definition.module
             targets.append(
                 {
                     "series_id": instance.service_instance_id,
@@ -2739,9 +2827,9 @@ class ExperimentRunner:
                         **context,
                         "service_id": instance.service_id,
                         "service_instance_id": instance.service_instance_id,
-                        "module_name": module["name"],
-                        "module_version": module["version"],
-                        "module_hash": module["hash"],
+                        "module_name": module.name,
+                        "module_version": module.version,
+                        "module_hash": module.hash,
                     },
                 }
             )
@@ -2778,8 +2866,8 @@ class ExperimentRunner:
             phase = "idle"
         services = []
         if state is not None:
-            for position, definition in enumerate(state.template["services"], 1):
-                instance = state.services.get(definition["service_id"])
+            for position, definition in enumerate(state.template.services, 1):
+                instance = state.services.get(definition.service_id)
                 services.append(_service_state(position, definition, instance))
         return {
             "experiment_id": self._requested_id,

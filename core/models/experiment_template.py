@@ -1,5 +1,6 @@
 """Experiment template contracts, independent of files and running participants."""
 
+import json
 from pathlib import Path
 from typing import Annotated, Literal, Self
 from uuid import UUID
@@ -19,7 +20,12 @@ from pydantic import (
 from core.models.journal_settings import JournalLimits
 from core.models.values import Number, PositiveInteger, PositiveNumber, Text
 from core.modules.validation import _validate_module_hash
-from core.primitives.json_values import JsonObject, copy_json_object, require_text
+from core.primitives.json_values import (
+    JsonObject,
+    _validate_json,
+    copy_json_object,
+    require_text,
+)
 
 
 def _identifier(value: object, info: ValidationInfo) -> str:
@@ -181,7 +187,8 @@ class ExperimentTemplate(_TemplateValue):
             ("storage", StoragePolicy),
             ("logging", TemplateLoggingPolicy),
         ):
-            if isinstance(document.get(name), expected):
+            if type(document.get(name)) is expected:
+                _validate_template_input(document[name], depth=1)
                 models[name] = document.pop(name)
         definitions: dict[str, dict[int, BaseModel]] = {}
         for name, expected in (
@@ -194,9 +201,11 @@ class ExperimentTemplate(_TemplateValue):
                 retained: dict[int, BaseModel] = {
                     index: item
                     for index, item in enumerate(items)
-                    if isinstance(item, expected)
+                    if type(item) in expected
                 }
                 if retained:
+                    for item in retained.values():
+                        _validate_template_input(item, depth=2)
                     definitions[name] = retained
                     document[name] = [
                         None if index in retained else item
@@ -256,6 +265,20 @@ class ExperimentTemplate(_TemplateValue):
 
 
 ResourceInputs = TypeAdapter(list[ResourceDefinition], config=ConfigDict(strict=True))
+
+
+def _validate_template_input(model: BaseModel, *, depth: int) -> None:
+    """Keep whole-document JSON limits when known nested inputs remain models."""
+    for name in model.model_fields_set:
+        value = getattr(model, name)
+        if isinstance(value, (_TemplateValue, TemplateLoggingPolicy)):
+            _validate_template_input(value, depth=depth + 1)
+        else:
+            _validate_json(value, depth + 1)
+            try:
+                json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("experiment template contains invalid Unicode.") from error
 
 
 def _assigned_definition(

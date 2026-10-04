@@ -40,6 +40,14 @@ overrides keep working, then validates its JSON result before module inspection.
 Registered hashes, actual module roles, filesystem boundaries, and resource
 ownership are checked by the operations that use those resources.
 
+Runtime and recovery keep a complete `ExperimentTemplate`, including at least one
+DAG node and assigned definition IDs in saved state. `RunnerState.template` and
+`ServiceInstance.definition` expose model attributes. Changes to frozen models
+produce validated replacements before the owner publishes them. State files,
+applied YAML, public JSON results, and launcher callbacks retain their document
+formats. Lightweight inspection and dashboard projections still validate only
+the fields they consume; an editable template draft may have an empty DAG.
+
 Participant identity, endpoint, hello, request, response, and notification models
 validate wire data at the receiving boundary. Connection operations use typed
 endpoints and replies; public protocol helpers and application handlers retain

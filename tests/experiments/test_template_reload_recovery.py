@@ -122,7 +122,9 @@ class TemplateReloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue((controls / "launcher-cleanup-finished").is_file())
                     self.assertFalse(marker.exists())
                     self.assertFalse(marker.with_name("launcher-cleanup.txt").exists())
-                    self.assertEqual(runner._state.template, old)
+                    self.assertEqual(
+                        runner._state.template.model_dump(exclude_unset=True), old
+                    )
                     self.assertEqual(await work.value(), 39)
                     self.assertIsNone(runner._state.pending_rebuild)
                     self.assertEqual(runner.get_state()["phase"], "waiting")
@@ -243,7 +245,9 @@ class TemplateReloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     await runner.close()
                     fresh = work.replacement()
                     await fresh.recover(identifier)
-                    self.assertEqual(fresh._state.template, old)
+                    self.assertEqual(
+                        fresh._state.template.model_dump(exclude_unset=True), old
+                    )
                     self.assertEqual(await work.value(), 39)
                     self.assertIsNone(fresh._state.pending_rebuild)
                     self.assertEqual(fresh._state.mode, "paused")
@@ -505,7 +509,9 @@ os.waitpid(pid, 0)
                 )
             )
             await runner.recover(identifier)
-            self.assertEqual(runner._state.template, original)
+            self.assertEqual(
+                runner._state.template.model_dump(exclude_unset=True), original
+            )
             self.assertIsNone(runner._state.pending_rebuild)
             self.assertEqual(await work.value(), 47)
             self.assertEqual(runner.get_state()["phase"], "waiting")
@@ -576,11 +582,11 @@ os.waitpid(pid, 0)
                             raise ctypes.WinError(absence)
                     return process_identity(pid)
 
-                with patch(
-                    "core.experiments.runner.process_identity", observe
-                ):
+                with patch("core.experiments.runner.process_identity", observe):
                     await runner.recover(identifier)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertEqual(await work.value(), 39)
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertEqual(runner.get_state()["phase"], "waiting")
@@ -614,7 +620,7 @@ os.waitpid(pid, 0)
         with patch.object(psutil.Process, "parents", exit_during_inspection):
             await runner.recover(identifier)
         self.assertEqual(observed, [child["pid"]])
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertEqual(await work.value(), 39)
         self.assertIsNone(runner._state.pending_rebuild)
         self.assertEqual(runner._state.mode, "paused")
@@ -660,7 +666,7 @@ os.waitpid(pid, 0)
         await runner.close()
         runner = work.replacement()
         await runner.recover(identifier)
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertEqual(await work.value(), 39)
         self.assertIsNone(runner._state.pending_rebuild)
 
@@ -775,7 +781,7 @@ os.waitpid(pid, 0)
 
             with patch.object(runner._snapshots, "restore", verify_launcher_stopped):
                 await runner.recover(identifier)
-            self.assertEqual(runner._state.template, old)
+            self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
             self.assertEqual(await work.value(), 39)
             self.assertIsNone(runner._state.pending_rebuild)
         finally:
@@ -801,7 +807,7 @@ os.waitpid(pid, 0)
         runner = work.replacement()
         await runner.recover(identifier)
         self.assertEqual(runner._state.run_id, saved["run_id"])
-        self.assertEqual(runner._state.template, new)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), new)
         self.assertIsNone(runner._state.pending_rebuild)
         self.assertEqual(runner._state.services[sid].service_instance_id, current_id)
         self.assertEqual(runner._state.services[sid].process_identity, current_process)
@@ -875,7 +881,9 @@ os.waitpid(pid, 0)
                 ) as lookup:
                     await runner.recover(identifier)
                 self.assertIn(((pid,), {}), lookup.call_args_list)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertEqual(await work.value(), 39)
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertEqual(runner._state.mode, "paused")
@@ -950,7 +958,9 @@ os.waitpid(pid, 0)
                     self.assertTrue(process_running(child["pid"]))
                 runner = work.replacement()
                 await runner.recover(identifier)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertEqual(await work.value(), 39)
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertEqual(runner._state.mode, "paused")
@@ -1084,7 +1094,8 @@ os.waitpid(pid, 0)
                 runner = work.replacement()
                 await runner.recover(identifier)
                 self.assertEqual(
-                    runner._state.template, new if phase == "rebuild_committed" else old
+                    runner._state.template.model_dump(exclude_unset=True),
+                    new if phase == "rebuild_committed" else old,
                 )
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertEqual(runner._state.mode, "paused")
@@ -1105,7 +1116,9 @@ os.waitpid(pid, 0)
                 work, old, _new, identifier = await self.crash(phase, services=True)
                 runner = work.replacement()
                 await runner.recover(identifier)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertEqual(await work.value(), 39)
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertTrue(all(s.ready for s in runner._state.services.values()))
@@ -1119,7 +1132,9 @@ os.waitpid(pid, 0)
                 work, old, _new, identifier = await self.crash(phase)
                 runner = work.replacement()
                 await runner.recover(identifier)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertEqual(len(events(runner, "template.applied")), 1)
                 candidate_ids = [
                     e["event_id"] for e in events(runner, "reload.candidate")

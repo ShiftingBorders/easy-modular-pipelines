@@ -12,14 +12,17 @@ from uuid import uuid4
 import yaml
 
 from core.experiments.state import RunnerState
-from core.experiments.template_validation import _template_document
+from core.experiments.template_validation import (
+    _assign_definition_ids,
+    _resolve_template_paths,
+    _template_document,
+)
 from core.models.experiment_registry import RegistryEntry
 from core.models.experiment_template import (
     ErrorPolicy,
     ExperimentTemplate,
     ModuleReference,
     ResourceDefinition,
-    ResourceInputs,
     ServiceCallDefinition,
     ServiceDefinition,
     StageDefinition,
@@ -135,11 +138,29 @@ class ExperimentAssembler:
         }
 
     def module_reference(
-        self, template: JsonObject, definition: JsonObject
+        self,
+        template: ExperimentTemplate | JsonObject,
+        definition: StageDefinition
+        | ServiceCallDefinition
+        | ServiceDefinition
+        | JsonObject,
     ) -> JsonObject:
+        if isinstance(template, ExperimentTemplate) and isinstance(
+            definition, (StageDefinition, ServiceCallDefinition, ServiceDefinition)
+        ):
+            return self._module_reference(template, definition).model_dump(
+                exclude_unset=True
+            )
+        if not isinstance(definition, dict):
+            definition = definition.model_dump(exclude_unset=True)
         if "module" in definition:
             return copy_json_object(definition["module"], "module")
         service_id = definition.get("service_id")
+        if isinstance(template, ExperimentTemplate):
+            for service in template.services:
+                if service_id is not None and service.service_id == service_id:
+                    return service.module.model_dump(exclude_unset=True)
+            raise ValueError(f"Unknown service reference: {service_id}")
         for service in template["services"]:
             if service_id is not None and service.get("service_id") == service_id:
                 return copy_json_object(service["module"], "service module")
@@ -155,14 +176,14 @@ class ExperimentAssembler:
 
     def _module_reference(
         self,
-        template: JsonObject,
+        template: ExperimentTemplate,
         definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
     ) -> ModuleReference:
         if not isinstance(definition, ServiceCallDefinition):
             return definition.module
-        for service in template["services"]:
-            if service.get("service_id") == definition.service_id:
-                return ModuleReference.model_validate(service["module"])
+        for service in template.services:
+            if service.service_id == definition.service_id:
+                return service.module
         raise ValueError(f"Unknown service reference: {definition.service_id}")
 
     def read_module(self, module_directory: Path) -> JsonObject:
@@ -179,7 +200,7 @@ class ExperimentAssembler:
         experiment_id: str,
         validated: ExperimentTemplate,
     ) -> RunnerState:
-        template = _template_document(validated, template_path)
+        template = _resolve_template_paths(validated, template_path)
         registry_path = self._project_root / "experiments.json"
         registry = {}
         if registry_path.exists():
@@ -191,12 +212,10 @@ class ExperimentAssembler:
         folder = str(uuid4())
         directory = self._project_root / "experiments" / folder
         directory.mkdir(parents=True, exist_ok=False)
-        # load_template has validated every definition; preserve the same objects
-        # so generated IDs also appear in the template written to the experiment.
-        for role in ("stage", "service"):
-            for definition in template[f"{role}s"]:
-                definition.setdefault(f"{role}_id", str(uuid4()))
-        template_yaml = yaml.safe_dump(template, allow_unicode=True, sort_keys=False)
+        template = _assign_definition_ids(template)
+        template_yaml = yaml.safe_dump(
+            template.model_dump(exclude_unset=True), allow_unicode=True, sort_keys=False
+        )
         state = RunnerState(
             experiment_id,
             directory,
@@ -323,7 +342,6 @@ class ExperimentAssembler:
         workspace: Path,
         prepare_only: bool,
     ) -> None:
-        document = template.model_dump(exclude_unset=True)
         root = state.experiment_directory.resolve()
         workspace = Path(workspace)
         if (
@@ -340,7 +358,7 @@ class ExperimentAssembler:
             state.template_path,
             state.template_revision_id,
             template_yaml,
-            document,
+            template,
             "paused",
         )
         staged = RunnerState(
@@ -350,7 +368,7 @@ class ExperimentAssembler:
             workspace / "experiment.yaml",
             state.template_revision_id,
             template_yaml,
-            document,
+            template,
             "paused",
         )
         if prepare_only:
@@ -466,7 +484,7 @@ class ExperimentAssembler:
         self._check_module(candidate, reference, conditional)
 
     def check_modules(self, state: RunnerState) -> None:
-        self._check_modules(state, ExperimentTemplate.model_validate(state.template))
+        self._check_modules(state, state.template)
 
     def _check_modules(self, state: RunnerState, template: ExperimentTemplate) -> None:
         for definition in (*template.stages, *template.services):
@@ -476,11 +494,23 @@ class ExperimentAssembler:
                 "returns_data" in definition.model_fields_set,
             )
 
-    def check_module(self, state: RunnerState, definition: JsonObject) -> None:
+    def check_module(
+        self,
+        state: RunnerState,
+        definition: StageDefinition
+        | ServiceCallDefinition
+        | ServiceDefinition
+        | JsonObject,
+    ) -> None:
         module = ModuleReference.model_validate(
             self.module_reference(state.template, definition)
         )
-        self._check_module(state, module, "returns_data" in definition)
+        fields = (
+            definition.keys()
+            if isinstance(definition, dict)
+            else definition.model_fields_set
+        )
+        self._check_module(state, module, "returns_data" in fields)
 
     def _check_module(
         self,
@@ -513,7 +543,7 @@ class ExperimentAssembler:
     def check_resources(self, state: RunnerState) -> None:
         self._check_resources(
             state.experiment_directory,
-            ResourceInputs.validate_python(state.template["resources"]),
+            state.template.resources,
         )
 
     def _check_resources(

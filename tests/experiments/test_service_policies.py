@@ -24,6 +24,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
                     definition["errors"]["on_exhausted"] = policy
                     sid = definition["service_id"]
                     (w.controls[sid] / "fail-health").touch()
+                    w.publish_service_definitions()
                     self.assertEqual(await w.manager.start_all(w.state), policy)
                     self.assertEqual(
                         len(
@@ -56,6 +57,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
             definition["errors"]["on_exhausted"] = "skip"
             sid = definition["service_id"]
             (w.controls[sid] / "fail-health").touch()
+            w.publish_service_definitions()
             starting = asyncio.create_task(w.manager.start_all(w.state))
             await wait_for(
                 lambda: (
@@ -82,6 +84,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
             definition = w.service()
             sid = definition["service_id"]
             (w.controls[sid] / "hold-start").touch()
+            w.publish_service_definitions()
             starting = asyncio.create_task(w.manager.start_all(w.state))
             started = await wait_for(
                 lambda: next(
@@ -101,6 +104,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             gate = w.root / "release"
             working = asyncio.create_task(
@@ -145,6 +149,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             instance = w.state.services[sid]
             (w.controls[sid] / "ignore-shutdown").touch()
@@ -185,6 +190,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service(implementation="action")
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             sid = definition["service_id"]
             (w.controls[sid] / "fail-stop").touch()

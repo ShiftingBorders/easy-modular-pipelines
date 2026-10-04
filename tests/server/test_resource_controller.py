@@ -139,7 +139,9 @@ class ResourceControllerTests(unittest.IsolatedAsyncioTestCase):
             )
             count = len(records)
             started = datetime.now(UTC)
-            module = runner._state.template["stages"][0]["module"]
+            module = runner._state.template.model_dump(exclude_unset=True)["stages"][0][
+                "module"
+            ]
             second = await self.session.launch(
                 self.workspace.template([self.workspace.stage(module)]), paused=True
             )

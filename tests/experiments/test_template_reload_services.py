@@ -106,7 +106,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                             create.assert_not_awaited()
                             stop.assert_not_awaited()
                             rebuild.assert_not_awaited()
-                        self.assertEqual(state.template, original)
+                        self.assertEqual(
+                            state.template.model_dump(exclude_unset=True), original
+                        )
                         self.assertEqual(state.template_path.read_bytes(), applied)
                         self.assertEqual(
                             (state.stage_position, state.stage_result_ids), progress
@@ -279,7 +281,12 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 replacement = version(work, work.socket, "1", name="replacement")
                 runner = await work.launch()
                 state = runner._state
-                sid, peer = (item["service_id"] for item in state.template["services"])
+                sid, peer = (
+                    item["service_id"]
+                    for item in state.template.model_dump(exclude_unset=True)[
+                        "services"
+                    ]
+                )
                 launcher = runner._services._processes[sid]
                 child = state.services[sid].process_identity
                 self.assertNotEqual(launcher.pid, child["pid"])
@@ -357,7 +364,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(rebuild.await_count, 1)
                         self.assertTrue(rebuild.await_args.kwargs["prepare_only"])
                         self.assertEqual(marker.read_text(encoding="utf-8"), "old data")
-                        self.assertEqual(state.template, original)
+                        self.assertEqual(
+                            state.template.model_dump(exclude_unset=True), original
+                        )
                         self.assertEqual(events(runner, "template.applied"), applied)
                         self.assertEqual(state.services[sid].process_identity, child)
                         self.assertTrue(state.services[peer].ready)
@@ -386,7 +395,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(state.services[peer].ready)
                     self.assertEqual(state.services[peer].restart_count, 0)
                     self.assertIsNone(state.services[peer].failure)
-                    self.assertEqual(state.template, document)
+                    self.assertEqual(
+                        state.template.model_dump(exclude_unset=True), document
+                    )
                 finally:
                     gate.unlink(missing_ok=True)
                     if task is not None:
@@ -474,7 +485,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                             )
                         self.assertEqual(waits[0], original["start_timeout"])
                         self.assertEqual(rebuild.await_count, 1)
-                        self.assertEqual(state.template, original)
+                        self.assertEqual(
+                            state.template.model_dump(exclude_unset=True), original
+                        )
                         self.assertIsNotNone(state.pending_rebuild)
                         self.assertEqual(marker.read_text(encoding="utf-8"), "old data")
                         self.assertIs(runner._services._processes[sid], launcher)
@@ -493,7 +506,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                         await wait_for(finished.is_set)
                     await runner.stop()
                     await runner.recover(state.experiment_id)
-                    self.assertEqual(runner._state.template, original)
+                    self.assertEqual(
+                        runner._state.template.model_dump(exclude_unset=True), original
+                    )
                     self.assertIsNone(runner._state.pending_rebuild)
                     self.assertEqual(runner.get_state()["phase"], "waiting")
                     self.assertEqual(marker.read_text(encoding="utf-8"), "old data")
@@ -609,7 +624,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.restart_count, 0)
         self.assertIsNone(current.failure)
         self.assertTrue(current.ready)
-        self.assertEqual(runner._state.template, document)
+        self.assertEqual(
+            runner._state.template.model_dump(exclude_unset=True), document
+        )
 
     async def test_readded_service_isolates_orphan_data_and_rollback_restores_it_rr01(
         self,
@@ -661,7 +678,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(audit["data"]["reason"], "no_applied_service")
                 await runner.rollback(result["snapshot_id"])
                 await runner._ready.wait()
-                self.assertEqual(runner._state.template, before_add)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), before_add
+                )
                 self.assertNotIn(sid, runner._state.services)
                 self.assertEqual(
                     marker.read_text(encoding="utf-8"), "removed module data"
@@ -809,7 +828,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         document["services"][0]["settings"]["reject_state"] = True
         with self.assertRaises(RuntimeError):
             await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(runner._state.template, before)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), before)
         self.assertEqual(runner._state.template_revision_id, old_revision)
         self.assertEqual(runner.get_state()["mode"], "paused")
         self.assertEqual(await work.value(), 67)
@@ -919,7 +938,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runner._state.pending_rebuild, pending)
             self.assertEqual(len(work.manifests()), 1)
             await runner.recover(runner._state.experiment_id)
-            self.assertEqual(runner._state.template, original)
+            self.assertEqual(
+                runner._state.template.model_dump(exclude_unset=True), original
+            )
             self.assertIsNone(runner._state.pending_rebuild)
         finally:
             (controls / "release-load").touch()
@@ -998,14 +1019,14 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         document["stages"][0]["module"] = copy.deepcopy(work.socket["module"])
         with self.assertRaisesRegex(ValueError, "role"):
             await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(runner._state.template, before)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), before)
         self.assertEqual(work.manifests(), [])
         document = candidate(work)
         extra = copy.deepcopy(document["services"][0])
         del extra["service_id"]
         document["services"].append(extra)
         await runner.reload_template(work.files.write_template(document))
-        services = runner._state.template["services"]
+        services = runner._state.template.model_dump(exclude_unset=True)["services"]
         self.assertEqual(len({s["service_id"] for s in services}), 3)
         added_id = services[-1]["service_id"]
         self.assertNotIn(added_id, {s["service_id"] for s in before["services"]})
@@ -1022,7 +1043,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         document["services"][0]["errors"]["retry_delay_seconds"] = 0
         with self.assertRaises(RuntimeError):
             await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(runner._state.template, original)
+        self.assertEqual(
+            runner._state.template.model_dump(exclude_unset=True), original
+        )
         self.assertEqual(await work.value(), 53)
 
     async def test_load_timeout_and_required_missing_state_fail_with_rollback_rt12(
@@ -1048,7 +1071,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                         await runner.reload_template(
                             work.files.write_template(document)
                         )
-                    self.assertEqual(runner._state.template, original)
+                    self.assertEqual(
+                        runner._state.template.model_dump(exclude_unset=True), original
+                    )
                     self.assertIsNone(runner._state.pending_rebuild)
                     self.assertEqual(runner.get_state()["mode"], "paused")
                 finally:

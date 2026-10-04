@@ -501,7 +501,10 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         await self.runner.run(Path(installed["template_path"]), delayed_start=True)
         await asyncio.wait_for(self.runner._ready.wait(), 30)
         self.assertEqual(
-            self.runner._state.template["stages"][1]["service_id"], self.sid
+            self.runner._state.template.model_dump(exclude_unset=True)["stages"][1][
+                "service_id"
+            ],
+            self.sid,
         )
         self.assertEqual(
             len(

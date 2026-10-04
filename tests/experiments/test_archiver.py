@@ -10,6 +10,8 @@ import yaml
 
 from core.experiments.archiver import ExperimentArchiver
 from core.experiments.assembler import ExperimentAssembler
+from core.models.experiment_template import ExperimentTemplate
+from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from core.storage.errors import StorageConflict
 from tests.helpers.archives import ArchiveTestCase, inventory
@@ -188,11 +190,11 @@ class ArchiveCreationTests(ArchiveTestCase):
         """B: integrity failures do not publish an archive."""
         await self.w.prepare()
         state = self.w.state
-        original = copy.deepcopy(state.template)
-        state.template["name"] = "different"
+        original = copy.deepcopy(state.template.model_dump(exclude_unset=True))
+        state.template = _update_model(state.template, name="different")
         with self.assertRaises(ValueError):
             await self.w.create()
-        state.template = original
+        state.template = ExperimentTemplate.model_validate(original)
         module = original["stages"][0]["module"]
         code = (
             state.experiment_directory

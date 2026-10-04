@@ -11,6 +11,7 @@ from pydantic import (
     model_validator,
 )
 
+from core.models.experiment_template import ExperimentTemplate, ServiceDefinition
 from core.models.participant_identity import ParticipantIdentity
 from core.models.process_identity import ProcessIdentity
 from core.models.values import (
@@ -79,11 +80,11 @@ class AttemptParameters(_Input):
 class ServiceParameters(_Input):
     service_id: UUIDText
     service_instance_id: UUIDText
-    definition: Object
+    definition: ServiceDefinition
 
     @model_validator(mode="after")
     def match_definition(self) -> Self:
-        if self.definition.get("service_id") != self.service_id:
+        if self.definition.service_id != self.service_id:
             raise ValueError("Service definition has a different service_id.")
         return self
 
@@ -95,7 +96,7 @@ class StateParameters(_Input):
     template_path: AbsolutePath
     template_revision_id: UUIDText
     template_yaml: Text
-    template: Object
+    template: ExperimentTemplate
     mode: Literal["running", "paused"]
 
 
@@ -153,7 +154,7 @@ class ServiceRequest(_Document):
 class SavedService(_Document):
     service_id: UUIDText
     service_instance_id: UUIDText
-    definition: JsonObject
+    definition: ServiceDefinition
     process_identity: ProcessIdentity | None
     endpoint_path: Text | None
     ready: Boolean
@@ -183,7 +184,7 @@ class SavedService(_Document):
 
     @model_validator(mode="after")
     def match_requests(self) -> Self:
-        if self.definition.get("service_id") != self.service_id:
+        if self.definition.service_id != self.service_id:
             raise ValueError("Service definition has a different service_id.")
         for request in self.pending_requests:
             if request.sent_monotonic is not None or request.timed_out:
@@ -248,7 +249,7 @@ class SavedRunnerState(_Document):
     template_path: str
     template_revision_id: UUIDText
     template_yaml: Text
-    template: JsonObject
+    template: ExperimentTemplate
     mode: Literal["running", "paused"]
     phase: Literal[
         "idle",
@@ -332,8 +333,12 @@ class SavedRunnerState(_Document):
         return self
 
     def _validate_transitions(self) -> None:
-        stages = self.template["stages"]
-        identifiers = {item["stage_id"] for item in stages}
+        stages = self.template.stages
+        if any(item.stage_id is None for item in stages) or any(
+            item.service_id is None for item in self.template.services
+        ):
+            raise ValueError("Saved runtime definitions require assigned IDs.")
+        identifiers = {item.stage_id for item in stages}
         for transfer in (self.pending_input, self.last_dag_decision):
             if transfer is not None and transfer.source_stage_id not in identifiers:
                 raise ValueError("Saved transition refers to an unknown source stage.")
@@ -343,7 +348,7 @@ class SavedRunnerState(_Document):
             if (
                 self.stage_position > len(stages)
                 or self.pending_input.stage_id
-                != stages[self.stage_position - 1]["stage_id"]
+                != stages[self.stage_position - 1].stage_id
             ):
                 raise ValueError("Pending input must belong to the current cursor.")
         if self.last_dag_decision is not None:

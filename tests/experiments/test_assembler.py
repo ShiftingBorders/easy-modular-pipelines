@@ -132,8 +132,14 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
             state = await self.assembler.assemble(path, "paths")
         finally:
             os.chdir(previous)
-        self.assertEqual(state.template["resources"][0]["path"], str(relative))
-        self.assertEqual(state.template["resources"][1]["path"], str(absolute))
+        self.assertEqual(
+            state.template.model_dump(exclude_unset=True)["resources"][0]["path"],
+            str(relative),
+        )
+        self.assertEqual(
+            state.template.model_dump(exclude_unset=True)["resources"][1]["path"],
+            str(absolute),
+        )
         for item, data in (("relative", b"relative"), ("absolute", b"absolute")):
             self.assertEqual(
                 (
@@ -166,13 +172,17 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             (state.experiment_directory / "modules" / unused["name"]).exists()
         )
-        ids = [stage["stage_id"] for stage in state.template["stages"]]
+        ids = [
+            stage["stage_id"]
+            for stage in state.template.model_dump(exclude_unset=True)["stages"]
+        ]
         self.assertEqual(len(set(ids)), 3)
         for value in ids:
             UUID(value)
         self.assertEqual(ids[0], stages[0]["stage_id"])
         self.assertEqual(
-            yaml.safe_load(state.template_path.read_text()), state.template
+            yaml.safe_load(state.template_path.read_text()),
+            state.template.model_dump(exclude_unset=True),
         )
         self.assertEqual(
             self.workspace.manager.module_hash(
@@ -184,7 +194,7 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
     async def test_module_integrity_mismatch_missing_and_unavailable_database(self):
         """A5: all three hash sources must agree; storage failures propagate."""
         state = await self.assembler.assemble(self.path, "integrity")
-        stage = state.template["stages"][0]
+        stage = state.template.model_dump(exclude_unset=True)["stages"][0]
         with (
             patch.object(self.workspace.hashes, "get_module_hash", return_value=""),
             self.assertRaises(ValueError),

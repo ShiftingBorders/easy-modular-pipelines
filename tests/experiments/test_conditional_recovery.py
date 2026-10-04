@@ -317,7 +317,9 @@ class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         seed_data = (await runner.step())["result"]["data"]
                         await runner.step()
                         transfer = copy.deepcopy(runner._state.pending_input)
-                        candidate = copy.deepcopy(runner._state.template)
+                        candidate = copy.deepcopy(
+                            runner._state.template.model_dump(exclude_unset=True)
+                        )
                         if change == "tail":
                             candidate["stages"][-1]["settings"]["echo"] = "new tail"
                         elif change == "source":
@@ -346,9 +348,9 @@ class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                             expected = (
                                 payload if change in ("tail", "reorder") else None
                             )
-                        next_id = runner._state.template["stages"][
-                            runner._state.stage_position - 1
-                        ]["stage_id"]
+                        next_id = runner._state.template.model_dump(exclude_unset=True)[
+                            "stages"
+                        ][runner._state.stage_position - 1]["stage_id"]
                         self.assertEqual(
                             next_id,
                             tail["stage_id"]

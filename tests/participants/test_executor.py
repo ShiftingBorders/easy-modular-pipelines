@@ -205,7 +205,8 @@ class StageExecutorTests(unittest.IsolatedAsyncioTestCase):
                 self.session.runner._state.template_yaml,
             )
             self.assertEqual(
-                parameters["data"]["template"], self.session.runner._state.template
+                parameters["data"]["template"],
+                self.session.runner._state.template.model_dump(exclude_unset=True),
             )
 
     async def test_parameter_write_failure_never_spawns_executor(self):

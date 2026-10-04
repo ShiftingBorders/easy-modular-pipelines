@@ -54,7 +54,7 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
             yaml.safe_dump(changed), encoding="utf-8"
         )
         result = await runner.reload_template()
-        self.assertEqual(runner._state.template, changed)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), changed)
         saved = read_json(work.archive(result["snapshot_id"]) / "manifest.json")
         self.assertEqual(saved["state"]["template"], old)
         self.assertEqual(saved["state"]["template"]["snapshots"]["mode"], "off")
@@ -153,7 +153,10 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
         del inserted["stage_id"]
         document["stages"].append(inserted)
         await runner.reload_template(work.files.write_template(document))
-        ids = [s["stage_id"] for s in runner._state.template["stages"]]
+        ids = [
+            s["stage_id"]
+            for s in runner._state.template.model_dump(exclude_unset=True)["stages"]
+        ]
         self.assertEqual(ids[:4], original_ids)
         UUID(ids[-1])
         self.assertEqual(len(set(ids)), 5)
@@ -258,7 +261,9 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
             document["stages"][1]["module"] = reference
             with self.assertRaises((ValueError, FileNotFoundError, NotADirectoryError)):
                 await runner.reload_template(work.files.write_template(document))
-            self.assertEqual(runner._state.template, before)
+            self.assertEqual(
+                runner._state.template.model_dump(exclude_unset=True), before
+            )
             self.assertEqual(work.manifests(), [])
         document = candidate(work)
         document["stages"][1] = second
@@ -500,7 +505,7 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
         document["stages"][0]["module"] = second["module"]
         with self.assertRaisesRegex(ValueError, "integrity"):
             await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(runner._state.template, before)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), before)
         self.assertFalse(
             (
                 runner._state.experiment_directory
@@ -549,11 +554,15 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
         continuation = work.replacement()
         await continuation.run(experiment_id=source, continue_run=True)
         await continuation._ready.wait()
-        self.assertEqual(continuation._state.template, old)
+        self.assertEqual(
+            continuation._state.template.model_dump(exclude_unset=True), old
+        )
         await continuation.close()
         recovered = work.replacement()
         await recovered.recover(source)
-        self.assertEqual(recovered._state.template, changed)
+        self.assertEqual(
+            recovered._state.template.model_dump(exclude_unset=True), changed
+        )
         self.assertEqual(
             recovered._state.template_revision_id, result["template_revision_id"]
         )
@@ -562,7 +571,9 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
         continuation = work.replacement()
         await continuation.run(experiment_id=source, continue_run=True)
         await continuation._ready.wait()
-        self.assertEqual(continuation._state.template, changed)
+        self.assertEqual(
+            continuation._state.template.model_dump(exclude_unset=True), changed
+        )
         self.assertEqual(
             continuation._state.stable_snapshot_id, snapshot["snapshot_id"]
         )

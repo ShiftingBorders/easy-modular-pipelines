@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from core.models.conditional_result import ConditionalDecision
+from core.models.experiment_template import ExperimentTemplate, StageDefinition
 from core.participants.protocol import validate_response
 from core.primitives.json_values import JsonObject, JsonValue
 
@@ -14,13 +15,19 @@ class MissingConditionalDataError(ValueError):
 def normalize_conditional_result(
     response: JsonObject,
     input_data: JsonValue,
-    definition: JsonObject,
-    template: JsonObject,
+    definition: StageDefinition | JsonObject,
+    template: ExperimentTemplate | JsonObject,
 ) -> JsonObject:
     """Separate a conditional decision from its accepted application output."""
     decision = ConditionalDecision.model_validate(response["data"])
     return _apply_conditional_decision(
-        decision, response, input_data, definition["returns_data"], template
+        decision,
+        response,
+        input_data,
+        definition.returns_data
+        if isinstance(definition, StageDefinition)
+        else definition["returns_data"],
+        template,
     )
 
 
@@ -29,11 +36,16 @@ def _apply_conditional_decision(
     response: JsonObject,
     input_data: JsonValue,
     returns_data: bool,
-    template: JsonObject,
+    template: ExperimentTemplate | JsonObject,
 ) -> JsonObject:
     control = {"command": decision.command}
     if decision.command == "move":
-        if decision.stage_id not in {stage["stage_id"] for stage in template["stages"]}:
+        identifiers = (
+            {stage.stage_id for stage in template.stages}
+            if isinstance(template, ExperimentTemplate)
+            else {stage["stage_id"] for stage in template["stages"]}
+        )
+        if decision.stage_id not in identifiers:
             raise ValueError("Conditional move target is not a node in this DAG.")
         control["stage_id"] = decision.stage_id
     if returns_data and "data" not in decision.model_fields_set:

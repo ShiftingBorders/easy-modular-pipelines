@@ -5,20 +5,27 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
 
 from core.experiments.state import RunnerState, ServiceInstance
+from core.experiments.template_validation import _assign_definition_ids
 from core.journal.logger import Operation, OperationLogger
+from core.models.experiment_template import (
+    ExperimentTemplate,
+    ServiceCallDefinition,
+    ServiceDefinition,
+    StageDefinition,
+)
+from core.models.updates import _update_model
 from core.primitives.json_values import JsonObject
 
 
 @dataclass(frozen=True)
 class ReloadLayout:
-    old_services: dict[str, JsonObject]
-    new_services: dict[str, JsonObject]
+    old_services: dict[str, ServiceDefinition]
+    new_services: dict[str, ServiceDefinition]
     changed_services: set[str]
-    old_stages: list[JsonObject]
-    new_stages: list[JsonObject]
+    old_stages: list[StageDefinition | ServiceCallDefinition]
+    new_stages: list[StageDefinition | ServiceCallDefinition]
     prefix: int
     next_position: int
 
@@ -34,9 +41,9 @@ class ReloadCursor:
 
 @dataclass
 class ReloadApplication:
-    template: JsonObject
+    template: ExperimentTemplate
     template_yaml: str
-    previous: JsonObject
+    previous: ExperimentTemplate
     layout: ReloadLayout
     cursor: ReloadCursor
     completed: set[str]
@@ -55,91 +62,129 @@ class ReloadApplication:
     committed: bool = False
 
 
+def _definition_fingerprint(
+    definition: StageDefinition | ServiceCallDefinition | ServiceDefinition | None,
+) -> str:
+    """Retain JSON equality, including omitted defaults and numeric spelling."""
+    return json.dumps(
+        None if definition is None else definition.model_dump(exclude_unset=True),
+        sort_keys=True,
+    )
+
+
+def _template_fingerprint(template: ExperimentTemplate) -> str:
+    return json.dumps(template.model_dump(exclude_unset=True), sort_keys=True)
+
+
 def _reload_layout(
-    previous: JsonObject, candidate: JsonObject, stage_position: int, pending_advance: bool
+    previous: ExperimentTemplate,
+    candidate: ExperimentTemplate,
+    stage_position: int,
+    pending_advance: bool,
 ) -> ReloadLayout:
-    old_services = {item["service_id"]: item for item in previous["services"]}
-    new_services = {item["service_id"]: item for item in candidate["services"]}
+    old_services = {item.service_id: item for item in previous.services}
+    new_services = {item.service_id: item for item in candidate.services}
     changed_services = {
-        service_id for service_id in old_services.keys() | new_services.keys()
-        if json.dumps(old_services.get(service_id), sort_keys=True)
-        != json.dumps(new_services.get(service_id), sort_keys=True)
+        service_id
+        for service_id in old_services.keys() | new_services.keys()
+        if _definition_fingerprint(old_services.get(service_id))
+        != _definition_fingerprint(new_services.get(service_id))
     }
-    old_stages, new_stages = previous["stages"], candidate["stages"]
+    old_stages, new_stages = previous.stages, candidate.stages
     prefix = 0
     for before, after in zip(old_stages, new_stages):
-        if (
-            json.dumps(before, sort_keys=True) != json.dumps(after, sort_keys=True)
-            or ("service_id" in before and before["service_id"] in changed_services)
+        if _definition_fingerprint(before) != _definition_fingerprint(after) or (
+            isinstance(before, ServiceCallDefinition)
+            and before.service_id in changed_services
         ):
             break
         prefix += 1
     old_next = stage_position - 1 + int(pending_advance)
     if not 0 <= old_next <= len(old_stages):
         raise ValueError("Saved cursor is outside the applied DAG.")
-    new_positions = {item["stage_id"]: index for index, item in enumerate(new_stages)}
+    new_positions = {item.stage_id: index for index, item in enumerate(new_stages)}
     next_position = len(new_stages)
     for definition in old_stages[old_next:]:
-        if definition["stage_id"] in new_positions:
-            next_position = new_positions[definition["stage_id"]]
+        if definition.stage_id in new_positions:
+            next_position = new_positions[definition.stage_id]
             break
     if old_next == prefix:
         next_position = prefix
     return ReloadLayout(
-        old_services, new_services, changed_services, old_stages, new_stages,
-        prefix, next_position,
+        old_services,
+        new_services,
+        changed_services,
+        old_stages,
+        new_stages,
+        prefix,
+        next_position,
     )
 
 
 def _reload_cursor(layout: ReloadLayout, completed: set[str]) -> ReloadCursor:
-    invalidated = {item["stage_id"] for item in layout.old_stages[layout.prefix:]}
+    invalidated = {item.stage_id for item in layout.old_stages[layout.prefix :]}
     rewind = bool(completed & invalidated) and layout.prefix < layout.next_position
     next_position = layout.prefix if rewind else layout.next_position
     next_position = min(next_position, len(layout.new_stages))
     pending = next_position == len(layout.new_stages)
     position = len(layout.new_stages) if pending else next_position + 1
-    preserved = {item["stage_id"] for item in layout.new_stages[:layout.prefix]}
+    preserved = {item.stage_id for item in layout.new_stages[: layout.prefix]}
     return ReloadCursor(next_position, position, pending, rewind, preserved)
 
 
-def _prepare_reload_candidate(state: RunnerState, template: JsonObject) -> None:
+def _prepare_reload_candidate(
+    state: RunnerState, template: ExperimentTemplate
+) -> ExperimentTemplate:
     # Equivalent file-relative spellings are not a resource change. Keep
     # the applied spelling, including configured absolute paths.
-    if len(template["resources"]) == len(state.template["resources"]) and all(
-        before["name"] == after["name"]
-        and before["hash"] == after["hash"]
-        and Path(before["path"]).resolve() == Path(after["path"]).resolve()
-        for before, after in zip(state.template["resources"], template["resources"])
+    if len(template.resources) == len(state.template.resources) and all(
+        before.name == after.name
+        and before.hash == after.hash
+        and Path(before.path).resolve() == Path(after.path).resolve()
+        for before, after in zip(state.template.resources, template.resources)
     ):
-        template["resources"] = [dict(item) for item in state.template["resources"]]
-    for key in state.template.keys() - {"stages", "services"}:
-        if json.dumps(template[key], sort_keys=True) != json.dumps(
-            state.template[key], sort_keys=True
+        template = _update_model(template, resources=state.template.resources)
+    previous = state.template.model_dump(exclude_unset=True)
+    candidate = template.model_dump(exclude_unset=True)
+    for key in previous.keys() - {"stages", "services"}:
+        if json.dumps(candidate[key], sort_keys=True) != json.dumps(
+            previous[key], sort_keys=True
         ):
             raise ValueError(f"reload_template cannot change {key}.")
-    old_roles = {
-        item[f"{role}_id"]: role
-        for role in ("stage", "service")
-        for item in state.template[f"{role}s"]
-    }
-    for role in ("stage", "service"):
-        for item in template[f"{role}s"]:
-            item.setdefault(f"{role}_id", str(uuid4()))
-            if old_roles.get(item[f"{role}_id"], role) != role:
+    old_roles = {item.stage_id: "stage" for item in state.template.stages}
+    old_roles.update({item.service_id: "service" for item in state.template.services})
+    template = _assign_definition_ids(template)
+    for role, entries in (("stage", template.stages), ("service", template.services)):
+        for item in entries:
+            identifier = (
+                item.service_id
+                if isinstance(item, ServiceDefinition)
+                else item.stage_id
+            )
+            if old_roles.get(identifier, role) != role:
                 raise ValueError("A stable definition ID cannot change its role.")
+    return template
 
 
 def _definition_change(
     role: str,
     identity: str,
-    before: dict[str, tuple[int, JsonObject]],
-    after: dict[str, tuple[int, JsonObject]],
+    before: dict[
+        str, tuple[int, StageDefinition | ServiceCallDefinition | ServiceDefinition]
+    ],
+    after: dict[
+        str, tuple[int, StageDefinition | ServiceCallDefinition | ServiceDefinition]
+    ],
 ) -> JsonObject:
     change = {
         "kind": role,
         "id": identity,
-        "before": None if identity not in before else before[identity][1],
-        "after": None if identity not in after else after[identity][1],
+        "before": None
+        if identity not in before
+        else before[identity][1].model_dump(exclude_unset=True),
+        "after": None
+        if identity not in after
+        else after[identity][1].model_dump(exclude_unset=True),
         "old_position": None if identity not in before else before[identity][0],
         "new_position": None if identity not in after else after[identity][0],
     }
@@ -185,13 +230,13 @@ def _definition_change(
 
 
 def _service_state(
-    position: int, definition: JsonObject, instance: ServiceInstance | None
+    position: int, definition: ServiceDefinition, instance: ServiceInstance | None
 ) -> JsonObject:
     active = None if instance is None else instance.active_request
     return {
         "position": position,
-        "service_id": definition["service_id"],
-        "module": definition["module"],
+        "service_id": definition.service_id,
+        "module": definition.module.model_dump(exclude_unset=True),
         "service_instance_id": None
         if instance is None
         else instance.service_instance_id,

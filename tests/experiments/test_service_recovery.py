@@ -7,6 +7,8 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.models.experiment_template import ExperimentTemplate
+from core.models.updates import _update_model
 from core.participants.connection import ParticipantConnection
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import process_running
@@ -24,6 +26,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             instance = w.state.services[sid]
             await w.manager.close()
@@ -76,6 +79,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             first, second = w.service(), w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             sid = first["service_id"]
             original = w.state.services[sid]
@@ -101,6 +105,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             original = w.state.services[sid]
             previous = original.last_status["request_id"]
@@ -141,11 +146,14 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             first, second, survivor = w.service(), w.service(), w.service()
             second["module"] = copy.deepcopy(first["module"])
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
-            template = copy.deepcopy(w.state.template)
+            template = copy.deepcopy(w.state.template.model_dump(exclude_unset=True))
             for definition in template["services"][:2]:
                 definition["module"]["hash"] = "f" * 64
-            await w.manager.prepare_rebuild(w.state, template)
+            await w.manager.prepare_rebuild(
+                w.state, ExperimentTemplate.model_validate(template)
+            )
             for definition in (first, second):
                 instance = w.state.services[definition["service_id"]]
                 self.assertTrue(instance.stopped)
@@ -160,6 +168,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             identity = w.state.services[sid].process_identity
             gate = w.root / "release"
@@ -210,6 +219,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             call = asyncio.create_task(
                 w.manager.request(w.state, sid, "echo", {"lose_result": True})
@@ -248,6 +258,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             call = asyncio.create_task(
                 w.manager.request(
@@ -284,6 +295,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             gate = w.root / "release"
             call = asyncio.create_task(
@@ -318,17 +330,22 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             first, second = w.service(), w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             old = {sid: instance for sid, instance in w.state.services.items()}
-            template = copy.deepcopy(w.state.template)
+            template = copy.deepcopy(w.state.template.model_dump(exclude_unset=True))
             template["services"][0]["settings"]["new_setting"] = True
-            await w.manager.prepare_rebuild(w.state, template)
+            await w.manager.prepare_rebuild(
+                w.state, ExperimentTemplate.model_validate(template)
+            )
             self.assertTrue(old[first["service_id"]].stopped)
             self.assertTrue(
                 process_running(old[second["service_id"]].process_identity["pid"])
             )
-            w.state.template = template
-            self.assertEqual(await w.manager.reconcile(w.state, template), "ready")
+            w.state.template = ExperimentTemplate.model_validate(template)
+            self.assertEqual(
+                await w.manager.reconcile(w.state, w.state.template), "ready"
+            )
             self.assertIs(
                 w.state.services[second["service_id"]], old[second["service_id"]]
             )
@@ -343,15 +360,23 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             removed, survivor, added = w.service(), w.service(), w.service()
-            template = copy.deepcopy(w.state.template)
-            w.state.template["services"] = [removed, survivor]
+            template = copy.deepcopy(w.state.template.model_dump(exclude_unset=True))
+            w.template["services"] = [removed, survivor]
+            w.state.template = _update_model(
+                w.state.template, services=[removed, survivor]
+            )
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             survivor_instance = w.state.services[survivor["service_id"]]
             removed_instance = w.state.services[removed["service_id"]]
             template["services"] = [survivor, added]
-            await w.manager.prepare_rebuild(w.state, template)
-            w.state.template = template
-            self.assertEqual(await w.manager.reconcile(w.state, template), "ready")
+            await w.manager.prepare_rebuild(
+                w.state, ExperimentTemplate.model_validate(template)
+            )
+            w.state.template = ExperimentTemplate.model_validate(template)
+            self.assertEqual(
+                await w.manager.reconcile(w.state, w.state.template), "ready"
+            )
             self.assertNotIn(removed["service_id"], w.state.services)
             self.assertFalse(process_running(removed_instance.process_identity["pid"]))
             self.assertIs(w.state.services[survivor["service_id"]], survivor_instance)
@@ -364,6 +389,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             blocked, healthy = w.service(), w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             sid = blocked["service_id"]
             (w.controls[sid] / "pause-reading").touch()
@@ -386,6 +412,7 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             sid = definition["service_id"]
             identity = w.state.services[sid].process_identity

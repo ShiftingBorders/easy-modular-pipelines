@@ -180,7 +180,7 @@ async def run_owner(options):
             and state.pending_rebuild is not None
             and any(
                 instance.stopped
-                and instance.definition["settings"].get("launcher_cleanup")
+                and instance.definition.settings.get("launcher_cleanup")
                 for instance in state.services.values()
             )
         ):

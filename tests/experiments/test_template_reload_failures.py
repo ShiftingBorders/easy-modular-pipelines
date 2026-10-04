@@ -146,7 +146,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                 path = work.files.write_template(document)
                 if outcome == "applied":
                     await runner.reload_template(path)
-                    self.assertEqual(runner._state.template, document)
+                    self.assertEqual(
+                        runner._state.template.model_dump(exclude_unset=True), document
+                    )
                 else:
                     rebuild = runner._assembler.rebuild
 
@@ -165,7 +167,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                         self.assertRaisesRegex(OSError, "publication denied"),
                     ):
                         await runner.reload_template(path)
-                    self.assertEqual(runner._state.template, old)
+                    self.assertEqual(
+                        runner._state.template.model_dump(exclude_unset=True), old
+                    )
                     self.assertTrue(
                         any(
                             event["data"].get("state") == "rolled_back"
@@ -214,9 +218,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                         await release.wait()
                     return result
 
-                with patch(
-                    "core.experiments.runner.asyncio.gather", wait_detached
-                ):
+                with patch("core.experiments.runner.asyncio.gather", wait_detached):
                     reload_task = asyncio.create_task(
                         runner.reload_template(work.files.write_template(document))
                     )
@@ -233,7 +235,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                         if not reload_task.done():
                             reload_task.cancel()
                         await gather(reload_task, return_exceptions=True)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertIsNone(runner._state.pending_rebuild)
                 if action in ("stop", "close"):
                     self.assertIs(runner._task, dag)
@@ -307,7 +311,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ):
                     await runner.reload_template(work.files.write_template(document))
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertEqual(len(work.manifests()), phase - 1)
                 if phase == 2:
@@ -378,7 +384,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         release.set()
                         await asyncio.gather(task, return_exceptions=True)
-                self.assertEqual(runner._state.template, old)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), old
+                )
                 if phase == 1:
                     self.assertIsNone(runner._state.pending_rebuild)
                     self.assertFalse(
@@ -393,7 +401,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                     await runner.close()
                     recovered = work.replacement()
                     await recovered.recover(runner._state.experiment_id)
-                    self.assertEqual(recovered._state.template, old)
+                    self.assertEqual(
+                        recovered._state.template.model_dump(exclude_unset=True), old
+                    )
                     self.assertIsNone(recovered._state.pending_rebuild)
                 await work.close()
 
@@ -494,7 +504,10 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                         )
                         result = await runner.reload_template(path)
                         self.assertTrue(result["changed"])
-                        self.assertEqual(runner._state.template, document)
+                        self.assertEqual(
+                            runner._state.template.model_dump(exclude_unset=True),
+                            document,
+                        )
                         self.assertEqual(len(work.manifests()), 1)
                     else:
                         await runner.resume()
@@ -527,7 +540,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(OSError, "copy refused"),
         ):
             await runner.reload_template(path)
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertEqual(work.manifests(), [])
         entered, release, finished = (
             threading.Event(),
@@ -559,7 +572,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
                 await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertFalse(
             list((runner._state.experiment_directory / "runner/rebuilds").iterdir())
         )
@@ -596,7 +609,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(OSError, "failure after publication"),
         ):
             await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertEqual(runner._state.stage_result_ids, old_results)
         self.assertEqual(runner._state.mode, "paused")
         restored = {e["event_id"]: e for e in events(runner)}
@@ -630,7 +643,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                 self.assertRaises(LoggingStorageError),
             ):
                 await runner.reload_template(work.files.write_template(document))
-            self.assertEqual(runner._state.template, old)
+            self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
             self.assertEqual(work.manifests(), [])
         finally:
             runner._journal.close()
@@ -648,7 +661,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         document["stages"][0]["settings"]["large"] = "x" * 100000
         with self.assertRaisesRegex(ValueError, "max_event_bytes"):
             await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertEqual(work.manifests(), [])
 
     async def test_optional_state_failure_is_recoverable_from_committed_journal_rt16(
@@ -668,7 +681,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         )
         recovered = work.replacement()
         await recovered.recover(result["experiment_id"])
-        self.assertEqual(recovered._state.template, document)
+        self.assertEqual(
+            recovered._state.template.model_dump(exclude_unset=True), document
+        )
         self.assertEqual(
             recovered._state.template_revision_id, result["template_revision_id"]
         )
@@ -706,7 +721,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         await runner.close()
         recovered = work.replacement()
         await recovered.recover(runner._state.experiment_id)
-        self.assertEqual(recovered._state.template, document)
+        self.assertEqual(
+            recovered._state.template.model_dump(exclude_unset=True), document
+        )
         self.assertIsNone(recovered._state.pending_rebuild)
         self.assertEqual(len(events(recovered, "template.applied")), 2)
 
@@ -735,7 +752,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         await runner.stop()
         self.assertEqual([m["snapshot_id"] for m in work.manifests()], [snapshot_id])
         await runner.recover(runner._state.experiment_id)
-        self.assertEqual(runner._state.template, old)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), old)
         self.assertIsNone(runner._state.pending_rebuild)
 
     async def test_snapshot_failure_never_applies_candidate_rt08(self):
@@ -781,7 +798,9 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                     for service in observation["services"]:
                         service.pop("last_status")
                 self.assertEqual(after, before)
-                self.assertEqual(runner._state.template, original)
+                self.assertEqual(
+                    runner._state.template.model_dump(exclude_unset=True), original
+                )
                 self.assertIsNone(runner._state.pending_rebuild)
                 self.assertIsNone(runner._services._snapshot_id)
                 self.assertEqual(work.manifests(), [])
@@ -813,7 +832,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.get_state()["phase"], "failed")
         self.assertTrue(runner._task.done())
         self.assertTrue(all(item.stopped for item in runner._state.services.values()))
-        self.assertEqual(runner._state.template, before)
+        self.assertEqual(runner._state.template.model_dump(exclude_unset=True), before)
         self.assertIsNone(runner._state.pending_rebuild)
         self.assertEqual(work.manifests(), [])
 

@@ -21,6 +21,7 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             w = self.workspace
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             self.assertEqual(await w.manager.start_all(w.state), "ready")
             instance = w.state.services[sid]
             self.assertNotEqual(instance.process_identity["pid"], os.getpid())
@@ -46,6 +47,7 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.workspace
             first, second = w.service(), w.service()
+            w.publish_service_definitions()
             self.assertEqual(await w.manager.start_all(w.state), "ready")
             self.assertLess(w.trace(first)[0]["at"], w.trace(second)[0]["at"])
             gate = w.root / "release-work"
@@ -97,6 +99,7 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.workspace
             definition = w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             instance = w.state.services[definition["service_id"]]
             result = await w.manager.request(w.state, instance.service_id, "fail", {})
@@ -116,6 +119,7 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             commands = w.service(interface="commands", implementation="action")
             control = w.controls[commands["service_id"]]
             (control / "hold-start").touch()
+            w.publish_service_definitions()
             starting = asyncio.create_task(w.manager.start_all(w.state))
             await wait_for(lambda: (control / "action-start.json").exists())
             command_pid = read_json(control / "action-start.json")["pid"]
@@ -137,6 +141,7 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             w = self.workspace
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             old = w.state.services[sid]
             first = asyncio.create_task(

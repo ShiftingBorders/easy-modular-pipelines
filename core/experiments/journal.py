@@ -9,6 +9,7 @@ from uuid import UUID, uuid4, uuid5
 from core.experiments.state import RunnerState, state_from_document
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
+from core.models.experiment_template import ExperimentTemplate
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
@@ -46,7 +47,7 @@ class RunnerJournal:
     def write_client_config(
         self, state: RunnerState, context: JsonObject, *, create: bool = False
     ) -> Path:
-        settings = dict(state.template["logging"])
+        settings = state.template.logging.model_dump(exclude_unset=True)
         settings.update(
             {
                 "db_path": str(
@@ -61,17 +62,23 @@ class RunnerJournal:
         return path
 
     def record_template(
-        self, state: RunnerState, template_yaml: str, template: JsonObject, reason: str
+        self,
+        state: RunnerState,
+        template_yaml: str,
+        template: ExperimentTemplate,
+        reason: str,
     ) -> None:
         previous = state.template_revision_id
-        changed = state.template != template
+        changed = state.template.model_dump(exclude_unset=True) != template.model_dump(
+            exclude_unset=True
+        )
         revision = str(uuid4()) if reason != "initial" else previous
         context = {"experiment_id": state.experiment_id, "run_id": state.run_id}
         if changed:
             context["previous_run_id"] = state.run_id
             context["run_id"] = f"{uuid4()}:{state.run_id}"
         self.client.record_template_applied(
-            template,
+            template.model_dump(exclude_unset=True),
             template_yaml=template_yaml,
             template_revision_id=revision,
             previous_template_revision_id=previous if revision != previous else None,
@@ -103,16 +110,16 @@ class RunnerJournal:
             root
         ):
             raise ValueError("Restored journal identity path escapes the experiment.")
-        settings = state.template["logging"]
+        settings = state.template.logging
         identity = {key: journal_manifest[key] for key in ("journal_id", "generation")}
         # The same transaction must choose the same generation after a crash
         # between the database commit and publication of runner/journal.json.
         generation = uuid5(restoration, "experiment-journal-generation").hex
         store = SQLiteEventStore(
             database,
-            busy_timeout_seconds=settings["busy_timeout_seconds"],
-            max_event_bytes=settings["max_event_bytes"],
-            min_free_bytes=settings["min_free_bytes"],
+            busy_timeout_seconds=settings.busy_timeout_seconds,
+            max_event_bytes=settings.max_event_bytes,
+            min_free_bytes=settings.min_free_bytes,
             open_mode="existing",
             expected_journal=identity,
             diagnostic_context={

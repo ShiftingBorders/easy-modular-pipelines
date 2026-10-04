@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.experiments.state import RunnerState
+from core.models.experiment_template import ServiceDefinition
 from core.models.participant_observations import ServiceRestorationPaths
 from core.primitives.json_values import JsonObject
 
@@ -29,7 +30,7 @@ def _load_state_paths(
             continue
         supplied = supplied_paths.paths[service_id]
         if supplied is None:
-            if instance.definition["state_required"]:
+            if instance.definition.state_required:
                 raise ValueError(f"Required service state is missing: {service_id}")
             continue
         path = (root / supplied).resolve()
@@ -53,9 +54,7 @@ def _context(state: RunnerState, service_id: str, instance_id: str) -> JsonObjec
     return context
 
 
-def _service_definition(state: RunnerState, position: int) -> JsonObject:
-    if type(position) is not int or not 1 <= position <= len(
-        state.template["services"]
-    ):
+def _service_definition(state: RunnerState, position: int) -> ServiceDefinition:
+    if type(position) is not int or not 1 <= position <= len(state.template.services):
         raise ValueError("Service position is outside the template.")
-    return state.template["services"][position - 1]
+    return state.template.services[position - 1]

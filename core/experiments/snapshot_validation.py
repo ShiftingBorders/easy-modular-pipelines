@@ -18,18 +18,14 @@ def _validate_snapshot_manifest(document: JsonObject) -> None:
 def _validate_snapshot_exports(
     directory: Path, document: JsonObject, state: RunnerState
 ) -> None:
-    if set(state.services) != {
-        item["service_id"] for item in state.template["services"]
-    }:
+    if set(state.services) != {item.service_id for item in state.template.services}:
         raise ValueError("Snapshot does not describe every service.")
     exports = copy_json_object(document["services"], "snapshot service exports")
     if exports.keys() - state.services.keys():
         raise ValueError("Snapshot exports an unknown service.")
     for service_id, instance in state.services.items():
         definition = next(
-            item
-            for item in state.template["services"]
-            if item["service_id"] == service_id
+            item for item in state.template.services if item.service_id == service_id
         )
         if instance.definition != definition:
             raise ValueError(
@@ -44,7 +40,7 @@ def _validate_snapshot_exports(
         ):
             raise ValueError("Snapshot contains unresolved service work.")
         if path is None:
-            if instance.definition["state_required"]:
+            if instance.definition.state_required:
                 raise ValueError("Required service export is missing.")
             continue
         name = require_text(path, "service state path")

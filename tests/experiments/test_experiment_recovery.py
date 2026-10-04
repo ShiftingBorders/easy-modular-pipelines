@@ -280,7 +280,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 runner = w.replacement()
                 await runner.recover(experiment_id)
                 self.assertEqual(runner._state.last_result["trail"], ["A"])
-                self.assertNotIn("unapplied", runner._state.template)
+                self.assertNotIn(
+                    "unapplied", runner._state.template.model_dump(exclude_unset=True)
+                )
                 self.assertEqual(
                     (await runner.step())["result"]["data"]["trail"], ["A", "B"]
                 )

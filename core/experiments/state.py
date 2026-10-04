@@ -6,6 +6,12 @@ import os
 from pathlib import Path
 from typing import Literal
 
+from core.models.experiment_template import (
+    ExperimentTemplate,
+    ServiceCallDefinition,
+    ServiceDefinition,
+    StageDefinition,
+)
 from core.models.runner_state import (
     AttemptParameters,
     SavedAttempt,
@@ -107,7 +113,7 @@ class ServiceInstance:
 
     service_id: str
     service_instance_id: str
-    definition: JsonObject
+    definition: ServiceDefinition
     process_identity: JsonObject | None
     endpoint_path: Path | None
     ready: bool
@@ -121,13 +127,13 @@ class ServiceInstance:
         self,
         service_id: str,
         service_instance_id: str,
-        definition: JsonObject,
+        definition: ServiceDefinition | JsonObject,
     ) -> None:
         self._configure(
             ServiceParameters(
                 service_id=service_id,
                 service_instance_id=service_instance_id,
-                definition=definition,
+                definition=ServiceDefinition.model_validate(definition),
             )
         )
 
@@ -165,7 +171,7 @@ class RunnerState:
     template_path: Path
     template_revision_id: str
     template_yaml: str
-    template: JsonObject
+    template: ExperimentTemplate
     mode: RunnerMode
     phase: RunnerPhase
     pause_requested: bool
@@ -191,7 +197,7 @@ class RunnerState:
         template_path: Path,
         template_revision_id: str,
         template_yaml: str,
-        template: JsonObject,
+        template: ExperimentTemplate | JsonObject,
         mode: RunnerMode,
     ) -> None:
         self._configure(
@@ -202,7 +208,7 @@ class RunnerState:
                 template_path=template_path,
                 template_revision_id=template_revision_id,
                 template_yaml=template_yaml,
-                template=template,
+                template=ExperimentTemplate.model_validate(template),
                 mode=mode,
             )
         )
@@ -316,6 +322,7 @@ def state_to_document(state: RunnerState) -> JsonObject:
     document = dict(vars(state))
     document.pop("experiment_directory")
     document["schema_version"] = 4
+    document["template"] = state.template.model_dump(exclude_unset=True)
     template_path = state.template_path.resolve()
     document["template_path"] = (
         template_path.relative_to(root).as_posix()
@@ -328,6 +335,7 @@ def state_to_document(state: RunnerState) -> JsonObject:
     document["services"] = {}
     for service_id, instance in state.services.items():
         saved = dict(vars(instance))
+        saved["definition"] = instance.definition.model_dump(exclude_unset=True)
         for name in ("endpoint_path", "artifacts_directory"):
             path = saved[name]
             saved[name] = (
@@ -371,64 +379,156 @@ def _saved_path(root: Path, relative: str, label: str) -> Path:
 
 
 def _restore_state(root: Path, document: SavedRunnerState) -> RunnerState:
-    values = document.model_dump(exclude_unset=True)
-    values.pop("schema_version")
     template_path = Path(document.template_path)
-    values["template_path"] = (
-        template_path if template_path.is_absolute() else root / template_path
-    )
-    values["used_request_ids"] = set(document.used_request_ids)
-    values["services"] = {
-        key: _restore_service(root, service)
-        for key, service in document.services.items()
-    }
-    values["active_attempt"] = (
-        None
-        if document.active_attempt is None
-        else _restore_attempt(root, document.active_attempt)
-    )
     artifacts = (root / "shared_artifacts").resolve()
     for relative in document.retained_artifacts:
         path = Path(relative)
         if path.anchor or not (root / path).resolve().is_relative_to(artifacts):
             raise ValueError("Retained artifact path escapes shared_artifacts.")
-    # Every field is guaranteed by the saved-document model. Avoid revalidating
-    # constructor inputs while restoring an already checked, complete record.
     state = RunnerState.__new__(RunnerState)
     state.experiment_directory = root
-    for name, value in values.items():
-        setattr(state, name, value)
+    state.experiment_id = document.experiment_id
+    state.run_id = document.run_id
+    state.template_path = (
+        template_path if template_path.is_absolute() else root / template_path
+    )
+    state.template_revision_id = document.template_revision_id
+    state.template_yaml = document.template_yaml
+    state.template = document.template
+    state.mode = document.mode
+    state.phase = document.phase
+    state.pause_requested = document.pause_requested
+    state.cycle_number = document.cycle_number
+    state.stage_position = document.stage_position
+    state.active_attempt = (
+        None
+        if document.active_attempt is None
+        else _restore_attempt(root, document.active_attempt)
+    )
+    state.stage_retry_counts = document.stage_retry_counts
+    state.stage_attempt_numbers = document.stage_attempt_numbers
+    state.services = {
+        key: _restore_service(root, service)
+        for key, service in document.services.items()
+    }
+    state.last_result = document.last_result
+    state.last_result_id = document.last_result_id
+    state.stage_result_ids = document.stage_result_ids
+    state.unknown_state_recovery_count = document.unknown_state_recovery_count
+    state.used_request_ids = set(document.used_request_ids)
+    state.stable_snapshot_id = document.stable_snapshot_id
+    state.pending_rebuild = (
+        None
+        if document.pending_rebuild is None
+        else document.pending_rebuild.model_dump(exclude_unset=True)
+    )
+    state.pending_advance = document.pending_advance
+    state.stage_result_origins = document.stage_result_origins
+    state.checkpoint_id = document.checkpoint_id
+    state.owner_identity = (
+        None
+        if document.owner_identity is None
+        else document.owner_identity.model_dump(exclude_unset=True)
+    )
+    state.pending_input = (
+        None
+        if document.pending_input is None
+        else document.pending_input.model_dump(exclude_unset=True)
+    )
+    state.last_dag_decision = (
+        None
+        if document.last_dag_decision is None
+        else document.last_dag_decision.model_dump(exclude_unset=True)
+    )
+    state.retained_artifacts = document.retained_artifacts
     return state
 
 
 def _restore_service(root: Path, document: SavedService) -> ServiceInstance:
-    values = document.model_dump(exclude_unset=True)
-    for name in ("endpoint_path", "artifacts_directory"):
-        if values[name] is not None:
-            values[name] = _saved_path(root, values[name], "service path")
     instance = ServiceInstance.__new__(ServiceInstance)
-    for name, value in values.items():
-        setattr(instance, name, value)
+    instance.service_id = document.service_id
+    instance.service_instance_id = document.service_instance_id
+    instance.definition = document.definition
+    instance.process_identity = (
+        None
+        if document.process_identity is None
+        else document.process_identity.model_dump(exclude_unset=True)
+    )
+    instance.endpoint_path = (
+        None
+        if document.endpoint_path is None
+        else _saved_path(root, document.endpoint_path, "service path")
+    )
+    instance.ready = document.ready
+    instance.started_at = document.started_at
+    instance.last_status = document.last_status
+    instance.restart_count = document.restart_count
+    instance.pending_requests = [
+        request.model_dump(exclude_unset=True) for request in document.pending_requests
+    ]
+    instance.active_request = (
+        None
+        if document.active_request is None
+        else document.active_request.model_dump(exclude_unset=True)
+    )
+    instance.start_deadline = document.start_deadline
+    instance.ever_ready = document.ever_ready
+    instance.stopping = document.stopping
+    instance.stopped = document.stopped
+    instance.manually_stopped = document.manually_stopped
+    instance.blocked_action = document.blocked_action
+    instance.failure = (
+        None
+        if document.failure is None
+        else document.failure.model_dump(exclude_unset=True)
+    )
+    instance.freeze_id = document.freeze_id
+    instance.prepared_freeze_id = document.prepared_freeze_id
+    instance.artifacts_directory = (
+        None
+        if document.artifacts_directory is None
+        else _saved_path(root, document.artifacts_directory, "service path")
+    )
+    instance.implementation = document.implementation
     return instance
 
 
 def _restore_attempt(root: Path, document: SavedAttempt) -> StageAttempt:
-    values = document.model_dump(exclude_unset=True)
-    values["artifacts_directory"] = _saved_path(
+    attempt = StageAttempt.__new__(StageAttempt)
+    attempt.attempt_id = document.attempt_id
+    attempt.stage_id = document.stage_id
+    attempt.stage_execution_id = document.stage_execution_id
+    attempt.cycle_number = document.cycle_number
+    attempt.attempt_number = document.attempt_number
+    attempt.artifacts_directory = _saved_path(
         root, document.artifacts_directory, "attempt directory"
     )
-    if document.endpoint_path is not None:
-        values["endpoint_path"] = _saved_path(
-            root, document.endpoint_path, "participant endpoint"
-        )
-    attempt = StageAttempt.__new__(StageAttempt)
-    for name, value in values.items():
-        setattr(attempt, name, value)
+    attempt.input_data = document.input_data
+    attempt.effective_settings = document.effective_settings
+    attempt.timeout_seconds = document.timeout_seconds
+    attempt.process_identity = document.process_identity
+    attempt.started_at = document.started_at
+    attempt.result_request_id = document.result_request_id
+    attempt.outcome = document.outcome
+    attempt.executor_status = document.executor_status
+    attempt.request_id = document.request_id
+    attempt.participant = document.participant.model_dump(exclude_unset=True)
+    attempt.endpoint_path = (
+        None
+        if document.endpoint_path is None
+        else _saved_path(root, document.endpoint_path, "participant endpoint")
+    )
+    attempt.service_id = document.service_id
+    attempt.queued_monotonic = document.queued_monotonic
+    attempt.queued_at = document.queued_at
     return attempt
 
 
 def _attempt_from_launch(
-    definition: JsonObject, launched: JsonObject, directory: Path, root: Path
+    definition: StageDefinition | ServiceCallDefinition,
+    launched: JsonObject,
+    directory: Path,
+    root: Path,
 ) -> StageAttempt:
     attempt = StageAttempt(
         launched["attempt_id"],
@@ -439,7 +539,7 @@ def _attempt_from_launch(
         directory,
         {},
         {},
-        definition["timeout_seconds"],
+        definition.timeout_seconds,
     )
     # Bind ownership before optional files are read so failure
     # handling still has to confirm this attempt's termination.
@@ -452,7 +552,9 @@ def _attempt_from_launch(
             "participant_instance_id",
         )
     }
-    attempt.service_id = definition.get("service_id")
+    attempt.service_id = (
+        definition.service_id if isinstance(definition, ServiceCallDefinition) else None
+    )
     attempt.endpoint_path = (
         root / "runner/endpoints" / f"{attempt.service_id}.json"
         if attempt.service_id is not None

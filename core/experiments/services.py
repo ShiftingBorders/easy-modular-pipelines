@@ -6,7 +6,6 @@ belong to their Python proxies. Global pause/stop decisions return to the runner
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 import time
 from collections.abc import Callable
@@ -19,6 +18,7 @@ import psutil
 
 from core.experiments.journal import RunnerJournal
 from core.experiments.launch import ModuleLauncher
+from core.experiments.reload import _definition_fingerprint
 from core.experiments.results import read_result
 from core.experiments.service_inputs import _context, _load_state_paths
 from core.experiments.state import (
@@ -28,6 +28,12 @@ from core.experiments.state import (
     state_to_document,
 )
 from core.journal.events import LoggingError
+from core.models.experiment_template import (
+    ErrorPolicy,
+    ExperimentTemplate,
+    ServiceCallDefinition,
+    ServiceDefinition,
+)
 from core.models.participant_observations import (
     CommandState,
     CommandStateResponse,
@@ -97,10 +103,10 @@ class ServiceManager:
             raise RuntimeError(
                 "start_all requires an open manager and no existing services."
             )
-        definitions = state.template["services"]
+        definitions = state.template.services
         if type(definitions) is not list:
             raise TypeError("services must be an array.")
-        identifiers = [item["service_id"] for item in definitions]
+        identifiers = [item.service_id for item in definitions]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("Service definition IDs must be unique.")
         if not definitions:
@@ -131,12 +137,12 @@ class ServiceManager:
         return "ready"
 
     async def _start_with_recovery(
-        self, state: RunnerState, definition: JsonObject
+        self, state: RunnerState, definition: ServiceDefinition
     ) -> ServiceAction:
         try:
             await self._start(state, definition)
         except (OSError, ConnectionError) as error:
-            instance = state.services.get(definition["service_id"])
+            instance = state.services.get(definition.service_id)
             if instance is None:
                 raise
             instance.failure = error_details(
@@ -153,11 +159,7 @@ class ServiceManager:
                 "Service start requires an open manager without a snapshot barrier."
             )
         definition = next(
-            (
-                item
-                for item in state.template["services"]
-                if item["service_id"] == service_id
-            ),
+            (item for item in state.template.services if item.service_id == service_id),
             None,
         )
         if definition is None:
@@ -206,7 +208,7 @@ class ServiceManager:
             raise
 
     async def _start(
-        self, state: RunnerState, definition: JsonObject
+        self, state: RunnerState, definition: ServiceDefinition
     ) -> ServiceInstance:
         instance, directory, launch, context = self._prepare_service_start(
             state, definition
@@ -214,7 +216,7 @@ class ServiceManager:
         service_id = instance.service_id
         instance_id = instance.service_instance_id
         self._starting.add(service_id)
-        instance.start_deadline = time.monotonic() + state.template["start_timeout"]
+        instance.start_deadline = time.monotonic() + state.template.start_timeout
         spawn = None
         try:
             self._publish_service_start_intent(state, definition, launch, context)
@@ -279,9 +281,9 @@ class ServiceManager:
             self._changed.set()
 
     def _prepare_service_start(
-        self, state: RunnerState, definition: JsonObject
+        self, state: RunnerState, definition: ServiceDefinition
     ) -> tuple[ServiceInstance, Path, JsonObject, JsonObject]:
-        service_id = require_text(definition["service_id"], "service_id")
+        service_id = require_text(definition.service_id, "service_id")
         old = state.services.get(service_id)
         if old is not None and not old.stopped:
             raise RuntimeError(
@@ -295,7 +297,9 @@ class ServiceManager:
             / service_id
             / instance_id
         )
-        launch = self._launcher.prepare(state, definition, context, directory, None)
+        launch = self._launcher.prepare(
+            state, definition.model_dump(exclude_unset=True), context, directory, None
+        )
         instance = ServiceInstance(service_id, instance_id, definition)
         instance.implementation = launch["module"]["implementation"]
         instance.artifacts_directory = directory
@@ -327,14 +331,14 @@ class ServiceManager:
     def _publish_service_start_intent(
         self,
         state: RunnerState,
-        definition: JsonObject,
+        definition: ServiceDefinition,
         launch: JsonObject,
         context: JsonObject,
     ) -> None:
         self._journal.client.record_event(
             "service.parameters",
             {
-                "definition": definition,
+                "definition": definition.model_dump(exclude_unset=True),
                 "effective_settings": launch["effective_settings"],
                 "template_revision_id": state.template_revision_id,
             },
@@ -454,7 +458,7 @@ class ServiceManager:
         self, state: RunnerState, *, service_ids: set[str] | None = None
     ) -> ServiceAction:
         required = (
-            {definition["service_id"] for definition in state.template["services"]}
+            {definition.service_id for definition in state.template.services}
             if service_ids is None
             else service_ids
         )
@@ -584,7 +588,7 @@ class ServiceManager:
                     and active.get("owner") != "caller"
                     and not active["timed_out"]
                     and time.monotonic() - active["sent_monotonic"]
-                    >= instance.definition["command_timeout_seconds"]
+                    >= instance.definition.command_timeout_seconds
                 ):
                     action = await self._handle_timeout(
                         state, service_id, active["request_id"]
@@ -627,9 +631,7 @@ class ServiceManager:
             else:
                 self._connecting[service_id] = asyncio.create_task(
                     self._connections[service_id].connect(
-                        timeout_seconds=instance.definition["heartbeat"][
-                            "grace_seconds"
-                        ]
+                        timeout_seconds=instance.definition.heartbeat.grace_seconds
                     )
                 )
                 self._next_probe[service_id] = 0
@@ -642,7 +644,7 @@ class ServiceManager:
             probe is not None
             and instance.ever_ready
             and time.monotonic() - probe["sent_monotonic"]
-            >= instance.definition["heartbeat"]["grace_seconds"]
+            >= instance.definition.heartbeat.grace_seconds
         ):
             instance.failure = error_details(
                 "heartbeat_timeout", "Service heartbeat grace period expired."
@@ -682,7 +684,7 @@ class ServiceManager:
                             )
                             if not instance.ever_ready
                             and instance.start_deadline is not None
-                            else instance.definition["heartbeat"]["grace_seconds"]
+                            else instance.definition.heartbeat.grace_seconds
                         ),
                     )
                 ),
@@ -702,16 +704,16 @@ class ServiceManager:
             if retry is not None
             and retry["timed_out"]
             and retry.get("owner") != "caller"
-            and instance.definition["on_command_timeout"] == "restart"
+            and instance.definition.on_command_timeout == "restart"
             else None
         )
         waiter = None if retry is None else self._waiters.pop(retry["request_id"], None)
         while not self._closed:
-            policy = instance.definition["errors"]
+            policy = instance.definition.errors
             exhausted = (
                 automatic
-                and instance.restart_count >= policy["retries"]
-                and policy["on_exhausted"] != "skip"
+                and instance.restart_count >= policy.retries
+                and policy.on_exhausted != "skip"
             )
             try:
                 stopped = await self.stop_all(
@@ -734,7 +736,7 @@ class ServiceManager:
             if automatic:
                 instance.restart_count += 1
                 try:
-                    await asyncio.sleep(policy["retry_delay_seconds"])
+                    await asyncio.sleep(policy.retry_delay_seconds)
                 except asyncio.CancelledError:
                     if waiter is not None and not waiter.done():
                         waiter.cancel()
@@ -772,11 +774,11 @@ class ServiceManager:
         state: RunnerState,
         service_id: str,
         instance: ServiceInstance,
-        policy: JsonObject,
+        policy: ErrorPolicy,
         retry: JsonObject | None,
         waiter: asyncio.Future | None,
     ) -> ServiceAction:
-        instance.blocked_action = policy["on_exhausted"]
+        instance.blocked_action = policy.on_exhausted
         if waiter is not None and not waiter.done():
             waiter.set_result(
                 {
@@ -977,7 +979,7 @@ class ServiceManager:
             active.get("owner") != "caller"
             and not active["timed_out"]
             and time.monotonic() - active["sent_monotonic"]
-            >= instance.definition["command_timeout_seconds"]
+            >= instance.definition.command_timeout_seconds
         ):
             await self._handle_timeout(state, service_id, request_id)
         if active["timed_out"]:
@@ -989,10 +991,11 @@ class ServiceManager:
             # A late result releases actual work, never changes its timed-out outcome.
             if (
                 active.get("owner") != "caller"
-                and instance.definition["on_command_timeout"] == "restart"
+                and instance.definition.on_command_timeout == "restart"
             ):
                 instance.failure = error_details(
-                    "service_failure", "Timed-out command requires an explicit restart.",
+                    "service_failure",
+                    "Timed-out command requires an explicit restart.",
                 )
                 self._restarts[service_id] = asyncio.create_task(
                     self.restart(state, service_id, automatic=True)
@@ -1002,7 +1005,10 @@ class ServiceManager:
                 instance.blocked_action = None
         else:
             self._finish_request(
-                state, instance, active, response,
+                state,
+                instance,
+                active,
+                response,
                 "succeeded" if observation.result == "success" else "failed",
             )
         instance.active_request = None
@@ -1037,7 +1043,7 @@ class ServiceManager:
         elif (
             instance.ever_ready
             and time.monotonic() - probe["sent_monotonic"]
-            >= instance.definition["heartbeat"]["grace_seconds"]
+            >= instance.definition.heartbeat.grace_seconds
         ):
             instance.failure = error_details(
                 "heartbeat_timeout",
@@ -1059,7 +1065,7 @@ class ServiceManager:
             self._bad_replies[service_id] = 0
         self._probes.pop(service_id, None)
         self._next_probe[service_id] = (
-            time.monotonic() + instance.definition["heartbeat"]["interval_seconds"]
+            time.monotonic() + instance.definition.heartbeat.interval_seconds
         )
         return True
 
@@ -1070,7 +1076,7 @@ class ServiceManager:
         active = instance.active_request
         if active is None or active["request_id"] != request_id:
             raise ValueError("Timeout does not match the active service request.")
-        action = instance.definition["on_command_timeout"]
+        action = instance.definition.on_command_timeout
         if not active["timed_out"]:
             response = {"result": "fail", "data": {"reason": "command_timeout"}}
             self._journal.client.record_command_result(
@@ -1108,28 +1114,32 @@ class ServiceManager:
         return "wait" if action == "pause" else action
 
     async def prepare_rebuild(
-        self, state: RunnerState, template: JsonObject, *, validate_only: bool = False
+        self,
+        state: RunnerState,
+        template: ExperimentTemplate,
+        *,
+        validate_only: bool = False,
     ) -> None:
-        desired = {item["service_id"]: item for item in template["services"]}
+        desired = {item.service_id: item for item in template.services}
         old_modules = {
-            (item["module"]["name"], item["module"]["version"]): item["module"]["hash"]
-            for item in [*state.template["stages"], *state.template["services"]]
-            if "module" in item
+            (item.module.name, item.module.version): item.module.hash
+            for item in [*state.template.stages, *state.template.services]
+            if not isinstance(item, ServiceCallDefinition)
         }
         new_modules = {
-            (item["module"]["name"], item["module"]["version"]): item["module"]["hash"]
-            for item in [*template["stages"], *template["services"]]
-            if "module" in item
+            (item.module.name, item.module.version): item.module.hash
+            for item in [*template.stages, *template.services]
+            if not isinstance(item, ServiceCallDefinition)
         }
         changed_code = {
             key for key, digest in old_modules.items() if new_modules.get(key) != digest
         }
         for service_id, instance in list(state.services.items()):
-            module = instance.definition["module"]
+            module = instance.definition.module
             if (
-                json.dumps(desired.get(service_id), sort_keys=True)
-                == json.dumps(instance.definition, sort_keys=True)
-                and (module["name"], module["version"]) not in changed_code
+                _definition_fingerprint(desired.get(service_id))
+                == _definition_fingerprint(instance.definition)
+                and (module.name, module.version) not in changed_code
             ):
                 continue
             process = self._processes.get(service_id)
@@ -1169,12 +1179,10 @@ class ServiceManager:
                 )
             # A child participant can exit before its launcher finishes touching
             # runtime files. Keep those files in place until both have stopped.
-            deadline = time.monotonic() + state.template["start_timeout"]
+            deadline = time.monotonic() + state.template.start_timeout
             if process is not None and process.poll() is None:
                 try:
-                    await asyncio.to_thread(
-                        process.wait, state.template["start_timeout"]
-                    )
+                    await asyncio.to_thread(process.wait, state.template.start_timeout)
                 except subprocess.TimeoutExpired as error:
                     raise RuntimeError(
                         f"Service {service_id} launcher still owns runtime files; "
@@ -1213,9 +1221,9 @@ class ServiceManager:
             await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
     async def reconcile(
-        self, state: RunnerState, template: JsonObject
+        self, state: RunnerState, template: ExperimentTemplate
     ) -> ServiceAction:
-        desired = {item["service_id"]: item for item in template["services"]}
+        desired = {item.service_id: item for item in template.services}
         for service_id, instance in list(state.services.items()):
             if service_id not in desired:
                 if not instance.stopped:
@@ -1223,24 +1231,21 @@ class ServiceManager:
                         "Removed services must stop before reconciliation."
                     )
                 del state.services[service_id]
-        for definition in template["services"]:
-            instance = state.services.get(definition["service_id"])
+        for definition in template.services:
+            instance = state.services.get(definition.service_id)
             if instance is not None and instance.manually_stopped:
                 continue
             if instance is not None and instance.blocked_action is not None:
                 return instance.blocked_action
             if instance is not None and not instance.stopped:
-                if json.dumps(instance.definition, sort_keys=True) != json.dumps(
-                    definition, sort_keys=True
-                ):
+                if _definition_fingerprint(
+                    instance.definition
+                ) != _definition_fingerprint(definition):
                     raise RuntimeError(
                         "Changed services must stop before reconciliation."
                     )
                 continue
-            if (
-                instance is not None
-                and instance.definition["module"] != definition["module"]
-            ):
+            if instance is not None and instance.definition.module != definition.module:
                 instance.restart_count = 0
             action = await self._start_with_recovery(state, definition)
             if action != "ready":
@@ -1250,9 +1255,7 @@ class ServiceManager:
         return await self.wait_ready(state)
 
     async def recover(self, state: RunnerState) -> ServiceAction:
-        if set(state.services) != {
-            item["service_id"] for item in state.template["services"]
-        }:
+        if set(state.services) != {item.service_id for item in state.template.services}:
             raise RuntimeError(
                 "Saved service ownership is incomplete; automatic launch is unsafe."
             )
@@ -1433,7 +1436,7 @@ class ServiceManager:
     async def _recover_connected_instance(
         self, state: RunnerState, service_id: str, instance: ServiceInstance
     ) -> tuple[bool, ServiceAction | None]:
-        timeout = instance.definition["heartbeat"]["grace_seconds"]
+        timeout = instance.definition.heartbeat.grace_seconds
         if not instance.ever_ready:
             if instance.start_deadline is None:
                 raise ValueError(
@@ -1607,15 +1610,12 @@ class ServiceManager:
             raise RuntimeError(f"Service {service_id} state export failed.")
         data = ServiceStateExport.model_validate(reply["data"])
         if data.state_path is None:
-            if instance.definition["state_required"]:
+            if instance.definition.state_required:
                 raise ValueError("Required service export is missing state_path.")
             return None
         relative = Path(data.state_path)
         resolved = (state.experiment_directory / relative).resolve()
-        if (
-            not resolved.is_relative_to(output.resolve())
-            or not resolved.exists()
-        ):
+        if not resolved.is_relative_to(output.resolve()) or not resolved.exists():
             raise ValueError(
                 "Service state_path must exist inside its allocated export directory."
             )
@@ -1721,7 +1721,7 @@ class ServiceManager:
         instance.stopping = True
         context = _context(state, service_id, instance.service_instance_id)
         await self._detach_service_tasks(service_id)
-        deadline = time.monotonic() + state.template["start_timeout"]
+        deadline = time.monotonic() + state.template.start_timeout
         owned_process = self._processes.get(service_id)
         if (
             owned_process is not None
@@ -1989,7 +1989,7 @@ class ServiceManager:
                 "Service reset requires confirmed stops and empty queues."
             )
         await self.close()
-        deadline = time.monotonic() + state.template["start_timeout"]
+        deadline = time.monotonic() + state.template.start_timeout
         for process in self._launch_processes:
             if process.poll() is None:
                 try:
@@ -2280,7 +2280,7 @@ class ServiceManager:
                 control_id,
                 "interrupt",
                 {"request_id": request_id},
-                timeout=state.template["start_timeout"],
+                timeout=state.template.start_timeout,
             )
             if reply["result"] == "success":
                 instance.active_request = None

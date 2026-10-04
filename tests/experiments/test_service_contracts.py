@@ -101,6 +101,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             previous = Path.cwd()
             try:
                 os.chdir(w.root)
+                w.publish_service_definitions()
                 self.assertEqual(await w.manager.start_all(w.state), "ready")
             finally:
                 os.chdir(previous)
@@ -120,11 +121,13 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             source = path.read_bytes()
             path.write_bytes(source + b"\n# changed\n")
             with self.assertRaises(ValueError):
+                w.publish_service_definitions()
                 await w.manager.start_all(w.state)
             self.assertEqual(w.trace(definition), [])
             path.write_bytes(source)
             w.hashes.remove_module_hash(definition["module"]["name"], "1")
             with self.assertRaises(ValueError):
+                w.publish_service_definitions()
                 await w.replacement_manager().start_all(w.state)
             self.assertEqual(w.trace(definition), [])
 
@@ -137,6 +140,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             locked.execute("BEGIN IMMEDIATE")
             try:
                 with self.assertRaises(LoggingError):
+                    w.publish_service_definitions()
                     await w.manager.start_all(w.state)
             finally:
                 locked.rollback()
@@ -154,6 +158,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             first, invalid = w.service(), w.service()
             w.hashes.remove_module_hash(invalid["module"]["name"], "1")
             with self.assertRaises(ValueError):
+                w.publish_service_definitions()
                 await w.manager.start_all(w.state)
             instance = w.state.services[first["service_id"]]
             self.assertTrue(instance.stopped)
@@ -166,6 +171,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             w.service()
             w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             locked = sqlite3.connect(w.experiment / "journals/events.sqlite")
             locked.execute("BEGIN IMMEDIATE")
@@ -194,6 +200,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(
                 w.store, "save", side_effect=OSError("test state storage unavailable")
             ):
+                w.publish_service_definitions()
                 self.assertEqual(await w.manager.start_all(w.state), "ready")
                 reply = await w.manager.request(
                     w.state, definition["service_id"], "echo", {"value": 1}
@@ -206,6 +213,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             instance = w.state.services[definition["service_id"]]
             endpoint = json.loads(instance.endpoint_path.read_text())
@@ -255,6 +263,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             active = asyncio.create_task(
                 w.manager.request(w.state, sid, "echo", {"gate": str(w.root / "gate")})

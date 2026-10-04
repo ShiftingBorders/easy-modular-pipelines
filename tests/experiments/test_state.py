@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+import yaml
+
 from core.experiments.state import (
     RunnerState,
     RunnerStateStore,
@@ -20,6 +22,12 @@ from core.experiments.state import (
     state_from_document,
     state_to_document,
 )
+from core.models.experiment_template import (
+    ExperimentTemplate,
+    HeartbeatPolicy,
+    ServiceDefinition,
+)
+from core.models.updates import _update_model
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
 from tests.helpers.dag import DagWorkspace
@@ -31,17 +39,48 @@ class RunnerStateTests(unittest.TestCase):
         self.addCleanup(self.workspace.close)
         self.root = self.workspace.root / "experiment"
         self.root.mkdir()
+        template = self.workspace.template()
         self.state = RunnerState(
             "experiment",
             self.root,
             "run",
             self.root / "experiment.yaml",
             str(uuid4()),
-            "stages: []\n",
-            {"stages": []},
+            yaml.safe_dump(template),
+            template,
             "paused",
         )
         self.store = RunnerStateStore()
+
+    def test_state_round_trip_retains_models_and_detaches_public_json(self):
+        _, service = self._add_path_participants()
+        self.store.save(self.state)
+        restored = self.store.load(self.root)
+        self.assertIsInstance(restored.template, ExperimentTemplate)
+        self.assertIsInstance(
+            restored.services[service.service_id].definition, ServiceDefinition
+        )
+        self.assertEqual(state_to_document(restored), state_to_document(self.state))
+        document = state_to_document(restored)
+        document["template"]["stages"][0]["settings"]["external"] = True
+        self.assertNotIn("external", restored.template.stages[0].settings)
+
+    def test_recovery_rejects_incomplete_or_unassigned_runtime_templates(self):
+        document = state_to_document(self.state)
+        incomplete = self.state.template.model_dump(exclude_unset=True)
+        del incomplete["stages"][0]["stage_id"]
+        for template in (
+            {},
+            {"stages": []},
+            {"stages": None},
+            {"stages": [{}]},
+            incomplete,
+        ):
+            with (
+                self.subTest(template=template),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                state_from_document(self.root, {**document, "template": template})
 
     def _add_path_participants(self):
         stage_id = str(uuid4())
@@ -65,7 +104,19 @@ class RunnerStateTests(unittest.TestCase):
         self.state.active_attempt = attempt
         self.state.used_request_ids.add(attempt.request_id)
         service_id = str(uuid4())
-        service = ServiceInstance(service_id, str(uuid4()), {"service_id": service_id})
+        stage = self.state.template.stages[0]
+        definition = ServiceDefinition(
+            service_id=service_id,
+            module=stage.module,
+            settings={},
+            heartbeat=HeartbeatPolicy(interval_seconds=1, grace_seconds=2),
+            command_timeout_seconds=3,
+            on_command_timeout="stop",
+            state_required=False,
+            errors=stage.errors,
+        )
+        service = ServiceInstance(service_id, str(uuid4()), definition)
+        self.state.template = _update_model(self.state.template, services=[definition])
         service.endpoint_path = self.root / "service-endpoint.json"
         self.state.services[service_id] = service
         return attempt, service

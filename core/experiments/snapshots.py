@@ -84,7 +84,7 @@ class ExperimentSnapshots:
             self._assembler.check_modules(state)
             if (
                 shutil.disk_usage(state.experiment_directory).free
-                < state.template["storage"]["min_snapshot_free_bytes"]
+                < state.template.storage.min_snapshot_free_bytes
             ):
                 raise OSError("Insufficient free space for an experiment snapshot.")
             # Result publication precedes executor cleanup. Reap its remaining
@@ -467,7 +467,7 @@ class ExperimentSnapshots:
         valid.sort(reverse=True)
         retained = {directory}
         for _, path in valid:
-            if len(retained) < state.template["snapshots"]["keep"]:
+            if len(retained) < state.template.snapshots.keep:
                 retained.add(path)
         for _, path in valid:
             if path in retained:
@@ -514,14 +514,16 @@ class ExperimentSnapshots:
         ):
             raise ValueError("Snapshot runner state is inconsistent.")
         yaml_text, template = self._assembler.load_template(state.template_path)
-        if yaml_text != state.template_yaml or template != state.template:
+        if yaml_text != state.template_yaml or template != state.template.model_dump(
+            exclude_unset=True
+        ):
             raise ValueError("Snapshot template differs from its applied revision.")
         self._validate_snapshot_modules(directory, template)
-        if state.cycle_number > state.template["cycles"] or state.stage_position > len(
-            state.template["stages"]
+        if state.cycle_number > state.template.cycles or state.stage_position > len(
+            state.template.stages
         ):
             raise ValueError("Snapshot cursor is outside its DAG.")
-        stage_ids = {item["stage_id"] for item in state.template["stages"]}
+        stage_ids = {item.stage_id for item in state.template.stages}
         for stage_id, request_id in state.stage_result_ids.items():
             if stage_id not in stage_ids:
                 raise ValueError("Snapshot result belongs to an unknown DAG node.")
@@ -555,10 +557,10 @@ class ExperimentSnapshots:
         try:
             database = Path(temporary.name) / "journal.sqlite"
             shutil.copyfile(directory / "journal/journal.sqlite", database)
-            settings = state.template["logging"]
+            settings = state.template.logging
             store_options = {
-                "busy_timeout_seconds": settings["busy_timeout_seconds"],
-                "max_event_bytes": settings["max_event_bytes"],
+                "busy_timeout_seconds": settings.busy_timeout_seconds,
+                "max_event_bytes": settings.max_event_bytes,
                 "min_free_bytes": 0,
                 "open_mode": "existing",
                 "expected_journal": {
@@ -793,7 +795,7 @@ class ExperimentSnapshots:
             self._assembler.check_modules(checked)
             required = (
                 3 * sum(item["size_bytes"] for item in manifest["files"].values())
-                + state.template["storage"]["min_snapshot_free_bytes"]
+                + state.template.storage.min_snapshot_free_bytes
             )
             if shutil.disk_usage(self._project_root).free < required:
                 raise OSError(
@@ -1005,8 +1007,8 @@ class ExperimentSnapshots:
         )
 
     def _restore_announced_services(self, state: RunnerState, target: Path) -> None:
-        for definition in state.template["services"]:
-            service_id = definition["service_id"]
+        for definition in state.template.services:
+            service_id = definition.service_id
             endpoint = target / "runner/endpoints" / f"{service_id}.json"
             if not endpoint.is_file():
                 continue
@@ -1019,9 +1021,7 @@ class ExperimentSnapshots:
             ):
                 continue
             instance_id = str(UUID(announced["participant_instance_id"]))
-            artifacts = (
-                target / "shared_artifacts/services" / service_id / instance_id
-            )
+            artifacts = target / "shared_artifacts/services" / service_id / instance_id
             if (
                 not artifacts.resolve().is_relative_to(target)
                 or not (artifacts / "process.json").is_file()
@@ -1045,10 +1045,7 @@ class ExperimentSnapshots:
             instance.endpoint_path = endpoint
             instance.artifacts_directory = artifacts
             metadata = self._assembler.read_module(
-                target
-                / "modules"
-                / definition["module"]["name"]
-                / definition["module"]["version"]
+                target / "modules" / definition.module.name / definition.module.version
             )
             instance.implementation = metadata["implementation"]
             state.services[service_id] = instance

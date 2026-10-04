@@ -98,6 +98,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             counter = w.experiment / "module_data" / sid / "counter.json"
             await wait_for(counter.exists)
@@ -126,6 +127,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             definition = w.service(required=False)
             sid = definition["service_id"]
             controls = w.controls[sid]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             (controls / "null-state").touch()
             snapshot = str(uuid4())
@@ -148,6 +150,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             first, second = w.service(), w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             path = w.experiment / "partial.json"
             write_json(path, {"counter": 5})
@@ -167,6 +170,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             snapshot = str(uuid4())
             await w.manager.save_states(w.state, snapshot)
@@ -186,6 +190,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             hold = w.controls[sid] / "hold-freeze"
             hold.touch()
@@ -209,6 +214,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(120):
             w = self.w
             first, second = w.service(), w.service()
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             (w.controls[second["service_id"]] / "fail-save").touch()
             with self.assertRaises(RuntimeError):
@@ -234,6 +240,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             hold = w.controls[sid] / "hold-save"
             hold.touch()
@@ -350,6 +357,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
         definition = w.service()
         sid = definition["service_id"]
         controls = w.controls[sid]
+        w.publish_service_definitions()
         await w.manager.start_all(w.state)
         instance = w.state.services[sid]
         snapshot = str(uuid4())

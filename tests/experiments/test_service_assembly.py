@@ -40,10 +40,18 @@ class ServiceAssemblyTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(
-            [node["settings"] for node in state.template["stages"]],
+            [
+                node["settings"]
+                for node in state.template.model_dump(exclude_unset=True)["stages"]
+            ],
             [{"call_only": 2}, {"call_only": 3}],
         )
-        self.assertEqual(state.template["services"][0]["settings"]["startup_only"], 1)
+        self.assertEqual(
+            state.template.model_dump(exclude_unset=True)["services"][0]["settings"][
+                "startup_only"
+            ],
+            1,
+        )
         self.assembler.check_modules(state)
 
     async def test_invalid_service_references_and_old_template_have_no_assembly_side_effects(
@@ -94,16 +102,24 @@ class ServiceAssemblyTests(unittest.IsolatedAsyncioTestCase):
         template = w.template(services=copy.deepcopy(services))
         del template["services"][0]["service_id"]
         state = await self.assembler.assemble(w.write_template(template), "variants")
-        identifiers = [item["service_id"] for item in state.template["services"]]
+        identifiers = [
+            item["service_id"]
+            for item in state.template.model_dump(exclude_unset=True)["services"]
+        ]
         self.assertEqual(len(set(identifiers)), 3)
         for identifier in identifiers:
             UUID(identifier)
         self.assertEqual(identifiers[1:], [item["service_id"] for item in services[1:]])
         self.assertEqual(
-            state.template["services"][0]["heartbeat"],
+            state.template.model_dump(exclude_unset=True)["services"][0]["heartbeat"],
             {"interval_seconds": 1, "grace_seconds": 10},
         )
-        self.assertEqual(state.template["services"][0]["command_timeout_seconds"], 30)
+        self.assertEqual(
+            state.template.model_dump(exclude_unset=True)["services"][0][
+                "command_timeout_seconds"
+            ],
+            30,
+        )
         self.assembler.check_modules(state)
 
     async def test_invalid_service_schemas_and_cross_role_ids_leave_no_build(self):

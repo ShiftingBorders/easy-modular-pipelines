@@ -90,7 +90,9 @@ async def run(options):
         operation = asyncio.create_task(manager.save_states(state, options.snapshot))
         if options.phase == "before_freeze":
             service_controls = Path(
-                state.template["services"][0]["settings"]["controls"]
+                state.template.model_dump(exclude_unset=True)["services"][0][
+                    "settings"
+                ]["controls"]
             )
 
             def reached():

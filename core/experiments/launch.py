@@ -75,7 +75,9 @@ class ModuleLauncher:
             else self._merge_settings(module.defaults, definition.settings)
         )
         owner_id = (
-            definition.service_id if module.role == "service" else definition.stage_id
+            definition.service_id
+            if isinstance(definition, (ServiceCallDefinition, ServiceDefinition))
+            else definition.stage_id
         )
         runtime_context, executor_config = self._prepare_context(
             state,
@@ -124,9 +126,7 @@ class ModuleLauncher:
             if logging_config is None
             else str(logging_config),
             "endpoint_path": str(endpoint_path),
-            "control_timeout_seconds": state.template["unknown_state"][
-                "timeout_seconds"
-            ],
+            "control_timeout_seconds": state.template.unknown_state.timeout_seconds,
             "context": inputs.context.model_dump(),
             "settings": settings,
             "input_data": inputs.input_data,
@@ -207,9 +207,7 @@ def _launch_document(
         "timeout_seconds": None
         if isinstance(definition, ServiceDefinition)
         else definition.timeout_seconds,
-        "control_timeout_seconds": state.template["unknown_state"]["timeout_seconds"],
-        "stop_timeout_seconds": state.template["start_timeout"],
-        "runner_timeout_margin_seconds": state.template[
-            "runner_timeout_margin_seconds"
-        ],
+        "control_timeout_seconds": state.template.unknown_state.timeout_seconds,
+        "stop_timeout_seconds": state.template.start_timeout,
+        "runner_timeout_margin_seconds": state.template.runner_timeout_margin_seconds,
     }

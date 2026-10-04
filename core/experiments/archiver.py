@@ -352,7 +352,7 @@ class ExperimentArchiver:
         _, template = self._assembler.load_template(
             state.template_path, template_yaml=state.template_yaml
         )
-        if template != state.template:
+        if template != state.template.model_dump(exclude_unset=True):
             raise ValueError(
                 "Applied template differs from the runner's normalized template."
             )

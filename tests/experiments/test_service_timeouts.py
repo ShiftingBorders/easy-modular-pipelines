@@ -20,6 +20,7 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
             definition = w.service()
             controls = w.controls[definition["service_id"]]
             (controls / "hold-start").touch()
+            w.publish_service_definitions()
             startup = asyncio.create_task(w.manager.start_all(w.state))
             received = await wait_for(
                 lambda: next(
@@ -44,6 +45,7 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
             definition["errors"]["on_exhausted"] = "stop"
             (w.controls[definition["service_id"]] / "hold-start").touch()
             before = time.monotonic()
+            w.publish_service_definitions()
             self.assertEqual(await w.manager.start_all(w.state), "stop")
             self.assertGreaterEqual(time.monotonic() - before, 30)
             self.assertEqual(
@@ -60,6 +62,7 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             original = w.state.services[sid]
             controls = w.controls[sid]
@@ -82,6 +85,7 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
         try:
             definition = w.service(policy=policy)
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             original = w.state.services[sid]
             gate = w.root / "release-work"
@@ -165,6 +169,7 @@ class ServiceTimeoutTests(unittest.IsolatedAsyncioTestCase):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
+            w.publish_service_definitions()
             await w.manager.start_all(w.state)
             instance = w.state.services[sid]
             controls = w.controls[sid]

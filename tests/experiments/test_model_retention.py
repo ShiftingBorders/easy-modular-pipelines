@@ -109,3 +109,16 @@ class ModelRetentionTests(unittest.TestCase):
         self.assertEqual(replacement.position, (1, "a", "b"))
         self.assertEqual(replacement.publication, "next")
         self.assertEqual(cursor.publication, "p")
+
+    def test_typed_definitions_keep_whole_template_depth_and_unicode_limits(self):
+        nested = None
+        for _ in range(30):
+            nested = [nested]
+        stage = _update_model(self.template.stages[0], settings={"deep": nested})
+        for definition in (stage, stage.model_dump(exclude_unset=True)):
+            with self.subTest(kind=type(definition).__name__), self.assertRaises(ValueError):
+                ExperimentTemplate.model_validate({**self.document, "stages": [definition]})
+        module = _update_model(self.template.stages[0].module, name="worker\ud800")
+        stage = _update_model(self.template.stages[0], module=module)
+        with self.assertRaises(ValueError):
+            ExperimentTemplate.model_validate({**self.document, "stages": [stage]})

@@ -30,6 +30,11 @@ from core.experiments.state import (
     state_to_document,
 )
 from core.journal.events import LoggingError
+from core.models.experiment_template import (
+    ModuleReference,
+    ServiceCallDefinition,
+    StageDefinition,
+)
 from core.models.participant_observations import ExecutorCommandStateResponse
 from core.participants.connection import ParticipantConnection
 from core.primitives.json_files import read_json, write_json
@@ -86,8 +91,8 @@ class StageRunner:
         | None = None,
         recovered: StageAttempt | None = None,
     ) -> StageOutcome:
-        definition = state.template["stages"][state.stage_position - 1]
-        stage_id = definition["stage_id"]
+        definition = state.template.stages[state.stage_position - 1]
+        stage_id = definition.stage_id
         input_data = (
             self.select_input(state) if recovered is None else recovered.input_data
         )
@@ -96,7 +101,7 @@ class StageRunner:
             state.stage_result_ids.pop(stage_id, None)
             state.stage_result_origins.pop(stage_id, None)
             state.last_result = state.last_result_id = None
-        policy = definition["errors"]
+        policy = definition.errors
         while True:
             attempt = (
                 recovered
@@ -124,11 +129,11 @@ class StageRunner:
             if state.pause_requested:
                 return StageOutcome(attempt, response, "pause")
             used = state.stage_retry_counts.get(stage_id, 0)
-            if used >= policy["retries"]:
+            if used >= policy.retries:
                 return StageOutcome(
                     attempt, response, self._exhausted_action(definition, response)
                 )
-            await asyncio.sleep(policy["retry_delay_seconds"])
+            await asyncio.sleep(policy.retry_delay_seconds)
             if state.pause_requested:
                 return StageOutcome(attempt, response, "pause")
             if wait_services is not None:
@@ -141,16 +146,19 @@ class StageRunner:
             self._save_state(state)
 
     def _exhausted_action(
-        self, definition: JsonObject, response: JsonObject | None
+        self,
+        definition: StageDefinition | ServiceCallDefinition,
+        response: JsonObject | None,
     ) -> Literal["advance", "pause", "stop"]:
         """Select failure policy separately from attempt execution and retries."""
         if (
-            definition.get("returns_data") is True
+            isinstance(definition, StageDefinition)
+            and definition.returns_data is True
             and response is not None
             and (response.get("error") or {}).get("code") == "conditional_missing_data"
         ):
             return "stop"
-        action = definition["errors"]["on_exhausted"]
+        action = definition.errors.on_exhausted
         return "advance" if action == "skip" else action
 
     def select_input(self, state: RunnerState) -> JsonValue:
@@ -159,7 +167,7 @@ class StageRunner:
             return self._read_move_input(state, transfer)
         if state.stage_position == 1:
             return None
-        previous = state.template["stages"][state.stage_position - 2]["stage_id"]
+        previous = state.template.stages[state.stage_position - 2].stage_id
         request_id = state.stage_result_ids.get(previous)
         if request_id is None:
             return None
@@ -186,7 +194,7 @@ class StageRunner:
     def _read_move_input(self, state: RunnerState, transfer: JsonObject) -> JsonValue:
         if (
             transfer["stage_id"]
-            != state.template["stages"][state.stage_position - 1]["stage_id"]
+            != state.template.stages[state.stage_position - 1].stage_id
         ):
             raise ValueError("Pending input belongs to another stage.")
         record = read_result(
@@ -210,11 +218,9 @@ class StageRunner:
 
     def _context(self, state: RunnerState, attempt: StageAttempt) -> JsonObject:
         definition = next(
-            item
-            for item in state.template["stages"]
-            if item["stage_id"] == attempt.stage_id
+            item for item in state.template.stages if item.stage_id == attempt.stage_id
         )
-        module = self._launcher._assembler.module_reference(state.template, definition)
+        module = self._launcher._assembler._module_reference(state.template, definition)
         return {
             "experiment_id": state.experiment_id,
             "run_id": state.run_id,
@@ -228,9 +234,9 @@ class StageRunner:
             else attempt.participant["participant_instance_id"],
             "cycle_number": attempt.cycle_number,
             "attempt_number": attempt.attempt_number,
-            "module_name": module["name"],
-            "module_version": module["version"],
-            "module_hash": module["hash"],
+            "module_name": module.name,
+            "module_version": module.version,
+            "module_hash": module.hash,
             "template_revision_id": state.template_revision_id,
             **(attempt.participant or {}),
         }
@@ -242,10 +248,14 @@ class StageRunner:
         *,
         execution_id: str | None = None,
     ) -> StageAttempt:
-        definition = state.template["stages"][state.stage_position - 1]
-        module = self._launcher._assembler.module_reference(state.template, definition)
-        attempt, instance = self._new_stage_attempt(state, definition, module, input_data, execution_id)
-        launch, context = self._write_attempt_context(state, attempt, definition, module)
+        definition = state.template.stages[state.stage_position - 1]
+        module = self._launcher._assembler._module_reference(state.template, definition)
+        attempt, instance = self._new_stage_attempt(
+            state, definition, module, input_data, execution_id
+        )
+        launch, context = self._write_attempt_context(
+            state, attempt, definition, module
+        )
         await self._bind_attempt_intent(state, attempt, instance, launch, context)
         if state.pending_input is not None or attempt.attempt_number > 1:
             # A self/backwards jump may reuse an attempt directory's parent
@@ -266,17 +276,21 @@ class StageRunner:
         )
 
     def _new_stage_attempt(
-        self, state: RunnerState, definition: JsonObject, module: JsonObject,
-        input_data: JsonValue, execution_id: str | None,
+        self,
+        state: RunnerState,
+        definition: StageDefinition | ServiceCallDefinition,
+        module: ModuleReference,
+        input_data: JsonValue,
+        execution_id: str | None,
     ) -> tuple[StageAttempt, ServiceInstance | None]:
-        stage_id = definition["stage_id"]
+        stage_id = definition.stage_id
         number = state.stage_attempt_numbers.get(stage_id, 0) + 1
         attempt_id = str(uuid4())
         directory = (
             state.experiment_directory
             / "shared_artifacts"
             / f"epoch_{state.cycle_number}"
-            / module["name"]
+            / module.name
             / stage_id
             / f"attempt_{number}"
         )
@@ -289,9 +303,13 @@ class StageRunner:
             directory,
             input_data,
             {},
-            definition["timeout_seconds"],
+            definition.timeout_seconds,
         )
-        attempt.service_id = definition.get("service_id")
+        attempt.service_id = (
+            definition.service_id
+            if isinstance(definition, ServiceCallDefinition)
+            else None
+        )
         instance = (
             None if attempt.service_id is None else state.services[attempt.service_id]
         )
@@ -307,17 +325,25 @@ class StageRunner:
         return attempt, instance
 
     def _write_attempt_context(
-        self, state: RunnerState, attempt: StageAttempt, definition: JsonObject, module: JsonObject
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        definition: StageDefinition | ServiceCallDefinition,
+        module: ModuleReference,
     ) -> tuple[JsonObject, JsonObject]:
         context = {
             **self._context(state, attempt),
             "template_revision_id": state.template_revision_id,
-            "module_name": module["name"],
-            "module_version": module["version"],
-            "module_hash": module["hash"],
+            "module_name": module.name,
+            "module_version": module.version,
+            "module_hash": module.hash,
         }
         launch = self._launcher.prepare(
-            state, definition, context, attempt.artifacts_directory, attempt.input_data
+            state,
+            definition.model_dump(exclude_unset=True),
+            context,
+            attempt.artifacts_directory,
+            attempt.input_data,
         )
         attempt.endpoint_path = Path(launch["endpoint_path"])
         attempt.effective_settings = launch["effective_settings"]
@@ -328,12 +354,18 @@ class StageRunner:
                 "service_id": attempt.service_id,
             }
         )
-        write_json(attempt.artifacts_directory / "context.json", launch["runtime_context"])
+        write_json(
+            attempt.artifacts_directory / "context.json", launch["runtime_context"]
+        )
         return launch, context
 
     async def _bind_attempt_intent(
-        self, state: RunnerState, attempt: StageAttempt, instance: ServiceInstance | None,
-        launch: JsonObject, context: JsonObject,
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        instance: ServiceInstance | None,
+        launch: JsonObject,
+        context: JsonObject,
     ) -> None:
         state.active_attempt = attempt
         state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number
@@ -349,7 +381,7 @@ class StageRunner:
             await self._connection.close()
         self._connection = None
         self._journal.client.record_attempt_parameters(
-            state.template,
+            state.template.model_dump(exclude_unset=True),
             attempt.effective_settings,
             template_yaml=state.template_yaml,
             context=context,
@@ -546,8 +578,12 @@ class StageRunner:
         response: JsonObject,
         outcome: str,
     ) -> tuple[JsonObject, str]:
-        definition = state.template["stages"][state.stage_position - 1]
-        if "returns_data" in definition and response["result"] == "success":
+        definition = state.template.stages[state.stage_position - 1]
+        if (
+            isinstance(definition, StageDefinition)
+            and "returns_data" in definition.model_fields_set
+            and response["result"] == "success"
+        ):
             decision = response["data"]
             try:
                 response = normalize_conditional_result(
@@ -571,7 +607,7 @@ class StageRunner:
                 outcome = "failed"
             else:
                 if (
-                    not definition["returns_data"]
+                    not definition.returns_data
                     and isinstance(decision, dict)
                     and "data" in decision
                 ):
@@ -707,7 +743,7 @@ class StageRunner:
             if not self._call_future.cancelled():
                 self._call_future.exception()
             self._call_future = None
-        timeout = state.template["unknown_state"]["timeout_seconds"]
+        timeout = state.template.unknown_state.timeout_seconds
         if deadline is not None:
             timeout = min(timeout, max(0.001, deadline - time.monotonic()))
         try:
@@ -721,8 +757,7 @@ class StageRunner:
                 )
             )
             first_observation = (
-                attempt.process_identity is None
-                and reply.data.process is not None
+                attempt.process_identity is None and reply.data.process is not None
             )
             attempt.executor_status = reply.data.model_dump(exclude_unset=True)
             attempt.process_identity = (
@@ -790,7 +825,7 @@ class StageRunner:
             attempt.process_identity = saved.get("stage")
             if saved.get("executor") is not None:
                 self._executor_identities[attempt.request_id] = saved["executor"]
-        deadline = time.monotonic() + state.template["unknown_state"]["timeout_seconds"]
+        deadline = time.monotonic() + state.template.unknown_state.timeout_seconds
         while time.monotonic() < deadline:
             try:
                 await self._connect(attempt, max(0.001, deadline - time.monotonic()))
@@ -820,8 +855,8 @@ class StageRunner:
                     request_id,
                     "interrupt",
                     {"request_id": attempt.request_id, "reason": reason},
-                    timeout_seconds=state.template["start_timeout"]
-                    + state.template["runner_timeout_margin_seconds"],
+                    timeout_seconds=state.template.start_timeout
+                    + state.template.runner_timeout_margin_seconds,
                 )
                 if reply["result"] == "success" and reply["data"].get("stopped"):
                     return True
@@ -863,9 +898,9 @@ class StageRunner:
         attempt = state.active_attempt
         if attempt is None:
             return None
-        definition = state.template["stages"][state.stage_position - 1]
+        definition = state.template.stages[state.stage_position - 1]
         if (
-            definition["stage_id"] != attempt.stage_id
+            definition.stage_id != attempt.stage_id
             or attempt.cycle_number != state.cycle_number
         ):
             raise ValueError("Saved attempt does not match the DAG cursor.")
@@ -888,7 +923,7 @@ class StageRunner:
             if record is None and attempt.service_id is None:
                 try:
                     await self._connect(
-                        attempt, state.template["unknown_state"]["timeout_seconds"]
+                        attempt, state.template.unknown_state.timeout_seconds
                     )
                 except (OSError, EOFError):
                     # The executor may finish between the journal read and connect.
@@ -924,11 +959,11 @@ class StageRunner:
         | None,
     ) -> StageOutcome:
         state.unknown_state_recovery_count += 1
-        policy = state.template["unknown_state"]
+        policy = state.template.unknown_state
         action = (
-            policy["on_recovery_limit"]
-            if state.unknown_state_recovery_count >= policy["recovery_limit"]
-            else policy["on_timeout"]
+            policy.on_recovery_limit
+            if state.unknown_state_recovery_count >= policy.recovery_limit
+            else policy.on_timeout
         )
         self._journal.client.record_event(
             "stage.recovery_failed",
@@ -962,7 +997,7 @@ class StageRunner:
         import shutil
 
         parent = attempt.artifacts_directory.parent
-        keep = state.template["keep_attempts"]
+        keep = state.template.keep_attempts
         for path in parent.iterdir():
             if (
                 path == attempt.artifacts_directory
@@ -1050,7 +1085,7 @@ class StageRunner:
             else:
                 await asyncio.to_thread(
                     process.wait,
-                    timeout=30 if state is None else state.template["start_timeout"],
+                    timeout=30 if state is None else state.template.start_timeout,
                 )
         self._executor_processes = remaining
         if state is not None:
@@ -1090,7 +1125,7 @@ class StageRunner:
                 if process_identity(identity["pid"]) == identity:
                     await asyncio.to_thread(
                         psutil.Process(identity["pid"]).wait,
-                        state.template["start_timeout"],
+                        state.template.start_timeout,
                     )
             except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
                 pass

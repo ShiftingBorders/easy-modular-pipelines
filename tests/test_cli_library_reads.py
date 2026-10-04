@@ -128,7 +128,11 @@ class TemplateValidationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(result["warnings"]), 1)
             self.assertIn(f"services[{index}]", result["warnings"][0])
             state = await self.assembler.assemble(self.path, str(uuid4()))
-            self.assertTrue(state.template["services"][index]["service_id"])
+            self.assertTrue(
+                state.template.model_dump(exclude_unset=True)["services"][index][
+                    "service_id"
+                ]
+            )
         self.template["services"] = [definition]
         self.files.write_template(self.template)
         self.assertEqual(
