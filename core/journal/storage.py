@@ -73,7 +73,7 @@ if TYPE_CHECKING:
         DiagnosticManifest,
         JournalSnapshotManifest,
     )
-    from core.models.journal_records import JournalContext
+    from core.models.journal_records import JournalContext, JournalEntry
     from core.models.journal_settings import JournalConfiguration
 
 
@@ -499,7 +499,7 @@ class SQLiteEventStore:
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "append event", snapshot)
 
-    def _decode_row(self, row: tuple) -> JsonObject:
+    def _decode_row(self, row: tuple) -> JournalEntry:
         return _decode_row(row)
 
     def read_events(
@@ -538,7 +538,7 @@ class SQLiteEventStore:
                 self._connection.execute("COMMIT")
                 self._check_health()
                 return {
-                    "events": result,
+                    "events": [entry.document() for entry in result],
                     "checkpoint": _checkpoint(boundary, "cursor", after),
                     "boundary": boundary,
                     "has_more": after < boundary["cursor"],
@@ -556,9 +556,9 @@ class SQLiteEventStore:
         view: str,
         limit: int,
         after: int,
-        result: list[JsonObject],
+        result: list[JournalEntry],
         page_bytes: int,
-    ) -> tuple[list[JsonObject], int]:
+    ) -> tuple[list[JournalEntry], int]:
         for row in rows:
             entry = self._decode_row(row)
             if view == "effective":
@@ -615,7 +615,10 @@ class SQLiteEventStore:
                     rows.close()
                 self._connection.execute("COMMIT")
                 self._check_health()
-                return {"events": entries, "boundary": boundary}
+                return {
+                    "events": [entry.document() for entry in entries],
+                    "boundary": boundary,
+                }
             except LoggingStateError as error:
                 self._rollback(self._connection, error)
                 raise
@@ -647,7 +650,9 @@ class SQLiteEventStore:
             )
         return rows
 
-    def _event_entry(self, event_id: str, connection: sqlite3.Connection) -> JsonObject:
+    def _event_entry(
+        self, event_id: str, connection: sqlite3.Connection
+    ) -> JournalEntry:
         row = connection.execute(
             "SELECT cursor, event_id, producer_instance_id, sequence_number, event_json "
             "FROM events WHERE event_id=?",
@@ -658,16 +663,16 @@ class SQLiteEventStore:
         return self._decode_row(row)
 
     def _effective_entry(
-        self, entry: JsonObject, connection: sqlite3.Connection
-    ) -> JsonObject | None:
-        event = entry["event"]
-        if event["event_type"] != "command.result":
-            return {**entry, "effective_author": None, "provisional": False}
-        data = _validated_command_result(event["data"])
+        self, entry: JournalEntry, connection: sqlite3.Connection
+    ) -> JournalEntry | None:
+        event = entry.event
+        if event.event_type != "command.result":
+            return entry._with_result(None, False)
+        data = _validated_command_result(event.data)
         state = self._load_command_result(data.request_id, connection=connection)
         if state is None:
             raise LoggingStorageError("Command observation has no result index.")
-        if event["event_id"] not in {
+        if event.event_id not in {
             state[author]["event_id"]
             for author in ("runner", "participant")
             if state[author] is not None
@@ -675,13 +680,9 @@ class SQLiteEventStore:
             raise LoggingStorageError(
                 "Command observation is absent from its result index."
             )
-        if event["event_id"] != state["effective_event_id"]:
+        if event.event_id != state["effective_event_id"]:
             return None
-        return {
-            **entry,
-            "effective_author": state["effective_author"],
-            "provisional": state["runner"] is None,
-        }
+        return entry._with_result(state["effective_author"], state["runner"] is None)
 
     def _record_change(
         self,
@@ -767,7 +768,7 @@ class SQLiteEventStore:
                 or change["provisional"]
                 or not change["result_changed"]
                 or change["observation"] is not None
-                or entry["event"]["event_type"] == "command.result"
+                or entry.event.event_type == "command.result"
             ):
                 raise LoggingStorageError("Invalid ordinary event change.")
         elif change["kind"] == "command.result":
@@ -779,17 +780,17 @@ class SQLiteEventStore:
             "event_id": event_id,
             **change,
             "entry": {
-                **entry,
+                **entry.document(),
                 "effective_author": change["effective_author"],
                 "provisional": change["provisional"],
             },
-            "observed_event": observed["event"],
+            "observed_event": observed.document()["event"],
         }
 
     def _validate_command_change(
         self,
         change: JsonObject,
-        entry: JsonObject,
+        entry: JournalEntry,
         connection: sqlite3.Connection,
         related: list[str],
     ) -> None:
@@ -801,16 +802,13 @@ class SQLiteEventStore:
                 "Change confirmation state disagrees with author."
             )
         for related_id in related:
-            event = self._event_entry(related_id, connection)["event"]
-            if event["event_type"] != "command.result":
+            event = self._event_entry(related_id, connection).event
+            if event.event_type != "command.result":
                 raise LoggingStorageError("Change refers to an unrelated event.")
-            if (
-                _validated_command_result(event["data"]).request_id
-                != change["request_id"]
-            ):
+            if _validated_command_result(event.data).request_id != change["request_id"]:
                 raise LoggingStorageError("Change refers to another request.")
             if any(
-                event["context"].get(key) != entry["event"]["context"].get(key)
+                event.context.root.get(key) != entry.event.context.root.get(key)
                 for key in (
                     "experiment_id",
                     "participant_id",
@@ -843,7 +841,7 @@ class SQLiteEventStore:
                 raise LoggingStorageError("Change observation time must be UTC.")
             context = validate_context(observation["context"])
             if any(
-                context.get(key) != entry["event"]["context"].get(key)
+                context.get(key) != entry.event.context.root.get(key)
                 for key in (
                     "experiment_id",
                     "participant_id",
@@ -955,13 +953,14 @@ class SQLiteEventStore:
                 ).fetchone()
                 if stored is None:
                     raise ValueError("Command result refers to a missing event.")
-                event = self._decode_row(stored)["event"]
+                entry = self._decode_row(stored)
+                event = entry.event
                 observation, command_data = _decode_author_observation(
                     event, observation_json, request_id, identity
                 )
                 result[author] = {
                     "event_id": event_id,
-                    "event": event,
+                    "entry": entry,
                     "observation": observation,
                     "result": command_data,
                 }
@@ -1028,9 +1027,9 @@ class SQLiteEventStore:
                 own = state[author]
                 other = state[other_author]
                 if own is not None:
-                    own_data = own["event"]["data"]
+                    own_data = own["result"]
                     own_key = json.dumps(
-                        [own_data["outcome"], own_data["response"]],
+                        [own_data.outcome, own_data.response],
                         sort_keys=True,
                         ensure_ascii=True,
                     )
@@ -1106,7 +1105,7 @@ class SQLiteEventStore:
         try:
             for row in rows:
                 entry = self._decode_row(row)
-                if entry["event"]["event_type"] == "command.result":
+                if entry.event.event_type == "command.result":
                     self._effective_entry(entry, reader)
         finally:
             rows.close()

@@ -29,29 +29,30 @@ if TYPE_CHECKING:
         DiagnosticCommand,
         JournalSnapshotManifest,
     )
-    from core.models.journal_records import CommandObservation
+    from core.models.journal_records import (
+        CommandObservation,
+        JournalEntry,
+        JournalEvent,
+    )
 
 
 def _decode_author_observation(
-    event: JsonObject,
+    event: JournalEvent,
     observation_json: str,
     request_id: str,
     identity: JsonObject,
 ) -> tuple[AuthorObservation, CommandObservation]:
     from core.models.journal_diagnostics import AuthorObservation
 
-    if (
-        event["schema_version"] != SCHEMA_VERSION
-        or event["event_type"] != "command.result"
-    ):
+    if event.schema_version != SCHEMA_VERSION or event.event_type != "command.result":
         raise ValueError("Command result refers to an unrelated event.")
-    data = _validated_command_result(event["data"])
+    data = _validated_command_result(event.data)
     if (
         data.request_id != request_id
-        or event["context"].get("request_id") != request_id
+        or event.context.root.get("request_id") != request_id
     ):
         raise ValueError("Command result request identity does not match.")
-    if {key: event["context"].get(key) for key in identity} != identity:
+    if {key: event.context.root.get(key) for key in identity} != identity:
         raise ValueError("Command result belongs to another request context.")
     observation = AuthorObservation.model_validate(json.loads(observation_json))
     context = observation.context.root
@@ -182,17 +183,21 @@ def _save_command_state(
 
 
 def _diagnostic_operation_events(
-    reader: sqlite3.Connection, roots: list[str], decode_row: Callable[[tuple], JsonObject]
-) -> tuple[dict[str, tuple[str | None, str | None]], dict[str | None, str], set[str], set[str]]:
+    reader: sqlite3.Connection,
+    roots: list[str],
+    decode_row: Callable[[tuple], JournalEntry],
+) -> tuple[
+    dict[str, tuple[str | None, str | None]], dict[str | None, str], set[str], set[str]
+]:
     metadata = {}
     starts = {}
     for row in reader.execute("SELECT * FROM events ORDER BY cursor"):
-        event = decode_row(row)["event"]
-        operation_id = event["operation_id"]
-        parent = event["context"].get("parent_operation_id")
-        metadata[event["event_id"]] = (operation_id, parent)
-        if event["event_type"] == "operation.started":
-            starts[operation_id] = event["event_id"]
+        event = decode_row(row).event
+        operation_id = event.operation_id
+        parent = event.context.root.get("parent_operation_id")
+        metadata[event.event_id] = (operation_id, parent)
+        if event.event_type == "operation.started":
+            starts[operation_id] = event.event_id
     known = {op for op, _ in metadata.values() if op is not None}
     if not set(roots) <= known:
         raise LoggingStateError(
@@ -240,32 +245,34 @@ def _add_diagnostic_observer_events(
 
 
 def _diagnostic_dependencies(
-    metadata: dict[str, tuple[str | None, str | None]], starts: dict[str | None, str],
-    selected: set[str], read_event: Callable[[str], JsonObject],
+    metadata: dict[str, tuple[str | None, str | None]],
+    starts: dict[str | None, str],
+    selected: set[str],
+    read_event: Callable[[str], JournalEntry],
     read_result: Callable[[str], dict],
 ) -> dict[str, dict]:
     pending = list(selected)
     requests = {}
     while pending:
         event_id = pending.pop()
-        event = read_event(event_id)["event"]
+        event = read_event(event_id).event
         dependencies = []
-        if event["operation_id"] in starts:
-            dependencies.append(starts[event["operation_id"]])
-        parent = event["context"].get("parent_operation_id")
+        if event.operation_id in starts:
+            dependencies.append(starts[event.operation_id])
+        parent = event.context.root.get("parent_operation_id")
         if parent in starts:
             dependencies.append(starts[parent])
-        if event["event_type"] in (
+        if event.event_type in (
             "control.intent",
             "control.observed",
             "control.reconciled",
         ):
             for field in ("intent_event_id", "parameters_event_id"):
-                reference = event["data"].get(field)
+                reference = event.data.get(field)
                 if reference is not None:
                     dependencies.append(require_text(reference, field))
-        if event["event_type"] == "command.result":
-            request_id = event["data"]["request_id"]
+        if event.event_type == "command.result":
+            request_id = event.data["request_id"]
             state = read_result(request_id)
             requests[request_id] = state
             dependencies.extend(
@@ -275,9 +282,7 @@ def _diagnostic_dependencies(
             )
         for reference in dependencies:
             if reference not in metadata:
-                raise LoggingStorageError(
-                    "Diagnostic dependency is missing."
-                )
+                raise LoggingStorageError("Diagnostic dependency is missing.")
             if reference not in selected:
                 selected.add(reference)
                 pending.append(reference)
@@ -289,7 +294,7 @@ def _write_diagnostic_records(
     metadata: dict[str, tuple[str | None, str | None]],
     selected: set[str],
     requests: dict[str, dict],
-    read_event: Callable[[str], JsonObject],
+    read_event: Callable[[str], JournalEntry],
 ) -> str:
     digest = hashlib.sha256()
     with (target / "records.jsonl.part").open("xb") as output:
@@ -298,7 +303,7 @@ def _write_diagnostic_records(
                 continue
             record = {
                 "kind": "event",
-                "event": read_event(event_id)["event"],
+                "event": read_event(event_id).document()["event"],
             }
             _write_diagnostic_record(output, digest, record)
         for request_id, state in requests.items():

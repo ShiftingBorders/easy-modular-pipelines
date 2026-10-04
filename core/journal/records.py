@@ -12,13 +12,16 @@ from core.journal.events import (
     JournalGenerationChanged,
     LoggingStateError,
     LoggingStorageError,
-    encode_event,
     validate_journal_identity,
 )
 from core.primitives.json_values import JsonObject
 
 if TYPE_CHECKING:
-    from core.models.journal_records import CommandObservation, JournalCheckpoint
+    from core.models.journal_records import (
+        CommandObservation,
+        JournalCheckpoint,
+        JournalEntry,
+    )
 
 
 def _read_journal_info(connection: sqlite3.Connection) -> JsonObject:
@@ -43,19 +46,20 @@ def _read_journal_info(connection: sqlite3.Connection) -> JsonObject:
     }
 
 
-def _decode_row(row: tuple) -> JsonObject:
+def _decode_row(row: tuple) -> JournalEntry:
+    from core.models.journal_records import JournalEntry, JournalEvent
+
     cursor, event_id, producer, sequence, encoded = row
     if not isinstance(encoded, str):
         raise TypeError("Stored event must be JSON text.")
-    event = json.loads(encoded)
-    encode_event(event, None)
+    event = JournalEvent.model_validate(json.loads(encoded))
     if (
-        event["event_id"],
-        event["producer_instance_id"],
-        event["sequence_number"],
+        event.event_id,
+        event.producer_instance_id,
+        event.sequence_number,
     ) != (event_id, producer, sequence):
         raise ValueError("Stored event disagrees with its indexed identity.")
-    return {"cursor": cursor, "event": event}
+    return JournalEntry(cursor=cursor, event=event, encoded_event=encoded)
 
 
 def _checkpoint(info: JsonObject, key: str, position: int) -> JsonObject:
@@ -209,7 +213,7 @@ def _command_result_document(request_id: str, state: dict) -> JsonObject:
             {
                 "author": author,
                 "event_id": entry["event_id"],
-                "event": entry["event"],
+                "event": entry["entry"].document()["event"],
                 "observation": entry["observation"].model_dump(),
                 "ignored": ignored,
             }
@@ -220,7 +224,7 @@ def _command_result_document(request_id: str, state: dict) -> JsonObject:
         "author": state["effective_author"],
         "outcome": data.outcome,
         "response": data.response,
-        "event": effective["event"],
+        "event": effective["entry"].document()["event"],
         "observations": observations,
         "provisional": state["runner"] is None,
     }

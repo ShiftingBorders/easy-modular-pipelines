@@ -1,5 +1,6 @@
 """Journal data contracts; constructors can keep shared standard-library rules."""
 
+import json
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
@@ -97,6 +98,40 @@ class JournalEvent(_Document):
         document = copy_json_object(document, "event")
         if document.keys() != EVENT_FIELDS:
             raise ValueError("Event fields do not match the journal envelope.")
+        return document
+
+
+class JournalEntry(BaseModel):
+    """Validated SQL entry with original event JSON kept for output and checksums."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    cursor: int
+    event: JournalEvent
+    encoded_event: str = Field(exclude=True)
+    effective_author: Literal["runner", "participant"] | None = None
+    provisional: Boolean = False
+
+    def _with_result(
+        self, author: Literal["runner", "participant"] | None, provisional: bool
+    ) -> "JournalEntry":
+        return JournalEntry(
+            cursor=self.cursor,
+            event=self.event,
+            encoded_event=self.encoded_event,
+            effective_author=author,
+            provisional=provisional,
+        )
+
+    def document(self) -> JsonObject:
+        document: JsonObject = {
+            "cursor": self.cursor,
+            "event": json.loads(self.encoded_event),
+        }
+        if "effective_author" in self.model_fields_set:
+            document["effective_author"] = self.effective_author
+        if "provisional" in self.model_fields_set:
+            document["provisional"] = self.provisional
         return document
 
 

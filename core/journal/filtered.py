@@ -35,6 +35,7 @@ _PAGE_BYTES = 16777216
 
 if TYPE_CHECKING:
     from core.models.journal_cache import FilteredCheckpoint, FilteredPublication
+    from core.models.journal_records import JournalEntry
 
 
 class FilteredJournal:
@@ -162,19 +163,19 @@ class FilteredJournal:
             return None
         return FilteredPublication.model_validate(json.loads(row[0]))
 
-    def _write_entry(self, entry: JsonObject) -> None:
-        event = entry["event"]
+    def _write_entry(self, entry: JournalEntry) -> None:
+        event = entry.event
         self._connection.execute(
             "INSERT INTO filtered_events VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(event_id) DO UPDATE SET cursor=excluded.cursor, "
             "event_json=excluded.event_json, effective_author=excluded.effective_author, "
             "provisional=excluded.provisional",
             (
-                entry["cursor"],
-                event["event_id"],
-                encode_event(event, None),
-                entry["effective_author"],
-                int(entry["provisional"]),
+                entry.cursor,
+                event.event_id,
+                encode_event(json.loads(entry.encoded_event), None),
+                entry.effective_author,
+                int(entry.provisional),
             ),
         )
 
@@ -340,7 +341,17 @@ class FilteredJournal:
                     "DELETE FROM filtered_events WHERE event_id=?",
                     (event_id,),
                 )
-        self._write_entry(change["entry"])
+        from core.models.journal_records import JournalEntry, JournalEvent
+
+        document = change["entry"]
+        entry = JournalEntry(
+            cursor=document["cursor"],
+            event=JournalEvent.model_validate(document["event"]),
+            encoded_event=json.dumps(document["event"], ensure_ascii=False),
+            effective_author=document["effective_author"],
+            provisional=document["provisional"],
+        )
+        self._write_entry(entry)
 
     def _fallback(
         self, checkpoint: FilteredCheckpoint | None, limit: int

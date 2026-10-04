@@ -15,6 +15,7 @@ from core.journal.events import (
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
+from core.models.journal_records import JournalContext, JournalEntry, JournalEvent
 from tests.helpers.logging_fixtures import context_event, write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -36,6 +37,38 @@ class JournalReadingTests(unittest.TestCase):
         self.logger = OperationLogger(self.config)
         self.addCleanup(self.logger.close)
         self.logger.open()
+
+    def test_sql_entry_keeps_models_and_original_json_order_at_public_output(self):
+        identifier = self.logger.record_event(
+            "ordered", {"b": [True, 1, 1.0], "a": None}
+        )
+        store = self.logger._store
+        with store._lock:
+            row = store._connection.execute(
+                "SELECT cursor, event_id, producer_instance_id, sequence_number, event_json "
+                "FROM events WHERE event_id=?",
+                (identifier,),
+            ).fetchone()
+            original = json.loads(row[4])
+            reordered = {key: original[key] for key in reversed(original)}
+            encoded = json.dumps(reordered, ensure_ascii=False, separators=(",", ":"))
+            store._connection.execute(
+                "UPDATE events SET event_json=? WHERE event_id=?", (encoded, identifier)
+            )
+            entry = store._event_entry(identifier, store._connection)
+        self.assertIsInstance(entry, JournalEntry)
+        self.assertIsInstance(entry.event, JournalEvent)
+        self.assertIsInstance(entry.event.context, JournalContext)
+        self.assertEqual(entry.encoded_event, encoded)
+        self.assertEqual(list(entry.document()["event"]), list(reordered))
+        raw = self.logger.read_event_batch([identifier])["events"][0]
+        effective = self.logger.read_events(view="effective")["events"][0]
+        self.assertEqual(raw, entry.document())
+        self.assertEqual(list(effective["event"]), list(reordered))
+        self.assertEqual(effective["effective_author"], None)
+        raw["event"]["data"]["b"].append("external")
+        self.assertEqual(entry.event.data["b"], [True, 1, 1.0])
+        self.assertEqual(entry.document()["event"], reordered)
 
     def test_create_existing_and_unknown_files_are_not_adopted(self):
         """A4/A5: neither create nor existing may invent a replacement journal."""
