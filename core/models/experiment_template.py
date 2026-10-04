@@ -168,8 +168,53 @@ class ExperimentTemplate(_TemplateValue):
 
     @model_validator(mode="before")
     @classmethod
-    def detach_document(cls, value: object) -> JsonObject:
-        return copy_json_object(value, "experiment template")
+    def detach_document(cls, value: object) -> object:
+        if type(value) is not dict:
+            return copy_json_object(value, "experiment template")
+        # Only known validated inputs may cross the internal model boundary.
+        # All remaining data still goes through the original JSON checks.
+        document = dict(value)
+        models: dict[str, BaseModel] = {}
+        for name, expected in (
+            ("unknown_state", UnknownStatePolicy),
+            ("snapshots", SnapshotPolicy),
+            ("storage", StoragePolicy),
+            ("logging", TemplateLoggingPolicy),
+        ):
+            if isinstance(document.get(name), expected):
+                models[name] = document.pop(name)
+        definitions: dict[str, dict[int, BaseModel]] = {}
+        for name, expected in (
+            ("stages", (StageDefinition, ServiceCallDefinition)),
+            ("services", (ServiceDefinition,)),
+            ("resources", (ResourceDefinition,)),
+        ):
+            items = document.get(name)
+            if type(items) is list:
+                retained: dict[int, BaseModel] = {
+                    index: item
+                    for index, item in enumerate(items)
+                    if isinstance(item, expected)
+                }
+                if retained:
+                    definitions[name] = retained
+                    document[name] = [
+                        None if index in retained else item
+                        for index, item in enumerate(items)
+                    ]
+        detached: dict[str, object] = dict(
+            copy_json_object(document, "experiment template")
+        )
+        detached.update(models)
+        for name, retained in definitions.items():
+            # Use detached JSON entries, preserving their caller ownership rules.
+            json_items = detached[name]
+            if isinstance(json_items, list):
+                detached[name] = [
+                    retained.get(index, item)
+                    for index, item in enumerate(json_items)
+                ]
+        return detached
 
     @model_validator(mode="after")
     def validate_references(self) -> Self:
