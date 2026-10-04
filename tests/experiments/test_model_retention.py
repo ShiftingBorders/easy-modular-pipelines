@@ -1,5 +1,6 @@
 """Validated replacements and typed experiment inputs retain boundary guarantees."""
 
+import asyncio
 import copy
 import unittest
 from pathlib import Path
@@ -15,8 +16,19 @@ from core.models.experiment_template import (
     ServiceDefinition,
     StageDefinition,
 )
+from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_launch import (
+    ExecutionCall,
+    ModuleContext,
+    ModulePreparation,
+    PreparedLaunch,
+    PreparedModuleContext,
+    StageExecutionIdentity,
+    StageLaunch,
+)
 from core.models.updates import _update_model
 from core.primitives.json_values import copy_json_object
+from tests.helpers.services import ServiceWorkspace
 
 
 class ModelRetentionTests(unittest.TestCase):
@@ -122,3 +134,160 @@ class ModelRetentionTests(unittest.TestCase):
         stage = _update_model(self.template.stages[0], module=module)
         with self.assertRaises(ValueError):
             ExperimentTemplate.model_validate({**self.document, "stages": [stage]})
+
+    def _execution_values(self, identity):
+        root = Path(__file__).resolve().parents[2]
+        return {
+            "context": identity,
+            "input_data": {"data": [1, None]},
+            "settings": {"application": [True, "данные"]},
+            "experiment_directory": root,
+            "resources_directory": root / "resources",
+            "settings_directory": root / "settings",
+            "module_data_directory": root / "data",
+            "artifacts_directory": root / "artifacts",
+        }
+
+    def test_execution_context_retains_models_and_native_paths_until_output(self):
+        identity = StageExecutionIdentity(
+            experiment_id="experiment",
+            participant_id=str(uuid4()),
+            participant_instance_id=str(uuid4()),
+            request_id=str(uuid4()),
+            historical={"values": [1, 1.0, True, None]},
+        )
+        values = self._execution_values(identity)
+        call = ExecutionCall.model_validate(values)
+        self.assertIs(call.context, identity)
+        self.assertEqual(call.experiment_directory, values["experiment_directory"])
+        document = call.model_dump(mode="json", exclude_unset=True)
+        self.assertEqual(document["context"], identity.model_dump())
+        self.assertEqual(
+            document["experiment_directory"], str(values["experiment_directory"])
+        )
+        values["settings"]["application"].append("external")
+        self.assertNotIn("external", call.settings["application"])
+        root = values["experiment_directory"]
+        context = PreparedModuleContext(
+            **self._execution_values(identity),
+            protocol_version=2,
+            logging_config_path=None,
+            endpoint_path=root / "endpoint.json",
+            control_timeout_seconds=1,
+        )
+        self.assertIsNone(context.logging_config_path)
+        with self.assertRaises((TypeError, ValueError)):
+            ModuleContext.model_validate(
+                context.model_dump(mode="json", exclude_unset=True)
+            )
+
+    def test_launch_identity_comparison_keeps_extras_and_rejects_mismatch(self):
+        identity = StageExecutionIdentity(
+            experiment_id="experiment",
+            participant_id=str(uuid4()),
+            participant_instance_id=str(uuid4()),
+            request_id=str(uuid4()),
+            historical={"value": 1},
+        )
+        root = Path(__file__).resolve().parents[2]
+        call = ExecutionCall.model_validate(self._execution_values(identity))
+        context = ModuleContext(
+            **self._execution_values(identity),
+            protocol_version=2,
+            logging_config_path=root / "logger.json",
+            endpoint_path=root / "endpoint.json",
+            control_timeout_seconds=1,
+        )
+        document = {
+            "argv": ["python"],
+            "code_directory": str(root),
+            "executor_logging_config": str(root / "executor.json"),
+            "context": identity.model_dump(),
+            "runtime_context": context.model_dump(mode="json", exclude_unset=True),
+            "call": call.model_dump(mode="json", exclude_unset=True),
+            "endpoint_path": str(context.endpoint_path),
+            "control_timeout_seconds": 1,
+            "stop_timeout_seconds": 1,
+            "runner_timeout_margin_seconds": 0,
+        }
+        launch = StageLaunch.model_validate(document)
+        self.assertEqual(launch.context.request_id, identity.request_id)
+        for field, value in (
+            ("request_id", str(uuid4())),
+            ("historical", {"value": 2}),
+        ):
+            candidate = copy.deepcopy(document)
+            candidate["call"]["context"][field] = value
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "same fixed call"),
+            ):
+                StageLaunch.model_validate(candidate)
+
+    def test_typed_execution_inputs_preserve_json_constraints(self):
+        identity = ParticipantIdentity(
+            experiment_id="experiment",
+            participant_id=str(uuid4()),
+            participant_instance_id=str(uuid4()),
+        )
+        values = self._execution_values(identity)
+        for bad in (float("inf"), "\ud800", {1: "invalid"}, identity):
+            with (
+                self.subTest(bad=type(bad).__name__),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                ExecutionCall.model_validate({**values, "input_data": bad})
+        nested = None
+        for _ in range(31):
+            nested = [nested]
+        too_deep = _update_model(identity, historical=nested)
+        with self.assertRaises(ValueError):
+            ExecutionCall.model_validate({**values, "context": too_deep})
+        with self.assertRaises(TypeError):
+            ExecutionCall.model_validate(
+                {**values, "arbitrary_path": values["experiment_directory"]}
+            )
+        with self.assertRaises(TypeError):
+            copy_json_object({"context": identity}, "JSON only")
+
+    def test_preparation_retains_models_and_public_service_call_stays_json(self):
+        workspace = ServiceWorkspace()
+        self.addCleanup(lambda: asyncio.run(workspace.close()))
+        service = workspace.service()
+        definition = workspace.state.template.services[0]
+        identity = ParticipantIdentity(
+            experiment_id=workspace.state.experiment_id,
+            participant_id=definition.service_id,
+            participant_instance_id=str(uuid4()),
+        )
+        inputs = ModulePreparation(
+            context=identity,
+            artifacts_directory=workspace.root / "typed-preparation",
+            input_data=None,
+        )
+        prepared = workspace.launcher._prepare(workspace.state, definition, inputs)
+        self.assertIsInstance(prepared, PreparedLaunch)
+        self.assertIsInstance(prepared.runtime_context, PreparedModuleContext)
+        self.assertIs(prepared.context, identity)
+        self.assertIs(prepared.call.context, identity)
+        self.assertIs(prepared.runtime_context.context, identity)
+        self.assertNotIn("request_id", prepared.context.model_fields_set)
+        call = ServiceCallDefinition(
+            stage_id=str(uuid4()),
+            service_id=definition.service_id,
+            settings={},
+            timeout_seconds=None,
+            errors=definition.errors,
+        )
+        document = workspace.launcher.prepare(
+            workspace.state,
+            call.model_dump(exclude_unset=True),
+            identity.model_dump(),
+            workspace.root / "public-preparation",
+            None,
+        )
+        self.assertIsInstance(document, dict)
+        self.assertIsNone(document["runtime_context"]["logging_config_path"])
+        self.assertIsNone(document["executor_logging_config"])
+        self.assertEqual(document["service_id"], service["service_id"])
+        self.assertEqual(document["context"], identity.model_dump())

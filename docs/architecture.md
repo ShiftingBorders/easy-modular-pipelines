@@ -62,6 +62,10 @@ files. StageClient validates its context before starting its communication threa
 the executor validates its fixed launch document before opening its journal or
 endpoint. Shared models describe progress limits and the exact stdout result
 shape. Application settings and result data remain opaque JSON.
+Internal preparation retains a PreparedLaunch with its manifest, execution call,
+identity and native paths. Public prepare and context files still contain JSON.
+Prepared service-call contexts allow an absent module logger; ModuleContext keeps
+its required logger path, and StageLaunch independently checks executor admission.
 
 Recovery validates command-state observations before updating executor records
 or reconciling service work. Service exports validate their relative path before
