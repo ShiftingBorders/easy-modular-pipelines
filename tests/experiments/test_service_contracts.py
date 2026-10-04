@@ -13,11 +13,14 @@ from uuid import uuid4
 import yaml
 
 from core.experiments.state import (
+    ServiceInstance,
     _process_identity_pid,
     state_from_document,
     state_to_document,
 )
 from core.journal.events import LoggingError
+from core.models.participant_observations import ServiceObservation
+from core.models.runner_state import WorkingServiceRequest
 from core.participants.connection import ParticipantConnection
 from tests.helpers.dag import process_running
 from tests.helpers.services import ServiceWorkspace, wait_for
@@ -27,6 +30,68 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.w = ServiceWorkspace()
         self.addAsyncCleanup(self.w.close)
+
+    async def test_work_observation_stays_typed_until_public_request_completion(self):
+        definition = self.w.service()
+        instance = ServiceInstance(definition["service_id"], str(uuid4()), definition)
+        request_id = str(uuid4())
+        entry = WorkingServiceRequest(
+            owner="caller",
+            request_id=request_id,
+            command="echo",
+            args={},
+            queued_monotonic=0,
+            sent_monotonic=0,
+            timed_out=False,
+        )
+        instance.active_request = entry
+        future = asyncio.get_running_loop().create_future()
+        self.w.manager._waiters[request_id] = future
+        observation = ServiceObservation.model_validate(
+            {
+                "protocol_version": 2,
+                "message_type": "response",
+                "request_id": request_id,
+                "command": "echo",
+                "result": "success",
+                "data": {"values": [True, 1, 1.0]},
+                "error": None,
+                "execution": {"duration": 1.0},
+                "extension": {"kept": True},
+            }
+        )
+        with patch.object(
+            self.w.manager, "_finish_request", wraps=self.w.manager._finish_request
+        ) as finish:
+            self.assertTrue(
+                await self.w.manager._handle_work_observation(
+                    self.w.state, instance.service_id, instance, observation, {}
+                )
+            )
+        self.assertIs(finish.call_args.args[3], observation)
+        self.assertIsNone(instance.active_request)
+        reply = await future
+        expected = {
+            "request_id": request_id,
+            "result": "success",
+            "data": {"values": [True, 1, 1.0]},
+            "error": None,
+            "execution": {"duration": 1.0},
+            "extension": {"kept": True},
+        }
+        self.assertEqual(reply, expected)
+        events = self.w.events("service.request_retired")
+        self.assertEqual(
+            events[-1]["data"],
+            {
+                "request_id": request_id,
+                "response": {
+                    key: value for key, value in expected.items() if key != "request_id"
+                },
+            },
+        )
+        reply["data"]["values"].append("external")
+        self.assertEqual(observation.data, {"values": [True, 1, 1.0]})
 
     async def test_module_variants_and_invalid_schemas(self):
         """A: module metadata distinguishes full/socket, action/socket and action/commands."""

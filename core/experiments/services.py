@@ -991,20 +991,18 @@ class ServiceManager:
         context: JsonObject,
     ) -> bool:
         """Return False when retired work or restart must skip the final state save."""
-        message = observation.model_dump(exclude_unset=True)
         request_id = observation.request_id
         active = instance.active_request
         if active is None or active.request_id != request_id:
             self._journal.client.record_event(
                 "service.message_ignored",
-                {"ignored": "retired_or_unknown_request", "message": message},
+                {
+                    "ignored": "retired_or_unknown_request",
+                    "message": observation.model_dump(exclude_unset=True),
+                },
                 context=context,
             )
             return False
-        response = observation.model_dump(
-            exclude_unset=True,
-            exclude={"protocol_version", "message_type", "request_id", "command"},
-        )
         if (
             active.owner != "caller"
             and not active.timed_out
@@ -1018,7 +1016,10 @@ class ServiceManager:
         if active.timed_out:
             self._journal.client.record_event(
                 "service.message_ignored",
-                {"ignored": "command_timeout", "message": message},
+                {
+                    "ignored": "command_timeout",
+                    "message": observation.model_dump(exclude_unset=True),
+                },
                 context=context,
             )
             # A late result releases actual work, never changes its timed-out outcome.
@@ -1041,7 +1042,7 @@ class ServiceManager:
                 state,
                 instance,
                 active,
-                response,
+                observation,
                 "succeeded" if observation.result == "success" else "failed",
             )
         instance.active_request = None
@@ -2165,9 +2166,14 @@ class ServiceManager:
         state: RunnerState,
         instance: ServiceInstance,
         entry: WorkingServiceRequest,
-        response: JsonObject,
+        response: ServiceObservation | JsonObject,
         outcome: str,
     ) -> None:
+        if isinstance(response, ServiceObservation):
+            response = response.model_dump(
+                exclude_unset=True,
+                exclude={"protocol_version", "message_type", "request_id", "command"},
+            )
         context = _context(state, instance.service_id, instance.service_instance_id)
         if entry.owner != "caller" and not entry.timed_out:
             self._journal.client.record_command_result(
