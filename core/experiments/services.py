@@ -43,6 +43,7 @@ from core.models.participant_observations import (
     ServiceObservation,
     ServiceStateExport,
 )
+from core.models.participant_protocol import ParticipantResult
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import ServiceFailureDetails, WorkingServiceRequest
 from core.models.updates import _update_model
@@ -1855,9 +1856,13 @@ class ServiceManager:
         return error_message
 
     async def _request_service_shutdown(
-        self, state: RunnerState, service_id: str, instance: ServiceInstance,
-        request_id: str, deadline: float,
-    ) -> tuple[JsonObject | None, str | None]:
+        self,
+        state: RunnerState,
+        service_id: str,
+        instance: ServiceInstance,
+        request_id: str,
+        deadline: float,
+    ) -> tuple[ParticipantResult | None, str | None]:
         connection = None
         shutdown_response = None
         error_message = None
@@ -1902,11 +1907,13 @@ class ServiceManager:
                         or "data" not in reply
                     ):
                         raise ValueError("Invalid shutdown result.")
-                    shutdown_response = {
-                        "result": reply["result"],
-                        "data": reply["data"],
-                    }
-                    if reply["result"] == "fail":
+                    shutdown_response = ParticipantResult.model_validate(
+                        {
+                            "result": reply["result"],
+                            "data": reply["data"],
+                        }
+                    )
+                    if shutdown_response.result == "fail":
                         error_message = "Service shutdown reported failure."
         except Exception as error:  # noqa: BLE001 - One failed stop must not leave other services untouched.
             error_message = str(error)
@@ -2004,21 +2011,27 @@ class ServiceManager:
         return error_message
 
     def _record_service_stop_outcome(
-        self, state: RunnerState, service_id: str, request_id: str,
-        shutdown_response: JsonObject | None, context: JsonObject, results: JsonObject,
+        self,
+        state: RunnerState,
+        service_id: str,
+        request_id: str,
+        shutdown_response: ParticipantResult | None,
+        context: JsonObject,
+        results: JsonObject,
     ) -> None:
         try:
             self._journal.client.record_command_result(
                 request_id,
-                shutdown_response
-                or {
+                shutdown_response.model_dump(exclude_unset=True)
+                if shutdown_response is not None
+                else {
                     "result": "success" if results[service_id]["stopped"] else "fail",
                     "data": results[service_id],
                 },
                 author="runner",
                 outcome="succeeded"
                 if results[service_id]["stopped"]
-                and (shutdown_response or {}).get("result") != "fail"
+                and (shutdown_response is None or shutdown_response.result != "fail")
                 else "failed",
                 context=context,
             )

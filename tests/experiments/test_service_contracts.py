@@ -20,6 +20,7 @@ from core.experiments.state import (
 )
 from core.journal.events import LoggingError
 from core.models.participant_observations import ServiceObservation
+from core.models.participant_protocol import ParticipantResult
 from core.models.runner_state import WorkingServiceRequest
 from core.participants.connection import ParticipantConnection
 from tests.helpers.dag import process_running
@@ -92,6 +93,27 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         )
         reply["data"]["values"].append("external")
         self.assertEqual(observation.data, {"values": [True, 1, 1.0]})
+
+    async def test_shutdown_result_remains_model_until_exit_confirmation_and_journal(
+        self,
+    ):
+        definition = self.w.service()
+        self.assertEqual(await self.w.manager.start_all(self.w.state), "ready")
+        with patch.object(
+            self.w.manager,
+            "_record_service_stop_outcome",
+            wraps=self.w.manager._record_service_stop_outcome,
+        ) as record:
+            results = await self.w.manager.stop_all(self.w.state)
+        state, service_id, request_id, response, _, _ = record.call_args.args
+        self.assertIs(state, self.w.state)
+        self.assertIsInstance(response, ParticipantResult)
+        self.assertTrue(results[definition["service_id"]]["stopped"])
+        self.assertEqual(service_id, definition["service_id"])
+        stored = self.w.journal.client.read_command_result(request_id)
+        self.assertEqual(stored["response"], response.model_dump(exclude_unset=True))
+        self.assertEqual(set(stored["response"]), {"result", "data"})
+        self.assertEqual(stored["outcome"], "succeeded")
 
     async def test_module_variants_and_invalid_schemas(self):
         """A: module metadata distinguishes full/socket, action/socket and action/commands."""

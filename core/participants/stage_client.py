@@ -121,20 +121,25 @@ class StageClient:
         if self._thread is None or not self._thread.is_alive() or self._closing:
             raise RuntimeError("StageClient is not open.")
 
-    async def _send(self, command: str, data: JsonObject) -> None:
+    async def _send(self, command: str, data: ModuleProgress | JsonObject) -> None:
         if command == "report_progress":
-            self._logger.record_progress(
-                data["value"], total=1, stage=data["message"], unit="fraction"
-            )
+            if isinstance(data, ModuleProgress):
+                value, message = data.value, data.message
+            else:
+                value, message = data["value"], data["message"]
+            self._logger.record_progress(value, total=1, stage=message, unit="fraction")
         else:
             self._logger.record_event(f"module.{command}", data)
         reply = await self._connection.request(
-            str(uuid4()), command, data, timeout_seconds=self._timeout
+            str(uuid4()),
+            command,
+            data.model_dump() if isinstance(data, ModuleProgress) else data,
+            timeout_seconds=self._timeout,
         )
         if reply["result"] != "success":
             raise RuntimeError(f"Executor rejected {command}: {reply['data']}")
 
-    def _report(self, command: str, data: JsonObject) -> None:
+    def _report(self, command: str, data: ModuleProgress | JsonObject) -> None:
         self._check_open()
         future = asyncio.run_coroutine_threadsafe(self._send(command, data), self._loop)
         try:
@@ -145,7 +150,7 @@ class StageClient:
 
     def report_progress(self, value: float, message: str | None = None) -> None:
         progress = ModuleProgress.model_validate({"value": value, "message": message})
-        self._report("report_progress", progress.model_dump())
+        self._report("report_progress", progress)
 
     def report_state(self, data: JsonObject) -> None:
         self._report("report_state", copy_json_object(data, "module state"))
@@ -156,10 +161,10 @@ class StageClient:
 
     def _finish(self, result: str, data: JsonValue) -> None:
         self._check_open()
-        response = StageResult.model_validate(
-            {"result": result, "data": data}
-        ).model_dump(exclude_unset=True)
-        encoded = json.dumps(response, ensure_ascii=True, allow_nan=False)
+        response = StageResult.model_validate({"result": result, "data": data})
+        encoded = json.dumps(
+            response.model_dump(exclude_unset=True), ensure_ascii=True, allow_nan=False
+        )
         with self._result_lock:
             if self._result_written:
                 raise RuntimeError("A stage may publish its stdout result only once.")

@@ -2,8 +2,9 @@
 
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from core.models.participant_protocol import ModuleProgress
 from core.participants.stage_client import StageClient
 from tests.helpers.dag import DagSession, DagWorkspace, wait_until
 
@@ -27,6 +28,28 @@ class StageClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             client.succeed({})
         client.close()
+
+    async def test_progress_model_reaches_logger_before_public_json_request(self):
+        client = StageClient(self.w.root / "context.json")
+        client._logger = Mock()
+        client._connection = Mock()
+
+        async def request(request_id, command, data, *, timeout_seconds):
+            client._logger.record_progress.assert_called_once_with(
+                0.25, total=1, stage=None, unit="fraction"
+            )
+            self.assertEqual(command, "report_progress")
+            self.assertEqual(data, {"value": 0.25, "message": None})
+            self.assertIsInstance(data, dict)
+            return {"result": "success", "data": {}}
+
+        client._connection.request = AsyncMock(side_effect=request)
+        with patch.object(client, "_report") as report:
+            client.report_progress(0.25)
+        command, progress = report.call_args.args
+        self.assertIsInstance(progress, ModuleProgress)
+        await client._send(command, progress)
+        client._connection.request.assert_awaited_once()
 
     async def test_progress_state_and_cooperative_cancellation(self):
         gate = self.w.gate()
