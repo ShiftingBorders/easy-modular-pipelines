@@ -181,9 +181,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         receipt = await self.views.command({"command": "pause"})
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["result"], "success")
-        self.assertEqual(
-            self.views._cache_errors["exp"]["code"], "history_refresh_failed"
-        )
+        self.assertEqual(self.views._cache_errors["exp"].code, "history_refresh_failed")
         self.assertNotIn("exp", self.views._command_refreshing)
 
     async def test_failed_cancelled_and_expired_results_do_not_repeat_commands(self):

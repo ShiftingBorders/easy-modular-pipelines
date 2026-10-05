@@ -81,7 +81,9 @@ class ModulePublicationTests(unittest.TestCase):
                 "dashboard.journals.read_object",
                 side_effect=AssertionError("Reparsed unchanged publication"),
             ):
-                self.assertIs(first, self.reader.modules())
+                retained = self.reader._module_publication
+                self.assertEqual(first, self.reader.modules())
+                self.assertIs(retained, self.reader._module_publication)
             self.assertTrue(self.reader.publish_modules())
         self.assertEqual(path.stat().st_mtime_ns, before)
         other = LocalJournals(self.settings)

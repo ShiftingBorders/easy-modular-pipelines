@@ -190,7 +190,7 @@ class LocalJournals:
         self._lock = threading.RLock()
         self._experiment_locks: dict[str, threading.RLock] = {}
         self._module_signature: tuple | None = None
-        self._module_publication: dict | None = None
+        self._module_publication: ModulePublication | None = None
         self._read_snapshots: dict[str, tuple[tuple, dict]] = {}
         self._windows: dict[str, tuple[dict, tuple, OrderedDict, dict]] = {}
         self._timeline_overviews: OrderedDict[tuple, dict] = OrderedDict()
@@ -376,7 +376,7 @@ class LocalJournals:
                 status.st_size,
             )
             if signature == self._module_signature:
-                return self._module_publication
+                return self._module_publication.model_dump(exclude_unset=True)
             try:
                 document = read_object(path, self.settings.max_response_bytes)
             except (OSError, TypeError, ValueError) as error:
@@ -397,10 +397,9 @@ class LocalJournals:
                 raise SystemAPIError(
                     "cache_unavailable", "Invalid module statistics publication."
                 ) from error
-            document = publication.model_dump(exclude_unset=True)
-            self._module_publication = document
+            self._module_publication = publication
             self._module_signature = signature
-            return document
+            return publication.model_dump(exclude_unset=True)
 
     def publish_modules(self) -> bool:
         """Materialize exact project statistics from consistent cache snapshots."""

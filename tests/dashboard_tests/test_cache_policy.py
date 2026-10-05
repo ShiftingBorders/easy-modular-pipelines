@@ -9,6 +9,8 @@ from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from core.models.dashboard_cache import CacheWorkerError, CacheWorkerResult
+from core.models.journal_cache import JournalBoundary
 from dashboard.api_client import SystemAPIClient
 from dashboard.config import load_settings
 from dashboard.journals import cache_experiment
@@ -22,6 +24,40 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace, history
 
 
 class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_progress_and_failures_remain_models_until_submission(self):
+        await self.views.experiment("stopped", "summary", {})
+        identity = self.workspaces[2].identity
+        target = {
+            **identity,
+            "schema_version": 2,
+            "event_count": 10,
+            "cursor": 10,
+            "change_cursor": 10,
+        }
+        self.views._cache_jobs["stopped"].set_result(
+            {
+                "experiment_id": "stopped",
+                "pid": os.getpid(),
+                "complete": False,
+                "cached_through": {**identity, "cursor": 1, "change_cursor": 1},
+                "target_boundary": target,
+            }
+        )
+        self.views._collect_cache_jobs()
+        progress = self.views._cache_progress["stopped"]
+        self.assertIsInstance(progress, CacheWorkerResult)
+        self.assertIsInstance(self.views._cache_targets["stopped"], JournalBoundary)
+        self.assertIs(self.views._cache_targets["stopped"], progress.target_boundary)
+        await self.views._submit_cache("stopped")
+        self.assertEqual(self.pool.submit.call_args.args[-1], target)
+        self.views._cache_jobs["stopped"].set_exception(OSError("worker failed"))
+        self.views._collect_cache_jobs()
+        self.assertIsInstance(self.views._cache_errors["stopped"], CacheWorkerError)
+        self.assertEqual(
+            self.views._cache_errors["stopped"].code, "cache_worker_failed"
+        )
+        self.assertNotIn("stopped", self.views._cache_targets)
+
     async def test_broken_pool_is_replaced_without_losing_captured_target(self):
         """T049/T050: pool recovery retries the saved target in a replacement pool."""
         target = {"cursor": 50, "change_cursor": 50}

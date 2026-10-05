@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from core.journal.events import LoggingError
-from core.models.dashboard_cache import CacheWorkerResult
+from core.models.dashboard_cache import CacheWorkerError, CacheWorkerResult
 from core.models.dashboard_commands import (
     DashboardCommand,
     LocalCommandRecord,
@@ -29,9 +29,11 @@ from core.models.dashboard_resources import (
 )
 from core.models.dashboard_settings import DashboardRuntimeConfiguration
 from core.models.dashboard_upstream import LiveState
+from core.models.journal_cache import JournalBoundary
 from core.models.server_receipts import CommandReceipt
 from core.models.updates import _update_model
 from core.primitives.json_files import write_json
+from core.primitives.json_values import JsonObject
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import (
     LocalJournals,
@@ -105,8 +107,8 @@ class DashboardViews:
         self._resource_observed_at = 0.0
         self._cache_pool: ProcessPoolExecutor | None = None
         self._cache_jobs: dict = {}
-        self._cache_targets: dict[str, dict] = {}
-        self._cache_errors: dict[str, dict] = {}
+        self._cache_targets: dict[str, JournalBoundary | JsonObject] = {}
+        self._cache_errors: dict[str, CacheWorkerError] = {}
         self._cache_checked: dict[str, float] = {}
         self._module_error: str | None = None
         self._module_job = None
@@ -121,7 +123,7 @@ class DashboardViews:
         self._cache_requests: set[str] = set()
         self._cache_final_requests: set[str] = set()
         self._cache_initial: set[str] = set()
-        self._cache_progress: dict[str, dict] = {}
+        self._cache_progress: dict[str, CacheWorkerResult] = {}
         self._ram_previews: dict[str, dict] = {}
         self._window_jobs: dict[str, asyncio.Task] = {}
         self._window_checked: dict[str, float] = {}
@@ -223,20 +225,24 @@ class DashboardViews:
                 # Source polling requests a writer when either cursor changes.
                 self._cache_checked[identifier] = time.monotonic()
                 return
-            if identifier in self._cache_jobs or len(
-                self._cache_jobs
-            ) >= self.settings.cache_workers:
+            if (
+                identifier in self._cache_jobs
+                or len(self._cache_jobs) >= self.settings.cache_workers
+            ):
                 return
             if not dataset.get("complete") and not (
                 dataset.get("cached_through") or {}
             ).get("cursor"):
                 self._cache_initial.add(identifier)
             final_refresh = identifier in self._cache_final_requests
+            target = None if final_refresh else self._cache_targets.get(identifier)
+            if isinstance(target, JournalBoundary):
+                target = target.model_dump(exclude_unset=True)
             self._cache_jobs[identifier] = self._cache_pool.submit(
                 cache_experiment,
                 self.settings.model_dump(),
                 identifier,
-                None if final_refresh else self._cache_targets.get(identifier),
+                target,
             )
             if final_refresh:
                 self._cache_final_requests.discard(identifier)
@@ -244,7 +250,9 @@ class DashboardViews:
         except BrokenProcessPool:
             self._replace_cache_pool()
         except SystemAPIError as error:
-            self._cache_errors[identifier] = {"code": error.code, "message": str(error)}
+            self._cache_errors[identifier] = CacheWorkerError(
+                code=error.code, message=str(error)
+            )
 
     def cache_activity(self) -> dict:
         """Small scheduling status; no source reads on the request path."""
@@ -252,14 +260,16 @@ class DashboardViews:
         for identifier, future in self._cache_jobs.items():
             if future.done():
                 continue
-            progress = self._cache_progress.get(identifier, {})
-            target = progress.get("target_boundary") or {}
+            progress = self._cache_progress.get(identifier)
+            target = None if progress is None else progress.target_boundary
             items.append(
                 {
                     "experiment_id": identifier,
                     "initial": identifier in self._cache_initial,
-                    "event_count": target.get("event_count"),
-                    "cached_through": progress.get("cached_through"),
+                    "event_count": None if target is None else target.event_count,
+                    "cached_through": None
+                    if progress is None or progress.cached_through is None
+                    else progress.cached_through.model_dump(exclude_unset=True),
                 }
             )
         return {
@@ -407,32 +417,35 @@ class DashboardViews:
             try:
                 outcome = CacheWorkerResult.model_validate(future.result())
                 if outcome.experiment_id != identifier:
-                    raise ValueError("Cache worker result belongs to another experiment.")
-                result = outcome.model_dump(exclude_unset=True)
+                    raise ValueError(
+                        "Cache worker result belongs to another experiment."
+                    )
             except Exception as error:  # noqa: BLE001 - Surface failed worker processes through history reads.
-                result = {
-                    "error": {"code": "cache_worker_failed", "message": str(error)}
-                }
-            error = result.get("error")
-            if result.get("modules_error"):
-                self._module_error = result["modules_error"]
+                outcome = None
+                failure = CacheWorkerError(
+                    code="cache_worker_failed", message=str(error)
+                )
+            else:
+                failure = outcome.error
+            if outcome is not None and outcome.modules_error:
+                self._module_error = outcome.modules_error
                 self._module_registry = None
-            elif result.get("modules_published"):
+            elif outcome is not None and outcome.modules_published:
                 self._module_error = None
-            elif result.get("modules_published") is False:
+            elif outcome is not None and outcome.modules_published is False:
                 # Retry publication even after a stopped experiment leaves the queue.
                 # An older module job completing must not clear this invalidation.
                 self._module_registry = None
-            if error:
+            if failure:
                 self._ram_previews.pop(identifier, None)
-                self._cache_errors[identifier] = error
+                self._cache_errors[identifier] = failure
                 self._cache_checked[identifier] = time.monotonic()
                 self._cache_targets.pop(identifier, None)
                 continue
             self._cache_errors.pop(identifier, None)
-            self._cache_progress[identifier] = result
-            self._cache_targets[identifier] = result["target_boundary"]
-            if result["complete"]:
+            self._cache_progress[identifier] = outcome
+            self._cache_targets[identifier] = outcome.target_boundary
+            if outcome.complete:
                 self._ram_previews.pop(identifier, None)
                 self._cache_requests.discard(identifier)
                 self._cache_initial.discard(identifier)
@@ -518,8 +531,8 @@ class DashboardViews:
     ) -> tuple[dict, dict]:
         async with self._model_locks.setdefault(identifier, asyncio.Lock()):
             error = self._cache_errors.get(identifier)
-            if error and error["code"] != "cache_busy":
-                raise SystemAPIError(error["code"], error["message"])
+            if error and error.code != "cache_busy":
+                raise SystemAPIError(error.code, error.message)
             if self._cache_pool is None:
                 dataset = await asyncio.to_thread(self.journals.load, identifier)
             else:
@@ -1773,10 +1786,7 @@ class DashboardViews:
                 self._collect_cache_jobs()
                 self._registry = await asyncio.to_thread(self.journals.registry)
             except Exception as error:  # noqa: BLE001 - Keep successful command outcomes independent of cache failures.
-                self._cache_errors[identifier] = {
-                    "code": "history_refresh_failed",
-                    "message": str(error),
-                }
+                self._cache_errors[identifier] = CacheWorkerError(code="history_refresh_failed", message=str(error))
             finally:
                 self._command_refreshing.discard(identifier)
 
