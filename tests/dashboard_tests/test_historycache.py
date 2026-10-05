@@ -19,6 +19,7 @@ from core.journal.history_cache import (
     acquire_cache_writer,
 )
 from core.journal.logger import OperationLogger
+from core.models.dashboard_metadata import RecordedReaderLogging
 from core.models.journal_cache import (
     CacheCheckpoint,
     CacheIdentity,
@@ -40,6 +41,48 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace
 
 
 class HistoryCacheTests(unittest.TestCase):
+    def test_reader_logging_model_preserves_recorded_file_values_and_reuse(self):
+        dataset = self.build()
+        state = copy.deepcopy(dataset["state"])
+        logging = state["template"]["logging"]
+        logging["historical_option"] = {"enabled": True}
+        # Full logger option validation still belongs to opening the materialized file.
+        logging["busy_timeout_seconds"] = "historical-invalid-value"
+        recorded = RecordedReaderLogging.model_validate(logging)
+        self.assertEqual(recorded.root, logging)
+        database = dataset["directory"] / "journals/events.sqlite"
+        path = self.reader._reader_configuration(
+            "exp-test", state, database, dataset["identity"]
+        )
+        expected = {
+            "logging": {
+                **logging,
+                "db_path": str(database),
+                "open_mode": "existing",
+                "expected_journal": dataset["identity"],
+            },
+            "operation_context": {"source": "dashboard", "experiment_id": "exp-test"},
+        }
+        self.assertEqual(
+            path.read_text(encoding="utf-8"), json.dumps(expected, ensure_ascii=False)
+        )
+        before = path.stat().st_mtime_ns
+        self.assertEqual(
+            self.reader._reader_configuration(
+                "exp-test", state, database, dataset["identity"]
+            ),
+            path,
+        )
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        for value in (None, "invalid", []):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    TypeError, "Recorded logging settings are missing"
+                ),
+            ):
+                RecordedReaderLogging.model_validate(value)
+
     def test_cached_dataset_retains_models_and_detaches_public_metadata(self):
         loaded = self.build()
         owned = self.reader._snapshots["exp-test"]

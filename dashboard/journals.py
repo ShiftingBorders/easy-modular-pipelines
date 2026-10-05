@@ -27,6 +27,7 @@ from core.journal.logger import OperationLogger
 from core.models.dashboard_cache import CacheWorkerResult, ModulePublication
 from core.models.dashboard_metadata import (
     CompactTemplate,
+    RecordedReaderLogging,
     SchedulingMetadata,
     SchedulingState,
 )
@@ -804,12 +805,12 @@ class LocalJournals:
     ) -> Path:
         # Check the compact projection contract before writing reader settings.
         CompactTemplate.model_validate(state.get("template", {}))
-        logging = state.get("template", {}).get("logging")
-        if not isinstance(logging, dict):
-            raise TypeError("Recorded logging settings are missing.")
+        logging = RecordedReaderLogging.model_validate(
+            state.get("template", {}).get("logging")
+        )
         configuration = {
             "logging": {
-                **logging,
+                **logging.root,
                 "db_path": str(database),
                 "open_mode": "existing",
                 "expected_journal": identity,

@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
 from core.primitives.json_values import JsonObject, JsonValue
 
@@ -24,6 +24,23 @@ class CompactTemplate(BaseModel):
     cycles: JsonValue = None
     stages: list[JsonObject] = Field(default_factory=list)
     services: list[JsonObject] = Field(default_factory=list)
+
+
+class RecordedReaderLogging(RootModel[JsonObject]):
+    """Recorded logging object before materializing the existing reader file.
+
+    Full option validation and path resolution remain with the logging loader;
+    this sparse check preserves unknown recorded fields and their original order.
+    """
+
+    model_config = ConfigDict(strict=True, frozen=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_logging_object(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            raise TypeError("Recorded logging settings are missing.")
+        return value
 
 
 @dataclass(frozen=True)
