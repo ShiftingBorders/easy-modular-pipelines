@@ -69,8 +69,7 @@ class DashboardViews:
             settings if isinstance(settings, DashboardRuntimeConfiguration)
             else DashboardRuntimeConfiguration.model_validate(settings)
         )
-        self.settings = settings if isinstance(settings, dict) else validated.model_dump()
-        self.settings.update(validated.model_dump())
+        self.settings = validated
         self.system = system
         self.journals = LocalJournals(self.settings)
         self._live: dict = {}
@@ -119,7 +118,7 @@ class DashboardViews:
         self._command_cache_locks: dict[str, asyncio.Lock] = {}
 
     async def open(self) -> None:
-        path = self.settings["state_directory"] / "commands.json"
+        path = self.settings.state_directory / "commands.json"
         if path.exists():
             document = await asyncio.to_thread(read_object, path, 8388608)
             self._restore_commands(SavedCommandHistory.model_validate(document))
@@ -160,12 +159,12 @@ class DashboardViews:
             if "cache" in dataset:
                 continue
             future = self._cache_pool.submit(
-                cache_experiment, self.settings, identifier
+                cache_experiment, self.settings.model_dump(), identifier
             )
             self._cache_jobs[identifier] = future
             self._cache_initial.add(identifier)
             initial.append(asyncio.wrap_future(future))
-            if len(initial) >= self.settings.get("cache_workers", 2):
+            if len(initial) >= self.settings.cache_workers:
                 break
         await asyncio.gather(*initial, return_exceptions=True)
         self._collect_cache_jobs()
@@ -198,7 +197,7 @@ class DashboardViews:
         self._collect_cache_jobs()
         if identifier in self._cache_jobs or identifier in self._command_refreshing:
             return
-        if len(self._cache_jobs) >= self.settings.get("cache_workers", 2):
+        if len(self._cache_jobs) >= self.settings.cache_workers:
             return
         try:
             dataset = await asyncio.to_thread(self.journals.cached, identifier)
@@ -213,7 +212,7 @@ class DashboardViews:
                 return
             if identifier in self._cache_jobs or len(
                 self._cache_jobs
-            ) >= self.settings.get("cache_workers", 2):
+            ) >= self.settings.cache_workers:
                 return
             if not dataset.get("complete") and not (
                 dataset.get("cached_through") or {}
@@ -222,7 +221,7 @@ class DashboardViews:
             final_refresh = identifier in self._cache_final_requests
             self._cache_jobs[identifier] = self._cache_pool.submit(
                 cache_experiment,
-                self.settings,
+                self.settings.model_dump(),
                 identifier,
                 None if final_refresh else self._cache_targets.get(identifier),
             )
@@ -290,7 +289,7 @@ class DashboardViews:
                 for identifier in self._registry:
                     if identifier not in self._automatic_caches | self._opened_caches:
                         continue
-                    if len(self._window_jobs) >= self.settings.get("cache_workers", 2):
+                    if len(self._window_jobs) >= self.settings.cache_workers:
                         break
                     if (
                         identifier in self._window_jobs
@@ -333,13 +332,13 @@ class DashboardViews:
             )
             if (
                 self._module_job is None
-                and self.settings["project_root"] is not None
+                and self.settings.project_root is not None
                 and signature != self._module_registry
                 and now >= self._module_retry_at
             ):
                 try:
                     self._module_job = self._cache_pool.submit(
-                        publish_module_statistics, self.settings
+                        publish_module_statistics, self.settings.model_dump()
                     )
                     self._module_registry = signature
                 except BrokenProcessPool:
@@ -347,7 +346,7 @@ class DashboardViews:
                     await asyncio.sleep(0.25)
                     continue
             for identifier in registry:
-                if len(self._cache_jobs) >= self.settings.get("cache_workers", 2):
+                if len(self._cache_jobs) >= self.settings.cache_workers:
                     break
                 if (
                     identifier
@@ -368,7 +367,7 @@ class DashboardViews:
         if self._cache_pool is not None:
             self._cache_pool.shutdown(wait=False, cancel_futures=True)
         self._cache_pool = ProcessPoolExecutor(
-            max_workers=self.settings.get("cache_workers", 2),
+            max_workers=self.settings.cache_workers,
             mp_context=multiprocessing.get_context("spawn"),
         )
 
@@ -428,7 +427,7 @@ class DashboardViews:
                 self._cache_checked[identifier] = time.monotonic()
 
     def _write_commands(self) -> None:
-        path = self.settings["state_directory"] / "commands.json"
+        path = self.settings.state_directory / "commands.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         encoded = json.dumps(
             {"items": self._commands}, ensure_ascii=False, allow_nan=False
@@ -603,7 +602,7 @@ class DashboardViews:
                     "operations": [],
                 }
             result.append((dataset, model))
-        if not result and self.settings["project_root"] is None:
+        if not result and self.settings.project_root is None:
             raise SystemAPIError(
                 "not_configured",
                 "Configure project_root to read the experiment journals.",
@@ -641,7 +640,7 @@ class DashboardViews:
         if resource == "overview":
             complete = (
                 source_error is None
-                and self.settings["project_root"] is not None
+                and self.settings.project_root is not None
                 and all(dataset["complete"] for dataset, _ in models)
             )
             metrics = {
@@ -1288,7 +1287,7 @@ class DashboardViews:
         else:
             offset, token = 0, uuid4().hex
             encoded_size = len(json.dumps(items, ensure_ascii=False).encode())
-            if encoded_size > self.settings["history_max_bytes"]:
+            if encoded_size > self.settings.history_max_bytes:
                 raise SystemAPIError(
                     "history_limit",
                     "This view exceeds the configured history memory limit.",
@@ -1298,7 +1297,7 @@ class DashboardViews:
                 len(self._publications) >= 16
                 or sum(item["bytes"] for item in self._publications.values())
                 + encoded_size
-                > self.settings["history_max_bytes"]
+                > self.settings.history_max_bytes
             ):
                 self._publications.pop(next(iter(self._publications)))
             self._publications[token] = {
@@ -1311,7 +1310,7 @@ class DashboardViews:
         selected, size = [], 1024
         for item in items[offset : offset + limit]:
             length = len(json.dumps(item, ensure_ascii=False).encode())
-            if size + length > self.settings["max_response_bytes"]:
+            if size + length > self.settings.max_response_bytes:
                 if not selected:
                     raise SystemAPIError(
                         "response_too_large",
@@ -1653,7 +1652,7 @@ class DashboardViews:
             if (
                 refresh_history
                 and self._cache_pool is not None
-                and self.settings["project_root"] is not None
+                and self.settings.project_root is not None
             ):
                 self._command_history_tasks = {
                     key: task
@@ -1679,7 +1678,7 @@ class DashboardViews:
                     await asyncio.shield(asyncio.wrap_future(previous))
                     self._collect_cache_jobs()
                 current = self._cache_pool.submit(
-                    cache_experiment, self.settings, identifier
+                    cache_experiment, self.settings.model_dump(), identifier
                 )
                 self._cache_jobs[identifier] = current
                 await asyncio.shield(asyncio.wrap_future(current))

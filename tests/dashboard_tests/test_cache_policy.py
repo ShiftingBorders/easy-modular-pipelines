@@ -37,7 +37,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.views._cache_targets["stopped"], target)
         await self.views._submit_cache("stopped")
         replacement.submit.assert_called_once_with(
-            cache_experiment, self.settings, "stopped", target
+            cache_experiment, self.views.settings.model_dump(), "stopped", target
         )
 
     async def asyncSetUp(self):
@@ -93,7 +93,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["cache_pending"])
         self.assertEqual(self.views._opened_caches, {"stopped"})
         self.pool.submit.assert_called_once_with(
-            cache_experiment, self.settings, "stopped", None
+            cache_experiment, self.views.settings.model_dump(), "stopped", None
         )
         await self.views.experiment("stopped", "artifacts", {"compact": "1"})
         self.assertEqual(self.pool.submit.call_count, 1)

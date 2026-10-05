@@ -1,3 +1,4 @@
+
 """HTTP boundary, application lifecycle and independent resource/ICMP failures."""
 
 import asyncio
@@ -6,10 +7,11 @@ import socket
 import unittest
 from contextlib import AsyncExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from core.models.updates import _update_model
 from dashboard.application import create_app
 from tests.dashboard_tests.helpers import (
     DASHBOARD,
@@ -154,8 +156,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             ).status_code,
             409,
         )
-        self.app.state.settings["max_response_bytes"] = 50
-        oversized = await self.http.get(path + "summary")
+        self.app.state.settings = _update_model(
+            self.app.state.settings, max_response_bytes=1024
+        )
+        with patch.object(
+            self.app.state.views,
+            "experiment",
+            new=AsyncMock(return_value={"large": "x" * 2048}),
+        ):
+            oversized = await self.http.get(path + "summary")
         self.assertEqual(oversized.status_code, 413)
 
     async def test_cache_publication_descriptors_are_bounded_and_filter_specific(self):
@@ -410,7 +419,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observation["source"], "dashboard_host")
         self.assertEqual(self.upstream_requests, [])
         stored = json.loads(
-            (self.app.state.settings["state_directory"] / "icmp.json").read_text()
+            (self.app.state.settings.state_directory / "icmp.json").read_text()
         )
         self.assertEqual(stored["settings"], icmp_settings())
         self.assertEqual(stored["history"][-1]["status"], "reply")
@@ -469,7 +478,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(response.status_code, expected)
         self.assertFalse(
-            (self.app.state.settings["state_directory"] / "icmp.json").exists()
+            (self.app.state.settings.state_directory / "icmp.json").exists()
         )
 
     async def test_config_write_failure_preserves_previous_settings(self) -> None:
@@ -494,7 +503,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.probes, [])
 
     async def test_lifespan_closes_http_client_monitor_and_state_lock(self) -> None:
-        state_path = self.app.state.settings["state_directory"]
+        state_path = self.app.state.settings.state_directory
         await self.stack.aclose()
         self.assertTrue(self.upstream.is_closed)
         self.assertTrue(self.app.state.icmp._task.done())

@@ -1,3 +1,4 @@
+
 """Approved D: local SQLite history, immutable snapshots, paths and publication limits."""
 
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
@@ -203,7 +205,10 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
                 "exp-test", "events", {"cursor": json.dumps(page["next_cursor"])}
             )
         self.assertEqual(expired.exception.status_code, 409)
-        self.views.settings["max_response_bytes"] = 1024
+        self.views.settings = _update_model(
+            self.views.settings, max_response_bytes=1024
+        )
+        self.views.journals.settings = self.views.settings
         with self.assertRaises(SystemAPIError) as large:
             await self.views.experiment("exp-test", "parameters", {})
         self.assertEqual(large.exception.status_code, 413)

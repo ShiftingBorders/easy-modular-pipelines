@@ -175,8 +175,7 @@ class LocalJournals:
             settings if isinstance(settings, DashboardRuntimeConfiguration)
             else DashboardRuntimeConfiguration.model_validate(settings)
         )
-        self.settings = settings if isinstance(settings, dict) else validated.model_dump()
-        self.settings.update(validated.model_dump())
+        self.settings = validated
         self._configure(validated)
 
     def _configure(self, settings: DashboardRuntimeConfiguration) -> None:
@@ -379,7 +378,7 @@ class LocalJournals:
             if signature == self._module_signature:
                 return self._module_publication
             try:
-                document = read_object(path, self.settings["max_response_bytes"])
+                document = read_object(path, self.settings.max_response_bytes)
             except (OSError, TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "cache_unavailable", f"Cannot read module statistics: {error}"
@@ -421,7 +420,7 @@ class LocalJournals:
                 "sources": sources,
             }
             previous = (
-                read_object(path, self.settings["max_response_bytes"])
+                read_object(path, self.settings.max_response_bytes)
                 if path.exists()
                 else {}
             )
@@ -442,7 +441,7 @@ class LocalJournals:
             }
             if (
                 len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
-                > self.settings["max_response_bytes"]
+                > self.settings.max_response_bytes
             ):
                 raise HistoryCacheLimit("Module statistics exceed max_response_bytes.")
             write_json(path, document)
@@ -576,7 +575,7 @@ class LocalJournals:
                     return None
                 encoded_size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
                 size += encoded_size
-                if size > min(self.max_bytes, self.settings["max_response_bytes"]):
+                if size > min(self.max_bytes, self.settings.max_response_bytes):
                     return None
                 metadata = {
                     "effective": True,
@@ -978,7 +977,7 @@ class LocalJournals:
             if params.get("compact") != "1" and item["detail_ref"]:
                 item = self.detail(dataset, item["detail_ref"], item)
             size += len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
-            if size > self.settings["max_response_bytes"]:
+            if size > self.settings.max_response_bytes:
                 if not selected:
                     raise SystemAPIError(
                         "response_too_large",
@@ -1072,7 +1071,7 @@ class LocalJournals:
                     **dataset["identity"],
                 }
                 size += len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
-                if size > self.settings["max_response_bytes"]:
+                if size > self.settings.max_response_bytes:
                     if not items:
                         raise SystemAPIError(
                             "response_too_large",

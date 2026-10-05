@@ -1,3 +1,4 @@
+
 """Approved C/F and navigation additions: cache liveness and durable command outcomes."""
 
 import asyncio
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
+from core.models.updates import _update_model
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
 from dashboard.views import DashboardViews
@@ -47,7 +49,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_command_polling_shares_one_history_refresh(self):
         """T074/T075: successful command observers share the same history task."""
-        self.views.settings["project_root"] = self.root
+        self.views.settings = _update_model(self.views.settings, project_root=self.root)
         self.views._cache_pool = Mock()
         receipt = await self.views.command({"command": "pause"})
         entered, release = asyncio.Event(), asyncio.Event()
@@ -76,7 +78,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cache_failure_does_not_reverse_successful_command_outcome(self):
         """T076: runtime success remains success even when cache refresh fails."""
-        self.views.settings["project_root"] = self.root
+        self.views.settings = _update_model(self.views.settings, project_root=self.root)
         self.views._cache_pool = Mock()
         self.views._cache_pool.submit.side_effect = OSError("worker unavailable")
         receipt = await self.views.command({"command": "pause"})

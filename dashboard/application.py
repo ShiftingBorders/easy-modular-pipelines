@@ -14,7 +14,7 @@ from starlette.background import BackgroundTask
 from core.models.dashboard_queries import DashboardQuery
 from dashboard.alerts import AlertMonitor
 from dashboard.api_client import SystemAPIClient, SystemAPIError
-from dashboard.config import load_settings
+from dashboard.config import _load_settings
 from dashboard.icmp import ICMPMonitor
 from dashboard.notifications import deliver
 from dashboard.views import DashboardViews
@@ -44,14 +44,14 @@ def check_write_origin(request: Request) -> None:
 def create_app(
     config_path: str | Path | None = None, *, overrides: dict | None = None
 ) -> FastAPI:
-    settings = load_settings(
+    settings = _load_settings(
         Path(config_path) if config_path else Path(__file__).with_name("settings.json"),
         overrides,
     )
     system = SystemAPIClient(settings)
-    monitor = ICMPMonitor(settings["state_directory"])
+    monitor = ICMPMonitor(settings.state_directory)
     views = DashboardViews(settings, system)
-    alerts = AlertMonitor(settings["state_directory"], views, monitor)
+    alerts = AlertMonitor(settings.state_directory, views, monitor)
 
     async def lifespan(application: FastAPI):
         await system.open()
@@ -83,10 +83,10 @@ def create_app(
         return {
             "application": "EMP Dashboard",
             "system_api_configured": system.base_url is not None,
-            "refresh_seconds": settings["refresh_seconds"],
+            "refresh_seconds": settings.refresh_seconds,
             "icmp_source": "dashboard_host",
             "dashboard_host": monitor.host_name,
-            "journals_configured": settings["project_root"] is not None,
+            "journals_configured": settings.project_root is not None,
             "data_mode": "local_journals_and_system_api",
             "cache_activity": views.cache_activity(),
             "system_connection": {
@@ -184,7 +184,7 @@ def create_app(
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
-        if len(encoded) > settings["max_response_bytes"]:
+        if len(encoded) > app.state.settings.max_response_bytes:
             raise SystemAPIError(
                 "response_too_large",
                 "This response exceeds max_response_bytes; request a smaller page.",

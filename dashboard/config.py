@@ -4,7 +4,10 @@ import json
 import math
 from pathlib import Path
 
-from core.models.dashboard_settings import DashboardConfiguration
+from core.models.dashboard_settings import (
+    DashboardConfiguration,
+    DashboardRuntimeConfiguration,
+)
 
 
 def number(value: object, name: str, minimum: float, maximum: float) -> float:
@@ -16,6 +19,17 @@ def number(value: object, name: str, minimum: float, maximum: float) -> float:
 
 
 def load_settings(path: Path, overrides: dict | None = None) -> dict:
+    validated = _load_settings(path, overrides)
+    settings = validated.model_dump()
+    # Optional token_env historically appears only when explicitly configured.
+    if "system_api_token_env" not in validated.model_fields_set:
+        settings.pop("system_api_token_env")
+    return settings
+
+
+def _load_settings(
+    path: Path, overrides: dict | None = None
+) -> DashboardRuntimeConfiguration:
     if not path.is_absolute():
         raise ValueError("The dashboard configuration path must be absolute.")
     path = path.resolve(strict=True)
@@ -25,21 +39,20 @@ def load_settings(path: Path, overrides: dict | None = None) -> dict:
             raise ValueError("Dashboard settings must be an object.")
         settings.update(overrides)
     validated = DashboardConfiguration.model_validate(settings)
-    settings = validated.model_dump()
-    # Optional token_env historically appears only when explicitly configured.
-    if "system_api_token_env" not in validated.model_fields_set:
-        settings.pop("system_api_token_env")
-    directory = settings["state_directory"]
-    state_path = Path(directory)
-    settings["state_directory"] = (
-        state_path if state_path.is_absolute() else path.parent / state_path
-    )
-    project = settings.get("project_root")
-    if project is not None:
-        project = Path(project)
-        settings["project_root"] = (
-            project if project.is_absolute() else path.parent / project
+    state_path = Path(validated.state_directory)
+    state_path = state_path if state_path.is_absolute() else path.parent / state_path
+    project = None
+    if validated.project_root is not None:
+        configured_project = Path(validated.project_root)
+        project = (
+            configured_project
+            if configured_project.is_absolute()
+            else path.parent / configured_project
         ).resolve()
-    else:
-        settings["project_root"] = None
-    return settings
+    values = {
+        name: getattr(validated, name)
+        for name in DashboardConfiguration.model_fields
+        if name != "system_api_token_env" or name in validated.model_fields_set
+    }
+    values.update(state_directory=state_path, project_root=project)
+    return DashboardRuntimeConfiguration.model_validate(values)

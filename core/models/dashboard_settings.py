@@ -1,7 +1,6 @@
 """Dashboard configuration without filesystem or environment access."""
 
 import re
-from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
 
@@ -52,28 +51,38 @@ class DashboardConnectionConfiguration(BaseModel):
         return value.rstrip("/") + "/"
 
 
-class DashboardConfiguration(DashboardConnectionConfiguration):
+class _DashboardOptions(DashboardConnectionConfiguration):
     model_config = ConfigDict(extra="forbid")
 
     host: str = Field(strict=True)
     port: PositiveInteger = Field(le=65535)
-    state_directory: str = Field(strict=True)
     refresh_seconds: Annotated[Number, Field(ge=1, le=600)]
-    project_root: str | None = Field(default=None, strict=True)
     history_max_events: PositiveInteger = Field(default=100000, le=10000000)
     history_max_bytes: PositiveInteger = Field(default=67108864, le=2147483648)
     history_window_events: PositiveInteger = Field(default=1000, le=100000)
     cache_workers: PositiveInteger = Field(default=2, le=32)
 
-    @field_validator("host", "state_directory", "project_root")
+    @field_validator("host")
     @classmethod
-    def validate_nonempty_text(cls, value: str | Path | None) -> str | Path | None:
+    def validate_nonempty_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Configured hosts and paths must be nonempty.")
+        return value
+
+
+class DashboardConfiguration(_DashboardOptions):
+    state_directory: str = Field(strict=True)
+    project_root: str | None = Field(default=None, strict=True)
+
+    @field_validator("state_directory", "project_root")
+    @classmethod
+    def validate_nonempty_paths(cls, value: str | None) -> str | None:
         if isinstance(value, str) and not value.strip():
             raise ValueError("Configured hosts and paths must be nonempty.")
         return value
 
 
-class DashboardRuntimeConfiguration(DashboardConfiguration):
+class DashboardRuntimeConfiguration(_DashboardOptions):
     """The already resolved, native-path configuration used by runtime consumers."""
 
     state_directory: AbsolutePath
