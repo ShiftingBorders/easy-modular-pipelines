@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from core.models.dashboard_cache import CacheWorkerError, CacheWorkerResult
+from core.models.dashboard_metadata import SchedulingMetadata, SchedulingState
 from core.models.journal_cache import JournalBoundary
 from dashboard.api_client import SystemAPIClient
 from dashboard.config import load_settings
@@ -24,6 +25,36 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace, history
 
 
 class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduling_retains_sparse_metadata_and_public_errors(self):
+        recorded = self.views._registry_states["running"]
+        self.assertIsInstance(recorded, SchedulingState)
+        self.assertIsInstance(recorded.metadata, SchedulingMetadata)
+        self.assertEqual(
+            recorded.document(),
+            self.views.journals.scheduling_states(self.views._registry)["running"],
+        )
+        path = self.workspaces[0].directory / "runner/state.json"
+        path.write_text(
+            json.dumps({"phase": "waiting", "template": {}}), encoding="utf-8"
+        )
+        await self.views._refresh_cache_selection()
+        self.assertIn("running", self.views._automatic_caches)
+        self.assertEqual(
+            self.views._registry_states["running"].document(),
+            {"phase": "waiting", "mode": None, "name": "running"},
+        )
+        path.write_text("{invalid", encoding="utf-8")
+        await self.views._refresh_cache_selection()
+        failed = self.views._registry_states["running"]
+        self.assertIsNone(failed.metadata)
+        self.assertEqual(failed.phase, "unknown")
+        self.assertNotIn("running", self.views._automatic_caches)
+        self.assertEqual(set(failed.document()), {"phase", "error"})
+        self.assertEqual(
+            failed.document(),
+            self.views.journals.scheduling_states(self.views._registry)["running"],
+        )
+
     async def test_worker_progress_and_failures_remain_models_until_submission(self):
         await self.views.experiment("stopped", "summary", {})
         identity = self.workspaces[2].identity

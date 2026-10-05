@@ -1,5 +1,8 @@
 """Sparse saved metadata and compact history inputs, distinct from runtime state."""
 
+from copy import deepcopy
+from dataclasses import dataclass
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.primitives.json_values import JsonObject, JsonValue
@@ -21,3 +24,27 @@ class CompactTemplate(BaseModel):
     cycles: JsonValue = None
     stages: list[JsonObject] = Field(default_factory=list)
     services: list[JsonObject] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SchedulingState:
+    """A sparse metadata observation and its owner-computed display/error fields."""
+
+    metadata: SchedulingMetadata | None = None
+    name: JsonValue = None
+    error: str | None = None
+
+    @property
+    def phase(self) -> JsonValue:
+        return self.metadata.phase if self.metadata is not None else "unknown"
+
+    def document(self) -> JsonObject:
+        if self.metadata is None:
+            return {"phase": "unknown", "error": self.error}
+        return deepcopy(
+            {
+                "phase": self.metadata.phase,
+                "mode": self.metadata.mode,
+                "name": self.name,
+            }
+        )

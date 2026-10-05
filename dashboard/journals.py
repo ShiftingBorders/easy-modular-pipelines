@@ -25,7 +25,11 @@ from core.journal.history_cache import (
 )
 from core.journal.logger import OperationLogger
 from core.models.dashboard_cache import CacheWorkerResult, ModulePublication
-from core.models.dashboard_metadata import CompactTemplate, SchedulingMetadata
+from core.models.dashboard_metadata import (
+    CompactTemplate,
+    SchedulingMetadata,
+    SchedulingState,
+)
 from core.models.dashboard_queries import (
     DetailIdentity,
     DetailReference,
@@ -519,6 +523,14 @@ class LocalJournals:
 
     def scheduling_states(self, registry: dict[str, Path]) -> dict[str, dict]:
         """Read runner metadata for scheduling without opening stopped journals."""
+        return {
+            identifier: state.document()
+            for identifier, state in self._scheduling_states(registry).items()
+        }
+
+    def _scheduling_states(
+        self, registry: dict[str, Path]
+    ) -> dict[str, SchedulingState]:
         states = {}
         for identifier, directory in registry.items():
             try:
@@ -527,13 +539,11 @@ class LocalJournals:
                 if state.get("experiment_id") not in (None, identifier):
                     raise ValueError("Experiment state belongs to another experiment.")
                 metadata = SchedulingMetadata.model_validate(state)
-                states[identifier] = {
-                    "phase": metadata.phase,
-                    "mode": metadata.mode,
-                    "name": metadata.template.get("name") or identifier,
-                }
+                states[identifier] = SchedulingState(
+                    metadata=metadata, name=metadata.template.get("name") or identifier
+                )
             except (OSError, ValueError, TypeError) as error:
-                states[identifier] = {"phase": "unknown", "error": str(error)}
+                states[identifier] = SchedulingState(error=str(error))
         return states
 
     def preview(self, identifier: str) -> dict | None:

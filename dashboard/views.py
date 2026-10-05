@@ -20,6 +20,7 @@ from core.models.dashboard_commands import (
     LocalCommandRecord,
     SavedCommandHistory,
 )
+from core.models.dashboard_metadata import SchedulingState
 from core.models.dashboard_queries import OffsetCursor, PageLimit, PublicationCursor
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
@@ -117,7 +118,7 @@ class DashboardViews:
         self._registry: dict = {}
         self._registry_error: str | None = None
         self._registry_checked = 0.0
-        self._registry_states: dict[str, dict] = {}
+        self._registry_states: dict[str, SchedulingState] = {}
         self._automatic_caches: set[str] = set()
         self._opened_caches: set[str] = set()
         self._cache_requests: set[str] = set()
@@ -186,7 +187,7 @@ class DashboardViews:
 
     async def _refresh_cache_selection(self) -> None:
         self._registry_states = await asyncio.to_thread(
-            self.journals.scheduling_states, self._registry
+            self.journals._scheduling_states, self._registry
         )
         active_phases = {
             "starting",
@@ -199,7 +200,7 @@ class DashboardViews:
         automatic = {
             identifier
             for identifier, state in self._registry_states.items()
-            if state.get("phase") in active_phases
+            if state.phase in active_phases
         }
         # A job already in flight may finish at a pre-terminal boundary.
         # Keep its successor separate so that completion cannot erase it.
@@ -542,7 +543,8 @@ class DashboardViews:
                     raise SystemAPIError("not_found", "Unknown experiment.", 404)
                 dataset = await asyncio.to_thread(self.journals.cached, identifier)
                 if "cache" not in dataset:
-                    recorded = self._registry_states.get(identifier, {})
+                    scheduling = self._registry_states.get(identifier)
+                    recorded = scheduling.document() if scheduling is not None else {}
                     dataset = {
                         **dataset,
                         "state": {

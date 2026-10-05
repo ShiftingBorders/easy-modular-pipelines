@@ -10,12 +10,15 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from core.journal.logger import OperationLogger
+from core.models.dashboard_metadata import CompactTemplate
 from dashboard.api_client import SystemAPIClient
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
 from dashboard.projections import (
     cached_experiment_views,
     cached_metrics,
+    compact_event,
+    compact_template,
     experiment_views,
     window_experiment_views,
 )
@@ -33,6 +36,41 @@ from tests.dashboard_tests.integration_helpers import (
 
 
 class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
+    def test_compact_template_keeps_sparse_model_fields_until_projection(self):
+        for document in (
+            {},
+            {"name": None, "cycles": None},
+            {
+                "name": ["historical", "name"],
+                "cycles": "unknown",
+                "stages": [{"stage_id": "A", "module": {"name": "module"}, "extra": 1}],
+                "services": [{"service_id": "service", "module": {}, "extra": 2}],
+                "unknown": True,
+            },
+        ):
+            with self.subTest(document=document):
+                template = CompactTemplate.model_validate(document)
+                expected = compact_template(document)
+                self.assertEqual(compact_template(template), expected)
+                event = {
+                    "event_type": "template.applied",
+                    "data": {"template": document, "template_revision_id": "revision"},
+                }
+                with patch.object(
+                    CompactTemplate,
+                    "model_dump",
+                    side_effect=AssertionError("Dumped before projection"),
+                ):
+                    result = compact_event(event)
+                self.assertEqual(result["data"]["template"], expected)
+                self.assertEqual(result["data"]["template_yaml"], "")
+                projected = compact_template(template)
+                if isinstance(projected.get("name"), list):
+                    projected["name"].append("caller change")
+                    self.assertEqual(template.name, document["name"])
+                    projected["stages"][0]["module"]["name"] = "caller change"
+                    self.assertEqual(template.stages[0]["module"], {"name": "module"})
+
     async def test_ram_measurement_cards_do_not_use_only_the_requested_page(self):
         """T043: a complete RAM view preserves metrics beyond the selected page."""
         data = self.measurements()
