@@ -126,9 +126,9 @@ def create_app(
         )
         if metrics is not None:
             for rule in alerts.rules:
-                if not rule["enabled"] or rule["kind"] != "resource":
+                if not rule.enabled or rule.kind != "resource":
                     continue
-                key = rule["metric"]
+                key = rule.metric
                 metric = metrics.get(
                     "disk"
                     if key == "disk_free_gib"
@@ -145,9 +145,9 @@ def create_app(
                     value = metric.get(key.removeprefix("internet_") + "_mbps")
                 if value is not None and metric.get("fresh"):
                     metric["exceeded"] = metric.get("exceeded", False) or (
-                        value > rule["threshold"]
-                        if rule["operator"] == "above"
-                        else value < rule["threshold"]
+                        value > rule.threshold
+                        if rule.operator == "above"
+                        else value < rule.threshold
                     )
         return result
 

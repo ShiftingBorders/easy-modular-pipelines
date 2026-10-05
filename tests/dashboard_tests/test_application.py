@@ -27,6 +27,27 @@ WRITE_HEADERS = {"X-Dashboard-Request": "1", "Origin": "http://dashboard.test"}
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_resource_thresholds_consume_retained_alert_rules(self):
+        rule = {
+            "id": "cpu-rule",
+            "name": "CPU threshold",
+            "kind": "resource",
+            "metric": "cpu",
+            "operator": "above",
+            "threshold": 20,
+            "enabled": True,
+        }
+        await self.app.state.alerts.configure(rule)
+        retained = self.app.state.alerts.rules[0]
+        response = await self.http.get("/api/system/compute")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["metrics"]["cpu"]["exceeded"])
+        self.assertIs(self.app.state.alerts.rules[0], retained)
+        await self.app.state.alerts.configure({**rule, "enabled": False})
+        response = await self.http.get("/api/system/compute")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["metrics"]["cpu"].get("exceeded", False))
+
     async def test_local_page_success_does_not_change_global_runtime_connection(self):
         self.app.state.views._live_available = False
         self.app.state.views._live_error = "offline"
