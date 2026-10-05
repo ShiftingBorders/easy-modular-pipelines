@@ -116,7 +116,7 @@ class ResourceCollector:
                             "previous_collector_id": None
                             if self._packet is None
                             else self._packet.collector_id,
-                            "context": dict(self._snapshot.context),
+                            "context": dict(self._snapshot.context.root),
                         }
                     )
                 finally:

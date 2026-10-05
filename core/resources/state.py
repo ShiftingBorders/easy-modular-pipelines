@@ -79,7 +79,9 @@ class ResourceTarget:
     @classmethod
     def from_document(cls, document: JsonObject) -> ResourceTarget:
         target = ResourceTargetDocument.model_validate(document)
-        return cls(target.series_id, target.identity.model_dump(), target.context)
+        return cls(
+            target.series_id, target.identity.model_dump(), target.context.model_dump()
+        )
 
 
 class ResourceHistory:

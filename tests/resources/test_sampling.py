@@ -5,12 +5,15 @@ import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import psutil
 
+from core.models.journal_records import JournalContext
+from core.models.resource_messages import CollectorSnapshot, CollectorUpdate
+from core.models.resource_target import ResourceTargetDocument
 from core.primitives.processes import process_identity
-from core.resources.sampling import ResourceSampler
+from core.resources.sampling import ResourceSampler, _apply_collector_update
 from core.resources.state import ResourceTarget
 from tests.helpers.dag import wait_until
 from tests.helpers.resources import (
@@ -22,10 +25,83 @@ from tests.helpers.resources import (
 
 
 class SamplerTests(unittest.TestCase):
+    def test_child_update_retains_models_and_context_with_original_wire_shape(self):
+        path = (Path.cwd() / ".artifacts/tmp/Resource.json").resolve()
+        document = {
+            "command": "update",
+            "revision": 1,
+            "snapshot": {
+                "context": {"experiment_id": "experiment"},
+                "logging_config_path": str(path),
+                "targets": [target(process_identity(os.getpid()))],
+            },
+            "restart_notice": {
+                "reason": "collector_restarted",
+                "error": "closed",
+                "previous_collector_id": None,
+                "context": {"experiment_id": "experiment"},
+            },
+        }
+        message = CollectorUpdate.model_validate(document)
+        initial = CollectorSnapshot.model_validate(
+            {"context": {}, "logging_config_path": None, "targets": []}
+        )
+        writer, sampler = Mock(), Mock()
+        result = _apply_collector_update(
+            message, writer, sampler, initial, [], 0, False, False
+        )
+        snapshot, targets, revision, received_notice, changed = result
+        self.assertIs(snapshot, message.snapshot)
+        self.assertIs(targets[0], message.snapshot.targets[0])
+        self.assertIsInstance(targets[0], ResourceTargetDocument)
+        self.assertIsInstance(snapshot.context, JournalContext)
+        self.assertIs(writer.restart_notice, message.restart_notice)
+        self.assertEqual((revision, received_notice, changed), (1, True, True))
+        writer.select.assert_called_once_with(path)
+        sampler.reset.assert_called_once_with()
+        self.assertEqual(
+            snapshot.model_dump(mode="json"), message.snapshot.model_dump(mode="json")
+        )
+        exported = ResourceTarget.from_document(document["snapshot"]["targets"][0])
+        self.assertEqual(
+            exported.identity, document["snapshot"]["targets"][0]["identity"]
+        )
+        self.assertEqual(
+            exported.context, document["snapshot"]["targets"][0]["context"]
+        )
+
     def setUp(self):
         self.sampler = ResourceSampler("test-collector")
         self.identity = process_identity(os.getpid())
         self.target = ResourceTarget.from_document(target(self.identity))
+
+    def test_model_and_public_targets_share_the_same_process_cpu_baseline(self):
+        retained = ResourceTargetDocument.model_validate(
+            {
+                "series_id": self.target.series_id,
+                "identity": self.identity,
+                "context": self.target.context,
+            }
+        )
+        with (
+            patch("core.resources.sampling.psutil.Process") as process,
+            patch(
+                "core.resources.sampling.process_identity", return_value=self.identity
+            ),
+            patch("core.resources.sampling.time.monotonic", side_effect=[10, 12, 13]),
+        ):
+            process.return_value.cpu_times.side_effect = [
+                SimpleNamespace(user=value, system=0) for value in (0, 1, 4)
+            ]
+            process.return_value.memory_info.return_value = SimpleNamespace(rss=4096)
+            samples = [
+                self.sampler._process_sample(item)
+                for item in (retained, self.target, retained)
+            ]
+        self.assertEqual(
+            [item["resources"]["process_cpu_percent"]["value"] for item in samples],
+            [None, 50, 300],
+        )
 
     def test_cpu_intervals_values_over_100_and_child_cpu_exclusion(self):
         """B: controlled CPU seconds give null, 50%, and 300%; children are excluded."""

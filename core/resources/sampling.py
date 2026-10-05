@@ -13,12 +13,18 @@ from uuid import uuid4
 import psutil
 
 from core.journal.logger import OperationLogger
-from core.journal.settings import load_logging_settings
+from core.journal.settings import _load_logging_settings
+from core.models.journal_records import JournalContext
+from core.models.process_identity import ProcessIdentity
 from core.models.resource_messages import (
     CollectorCommand,
+    CollectorRestart,
+    CollectorSnapshot,
     CollectorStop,
     CollectorUpdate,
 )
+from core.models.resource_target import ResourceTargetDocument
+from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from core.primitives.json_values import JsonObject
 from core.primitives.processes import process_identity
@@ -37,14 +43,18 @@ class ResourceSampler:
         self.collector_id = collector_id
         self.host = process_identity(os.getpid())
         self._host_previous: float | None = None
-        self._process_previous: dict[str, tuple[JsonObject, float, float]] = {}
+        self._process_previous: dict[
+            str, tuple[ProcessIdentity | JsonObject, float, float]
+        ] = {}
 
     def reset(self) -> None:
         self._host_previous = None
         self._process_previous.clear()
 
     def sample(
-        self, context: JsonObject, targets: list[ResourceTarget]
+        self,
+        context: JournalContext | JsonObject,
+        targets: list[ResourceTarget | ResourceTargetDocument],
     ) -> list[JsonObject]:
         active = {target.series_id for target in targets}
         self._process_previous = {
@@ -84,7 +94,7 @@ class ResourceSampler:
             },
         }
 
-    def _host_sample(self, context: JsonObject) -> JsonObject:
+    def _host_sample(self, context: JournalContext | JsonObject) -> JsonObject:
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
         interval = None if self._host_previous is None else now - self._host_previous
@@ -145,19 +155,25 @@ class ResourceSampler:
                 resources[name] = measured
         return {
             "series_id": f"host:{self.host['host_id']}:{self.host['boot_id']}",
-            "context": context,
+            "context": context.model_dump()
+            if isinstance(context, JournalContext)
+            else context,
             "observed_at": observed_at,
             "observed_monotonic": now,
             "resources": resources,
         }
 
-    def _process_sample(self, target: ResourceTarget) -> JsonObject:
+    def _process_sample(
+        self, target: ResourceTarget | ResourceTargetDocument
+    ) -> JsonObject:
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
         cpu, memory, reason, cpu_reason, interval = self._observe_process(target, now)
         return {
             "series_id": target.series_id,
-            "context": target.context,
+            "context": target.context.model_dump()
+            if isinstance(target, ResourceTargetDocument)
+            else target.context,
             "observed_at": observed_at,
             "observed_monotonic": now,
             "resources": {
@@ -168,7 +184,9 @@ class ResourceSampler:
                     observed_at,
                     reason=reason or cpu_reason,
                     interval=interval,
-                    identity=target.identity,
+                    identity=target.identity.model_dump()
+                    if isinstance(target, ResourceTargetDocument)
+                    else target.identity,
                 ),
                 "process_memory_rss_bytes": self._measurement(
                     memory,
@@ -176,47 +194,48 @@ class ResourceSampler:
                     "process",
                     observed_at,
                     reason=reason,
-                    identity=target.identity,
+                    identity=target.identity.model_dump()
+                    if isinstance(target, ResourceTargetDocument)
+                    else target.identity,
                 ),
             },
         }
 
     def _observe_process(
-        self, target: ResourceTarget, now: float
+        self, target: ResourceTarget | ResourceTargetDocument, now: float
     ) -> tuple[float | None, int | None, str | None, str | None, float | None]:
         cpu = memory = None
         reason = cpu_reason = None
         interval = None
         try:
             identity = target.identity
-            if any(identity[key] != self.host[key] for key in ("host_id", "boot_id")):
+            if isinstance(identity, ProcessIdentity):
+                pid, host_id, boot_id = identity.pid, identity.host_id, identity.boot_id
+                # Compare the actual OS record with the existing JSON identity contract.
+                observed_identity = identity.model_dump()
+            else:
+                pid, host_id, boot_id = (
+                    identity["pid"],
+                    identity["host_id"],
+                    identity["boot_id"],
+                )
+                observed_identity = identity
+            if host_id != self.host["host_id"] or boot_id != self.host["boot_id"]:
                 reason = "different_host_or_boot"
-            elif process_identity(identity["pid"]) != identity:
+            elif process_identity(pid) != observed_identity:
                 reason = "identity_changed"
             else:
-                process = psutil.Process(identity["pid"])
+                process = psutil.Process(pid)
                 times = process.cpu_times()
                 measured_memory = process.memory_info().rss
                 # Check both sides of the read so reused PIDs cannot mix two processes.
-                if process_identity(identity["pid"]) != identity:
+                if process_identity(pid) != observed_identity:
                     reason = "identity_changed"
                 else:
                     memory = measured_memory
                     cpu_seconds = times.user + times.system
-                    previous = self._process_previous.get(target.series_id)
-                    if previous is not None and previous[0] == identity:
-                        interval = now - previous[1]
-                        elapsed_cpu = cpu_seconds - previous[2]
-                        if interval > 0 and elapsed_cpu >= 0:
-                            cpu = 100 * elapsed_cpu / interval
-                        else:
-                            cpu_reason = "counter_reset"
-                    else:
-                        cpu_reason = "first_interval"
-                    self._process_previous[target.series_id] = (
-                        identity,
-                        now,
-                        cpu_seconds,
+                    cpu, cpu_reason, interval = self._process_cpu_usage(
+                        target.series_id, identity, observed_identity, now, cpu_seconds
                     )
         except (psutil.NoSuchProcess, ProcessLookupError, FileNotFoundError):
             reason = "process_gone"
@@ -227,6 +246,32 @@ class ResourceSampler:
         if reason is not None:
             self._process_previous.pop(target.series_id, None)
         return cpu, memory, reason, cpu_reason, interval
+
+    def _process_cpu_usage(
+        self,
+        series_id: str,
+        identity: ProcessIdentity | JsonObject,
+        observed_identity: JsonObject,
+        now: float,
+        cpu_seconds: float,
+    ) -> tuple[float | None, str | None, float | None]:
+        """Advance one identity's CPU baseline; interval and counters are seconds."""
+        cpu = interval = None
+        reason = "first_interval"
+        previous = self._process_previous.get(series_id)
+        previous_identity = None if previous is None else previous[0]
+        if isinstance(previous_identity, ProcessIdentity):
+            previous_identity = previous_identity.model_dump()
+        if previous is not None and previous_identity == observed_identity:
+            interval = now - previous[1]
+            elapsed_cpu = cpu_seconds - previous[2]
+            if interval > 0 and elapsed_cpu >= 0:
+                cpu = 100 * elapsed_cpu / interval
+                reason = None
+            else:
+                reason = "counter_reset"
+        self._process_previous[series_id] = (identity, now, cpu_seconds)
+        return cpu, reason, interval
 
 
 class ResourceWriter:
@@ -241,9 +286,9 @@ class ResourceWriter:
         self.error: str | None = None
         self.unconfirmed_samples = 0
         self._reported_losses = 0
-        self.restart_notice: JsonObject | None = None
+        self.restart_notice: CollectorRestart | JsonObject | None = None
 
-    def select(self, source: str | None) -> None:
+    def select(self, source: Path | str | None) -> None:
         path = None if source is None else Path(source)
         if path != self._source:
             self.close()
@@ -266,10 +311,21 @@ class ResourceWriter:
             if self.restart_notice is not None:
                 notice, self.restart_notice = self.restart_notice, None
                 if context.get("experiment_id") is not None and all(
-                    notice["context"].get(key) == context.get(key)
+                    (
+                        notice.context.root
+                        if isinstance(notice, CollectorRestart)
+                        else notice["context"]
+                    ).get(key)
+                    == context.get(key)
                     for key in ("experiment_id", "run_id")
                 ):
-                    self._client.record_event("resources.gap", notice, context=context)
+                    self._client.record_event(
+                        "resources.gap",
+                        notice.model_dump(exclude_unset=True)
+                        if isinstance(notice, CollectorRestart)
+                        else notice,
+                        context=context,
+                    )
             if self.unconfirmed_samples > self._reported_losses:
                 self._client.record_event(
                     "resources.gap",
@@ -289,15 +345,17 @@ class ResourceWriter:
             self._retry_at = time.monotonic() + self._settings.logging_retry_seconds
 
     def _open_selected_journal(self) -> None:
-        settings, _ = load_logging_settings(self._source)
-        settings["db_path"] = str(settings["db_path"])
-        settings["busy_timeout_seconds"] = self._settings.logging_busy_timeout_seconds
-        settings["open_mode"] = "existing"
+        settings, _ = _load_logging_settings(self._source)
+        settings = _update_model(
+            settings,
+            busy_timeout_seconds=self._settings.logging_busy_timeout_seconds,
+            open_mode="existing",
+        )
         path = self._source.parent / f"resource-{self._collector_id}.json"
         write_json(
             path,
             {
-                "logging": settings,
+                "logging": settings.model_dump(mode="json"),
                 "operation_context": {"source": "resource_collector"},
             },
         )
@@ -319,8 +377,10 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
     sampler = ResourceSampler(collector_id, settings)
     revision = -1
     received_notice = False
-    snapshot: JsonObject = {"context": {}, "logging_config_path": None, "targets": []}
-    targets: list[ResourceTarget] = []
+    snapshot = CollectorSnapshot.model_validate(
+        {"context": {}, "logging_config_path": None, "targets": []}
+    )
+    targets: list[ResourceTargetDocument] = []
     last_owner = next_sample = next_status = time.monotonic()
     parent = multiprocessing.parent_process()
     try:
@@ -354,11 +414,11 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
             now = time.monotonic()
             samples = []
             if now >= next_sample:
-                samples = sampler.sample(snapshot["context"], targets)
+                samples = sampler.sample(snapshot.context, targets)
                 # A pending lifecycle change takes precedence over optional writes.
                 for index, sample in enumerate(samples):
                     if connection.poll():
-                        if snapshot["logging_config_path"] is not None:
+                        if snapshot.logging_config_path is not None:
                             writer.unconfirmed_samples += len(samples) - index
                         break
                     writer.record(sample)
@@ -389,27 +449,29 @@ def _apply_collector_update(
     message: CollectorUpdate,
     writer: ResourceWriter,
     sampler: ResourceSampler,
-    snapshot: JsonObject,
-    targets: list[ResourceTarget],
+    snapshot: CollectorSnapshot,
+    targets: list[ResourceTargetDocument],
     revision: int,
     received_notice: bool,
     changed: bool,
-) -> tuple[JsonObject, list[ResourceTarget], int, bool, bool]:
+) -> tuple[CollectorSnapshot, list[ResourceTargetDocument], int, bool, bool]:
     if not received_notice and message.restart_notice is not None:
-        writer.restart_notice = message.restart_notice.model_dump(exclude_unset=True)
+        writer.restart_notice = message.restart_notice
         received_notice = True
     if message.revision != revision:
-        incoming = message.snapshot.model_dump(mode="json", exclude_unset=True)
-        if (
-            incoming["context"] != snapshot["context"]
-            or incoming["logging_config_path"] != snapshot["logging_config_path"]
+        incoming = message.snapshot
+        if incoming.context != snapshot.context or (
+            None
+            if incoming.logging_config_path is None
+            else str(incoming.logging_config_path)
+        ) != (
+            None
+            if snapshot.logging_config_path is None
+            else str(snapshot.logging_config_path)
         ):
             sampler.reset()
-        writer.select(incoming["logging_config_path"])
-        targets = [
-            ResourceTarget(target.series_id, target.identity.model_dump(), target.context)
-            for target in message.snapshot.targets
-        ]
+        writer.select(incoming.logging_config_path)
+        targets = list(incoming.targets)
         snapshot = incoming
         revision = message.revision
         changed = True

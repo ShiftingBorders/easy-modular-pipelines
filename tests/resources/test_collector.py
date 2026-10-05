@@ -57,7 +57,7 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(collector._revision, revision + 1)
         first["context"]["source"] = "external"
-        self.assertEqual(collector._snapshot.context, {})
+        self.assertEqual(collector._snapshot.context.root, {})
 
     async def asyncSetUp(self):
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)

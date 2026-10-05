@@ -1,15 +1,13 @@
 """A resource-monitoring target validates a complete process identity at entry."""
 
-from typing import Annotated
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
-
-from core.journal.events import validate_context
+from core.models.journal_records import JournalContext
 from core.models.process_identity import ProcessIdentity
 from core.models.values import NonnegativeInteger, UUIDText
 from core.primitives.json_values import JsonObject, copy_json_object
 
-ResourceContext = Annotated[JsonObject, BeforeValidator(validate_context)]
+ResourceContext = JournalContext
 
 
 class ResourceProcessIdentity(ProcessIdentity):
