@@ -101,7 +101,9 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_readonly_snapshot_is_reused_and_not_mutated_by_later_ingestion(self):
         before = self.reader.load("exp-test")
-        self.assertIs(before, self.reader.load("exp-test"))
+        retained = self.reader._snapshots["exp-test"]
+        self.assertEqual(before, self.reader.load("exp-test"))
+        self.assertIs(retained, self.reader._snapshots["exp-test"])
         size = len(before["entries"])
         self.workspace.logger.record_event("later.event")
         after = self.reader.load("exp-test", force=True)

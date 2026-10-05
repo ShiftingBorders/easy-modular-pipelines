@@ -23,10 +23,12 @@ from core.models.journal_cache import (
     CacheCheckpoint,
     CacheIdentity,
     CachePublication,
+    CacheReaderContext,
     CacheSource,
     JournalBoundary,
 )
 from dashboard.api_client import SystemAPIError
+from dashboard.cache_dataset import CachedDataset, CacheReader, CacheWindow
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
 from tests.dashboard_tests.helpers import (
@@ -38,6 +40,42 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace
 
 
 class HistoryCacheTests(unittest.TestCase):
+    def test_cached_dataset_retains_models_and_detaches_public_metadata(self):
+        loaded = self.build()
+        owned = self.reader._snapshots["exp-test"]
+        self.assertIsInstance(owned, CachedDataset)
+        self.assertIsInstance(self.reader._cache["exp-test"], CacheReader)
+        self.assertIsInstance(self.reader._windows["exp-test"], CacheWindow)
+        self.assertIsInstance(owned.publication, CachePublication)
+        self.assertIs(owned.source.identity, loaded["cache"].identity)
+        loaded["state"]["template"]["name"] = "caller change"
+        loaded["entries"][0]["event_type"] = "caller change"
+        self.assertNotEqual(owned.context.state["template"]["name"], "caller change")
+        self.assertNotEqual(owned.entries[0]["event_type"], "caller change")
+
+        cached = self.reader.cached("exp-test")
+        retained = self.reader._read_snapshots["exp-test"][1]
+        self.assertIsInstance(retained.source, CacheSource)
+        self.assertIsInstance(retained.context, CacheReaderContext)
+        self.assertIsInstance(retained.publication.cached_through, CacheCheckpoint)
+        original = retained.publication.model_dump(exclude_unset=True)
+        with patch.object(
+            self.reader,
+            "_load_cached_snapshot",
+            side_effect=AssertionError("Reconstructed unchanged cache metadata"),
+        ):
+            self.assertEqual(cached, self.reader.cached("exp-test"))
+            cached["identity"]["journal_id"] = "caller change"
+            cached["cached_through"]["cursor"] = -1
+            cached["state"]["template"]["name"] = "caller change"
+            current = self.reader.cached("exp-test")
+        self.assertIs(retained, self.reader._read_snapshots["exp-test"][1])
+        self.assertIs(current["cache"], retained.reader)
+        self.assertEqual(retained.publication.model_dump(exclude_unset=True), original)
+        self.assertEqual(current["identity"], retained.source.identity.model_dump())
+        self.assertGreaterEqual(current["cached_through"]["cursor"], 0)
+        self.assertNotEqual(current["state"]["template"]["name"], "caller change")
+
     def test_private_publication_keeps_models_and_public_observe_is_detached_json(self):
         dataset = self.build()
         cache = dataset["cache"]
@@ -127,6 +165,7 @@ class HistoryCacheTests(unittest.TestCase):
         """T027/T028/T055: a newer observed tail cannot be labelled fully cached."""
         first = self.build()
         self.assertTrue(self.reader.cached("exp-test")["complete"])
+        retained = self.reader._read_snapshots["exp-test"][1]
         self.workspace.logger.record_error(ValueError("not yet projected"))
         observed = self.reader.load("exp-test", force=True, build=False)
         current = self.reader.cached("exp-test")
@@ -135,6 +174,11 @@ class HistoryCacheTests(unittest.TestCase):
         self.assertEqual(current["target_boundary"], observed["boundary"])
         self.assertGreater(
             current["target_boundary"]["cursor"], current["cached_through"]["cursor"]
+        )
+        self.assertIs(retained, self.reader._read_snapshots["exp-test"][1])
+        self.assertTrue(retained.publication.complete)
+        self.assertEqual(
+            retained.publication.target_boundary.model_dump(), first["target_boundary"]
         )
         self.build()
         self.assertTrue(self.reader.cached("exp-test")["complete"])

@@ -32,6 +32,7 @@ from core.journal.logger import OperationLogger
 from core.models.journal_cache import (
     CacheChangeCheckpoint,
     CacheCheckpoint,
+    CacheIdentity,
     CachePublication,
     CacheSource,
     HistoryCacheParameters,
@@ -96,7 +97,7 @@ class JournalHistoryCache:
         self,
         path: Path,
         config_path: Path,
-        identity: dict[str, str],
+        identity: dict[str, str] | CacheIdentity,
         file_key: tuple[int, int],
         experiment_id: str,
         window_events: int,
@@ -275,12 +276,19 @@ class JournalHistoryCache:
                 else None,
             }
         )
+        return self._refresh(request, compact, project).model_dump(exclude_unset=True)
+
+    def _refresh(
+        self,
+        request: HistoryCacheRefresh,
+        compact: Callable,
+        project: Callable,
+    ) -> CachePublication:
+        """Refresh a validated request while owning the writer and reader lock."""
         with self._lock:
             writer = acquire_cache_writer(self.path)
             try:
-                return self._refresh_owned(request, compact, project).model_dump(
-                    exclude_unset=True
-                )
+                return self._refresh_owned(request, compact, project)
             finally:
                 writer.close()
 

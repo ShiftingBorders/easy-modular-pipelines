@@ -34,9 +34,22 @@ from core.models.dashboard_queries import (
 )
 from core.models.dashboard_settings import DashboardRuntimeConfiguration
 from core.models.experiment_registry import RegistryEntry
-from core.models.journal_cache import CachePublication, CacheReaderContext, CacheSource
+from core.models.journal_cache import (
+    CacheIdentity,
+    CachePublication,
+    CacheReaderContext,
+    CacheSource,
+    HistoryCacheRefresh,
+    JournalBoundary,
+)
 from core.primitives.json_files import read_json, write_json
 from dashboard.api_client import SystemAPIError
+from dashboard.cache_dataset import (
+    CachedDataset,
+    CacheReader,
+    CacheWindow,
+    _history_dataset,
+)
 from dashboard.projections import (
     compact_event,
     instant,
@@ -184,15 +197,15 @@ class LocalJournals:
         self.max_events = settings.history_max_events
         self.max_bytes = settings.history_max_bytes
         self.interval = min(settings.refresh_seconds, 5)
-        self._cache: dict[str, dict] = {}
-        self._snapshots: dict[str, dict] = {}
+        self._cache: dict[str, CacheReader] = {}
+        self._snapshots: dict[str, CachedDataset] = {}
         self.window_events = settings.history_window_events
         self._lock = threading.RLock()
         self._experiment_locks: dict[str, threading.RLock] = {}
         self._module_signature: tuple | None = None
         self._module_publication: ModulePublication | None = None
-        self._read_snapshots: dict[str, tuple[tuple, dict]] = {}
-        self._windows: dict[str, tuple[dict, tuple, OrderedDict, dict]] = {}
+        self._read_snapshots: dict[str, tuple[tuple, CachedDataset]] = {}
+        self._windows: dict[str, CacheWindow] = {}
         self._timeline_overviews: OrderedDict[tuple, dict] = OrderedDict()
         self._timeline_lock = threading.Lock()
 
@@ -239,67 +252,54 @@ class LocalJournals:
             )
             previous = self._read_snapshots.get(identifier)
             if previous and previous[0] == signature:
-                dataset = previous[1]
+                retained = previous[1]
             else:
-                dataset = self._load_cached_snapshot(identifier, path, key, db, metadata)
-                if "cache" not in dataset:
-                    return dataset
-                self._read_snapshots[identifier] = (signature, dataset)
+                retained = self._load_cached_snapshot(
+                    identifier, path, key, db, metadata
+                )
+                if retained is None:
+                    return self._pending_dataset(identifier)
+                self._read_snapshots[identifier] = (signature, retained)
             window = self._windows.get(identifier)
             if (
                 window
-                and window[0] == dataset["identity"]
-                and window[1] == dataset["file_key"]
+                and window.identity == retained.source.identity
+                and window.file_key == retained.file_key
             ):
-                dataset["cache"].window = window[2]
-                first = next(iter(window[2].values()), None)
-                dataset["window_start_cursor"] = (
-                    first["entry"]["cursor"] if first else None
-                )
-                dataset["window_count"] = len(window[2])
-                observed = window[3].get("boundary") or {}
-                requested = dataset.get("target_boundary") or {}
-                if observed.get("change_cursor", 0) > requested.get("change_cursor", 0):
-                    dataset["target_boundary"] = observed
-                cached = dataset["cached_through"]
-                if cached["cursor"] < observed.get("cursor", 0) or cached[
-                    "change_cursor"
-                ] < observed.get("change_cursor", 0):
-                    dataset["complete"] = False
-                predecessor = window[3].get("window_predecessor_cursor")
-                cached_end = dataset["cached_through"]["cursor"]
-                if predecessor is not None and cached_end < predecessor:
-                    dataset["gap"] = {
-                        "after": cached_end,
-                        "before": dataset["window_start_cursor"],
-                    }
-                    dataset["complete"] = False
-            return dataset
+                retained.reader.window = window.entries
+                return retained.document(retained.publication_in_window(window))
+            return retained.document()
 
     def _load_cached_snapshot(
-        self, identifier: str, path: Path, key: str,
-        db: sqlite3.Connection, metadata: dict[str, str],
-    ) -> dict:
+        self,
+        identifier: str,
+        path: Path,
+        key: str,
+        db: sqlite3.Connection,
+        metadata: dict[str, str],
+    ) -> CachedDataset | None:
         source_document = json.loads(metadata["source"])
         if source_document.get("version") != JournalHistoryCache.SCHEMA_VERSION:
-            return self._pending_dataset(identifier)
+            return None
         source = CacheSource.model_validate(source_document)
         values = dict(
             db.execute(
                 "SELECT key,value FROM metadata WHERE key IN ('reader_context','ready','cached_through','boundary','publication_boundary')"
             )
         )
-        context = CacheReaderContext.model_validate(json.loads(values["reader_context"]))
+        context = CacheReaderContext.model_validate(
+            json.loads(values["reader_context"])
+        )
         if (
             context.project_root != str(self.project)
             or source.experiment_id != identifier
         ):
-            return self._pending_dataset(identifier)
-        identity, file_key = source.identity.model_dump(), tuple(source.file_key)
+            return None
+        file_key = (source.file_key[0], source.file_key[1])
         reader = JournalHistoryCache(
             path,
             self.state_directory / f"{key}.json",
-            identity,
+            source.identity,
             file_key,
             identifier,
             self.window_events,
@@ -313,30 +313,20 @@ class LocalJournals:
         target_key = (
             "publication_boundary" if values.get("ready") == "1" else "boundary"
         )
-        publication = CachePublication.model_validate({
-            "version": int(metadata["version"]),
-            "complete": values.get("ready") == "1",
-            "cached_through": json.loads(values["cached_through"]),
-            "boundary": boundary,
-            "target_boundary": json.loads(
-                values.get(target_key, values.get("boundary", "null"))
-            ),
-            "observed_at": latest[0] if latest else None,
-            "gap": None,
-        }).model_dump(exclude_unset=True)
-        dataset = {
-            "experiment_id": identifier,
-            "directory": Path(context.directory),
-            "identity": identity,
-            "file_key": file_key,
-            "state": context.state,
-            "entries": [],
-            "cache": reader,
-            **publication,
-            "error": None,
-            "refreshed": time.monotonic(),
-        }
-        return dataset
+        publication = CachePublication.model_validate(
+            {
+                "version": int(metadata["version"]),
+                "complete": values.get("ready") == "1",
+                "cached_through": json.loads(values["cached_through"]),
+                "boundary": boundary,
+                "target_boundary": json.loads(
+                    values.get(target_key, values.get("boundary", "null"))
+                ),
+                "observed_at": latest[0] if latest else None,
+                "gap": None,
+            }
+        )
+        return CachedDataset(source, context, publication, reader, time.monotonic())
 
     def _pending_dataset(self, identifier: str) -> dict:
         return {
@@ -606,7 +596,12 @@ class LocalJournals:
                 window[event["event_id"]] = {"entry": item, "size": encoded_size}
             if source.read_event_batch([])["boundary"] != boundary:
                 return None
-        self._windows[identifier] = (identity, file_key, window, {"boundary": boundary})
+        self._windows[identifier] = CacheWindow(
+            CacheIdentity.model_validate(identity),
+            file_key,
+            window,
+            JournalBoundary.model_validate(boundary),
+        )
         return {
             "experiment_id": identifier,
             "directory": directory,
@@ -696,17 +691,17 @@ class LocalJournals:
         file_key = (status.st_dev, status.st_ino)
         previous = self._cache.get(identifier)
         if previous and (
-            previous["identity"] != identity or previous["file_key"] != file_key
+            previous.identity.model_dump() != identity or previous.file_key != file_key
         ):
-            previous["reader"].close()
+            previous.reader.close()
             previous = None
         if (
             previous
             and build
             and not force
-            and time.monotonic() - previous["checked"] < self.interval
+            and time.monotonic() - previous.checked < self.interval
         ):
-            return self._snapshots[identifier]
+            return self._snapshots[identifier].document()
         config_path = self._reader_configuration(identifier, state, database, identity)
         if previous is None:
             reader = JournalHistoryCache(
@@ -719,62 +714,79 @@ class LocalJournals:
                 self.max_bytes,
                 self.max_events,
             )
-            previous = {"reader": reader, "identity": identity, "file_key": file_key}
-        reader = previous["reader"]
-        if build:
-            publication = reader.refresh(
-                state,
-                compact_event,
-                project_scope,
-                target=target,
-                window=window,
-                reader_context={
-                    "directory": str(directory),
-                    "project_root": str(self.project),
-                },
-            )
-        else:
-            publication = reader.observe(target)
+            previous = CacheReader(reader, reader.identity, file_key)
+        reader = previous.reader
+        publication = self._history_publication(
+            reader, directory, state, build, window, target
+        )
         if read_object(identity_path) != identity:
             raise ValueError("Journal generation changed while reading history.")
         old = self._snapshots.get(identifier)
-        previous["checked"] = time.monotonic()
+        previous.checked = time.monotonic()
         self._cache[identifier] = previous
         if window:
-            self._windows[identifier] = (
-                identity,
+            self._windows[identifier] = CacheWindow(
+                reader.identity,
                 file_key,
                 OrderedDict(reader.window),
                 publication,
             )
         if (
             old
-            and old.get("version") == publication["version"]
-            and old["state"] == state
-            and old["identity"] == identity
-            and old["complete"] == publication["complete"]
-            and old.get("boundary") == publication.get("boundary")
-            and old.get("target_boundary") == publication.get("target_boundary")
+            and old.publication.version == publication.version
+            and old.context.state == state
+            and old.source.identity.model_dump() == identity
+            and old.publication.complete == publication.complete
+            and old.publication.boundary == publication.boundary
+            and old.publication.target_boundary == publication.target_boundary
         ):
-            return old
+            return old.document()
         # Only the configured RAM window is detached for legacy reader consumers.
-        available = publication.get("cache_available", True)
+        available = (
+            publication.cache_available
+            if "cache_available" in publication.model_fields_set
+            else True
+        )
         entries = reader.events(list(reader.window)) if window and available else []
-        snapshot = {
-            "experiment_id": identifier,
-            "directory": directory,
-            "identity": identity,
-            "file_key": file_key,
-            "state": state,
-            "entries": entries,
-            **publication,
-            "error": None if available else "The history cache is being initialized.",
-            "refreshed": time.monotonic(),
-        }
-        if available:
-            snapshot["cache"] = reader
+        snapshot = _history_dataset(
+            reader,
+            directory,
+            str(self.project),
+            state,
+            publication,
+            entries,
+            time.monotonic(),
+        )
         self._snapshots[identifier] = snapshot
-        return snapshot
+        return snapshot.document()
+
+    def _history_publication(
+        self,
+        reader: JournalHistoryCache,
+        directory: Path,
+        state: dict,
+        build: bool,
+        window: bool,
+        target: dict | None,
+    ) -> CachePublication:
+        if not build:
+            requested = (
+                JournalBoundary.model_validate(target) if target is not None else None
+            )
+            return reader._observe(requested)
+        request = HistoryCacheRefresh.model_validate(
+            {
+                "state": state,
+                "target": target,
+                "window": window,
+                "reader_context": {
+                    "directory": str(directory),
+                    "project_root": str(self.project),
+                    "state": state,
+                },
+            }
+        )
+        return reader._refresh(request, compact_event, project_scope)
 
     def _reader_configuration(
         self, identifier: str, state: dict, database: Path, identity: dict
@@ -808,7 +820,7 @@ class LocalJournals:
         with self._lock:
             for identifier, entry in self._cache.items():
                 with self._experiment_locks[identifier]:
-                    entry["reader"].close()
+                    entry.reader.close()
             self._cache.clear()
             self._snapshots.clear()
             self._read_snapshots.clear()
@@ -1189,8 +1201,12 @@ class LocalJournals:
         cache = dataset.get("cache")
         window = self._windows.get(identifier)
         entries = []
-        if window and window[:2] == (dataset["identity"], dataset.get("file_key")):
-            entries = [item["entry"]["event"] for item in window[2].values()]
+        if (
+            window
+            and window.identity.model_dump() == dataset["identity"]
+            and window.file_key == dataset.get("file_key")
+        ):
+            entries = [item["entry"]["event"] for item in window.entries.values()]
         records = (
             cache.query(
                 "SELECT payload FROM records WHERE kind='artifacts' AND record_key=? LIMIT 1",
