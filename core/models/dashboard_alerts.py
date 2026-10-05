@@ -104,6 +104,11 @@ class AlertIncident(_Document):
     started_at: str
     rule_id: JsonValue = None
     fresh: Boolean = False
+    ended_at: JsonValue = None
+    resolution: JsonValue = None
+    value: JsonValue = None
+    last_notification: JsonValue = None
+    delivery: JsonValue = None
 
     @model_validator(mode="after")
     def validate_rule_reference(self) -> Self:

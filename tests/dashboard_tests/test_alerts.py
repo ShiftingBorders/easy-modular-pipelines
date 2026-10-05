@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from core.models.dashboard_alerts import AlertIncident, AlertRule, NotificationChannels
 from dashboard.alerts import AlertMonitor
 from dashboard.api_client import SystemAPIClient
 from dashboard.config import load_settings
@@ -22,6 +23,53 @@ from tests.helpers.dag import wait_until
 
 
 class AlertTests(unittest.IsolatedAsyncioTestCase):
+    async def test_models_survive_configuration_evaluation_and_failed_replacement(self):
+        await self.rule()
+        self.assertIsInstance(self.monitor.rules[0], AlertRule)
+        self.assertIsInstance(self.monitor.channels, NotificationChannels)
+        await self.evaluate()
+        incident = self.monitor.incidents[0]
+        self.assertIsInstance(incident, AlertIncident)
+        before = self.monitor.status()
+        emitted = self.monitor.status()
+        emitted["items"][0]["status"] = "closed"
+        emitted["rules"][0]["threshold"] = 0
+        self.assertEqual(self.monitor.status(), before)
+        with (
+            patch.object(
+                self.monitor, "_write", side_effect=OSError("failed replacement")
+            ),
+            self.assertRaises(OSError),
+        ):
+            await self.rule(threshold=80)
+        self.assertEqual(self.monitor.status(), before)
+        self.assertIs(self.monitor.incidents[0], incident)
+        await self.rule(threshold=80)
+        self.assertEqual(incident.status, "active")
+        self.assertEqual(self.monitor.incidents[0].status, "closed")
+
+    async def test_queued_active_notification_observes_a_closed_replacement(self):
+        await self.monitor.configure(
+            channels={
+                "desktop": True,
+                "sound": False,
+                "on_recovery": True,
+                "repeat_seconds": 60,
+            }
+        )
+        await self.rule()
+        await self.evaluate()
+        self.assertEqual(self.monitor._queue.qsize(), 1)
+        await self.monitor.configure(delete="rule")
+        with patch("dashboard.alerts.deliver", new=AsyncMock()) as delivered:
+            task = asyncio.create_task(self.monitor._deliver())
+            try:
+                await wait_until(lambda: not self.monitor._pending)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        delivered.assert_not_awaited()
+
     async def test_cached_error_window_includes_old_payloads_and_preserves_unknown(
         self,
     ):
@@ -128,8 +176,8 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.monitor.incidents), 1)
         self.metrics["cpu"]["value"] = 10
         await self.evaluate()
-        self.assertEqual(self.monitor.incidents[0]["status"], "resolved")
-        self.assertEqual(self.monitor.incidents[0]["resolution"], "condition_cleared")
+        self.assertEqual(self.monitor.incidents[0].status, "resolved")
+        self.assertEqual(self.monitor.incidents[0].resolution, "condition_cleared")
 
     async def test_sustained_duration_resets_after_unknown_and_does_not_resolve_active(
         self,
@@ -147,7 +195,7 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         self.metrics["cpu"].update(value=0, fresh=False)
         await self.evaluate()
         self.assertEqual(self.monitor.status()["active_count"], 1)
-        self.assertFalse(self.monitor.incidents[0]["fresh"])
+        self.assertFalse(self.monitor.incidents[0].fresh)
 
     async def test_disk_ram_and_network_thresholds_use_their_units(self):
         for metric, operator, threshold in (
@@ -165,10 +213,8 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.monitor.status()["active_count"], 5)
         self.assertEqual(
             next(
-                row
-                for row in self.monitor.incidents
-                if row["rule_id"] == "disk_free_gib"
-            )["value"],
+                row for row in self.monitor.incidents if row.rule_id == "disk_free_gib"
+            ).value,
             2,
         )
 
@@ -214,12 +260,10 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(OSError),
         ):
             await self.monitor.configure({**rule, "threshold": 100})
-        self.assertEqual(self.monitor.rules[0]["threshold"], 90)
-        self.assertEqual(self.monitor.incidents[0]["status"], "active")
+        self.assertEqual(self.monitor.rules[0].threshold, 90)
+        self.assertEqual(self.monitor.incidents[0].status, "active")
         await self.monitor.configure(delete="rule")
-        self.assertEqual(
-            self.monitor.incidents[0]["resolution"], "configuration_changed"
-        )
+        self.assertEqual(self.monitor.incidents[0].resolution, "configuration_changed")
         self.assertEqual(self.monitor.status()["active_count"], 0)
 
     async def test_restart_preserves_incident_but_not_freshness_and_corruption_is_rejected(
@@ -230,7 +274,7 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         restored = AlertMonitor(self.root, self.views, self.icmp)
         await restored.open()
         self.assertEqual(restored.status()["active_count"], 1)
-        self.assertFalse(restored.incidents[0]["fresh"])
+        self.assertFalse(restored.incidents[0].fresh)
         await restored.close()
         path = self.root / "alerts.json"
         path.write_text("{", encoding="utf-8")
@@ -278,7 +322,7 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         ) as delivery:
             task = asyncio.create_task(self.monitor._deliver())
             try:
-                await wait_until(lambda: self.monitor.incidents[0].get("delivery"))
+                await wait_until(lambda: self.monitor.incidents[0].delivery)
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
