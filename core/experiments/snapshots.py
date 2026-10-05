@@ -1214,7 +1214,7 @@ class ExperimentSnapshots:
         if transaction.phase == "files_installed":
             self._journal.complete_restore(
                 state,
-                manifest.journal.model_dump(),
+                manifest.journal,
                 restoration_id,
                 work / "diagnostics",
             )

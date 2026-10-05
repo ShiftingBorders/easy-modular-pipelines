@@ -10,6 +10,7 @@ from core.experiments.state import RunnerState, state_from_document
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
 from core.models.experiment_template import ExperimentTemplate
+from core.models.journal_diagnostics import JournalSnapshotManifest
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
@@ -93,13 +94,14 @@ class RunnerJournal:
     def complete_restore(
         self,
         state: RunnerState,
-        journal_manifest: JsonObject,
+        journal_manifest: JournalSnapshotManifest | JsonObject,
         restoration_id: str,
         diagnostics_directory: Path | None = None,
     ) -> None:
         if getattr(self, "_opened", False):
             raise RuntimeError("Close the runner journal before restoring it.")
-        journal_manifest = copy_json_object(journal_manifest, "journal manifest")
+        if not isinstance(journal_manifest, JournalSnapshotManifest):
+            journal_manifest = copy_json_object(journal_manifest, "journal manifest")
         restoration = UUID(require_text(restoration_id, "restoration_id"))
         root = state.experiment_directory.resolve()
         database = root / "journals" / "events.sqlite"
@@ -111,7 +113,14 @@ class RunnerJournal:
         ):
             raise ValueError("Restored journal identity path escapes the experiment.")
         settings = state.template.logging
-        identity = {key: journal_manifest[key] for key in ("journal_id", "generation")}
+        identity = (
+            {
+                "journal_id": journal_manifest.journal_id,
+                "generation": journal_manifest.generation,
+            }
+            if isinstance(journal_manifest, JournalSnapshotManifest)
+            else {key: journal_manifest[key] for key in ("journal_id", "generation")}
+        )
         # The same transaction must choose the same generation after a crash
         # between the database commit and publication of runner/journal.json.
         generation = uuid5(restoration, "experiment-journal-generation").hex
@@ -130,7 +139,9 @@ class RunnerJournal:
         )
         try:
             result = store.complete_restore(
-                journal_manifest,
+                journal_manifest.model_dump()
+                if isinstance(journal_manifest, JournalSnapshotManifest)
+                else journal_manifest,
                 restoration_id=restoration.hex,
                 new_generation=generation,
                 diagnostics=diagnostics_directory,

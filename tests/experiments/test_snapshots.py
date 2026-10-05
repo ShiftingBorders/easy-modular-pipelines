@@ -10,6 +10,7 @@ from unittest.mock import patch
 from core.experiments.state import _process_identity_pid, _restore_state
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
+from core.models.journal_diagnostics import JournalSnapshotManifest
 from core.models.snapshot_documents import RestoreTransaction
 from core.models.updates import _update_model
 from core.primitives.json_files import read_json
@@ -40,6 +41,11 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 owner, "_start_restore_services", wraps=owner._start_restore_services
             ) as services,
+            patch.object(
+                runner._journal,
+                "complete_restore",
+                wraps=runner._journal.complete_restore,
+            ) as journal,
         ):
             await runner.rollback(snapshot["snapshot_id"])
         transactions = (
@@ -74,6 +80,34 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         completed = RestoreTransaction.model_validate(read_json(marker))
         self.assertEqual(completed.phase, "complete")
         self.assertEqual(completed.restoration_id, original.restoration_id)
+        self.assertIsInstance(journal.call_args.args[1], JournalSnapshotManifest)
+
+    async def test_runner_journal_restore_accepts_the_existing_json_input(self):
+        runner = await self.w.launch()
+        await runner.step()
+        snapshot = await runner.snapshot("JSON journal restoration")
+        await runner.step()
+        complete = runner._journal.complete_restore
+        seen = []
+
+        def restore_json(state, manifest, restoration_id, diagnostics_directory=None):
+            self.assertIsInstance(manifest, JournalSnapshotManifest)
+            document = manifest.model_dump()
+            seen.append(document)
+            return complete(state, document, restoration_id, diagnostics_directory)
+
+        with patch.object(
+            runner._journal, "complete_restore", side_effect=restore_json
+        ):
+            result = await runner.rollback(snapshot["snapshot_id"])
+        self.assertEqual(result["mode"], "paused")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            seen[0],
+            read_json(
+                self.w.archive(snapshot["snapshot_id"]) / "journal/manifest.json"
+            ),
+        )
 
     async def asyncSetUp(self):
         self.w = SnapshotWorkspace()
