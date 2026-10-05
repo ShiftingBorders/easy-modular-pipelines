@@ -1,6 +1,9 @@
 """Query and cursor syntax; publication lifetime and source identity remain live checks."""
 
-from typing import Annotated
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Annotated, SupportsIndex, SupportsInt
 
 from pydantic import (
     BaseModel,
@@ -61,12 +64,66 @@ class DashboardQuery(BaseModel):
         return value
 
 
+@dataclass(frozen=True)
+class ViewQuery:
+    """Bound operation arguments; native values keep their existing local checks.
+
+    HTTP text is validated by DashboardQuery. Library callers retain int()
+    conversion for limits and instant() handling of non-text range values.
+    Presence matters for explicit nulls versus omitted defaults.
+    """
+
+    run_id: str | None = None
+    view: str | None = "effective"
+    cursor: str | bytes | bytearray | None = None
+    limit: object = 200
+    since: object = None
+    until: object = None
+    revision: str | None = None
+    ref: str | bytes | bytearray | None = "{}"
+    compact: str | None = None
+    has_range: bool = False
+
+    @classmethod
+    def from_query(cls, query: DashboardQuery | dict | ViewQuery) -> ViewQuery:
+        if isinstance(query, ViewQuery):
+            return query
+        if isinstance(query, DashboardQuery):
+            fields = query.model_fields_set
+            return cls(
+                run_id=query.run_id,
+                view=query.view if "view" in fields else "effective",
+                cursor=query.cursor,
+                limit=query.limit if "limit" in fields else 200,
+                since=query.since,
+                until=query.until,
+                revision=query.revision,
+                ref=query.ref if "ref" in fields else "{}",
+                compact=query.compact,
+                has_range=bool(fields & {"since", "until"}),
+            )
+        return cls(
+            run_id=query.get("run_id"),
+            view=query.get("view", "effective"),
+            cursor=query.get("cursor"),
+            limit=query.get("limit", 200),
+            since=query.get("since"),
+            until=query.get("until"),
+            revision=query.get("revision"),
+            ref=query.get("ref", "{}"),
+            compact=query.get("compact"),
+            has_range="since" in query or "until" in query,
+        )
+
+
 class PageLimit(RootModel[Annotated[int, Field(ge=1, le=1000)]]):
     model_config = ConfigDict(strict=True)
 
     @model_validator(mode="before")
     @classmethod
-    def parse_integer(cls, value: object) -> int:
+    def parse_integer(
+        cls, value: str | bytes | bytearray | SupportsInt | SupportsIndex
+    ) -> int:
         # Preserve the existing explicit int() conversion for library query values.
         return int(value)
 

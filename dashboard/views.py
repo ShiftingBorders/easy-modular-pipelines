@@ -10,6 +10,7 @@ import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -21,7 +22,13 @@ from core.models.dashboard_commands import (
     SavedCommandHistory,
 )
 from core.models.dashboard_metadata import SchedulingState
-from core.models.dashboard_queries import OffsetCursor, PageLimit, PublicationCursor
+from core.models.dashboard_queries import (
+    DashboardQuery,
+    OffsetCursor,
+    PageLimit,
+    PublicationCursor,
+    ViewQuery,
+)
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
     CollectorSample,
@@ -639,7 +646,9 @@ class DashboardViews:
             )
         return result
 
-    async def read(self, resource: str, params: dict) -> dict:
+    async def read(
+        self, resource: str, params: dict | DashboardQuery | ViewQuery
+    ) -> dict:
         if resource == "compute":
             return await self.compute(params)
         if resource == "modules":
@@ -763,8 +772,14 @@ class DashboardViews:
         )[0][0]
 
     async def experiment(
-        self, identifier: str, view: str, params: dict, *, defer_cache: bool = False
+        self,
+        identifier: str,
+        view: str,
+        params: dict | DashboardQuery | ViewQuery,
+        *,
+        defer_cache: bool = False,
     ) -> dict:
+        params = ViewQuery.from_query(params)
         first_open = identifier not in self._opened_caches
         if self._cache_pool is not None:
             self._collect_cache_jobs()
@@ -779,7 +794,7 @@ class DashboardViews:
             # The first request may hydrate a complete RAM preview itself.
             # Avoid starting a second source read during that short operation.
             self._window_checked[identifier] = time.monotonic()
-        dataset, model = await self._model(identifier, params.get("run_id"))
+        dataset, model = await self._model(identifier, params.run_id)
         preview = self._ram_previews.get(identifier)
         if first_open and self._cache_pool is not None and not dataset["complete"]:
             try:
@@ -807,7 +822,7 @@ class DashboardViews:
                     window_experiment_views,
                     preview,
                     await self.state(),
-                    params.get("run_id"),
+                    params.run_id,
                 )
         # Hydrate the first RAM response before a worker competes for this journal.
         if first_open and self._cache_pool is not None and not defer_cache:
@@ -870,7 +885,7 @@ class DashboardViews:
             )
         if view == "template":
             template = model["template"]
-            revision = params.get("revision")
+            revision = params.revision
             if revision:
                 selected = next(
                     (
@@ -905,11 +920,7 @@ class DashboardViews:
         if view == "snapshots":
             snapshots = await asyncio.to_thread(self.journals.snapshots, identifier)
             return self.page(snapshots, metadata, view, params)
-        key = (
-            "effective"
-            if view == "events" and params.get("view", "effective") == "effective"
-            else view
-        )
+        key = "effective" if view == "events" and params.view == "effective" else view
         if key not in model or not isinstance(model[key], list):
             raise SystemAPIError("not_found", "Unknown experiment view.", 404)
         items = model[key]
@@ -925,13 +936,11 @@ class DashboardViews:
         return self.page(items, metadata, view, params)
 
     def _timeline_view(
-        self, dataset: dict, model: dict, metadata: dict, params: dict
+        self, dataset: dict, model: dict, metadata: dict, params: ViewQuery
     ) -> dict:
         """Keep timeline selection independent of ordinary operation pagination."""
-        since, until = instant(params.get("since")), instant(params.get("until"))
-        if ("since" in params or "until" in params) and (
-            since is None or until is None or since >= until
-        ):
+        since, until = instant(params.since), instant(params.until)
+        if params.has_range and (since is None or until is None or since >= until):
             raise SystemAPIError(
                 "invalid_range",
                 "Provide valid since and until times with since < until.",
@@ -1045,11 +1054,11 @@ class DashboardViews:
         }
 
     def _cached_view(
-        self, dataset: dict, model: dict, metadata: dict, view: str, params: dict
+        self, dataset: dict, model: dict, metadata: dict, view: str, params: ViewQuery
     ) -> dict:
         if view == "detail":
             try:
-                reference = json.loads(params.get("ref", "{}"))
+                reference = json.loads(params.ref)
             except (TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "invalid_reference", "Detail reference must be valid JSON.", 400
@@ -1088,11 +1097,11 @@ class DashboardViews:
         }:
             raise SystemAPIError("not_found", "Unknown experiment view.", 404)
         if view == "measurements":
-            params = {
-                **params,
-                "run_id": model["summary"]["run_id"],
-                "revision": model["summary"]["template_revision_id"],
-            }
+            params = replace(
+                params,
+                run_id=model["summary"]["run_id"],
+                revision=model["summary"]["template_revision_id"],
+            )
         page = self._cached_page(dataset, metadata, view, params)
         if view in {"parameters", "operations"}:
             for row in page["items"]:
@@ -1132,7 +1141,7 @@ class DashboardViews:
         return {**metadata, **page}
 
     def _cached_page(
-        self, dataset: dict, metadata: dict, view: str, params: dict
+        self, dataset: dict, metadata: dict, view: str, params: ViewQuery
     ) -> dict:
         now = time.monotonic()
         self._publications = {
@@ -1142,12 +1151,12 @@ class DashboardViews:
         }
         scope = (
             dataset["experiment_id"],
-            params.get("run_id"),
+            params.run_id,
             view,
-            params.get("view", "effective"),
-            params.get("revision"),
+            params.view,
+            params.revision,
         )
-        cursor = params.get("cursor")
+        cursor = params.cursor
         if cursor:
             try:
                 cursor = PublicationCursor.model_validate_json(cursor)
@@ -1160,7 +1169,7 @@ class DashboardViews:
                 ):
                     raise ValueError("History publication changed.")
                 internal = {**publication["cursor"], "position": list(cursor.position)}
-                params = {**params, "cursor": json.dumps(internal)}
+                params = replace(params, cursor=json.dumps(internal))
             except (ValueError, TypeError, KeyError) as error:
                 raise SystemAPIError(
                     "history_changed", "Refresh this history publication.", 409
@@ -1222,9 +1231,9 @@ class DashboardViews:
             )
         return runs
 
-    def _cached_template(self, dataset: dict, model: dict, params: dict) -> dict:
-        selection = " AND run_id=?" if params.get("run_id") else ""
-        args = (params["run_id"],) if params.get("run_id") else ()
+    def _cached_template(self, dataset: dict, model: dict, params: ViewQuery) -> dict:
+        selection = " AND run_id=?" if params.run_id else ""
+        args = (params.run_id,) if params.run_id else ()
         rows = dataset["cache"].query(
             "SELECT event_id, compact FROM facts WHERE kind='template.applied' AND effective=1"
             + selection
@@ -1240,12 +1249,11 @@ class DashboardViews:
             (
                 row
                 for row in reversed(revisions)
-                if not params.get("revision")
-                or row["template_revision_id"] == params["revision"]
+                if not params.revision or row["template_revision_id"] == params.revision
             ),
             None,
         )
-        if params.get("revision") and selected is None:
+        if params.revision and selected is None:
             raise SystemAPIError(
                 "not_found", "The requested template revision is unavailable.", 404
             )
@@ -1282,8 +1290,15 @@ class DashboardViews:
         ]
         return template
 
-    def page(self, items: list[dict], metadata: dict, view: str, params: dict) -> dict:
-        limit = PageLimit.model_validate(params.get("limit", 200)).root
+    def page(
+        self,
+        items: list[dict],
+        metadata: dict,
+        view: str,
+        params: dict | DashboardQuery | ViewQuery,
+    ) -> dict:
+        params = ViewQuery.from_query(params)
+        limit = PageLimit.model_validate(params.limit).root
         now = time.monotonic()
         self._publications = {
             key: publication
@@ -1292,13 +1307,13 @@ class DashboardViews:
         }
         scope = (
             metadata["experiment_id"],
-            params.get("run_id"),
+            params.run_id,
             view,
-            params.get("view", "effective"),
+            params.view,
         )
-        if params.get("cursor"):
+        if params.cursor:
             try:
-                cursor = OffsetCursor.model_validate_json(params["cursor"])
+                cursor = OffsetCursor.model_validate_json(params.cursor)
                 publication = self._publications[cursor.publication]
                 offset = cursor.offset
                 if (
@@ -1431,7 +1446,8 @@ class DashboardViews:
         self._history_cursor = page.cursor
         return not page.samples or self._history_cursor == previous_cursor
 
-    async def compute(self, params: dict) -> dict:
+    async def compute(self, params: dict | DashboardQuery | ViewQuery) -> dict:
+        params = ViewQuery.from_query(params)
         observed = self._resource_status
         state = None if observed is None else observed.state
         error = None if observed is None else observed.error
@@ -1452,12 +1468,12 @@ class DashboardViews:
             (sample for sample in latest if sample.series_id.startswith("host:")), None
         )
         metrics = self._resource_metrics(host, state == "running")
-        since = instant(params.get("since"))
-        until = instant(params.get("until"))
+        since = instant(params.since)
+        until = instant(params.until)
         if (
-            params.get("since")
+            params.since
             and since is None
-            or params.get("until")
+            or params.until
             and until is None
             or since is not None
             and until is not None

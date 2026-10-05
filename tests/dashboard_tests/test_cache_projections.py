@@ -1,6 +1,7 @@
 """Approved exactness regressions for partitioned journal projections."""
 
 import copy
+import json
 import sqlite3
 import time
 import unittest
@@ -11,7 +12,8 @@ from uuid import uuid4
 
 from core.journal.logger import OperationLogger
 from core.models.dashboard_metadata import CompactTemplate
-from dashboard.api_client import SystemAPIClient
+from core.models.dashboard_queries import DashboardQuery, PageLimit, ViewQuery
+from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
 from dashboard.projections import (
@@ -36,6 +38,56 @@ from tests.dashboard_tests.integration_helpers import (
 
 
 class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timeline_queries_keep_range_presence_and_paging_scope(self):
+        _, reader, dataset = self.cache(history(((2, 5),)))
+        views = DashboardViews(reader.settings, SystemAPIClient(reader.settings))
+        self.addCleanup(views.journals.close)
+        model = cached_experiment_views(dataset, {})
+        with (
+            patch.object(views, "_model", AsyncMock(return_value=(dataset, model))),
+            patch.object(views, "state", AsyncMock(return_value={})),
+        ):
+            first = await views.experiment(
+                "exp-test", "timeline", DashboardQuery(limit="1")
+            )
+            self.assertGreater(first["total"], 1)
+            self.assertTrue(first["next_cursor"])
+            second = await views.experiment(
+                "exp-test",
+                "timeline",
+                DashboardQuery(limit="1", cursor=json.dumps(first["next_cursor"])),
+            )
+            self.assertEqual(first["total"], second["total"])
+            self.assertNotEqual(first["next_cursor"], second["next_cursor"])
+            for query in ({"since": None}, {"since": "bad"}, {"until": timestamp(1)}):
+                with (
+                    self.subTest(query=query),
+                    self.assertRaises(SystemAPIError) as error,
+                ):
+                    await views.experiment("exp-test", "timeline", query)
+                self.assertEqual(error.exception.code, "invalid_range")
+
+    def test_query_arguments_preserve_native_conversion_and_sparse_defaults(self):
+        for document in (
+            {},
+            {"limit": "1", "compact": "1", "view": "raw", "ref": "{}"},
+            {"view": None, "limit": None, "ref": None, "since": None},
+        ):
+            with self.subTest(document=document):
+                model = DashboardQuery.model_validate(document)
+                bound = ViewQuery.from_query(model)
+                self.assertEqual(bound, ViewQuery.from_query(document))
+                self.assertIs(ViewQuery.from_query(bound), bound)
+                self.assertEqual(
+                    bound.has_range, "since" in document or "until" in document
+                )
+                self.assertEqual(model.model_dump(exclude_unset=True), document)
+        for value, expected in ((1.9, 1), (True, 1), (b"2", 2), ("3", 3)):
+            with self.subTest(value=value):
+                bound = ViewQuery.from_query({"limit": value, "unused": object()})
+                self.assertIs(bound.limit, value)
+                self.assertEqual(PageLimit.model_validate(bound.limit).root, expected)
+
     def test_compact_template_keeps_sparse_model_fields_until_projection(self):
         for document in (
             {},
@@ -238,7 +290,7 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
         views = DashboardViews(reader.settings, SystemAPIClient(reader.settings))
         self.addCleanup(views.journals.close)
         model = cached_experiment_views(dataset, {})
-        template = views._cached_template(dataset, model, {"revision": "rev-1"})
+        template = views._cached_template(dataset, model, ViewQuery(revision="rev-1"))
         self.assertEqual(len(template["template"]["stages"]), 2)
 
     async def test_command_observations_from_different_cycles_are_grouped_once(self):
@@ -501,7 +553,7 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
                     model,
                     {},
                     "parameters",
-                    {"compact": "1", **({"run_id": run} if run else {})},
+                    ViewQuery(compact="1", run_id=run if run else None),
                 )
                 self.assertEqual(
                     [(row["attempt_id"], row["status"]) for row in page["items"]],

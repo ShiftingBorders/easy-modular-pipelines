@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from core.models.dashboard_queries import DashboardQuery, ViewQuery
 from core.models.updates import _update_model
 from dashboard.application import create_app
 from tests.dashboard_tests.helpers import (
@@ -27,6 +28,31 @@ WRITE_HEADERS = {"X-Dashboard-Request": "1", "Origin": "http://dashboard.test"}
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_queries_reach_consumers_as_models_without_dump(self):
+        views = self.app.state.views
+        with (
+            patch.object(views, "compute", wraps=views.compute) as compute,
+            patch.object(views, "experiment", wraps=views.experiment) as experiment,
+            patch.object(
+                DashboardQuery,
+                "model_dump",
+                side_effect=AssertionError("Dumped HTTP query before consumption"),
+            ),
+        ):
+            response = await self.http.get("/api/system/compute", params={"limit": 1})
+            self.assertEqual(response.status_code, 200)
+            query = compute.call_args.args[0]
+            self.assertIsInstance(query, DashboardQuery)
+            self.assertEqual(query.limit, "1")
+            response = await self.http.get(
+                "/api/system/experiments/exp-test/events",
+                params={"limit": 1, "compact": "1"},
+            )
+            self.assertEqual(response.status_code, 200)
+            query = experiment.call_args.args[2]
+            self.assertIsInstance(query, DashboardQuery)
+            self.assertEqual(ViewQuery.from_query(query).compact, "1")
+
     async def test_http_resource_thresholds_consume_retained_alert_rules(self):
         rule = {
             "id": "cpu-rule",

@@ -31,10 +31,12 @@ from core.models.dashboard_metadata import (
     SchedulingState,
 )
 from core.models.dashboard_queries import (
+    DashboardQuery,
     DetailIdentity,
     DetailReference,
     KeysetCursor,
     PageLimit,
+    ViewQuery,
 )
 from core.models.dashboard_settings import DashboardRuntimeConfiguration
 from core.models.experiment_registry import RegistryEntry
@@ -851,19 +853,25 @@ class LocalJournals:
         except (LoggingError, OSError, sqlite3.Error) as error:
             raise SystemAPIError("journal_unavailable", str(error)) from error
 
-    def timeline(self, dataset: dict, params: dict, observed_at: str | None) -> dict:
+    def timeline(
+        self,
+        dataset: dict,
+        params: dict | DashboardQuery | ViewQuery,
+        observed_at: str | None,
+    ) -> dict:
         """Read a bounded time slice and its ancestors from the existing cache."""
+        params = ViewQuery.from_query(params)
         cache = dataset["cache"]
         scope = [
             dataset["identity"],
-            params.get("run_id"),
-            params.get("since"),
-            params.get("until"),
+            params.run_id,
+            params.since,
+            params.until,
         ]
         position = [0, "", ""]
-        if params.get("cursor"):
+        if params.cursor:
             try:
-                cursor = KeysetCursor.model_validate_json(params["cursor"])
+                cursor = KeysetCursor.model_validate_json(params.cursor)
                 if (
                     cursor.scope != scope
                     or cursor.version != dataset["version"]
@@ -876,7 +884,7 @@ class LocalJournals:
                     "history_changed", "Refresh this timeline range.", 409
                 ) from error
         try:
-            limit = PageLimit.model_validate(params.get("limit", 200)).root
+            limit = PageLimit.model_validate(params.limit).root
         except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_limit", "limit must be between 1 and 1000.", 400
@@ -885,13 +893,13 @@ class LocalJournals:
         # Open operations extend only to the last available observation.
         end_sql = f"MAX({start_sql},COALESCE(julianday(json_extract(payload,'$.finished_at')),julianday(?),{start_sql}))"
         where, args = "kind='operations'", []
-        if params.get("run_id"):
+        if params.run_id:
             where += " AND run_id=?"
-            args.append(params["run_id"])
+            args.append(params.run_id)
         where += f" AND {start_sql} IS NOT NULL"
         # Reader identity changes on replacement/rebuild, even if version resets.
         # Weak references avoid retaining readers and their raw payload windows.
-        overview_key = (weakref.ref(cache), dataset["version"], params.get("run_id"))
+        overview_key = (weakref.ref(cache), dataset["version"], params.run_id)
         with self._timeline_lock:
             overview = self._timeline_overviews.get(overview_key)
             if overview is not None:
@@ -912,11 +920,11 @@ class LocalJournals:
         observed = instant(observed_at)
         if overview["has_open"] and observed is not None:
             timeline["end"] = max(timeline["end"], round(observed * 1000))
-        if params.get("since") is not None:
+        if params.since is not None:
             where += f" AND {start_sql}<=julianday(?) AND {end_sql}>=julianday(?)"
-            args.extend((params["until"], observed_at, params["since"]))
+            args.extend((params.until, observed_at, params.since))
         total = timeline["operation_count"]
-        if params.get("since") is not None:
+        if params.since is not None:
             total = cache.query(
                 f"SELECT COUNT(*) FROM records WHERE {where}", tuple(args)
             )[0][0]
@@ -941,20 +949,23 @@ class LocalJournals:
             else None,
         }
 
-    def page(self, dataset: dict, view: str, params: dict) -> dict:
+    def page(
+        self, dataset: dict, view: str, params: dict | DashboardQuery | ViewQuery
+    ) -> dict:
+        params = ViewQuery.from_query(params)
         cache = dataset["cache"]
-        run_id = params.get("run_id")
+        run_id = params.run_id
         scope = [
             dataset["identity"],
             run_id,
             view,
-            params.get("view", "effective"),
-            params.get("revision"),
+            params.view,
+            params.revision,
         ]
         position = [0, "", ""]
-        if params.get("cursor"):
+        if params.cursor:
             try:
-                cursor = KeysetCursor.model_validate_json(params["cursor"])
+                cursor = KeysetCursor.model_validate_json(params.cursor)
                 if (
                     cursor.scope != scope
                     or cursor.version != dataset["version"]
@@ -966,7 +977,7 @@ class LocalJournals:
                 raise SystemAPIError(
                     "history_changed", "Refresh this history publication.", 409
                 ) from error
-        limit = PageLimit.model_validate(params.get("limit", 200)).root
+        limit = PageLimit.model_validate(params.limit).root
         if view == "events":
             return self._event_page(dataset, params, scope, position, limit)
         if view == "runs":
@@ -975,9 +986,9 @@ class LocalJournals:
         if run_id:
             selection += " AND run_id=?"
             args.append(run_id)
-        if view == "measurements" and params.get("revision"):
+        if view == "measurements" and params.revision:
             selection += " AND revision=?"
-            args.append(params["revision"])
+            args.append(params.revision)
         total = cache.query(
             "SELECT COUNT(*) FROM records WHERE " + selection, tuple(args)
         )[0][0]
@@ -995,7 +1006,7 @@ class LocalJournals:
                 if item.get("detail_ref")
                 else None
             )
-            if params.get("compact") != "1" and item["detail_ref"]:
+            if params.compact != "1" and item["detail_ref"]:
                 item = self.detail(dataset, item["detail_ref"], item)
             size += len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
             if size > self.settings.max_response_bytes:
@@ -1023,11 +1034,9 @@ class LocalJournals:
         }
 
     def _run_page(
-        self, dataset: dict, params: dict, scope: list, position: list, limit: int
+        self, dataset: dict, params: ViewQuery, scope: list, position: list, limit: int
     ) -> dict:
-        where, args = (
-            ("run_id=?", [params["run_id"]]) if params.get("run_id") else ("1=1", [])
-        )
+        where, args = ("run_id=?", [params.run_id]) if params.run_id else ("1=1", [])
         cache = dataset["cache"]
         rows = cache.query(
             "SELECT first_cursor, run_id, started_at, revision FROM runs WHERE "
@@ -1061,14 +1070,14 @@ class LocalJournals:
         }
 
     def _event_page(
-        self, dataset: dict, params: dict, scope: list, position: list, limit: int
+        self, dataset: dict, params: ViewQuery, scope: list, position: list, limit: int
     ) -> dict:
         cache = dataset["cache"]
         selection, args = "1=1", []
-        if params.get("run_id"):
+        if params.run_id:
             selection += " AND run_id=?"
-            args.append(params["run_id"])
-        if params.get("view", "effective") == "effective":
+            args.append(params.run_id)
+        if params.view == "effective":
             selection += " AND effective=1"
         total = cache.query(
             "SELECT COUNT(*) FROM facts WHERE " + selection, tuple(args)
@@ -1080,7 +1089,7 @@ class LocalJournals:
             (*args, position[0], limit + 1),
         )
         items, size = [], 1024
-        if params.get("compact") == "1":
+        if params.compact == "1":
             events = iter(json.loads(row[2]) for row in records[:limit])
         else:
             events = cache.iter_events([row[1] for row in records[:limit]])

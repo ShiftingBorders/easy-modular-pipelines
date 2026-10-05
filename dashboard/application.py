@@ -21,10 +21,12 @@ from dashboard.views import DashboardViews
 
 
 def query_parameters(request: Request) -> dict:
+    return _query_parameters(request).model_dump(exclude_unset=True)
+
+
+def _query_parameters(request: Request) -> DashboardQuery:
     try:
-        return DashboardQuery.model_validate(dict(request.query_params)).model_dump(
-            exclude_unset=True
-        )
+        return DashboardQuery.model_validate(dict(request.query_params))
     except ValidationError as error:
         context = error.errors()[0].get("ctx", {})
         message = str(context.get("error", error))
@@ -111,7 +113,7 @@ def create_app(
         }
         if resource not in paths:
             raise HTTPException(404, "Unknown resource.")
-        params = query_parameters(request)
+        params = _query_parameters(request)
         if resource == "alerts":
             return alerts.status(system_only=True)
         result = await views.read(resource, params)
@@ -179,7 +181,7 @@ def create_app(
         ):
             raise HTTPException(400, "Invalid experiment identifier.")
         result = await views.experiment(
-            experiment_id, view, query_parameters(request), defer_cache=True
+            experiment_id, view, _query_parameters(request), defer_cache=True
         )
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
