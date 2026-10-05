@@ -7,9 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core.experiments.state import _process_identity_pid
+from core.experiments.state import _process_identity_pid, _restore_state
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
+from core.models.snapshot_documents import RestoreTransaction
+from core.models.updates import _update_model
 from core.primitives.json_files import read_json
 from tests.helpers.dag import process_running
 from tests.helpers.services import wait_for
@@ -17,6 +19,62 @@ from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
 
 
 class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restore_phases_retain_models_and_leave_previous_states_unchanged(
+        self,
+    ):
+        runner = await self.w.launch()
+        await runner.step()
+        snapshot = await runner.snapshot("typed restoration")
+        await runner.step()
+        owner = runner._snapshots
+        with (
+            patch.object(
+                owner, "_stage_restore_snapshot", wraps=owner._stage_restore_snapshot
+            ) as staging,
+            patch.object(
+                owner, "_install_restore_files", wraps=owner._install_restore_files
+            ) as installation,
+            patch.object(
+                owner, "_bind_restored_journal", wraps=owner._bind_restored_journal
+            ) as binding,
+            patch.object(
+                owner, "_start_restore_services", wraps=owner._start_restore_services
+            ) as services,
+        ):
+            await runner.rollback(snapshot["snapshot_id"])
+        transactions = (
+            staging.call_args.args[1],
+            installation.call_args.args[0],
+            binding.call_args.args[1],
+            services.call_args.args[1],
+        )
+        self.assertTrue(
+            all(isinstance(item, RestoreTransaction) for item in transactions)
+        )
+        self.assertEqual(
+            [item.phase for item in transactions],
+            ["staging", "prepared", "files_installed", "journal_restored"],
+        )
+        original = transactions[0]
+        before = original.model_dump(exclude_unset=True)
+        with self.assertRaises(ValueError):
+            _update_model(original, phase="invalid")
+        detached = _restore_state(
+            runner._state.experiment_directory,
+            original.stopped_state.model_copy(deep=True),
+        )
+        detached.stage_result_ids.clear()
+        detached.used_request_ids.clear()
+        self.assertEqual(original.model_dump(exclude_unset=True), before)
+        marker = (
+            self.w.root
+            / "controller/restore_transactions"
+            / f"{runner._state.experiment_directory.name}.json"
+        )
+        completed = RestoreTransaction.model_validate(read_json(marker))
+        self.assertEqual(completed.phase, "complete")
+        self.assertEqual(completed.restoration_id, original.restoration_id)
+
     async def asyncSetUp(self):
         self.w = SnapshotWorkspace()
         self.addAsyncCleanup(self.w.close)

@@ -29,6 +29,7 @@ from core.experiments.state import (
     RunnerState,
     RunnerStateStore,
     ServiceInstance,
+    _restore_state,
     state_from_document,
     state_to_document,
 )
@@ -41,6 +42,7 @@ from core.models.snapshot_documents import (
     RestoreTransaction,
     SnapshotInventory,
 )
+from core.models.updates import _update_model
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 from core.primitives.processes import process_identity
@@ -739,34 +741,34 @@ class ExperimentSnapshots:
             raise ValueError("Restore marker escapes the project.")
         async with self._lock:
             if marker.exists():
-                transaction = read_json(marker)
+                transaction = RestoreTransaction.model_validate(read_json(marker))
                 await self._finish_restore(
                     state, transaction, marker, validate_only=True
                 )
-                if transaction.get("phase") == "failed" and resume_transaction:
+                if transaction.phase == "failed" and resume_transaction:
                     if suspend_resources is not None:
                         await suspend_resources()
                     return await self._finish_restore(state, transaction, marker)
-                if transaction["phase"] == "failed":
+                if transaction.phase == "failed":
                     if suspend_resources is not None:
                         await suspend_resources()
                     await self._finish_restore(
                         state, transaction, marker, retry_failed=True
                     )
-                if transaction.get("phase") in ("complete", "failed"):
+                if transaction.phase in ("complete", "failed"):
                     abandoned = (
                         self._project_root
                         / "controller/restores"
-                        / str(UUID(transaction["restoration_id"]))
+                        / str(UUID(transaction.restoration_id))
                         / "previous-transaction.json"
                     )
                     if not abandoned.resolve().is_relative_to(self._project_root):
                         raise ValueError("Restore diagnostic path escapes the project.")
-                    write_json(abandoned, transaction)
+                    write_json(abandoned, transaction.model_dump(exclude_unset=True))
                     marker.unlink()
                 elif (
-                    transaction.get("snapshot_id") == snapshot_id
-                    and transaction.get("source_folder") == source.name
+                    transaction.snapshot_id == snapshot_id
+                    and transaction.source_folder == source.name
                 ):
                     if suspend_resources is not None:
                         await suspend_resources()
@@ -846,23 +848,25 @@ class ExperimentSnapshots:
                 operations.append(state.pending_rebuild.operation_id)
             self._journal.client.export_diagnostics(operations, work / "diagnostics")
             self._journal.close()
-            transaction = {
-                "schema_version": 2,
-                "restoration_id": restoration_id,
-                "experiment_id": state.experiment_id,
-                "target_folder": target.name,
-                "source_folder": source.name,
-                "snapshot_id": snapshot_id,
-                "run_id": state.run_id
-                if source_directory is not None
-                else checked.run_id,
-                "clone": source_directory is not None,
-                "phase": "staging",
-                "preserve_diagnostics": preserve_rebuild_diagnostics,
-                "stopped_state": state_to_document(state),
-                "owner": process_identity(os.getpid()),
-            }
-            write_json(marker, transaction)
+            transaction = RestoreTransaction.model_validate(
+                {
+                    "schema_version": 2,
+                    "restoration_id": restoration_id,
+                    "experiment_id": state.experiment_id,
+                    "target_folder": target.name,
+                    "source_folder": source.name,
+                    "snapshot_id": snapshot_id,
+                    "run_id": state.run_id
+                    if source_directory is not None
+                    else checked.run_id,
+                    "clone": source_directory is not None,
+                    "phase": "staging",
+                    "preserve_diagnostics": preserve_rebuild_diagnostics,
+                    "stopped_state": state_to_document(state),
+                    "owner": process_identity(os.getpid()),
+                }
+            )
+            write_json(marker, transaction.model_dump(exclude_unset=True))
             return await self._finish_restore(state, transaction, marker)
 
     def _bootstrap_clone_journal(
@@ -883,59 +887,67 @@ class ExperimentSnapshots:
     async def _finish_restore(
         self,
         state: RunnerState,
-        transaction: JsonObject,
+        transaction: RestoreTransaction,
         marker: Path,
         *,
         validate_only: bool = False,
         retry_failed: bool = False,
     ) -> RunnerState:
-        validated = RestoreTransaction.model_validate(transaction)
-        transaction = validated.model_dump(exclude_unset=True)
-        restoration_id = str(UUID(validated.restoration_id))
-        snapshot_id = str(UUID(validated.snapshot_id))
-        paths = self._check_restore_paths(state, validated, marker)
+        restoration_id = str(UUID(transaction.restoration_id))
+        snapshot_id = str(UUID(transaction.snapshot_id))
+        paths = self._check_restore_paths(state, transaction, marker)
         if validate_only:
             return state
-        if transaction["phase"] in ("services_starting", "failed"):
+        if transaction.phase in ("services_starting", "failed"):
             return await self._stop_interrupted_restore(
                 state, transaction, marker, paths.target, retry_failed
             )
         target = paths.target
-        stopped = state_from_document(target, transaction["stopped_state"])
+        stopped = _restore_state(
+            target, transaction.stopped_state.model_copy(deep=True)
+        )
         if (
-            stopped.experiment_id != transaction["experiment_id"]
+            stopped.experiment_id != transaction.experiment_id
             or stopped.active_attempt is not None
             or any(not item.stopped for item in stopped.services.values())
         ):
             raise ValueError("Restore marker does not confirm the participant barrier.")
-        if transaction["phase"] != "complete":
+        if transaction.phase != "complete":
             await self._services.reset(stopped)
-            transaction["owner"] = process_identity(os.getpid())
-            write_json(marker, transaction)
-        if transaction["phase"] == "staging":
-            await self._stage_restore_snapshot(state, transaction, marker, paths, snapshot_id)
-        manifest = await self._cached_restore_manifest(transaction, paths.cached, snapshot_id)
-        if transaction["phase"] == "prepared":
-            await self._install_restore_files(transaction, marker, paths)
-        self._bind_restored_journal(state, transaction, marker, paths, manifest, restoration_id)
-        if transaction["phase"] == "complete":
+            transaction = _update_model(
+                transaction, owner=process_identity(os.getpid())
+            )
+            write_json(marker, transaction.model_dump(exclude_unset=True))
+        if transaction.phase == "staging":
+            transaction = await self._stage_restore_snapshot(
+                state, transaction, marker, paths, snapshot_id
+            )
+        manifest = await self._cached_restore_manifest(
+            transaction, paths.cached, snapshot_id
+        )
+        if transaction.phase == "prepared":
+            transaction = await self._install_restore_files(transaction, marker, paths)
+        transaction = self._bind_restored_journal(
+            state, transaction, marker, paths, manifest, restoration_id
+        )
+        if transaction.phase == "complete":
             return state
-        await self._start_restore_services(
+        transaction = await self._start_restore_services(
             state, transaction, marker, manifest, snapshot_id, restoration_id
         )
-        if not transaction["preserve_diagnostics"]:
+        if not transaction.preserve_diagnostics:
             await self._cleanup_completed_restore(paths)
         return state
 
     def _check_restore_paths(
         self, state: RunnerState, validated: RestoreTransaction, marker: Path
     ) -> RestorePaths:
-        owner = validated.owner.model_dump()
-        if owner.get("pid") != os.getpid():
+        owner = validated.owner
+        if owner.pid != os.getpid():
             try:
-                if process_identity(owner["pid"]) == owner:
+                if process_identity(owner.pid) == owner.model_dump():
                     try:
-                        psutil.Process(owner["pid"]).wait(timeout=0)
+                        psutil.Process(owner.pid).wait(timeout=0)
                     except psutil.TimeoutExpired as error:
                         raise RuntimeError(
                             "Another live process owns this restoration."
@@ -948,7 +960,11 @@ class ExperimentSnapshots:
                 ) and getattr(error, "winerror", None) not in (87, 1168):
                     raise
         target = self._project_root / "experiments" / validated.target_folder
-        work = self._project_root / "controller/restores" / str(UUID(validated.restoration_id))
+        work = (
+            self._project_root
+            / "controller/restores"
+            / str(UUID(validated.restoration_id))
+        )
         if (
             target.resolve() != state.experiment_directory.resolve()
             or validated.experiment_id != state.experiment_id
@@ -969,11 +985,17 @@ class ExperimentSnapshots:
                 or not path.resolve().is_relative_to(self._project_root)
             ):
                 raise ValueError("Restoration paths cannot escape the project.")
-        return RestorePaths(target, work, work / "snapshot", work / "replacement", work / "previous")
+        return RestorePaths(
+            target, work, work / "snapshot", work / "replacement", work / "previous"
+        )
 
     async def _stop_interrupted_restore(
-        self, state: RunnerState, transaction: JsonObject, marker: Path,
-        target: Path, retry_failed: bool,
+        self,
+        state: RunnerState,
+        transaction: RestoreTransaction,
+        marker: Path,
+        target: Path,
+        retry_failed: bool,
     ) -> RunnerState:
         # An interrupted load is not evidence that it was never executed.
         # Stop its participants, retain diagnostics, and require a new rollback.
@@ -991,16 +1013,16 @@ class ExperimentSnapshots:
         self._journal.open(state, create=False)
         self._restore_announced_services(state, target)
         stops = await self._services.stop_all(state)
-        transaction["stopped_state"] = state_to_document(state)
+        transaction = _update_model(transaction, stopped_state=state_to_document(state))
         if any(not item["stopped"] or item["error"] for item in stops.values()):
-            transaction["phase"] = "failed"
-            write_json(marker, transaction)
+            transaction = _update_model(transaction, phase="failed")
+            write_json(marker, transaction.model_dump(exclude_unset=True))
             raise RuntimeError(
                 "Interrupted restoration participants have not stopped cleanly."
             )
         await self._services.reset(state)
-        transaction["phase"] = "failed"
-        write_json(marker, transaction)
+        transaction = _update_model(transaction, phase="failed")
+        write_json(marker, transaction.model_dump(exclude_unset=True))
         if retry_failed:
             return state
         raise RuntimeError(
@@ -1054,15 +1076,16 @@ class ExperimentSnapshots:
             state.services[service_id] = instance
 
     async def _stage_restore_snapshot(
-        self, state: RunnerState, transaction: JsonObject, marker: Path,
-        paths: RestorePaths, snapshot_id: str,
-    ) -> None:
+        self,
+        state: RunnerState,
+        transaction: RestoreTransaction,
+        marker: Path,
+        paths: RestorePaths,
+        snapshot_id: str,
+    ) -> RestoreTransaction:
         work, cached, replacement = paths.work, paths.cached, paths.replacement
         archive = (
-            self._project_root
-            / "snapshots"
-            / transaction["source_folder"]
-            / snapshot_id
+            self._project_root / "snapshots" / transaction.source_folder / snapshot_id
         )
         manifest = await asyncio.to_thread(self._validate_snapshot, archive)
         for path in (cached, replacement):
@@ -1097,7 +1120,7 @@ class ExperimentSnapshots:
             replacement / "journals/events.sqlite",
         )
         document = _restored_state_document(
-            manifest, transaction["stopped_state"], state.experiment_id, transaction["run_id"]
+            manifest, transaction.stopped_state, state.experiment_id, transaction.run_id
         )
         restored = state_from_document(replacement, document)
         self._state_store.save(restored)
@@ -1105,27 +1128,28 @@ class ExperimentSnapshots:
             replacement / "runner/journal.json",
             {key: manifest["journal"][key] for key in ("journal_id", "generation")},
         )
-        transaction["phase"] = "prepared"
-        write_json(marker, transaction)
+        transaction = _update_model(transaction, phase="prepared")
+        write_json(marker, transaction.model_dump(exclude_unset=True))
+        return transaction
 
     async def _cached_restore_manifest(
-        self, transaction: JsonObject, cached: Path, snapshot_id: str
+        self, transaction: RestoreTransaction, cached: Path, snapshot_id: str
     ) -> JsonObject:
         manifest = await asyncio.to_thread(self._validate_snapshot, cached)
         if (
             manifest["snapshot_id"] != snapshot_id
-            or manifest["experiment_folder"] != transaction["source_folder"]
+            or manifest["experiment_folder"] != transaction.source_folder
             or (
-                not transaction["clone"]
-                and manifest["experiment_id"] != transaction["experiment_id"]
+                not transaction.clone
+                and manifest["experiment_id"] != transaction.experiment_id
             )
         ):
             raise ValueError("Cached restoration snapshot has a different identity.")
         return manifest
 
     async def _install_restore_files(
-        self, transaction: JsonObject, marker: Path, paths: RestorePaths
-    ) -> None:
+        self, transaction: RestoreTransaction, marker: Path, paths: RestorePaths
+    ) -> RestoreTransaction:
         target, previous, replacement = paths.target, paths.previous, paths.replacement
         if not previous.exists():
             if not target.is_dir() or not replacement.is_dir():
@@ -1146,33 +1170,45 @@ class ExperimentSnapshots:
             raise RuntimeError(
                 "Ambiguous restoration directories; no files were overwritten."
             )
-        transaction["phase"] = "files_installed"
-        write_json(marker, transaction)
+        transaction = _update_model(transaction, phase="files_installed")
+        write_json(marker, transaction.model_dump(exclude_unset=True))
+        return transaction
 
     def _bind_restored_journal(
-        self, state: RunnerState, transaction: JsonObject, marker: Path,
-        paths: RestorePaths, manifest: JsonObject, restoration_id: str,
-    ) -> None:
+        self,
+        state: RunnerState,
+        transaction: RestoreTransaction,
+        marker: Path,
+        paths: RestorePaths,
+        manifest: JsonObject,
+        restoration_id: str,
+    ) -> RestoreTransaction:
         target, work = paths.target, paths.work
         restored = self._state_store.load(target)
-        if restored.experiment_id != transaction["experiment_id"]:
+        if restored.experiment_id != transaction.experiment_id:
             raise ValueError("Installed state has another experiment identity.")
         vars(state).update(vars(restored))
-        if transaction["phase"] == "files_installed":
+        if transaction.phase == "files_installed":
             self._journal.complete_restore(
                 state, manifest["journal"], restoration_id, work / "diagnostics"
             )
-            transaction["phase"] = "journal_restored"
-            write_json(marker, transaction)
-        elif transaction["phase"] == "journal_restored":
+            transaction = _update_model(transaction, phase="journal_restored")
+            write_json(marker, transaction.model_dump(exclude_unset=True))
+        elif transaction.phase == "journal_restored":
             self._journal.open(state, create=False)
+        return transaction
 
     async def _start_restore_services(
-        self, state: RunnerState, transaction: JsonObject, marker: Path,
-        manifest: JsonObject, snapshot_id: str, restoration_id: str,
-    ) -> None:
-        transaction["phase"] = "services_starting"
-        write_json(marker, transaction)
+        self,
+        state: RunnerState,
+        transaction: RestoreTransaction,
+        marker: Path,
+        manifest: JsonObject,
+        snapshot_id: str,
+        restoration_id: str,
+    ) -> RestoreTransaction:
+        transaction = _update_model(transaction, phase="services_starting")
+        write_json(marker, transaction.model_dump(exclude_unset=True))
         try:
             if await self._services.reconcile(state, state.template) != "ready":
                 raise RuntimeError("Restored services did not become ready.")
@@ -1190,16 +1226,17 @@ class ExperimentSnapshots:
                 context={"experiment_id": state.experiment_id, "run_id": state.run_id},
             )
             self._state_store.save(state)
-            transaction["phase"] = "complete"
-            write_json(marker, transaction)
+            transaction = _update_model(transaction, phase="complete")
+            write_json(marker, transaction.model_dump(exclude_unset=True))
         except BaseException as error:
             try:
                 await self._services.stop_all(state)
             except Exception as shutdown_error:  # noqa: BLE001 - Preserve the restore failure and shutdown diagnostics.
                 error.add_note(f"Restored service shutdown failed: {shutdown_error}")
-            transaction["phase"] = "failed"
-            write_json(marker, transaction)
+            transaction = _update_model(transaction, phase="failed")
+            write_json(marker, transaction.model_dump(exclude_unset=True))
             raise
+        return transaction
 
     async def _cleanup_completed_restore(self, paths: RestorePaths) -> None:
         previous, cached, work = paths.previous, paths.cached, paths.work

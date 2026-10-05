@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.models.runner_state import SavedRunnerState
 from core.primitives.json_values import JsonObject, copy_json_object
 
 
@@ -16,7 +17,10 @@ class RestorePaths:
 
 
 def _restored_state_document(
-    manifest: JsonObject, stopped_state: JsonObject, experiment_id: str, run_id: str
+    manifest: JsonObject,
+    stopped_state: SavedRunnerState,
+    experiment_id: str,
+    run_id: str,
 ) -> JsonObject:
     document = copy_json_object(manifest["state"], "restored state")
     document["experiment_id"] = experiment_id
@@ -38,13 +42,10 @@ def _restored_state_document(
         # after the condition, rather than issuing the stop again.
         document["last_dag_decision"] = None
     document["used_request_ids"] = sorted(
-        set(document["used_request_ids"])
-        | set(stopped_state["used_request_ids"])
+        set(document["used_request_ids"]) | set(stopped_state.used_request_ids)
     )
     for stage_id in document["stage_result_ids"]:
-        document["stage_result_origins"].setdefault(
-            stage_id, manifest["experiment_id"]
-        )
+        document["stage_result_origins"].setdefault(stage_id, manifest["experiment_id"])
     for instance in document["services"].values():
         instance.update(
             process_identity=None,
