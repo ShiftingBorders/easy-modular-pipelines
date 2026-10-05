@@ -15,7 +15,11 @@ from uuid import uuid4
 
 from core.journal.events import LoggingError
 from core.models.dashboard_cache import CacheWorkerResult
-from core.models.dashboard_commands import DashboardCommand, SavedCommandHistory
+from core.models.dashboard_commands import (
+    DashboardCommand,
+    LocalCommandRecord,
+    SavedCommandHistory,
+)
 from core.models.dashboard_queries import OffsetCursor, PageLimit, PublicationCursor
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
@@ -26,6 +30,7 @@ from core.models.dashboard_resources import (
 from core.models.dashboard_settings import DashboardRuntimeConfiguration
 from core.models.dashboard_upstream import LiveState
 from core.models.server_receipts import CommandReceipt
+from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import (
@@ -91,7 +96,7 @@ class DashboardViews:
         self._history_cursor = 0
         self._history_gap = False
         self._publications: dict[str, dict] = {}
-        self._commands: list[dict] = []
+        self._commands: list[LocalCommandRecord] = []
         self._command_lock = asyncio.Lock()
         self._command_task: asyncio.Task | None = None
         self._source_tasks: list[asyncio.Task] = []
@@ -148,9 +153,9 @@ class DashboardViews:
     def _restore_commands(self, history: SavedCommandHistory) -> None:
         records = []
         for saved in history.items[-1000:]:
-            record = saved.model_dump()
+            record = saved
             if saved.status == "submitting":
-                record.update(status="unknown", polling=True)
+                record = _update_model(record, status="unknown", polling=True)
             records.append(record)
         self._commands = records
 
@@ -437,12 +442,11 @@ class DashboardViews:
     def _write_commands(self) -> None:
         path = self.settings.state_directory / "commands.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(
-            {"items": self._commands}, ensure_ascii=False, allow_nan=False
-        )
+        document = {"items": [record.model_dump(exclude_unset=True) for record in self._commands]}
+        encoded = json.dumps(document, ensure_ascii=False, allow_nan=False)
         if len(encoded.encode("utf-8")) > 8388608:
             raise OSError("Dashboard command history exceeds its 8 MiB limit.")
-        write_json(path, {"items": self._commands})
+        write_json(path, document)
 
     async def _save_commands(self) -> None:
         writing = asyncio.create_task(asyncio.to_thread(self._write_commands))
@@ -898,9 +902,9 @@ class DashboardViews:
             items = [
                 *items,
                 *(
-                    row
+                    row.model_dump(exclude_unset=True)
                     for row in self._commands
-                    if row.get("experiment_id") == identifier
+                    if row.experiment_id == identifier
                 ),
             ]
         return self.page(items, metadata, view, params)
@@ -1106,9 +1110,9 @@ class DashboardViews:
             page["total"] += len(parents)
         if view == "commands":
             page["items"] += [
-                row
+                row.model_dump(exclude_unset=True)
                 for row in self._commands
-                if row.get("experiment_id") == dataset["experiment_id"]
+                if row.experiment_id == dataset["experiment_id"]
             ]
         return {**metadata, **page}
 
@@ -1586,31 +1590,32 @@ class DashboardViews:
         record = await self._reserve_command(request)
         return await self._submit_reserved_command(request, record)
 
-    async def _reserve_command(self, request: DashboardCommand) -> dict:
+    async def _reserve_command(self, request: DashboardCommand) -> LocalCommandRecord:
         """Persist a local submission record before the first network effect."""
-        command = request.wire_document()
         async with self._command_lock:
-            if any(
-                item["command_id"] == command["command_id"] for item in self._commands
-            ):
+            if any(item.command_id == request.command_id for item in self._commands):
                 raise SystemAPIError(
                     "command_exists",
                     "This command ID is already recorded; read its result instead.",
                     409,
                 )
-            record = {
-                "command_id": command["command_id"],
-                "command": command["command"],
-                "experiment_id": command.get("args", {}).get("experiment_id")
-                or (None if self._live is None else self._live.experiment_id),
-                "target": "Runner",
-                "kind": "control",
-                "status": "submitting",
-                "sent_at": datetime.now(UTC).isoformat(),
-                "server_instance_id": None if self._live is None else self._live.server_instance_id,
-                "args": command.get("args", {}),
-                "polling": False,
-            }
+            record = LocalCommandRecord.model_validate(
+                {
+                    "command_id": request.command_id,
+                    "command": request.command,
+                    "experiment_id": request.args.get("experiment_id")
+                    or (None if self._live is None else self._live.experiment_id),
+                    "target": "Runner",
+                    "kind": "control",
+                    "status": "submitting",
+                    "sent_at": datetime.now(UTC).isoformat(),
+                    "server_instance_id": None
+                    if self._live is None
+                    else self._live.server_instance_id,
+                    "args": request.args,
+                    "polling": False,
+                }
+            )
             previous = list(self._commands)
             self._commands.append(record)
             self._commands = self._commands[-1000:]
@@ -1625,75 +1630,67 @@ class DashboardViews:
         return record
 
     async def _submit_reserved_command(
-        self, request: DashboardCommand, record: dict
+        self, request: DashboardCommand, record: LocalCommandRecord
     ) -> dict:
         command = request.wire_document()
         try:
             validated_receipt = _command_receipt(await self.system.submit(command))
             if validated_receipt.command_id != command["command_id"]:
                 raise SystemAPIError(
-                    "invalid_response", "System returned a receipt for another command.", 502
+                    "invalid_response",
+                    "System returned a receipt for another command.",
+                    502,
                 )
-            receipt = validated_receipt.model_dump(exclude_unset=True)
         except SystemAPIError as error:
             async with self._command_lock:
-                record.update(
-                    status="unknown"
+                status = (
+                    "unknown"
                     if error.code in {"connection_error", "timeout", "invalid_response"}
-                    else "failed",
-                    error=str(error),
+                    else "failed"
                 )
-                record["polling"] = record["status"] == "unknown"
+                self._replace_command_record(
+                    record,
+                    status=status,
+                    error=str(error),
+                    polling=status == "unknown",
+                )
                 await self._save_commands()
             raise
         async with self._command_lock:
-            record.update(
+            self._replace_command_record(
+                record,
                 status=validated_receipt.state,
                 server_instance_id=validated_receipt.server_instance_id,
                 polling=validated_receipt.state == "pending",
-                result=receipt,
+                result=validated_receipt,
             )
             await self._save_commands()
-        return receipt
+        return validated_receipt.model_dump(exclude_unset=True)
 
     async def command_result(self, identifier: str) -> dict:
-        validated_result = _command_receipt(await self.system.read(f"commands/{identifier}"))
+        validated_result = _command_receipt(
+            await self.system.read(f"commands/{identifier}")
+        )
         if validated_result.command_id != identifier:
             raise SystemAPIError(
                 "invalid_response", "System returned a result for another command.", 502
             )
-        result = validated_result.model_dump(exclude_unset=True)
         refresh_history = None
         async with self._command_lock:
             record = next(
-                (item for item in self._commands if item["command_id"] == identifier),
+                (item for item in self._commands if item.command_id == identifier),
                 None,
             )
             if record:
-                if record.get("server_instance_id") not in (
-                    None,
-                    validated_result.server_instance_id,
-                ):
-                    record.update(
-                        status="unknown",
-                        polling=False,
-                        error="System server instance changed.",
-                    )
-                    await self._save_commands()
-                    return {**result, "state": "unknown", "result": None}
-                if (
-                    record.get("polling")
-                    and validated_result.result == "success"
-                    and validated_result.state != "pending"
-                ):
-                    refresh_history = result.get("experiment_id") or record.get(
-                        "experiment_id"
-                    )
-                record.update(status=validated_result.state, result=result)
-                record["polling"] = validated_result.state == "pending"
-                if result.get("experiment_id"):
-                    record["experiment_id"] = result["experiment_id"]
-                await self._save_commands()
+                changed_instance, refresh_history = await self._apply_command_result(
+                    record, validated_result
+                )
+                if changed_instance:
+                    return {
+                        **validated_result.model_dump(exclude_unset=True),
+                        "state": "unknown",
+                        "result": None,
+                    }
             if (
                 refresh_history
                 and self._cache_pool is not None
@@ -1711,7 +1708,53 @@ class DashboardViews:
         self._live_at = 0
         if history_task is not None:
             await asyncio.shield(history_task)
-        return result
+        return validated_result.model_dump(exclude_unset=True)
+
+    async def _apply_command_result(
+        self, record: LocalCommandRecord, result: CommandReceipt
+    ) -> tuple[bool, object]:
+        """Apply a correlated receipt while the caller owns the command lock."""
+        if record.server_instance_id not in (None, result.server_instance_id):
+            self._replace_command_record(
+                record,
+                status="unknown",
+                polling=False,
+                error="System server instance changed.",
+            )
+            await self._save_commands()
+            return True, None
+        experiment_id = (result.model_extra or {}).get("experiment_id")
+        refresh_history = None
+        if record.polling and result.result == "success" and result.state != "pending":
+            refresh_history = experiment_id or record.experiment_id
+        changes: dict[str, object] = {
+            "status": result.state,
+            "result": result,
+            "polling": result.state == "pending",
+        }
+        if experiment_id:
+            changes["experiment_id"] = experiment_id
+        self._replace_command_record(record, **changes)
+        await self._save_commands()
+        return False, refresh_history
+
+    def _replace_command_record(
+        self, record: LocalCommandRecord, **changes: object
+    ) -> LocalCommandRecord:
+        """Replace the current owned version; an evicted in-flight record stays detached."""
+        index = next(
+            (
+                index
+                for index, item in enumerate(self._commands)
+                if item.command_id == record.command_id
+            ),
+            None,
+        )
+        current = record if index is None else self._commands[index]
+        replacement = _update_model(current, **changes)
+        if index is not None:
+            self._commands[index] = replacement
+        return replacement
 
     async def _refresh_command_history(self, identifier: str) -> None:
         """Make command effects visible without putting worker waits in page reads."""
@@ -1740,21 +1783,36 @@ class DashboardViews:
     async def _poll_commands(self) -> None:
         while True:
             for record in list(self._commands):
-                if not record.get("polling") or self.system.base_url is None:
+                if not record.polling or self.system.base_url is None:
                     continue
                 try:
-                    await self.command_result(record["command_id"])
+                    await self.command_result(record.command_id)
                 except SystemAPIError as error:
                     async with self._command_lock:
-                        record.update(status="unknown", error=str(error))
-                        if error.status_code == 404:
-                            record["polling"] = False
+                        current = next(
+                            (
+                                item
+                                for item in self._commands
+                                if item.command_id == record.command_id
+                            ),
+                            record,
+                        )
+                        self._replace_command_record(
+                            current,
+                            status="unknown",
+                            error=str(error),
+                            polling=False
+                            if error.status_code == 404
+                            else current.polling,
+                        )
                         try:
                             await self._save_commands()
                         except OSError as failure:
-                            record["storage_error"] = str(failure)
+                            self._replace_command_record(
+                                record, storage_error=str(failure)
+                            )
                 except OSError as error:
-                    record["storage_error"] = str(error)
+                    self._replace_command_record(record, storage_error=str(error))
             await asyncio.sleep(1)
 
     async def close(self) -> None:

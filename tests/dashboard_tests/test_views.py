@@ -11,12 +11,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
+from core.models.dashboard_commands import LocalCommandRecord
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
     CollectorSample,
     CollectorStatus,
 )
 from core.models.dashboard_upstream import LiveState
+from core.models.server_receipts import CommandReceipt
 from core.models.updates import _update_model
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
@@ -31,6 +33,27 @@ from tests.helpers.dag import wait_until
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_records_and_receipts_survive_until_json_publication(self):
+        receipt = await self.views.command({"command": "pause"})
+        record = self.views._commands[0]
+        self.assertIsInstance(record, LocalCommandRecord)
+        self.assertIsInstance(record.result, CommandReceipt)
+        self.assertEqual(record.result.model_dump(exclude_unset=True), receipt)
+        original = record.model_dump(exclude_unset=True)
+        receipt["state"] = "external"
+        self.assertEqual(record.model_dump(exclude_unset=True), original)
+        emitted = await self.views.command_result(record.command_id)
+        current = self.views._commands[0]
+        self.assertIsInstance(current.result, CommandReceipt)
+        self.assertEqual(current.status, "succeeded")
+        self.assertEqual(record.status, "pending")
+        emitted["state"] = "external"
+        self.assertEqual(current.result.state, "succeeded")
+        saved = json.loads(
+            (self.config["state_directory"] / "commands.json").read_text()
+        )
+        self.assertEqual(saved["items"][0], current.model_dump(exclude_unset=True))
+
     async def test_live_observation_models_survive_transport_failure_and_output_mutation(
         self,
     ):
@@ -97,7 +120,9 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.views._write_commands()
         path = self.config["state_directory"] / "commands.json"
         self.views._commands = [
-            {"command_id": str(uuid4()), "status": "pending", "polling": True}
+            LocalCommandRecord.model_validate(
+                {"command_id": str(uuid4()), "status": "pending", "polling": True}
+            )
         ]
         if os.name == "nt":
             failure = PermissionError("MoveFileEx denied replacement")
@@ -110,7 +135,12 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.load(previous), {"items": []})
         self.assertEqual(
             json.loads(path.read_text(encoding="utf-8")),
-            {"items": self.views._commands},
+            {
+                "items": [
+                    record.model_dump(exclude_unset=True)
+                    for record in self.views._commands
+                ]
+            },
         )
         self.assertFalse(list(path.parent.glob(".publish-*")))
 
@@ -162,16 +192,16 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             self.result.update(state=state, result="fail")
             result = await self.views.command_result(receipt["command_id"])
             self.assertEqual(result["state"], state)
-            self.assertFalse(self.views._commands[-1]["polling"])
+            self.assertFalse(self.views._commands[-1].polling)
         await self.views.command({"command": "pause"})
         self.api.read.side_effect = SystemAPIError("unavailable", "expired", 404)
         task = asyncio.create_task(self.views._poll_commands())
         try:
-            await wait_until(lambda: not self.views._commands[-1]["polling"])
+            await wait_until(lambda: not self.views._commands[-1].polling)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(self.views._commands[-1]["status"], "unknown")
+        self.assertEqual(self.views._commands[-1].status, "unknown")
         self.assertEqual(self.api.submit.await_count, 3)
 
     async def test_receipt_persistence_failure_leaves_reconcilable_submission(self):
@@ -195,7 +225,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(saved["items"][0]["status"], "submitting")
         self.api.submit.assert_awaited_once()
-        self.assertEqual(self.views._commands[0]["status"], "pending")
+        self.assertEqual(self.views._commands[0].status, "pending")
 
     async def asyncSetUp(self):
         tmp = temporary_directory()
@@ -323,10 +353,10 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_persist_before_submission_and_pending_is_not_success(self):
         receipt = await self.views.command({"command": "pause"})
         self.assertEqual(receipt["state"], "pending")
-        self.assertTrue(self.views._commands[0]["polling"])
+        self.assertTrue(self.views._commands[0].polling)
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["result"], "success")
-        self.assertFalse(self.views._commands[0]["polling"])
+        self.assertFalse(self.views._commands[0].polling)
         with self.assertRaises(SystemAPIError) as duplicate:
             await self.views.command(
                 {"command": "pause", "command_id": receipt["command_id"]}
@@ -350,10 +380,10 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.api.submit.side_effect = SystemAPIError("timeout", "lost response")
         with self.assertRaises(SystemAPIError):
             await self.views.command({"command": "pause"})
-        self.assertEqual(self.views._commands[0]["status"], "unknown")
+        self.assertEqual(self.views._commands[0].status, "unknown")
         task = asyncio.create_task(self.views._poll_commands())
         try:
-            await wait_until(lambda: self.views._commands[0]["status"] == "succeeded")
+            await wait_until(lambda: self.views._commands[0].status == "succeeded")
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -378,7 +408,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["state"], "unknown")
         self.assertIsNone(result["result"])
-        self.assertFalse(self.views._commands[0]["polling"])
+        self.assertFalse(self.views._commands[0].polling)
 
     async def test_restart_reconciles_submitting_record_and_closes_background_tasks(
         self,
@@ -401,7 +431,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.views.open()
         tasks = list(self.views._source_tasks) + [self.views._command_task]
-        await wait_until(lambda: self.views._commands[0]["status"] == "succeeded")
+        await wait_until(lambda: self.views._commands[0].status == "succeeded")
         self.api.submit.assert_not_awaited()
         await self.views.close()
         self.assertTrue(all(task.done() for task in tasks))

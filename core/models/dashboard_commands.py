@@ -6,6 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from core.models.server_commands import ServerCommand
+from core.models.server_receipts import CommandReceipt
 from core.models.values import UUIDText
 from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
 
@@ -50,10 +51,26 @@ class LocalCommandRecord(BaseModel):
     command_id: UUIDText
     status: str
     polling: bool
+    command: JsonValue = None
+    experiment_id: JsonValue = None
+    server_instance_id: JsonValue = None
+    args: JsonValue = None
+    error: JsonValue = None
+    storage_error: JsonValue = None
+    result: CommandReceipt | JsonValue = None
 
     @model_validator(mode="before")
     @classmethod
-    def detach(cls, document: object) -> JsonObject:
+    def detach(cls, document: object) -> object:
+        if isinstance(document, dict) and isinstance(
+            document.get("result"), CommandReceipt
+        ):
+            receipt = document["result"]
+            values = copy_json_object(
+                {**document, "result": receipt.model_dump(exclude_unset=True)},
+                "local command record",
+            )
+            return {**values, "result": receipt}
         return copy_json_object(document, "local command record")
 
 
