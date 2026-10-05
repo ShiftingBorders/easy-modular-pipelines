@@ -2,6 +2,7 @@
 
 import copy
 import sqlite3
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -241,6 +242,10 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
         reader = LocalJournals(settings)
         self.addCleanup(reader.close)
         dataset = reader.load("exp-test", force=True)
+        deadline = time.monotonic() + 30
+        target = dataset["target_boundary"]
+        while not dataset["complete"] and time.monotonic() < deadline:
+            dataset = reader.load("exp-test", force=True, target=target)
         self.assertTrue(dataset["complete"])
         return workspace, reader, dataset
 

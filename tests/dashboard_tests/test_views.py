@@ -16,6 +16,7 @@ from core.models.dashboard_resources import (
     CollectorSample,
     CollectorStatus,
 )
+from core.models.dashboard_upstream import LiveState
 from core.models.updates import _update_model
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
@@ -30,6 +31,32 @@ from tests.helpers.dag import wait_until
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_observation_models_survive_transport_failure_and_output_mutation(
+        self,
+    ):
+        await self.views.state(refresh=True)
+        retained = self.views._live
+        self.assertIsInstance(retained, LiveState)
+        before = retained.model_dump(exclude_unset=True)
+        emitted = await self.views.state()
+        emitted["experiment_id"] = "external"
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+        self.api.read.side_effect = SystemAPIError("timeout", "runtime timeout")
+        self.views._live_at = 0
+        failed = await self.views.state(refresh=True)
+        self.assertIs(self.views._live, retained)
+        self.assertFalse(failed["available"])
+        self.assertFalse(failed["fresh"])
+        self.assertEqual(failed["connection_error"], "runtime timeout")
+        self.assertEqual(failed["experiment_id"], before["experiment_id"])
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+        self.api.read.side_effect = self.read
+        self.views._live_at = 0
+        recovered = await self.views.state(refresh=True)
+        self.assertTrue(recovered["available"])
+        self.assertTrue(recovered["fresh"])
+        self.assertNotIn("connection_error", recovered)
+
     async def test_resource_models_remain_retained_through_failures_and_json_output(
         self,
     ):
@@ -333,7 +360,9 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.api.submit.assert_awaited_once()
 
     async def test_wrong_runtime_selection_uses_fresh_preflight_and_rejects_send(self):
-        self.views._live = {"experiment_id": "wrong", "fresh": True}
+        self.views._live = LiveState.model_validate(
+            {"experiment_id": "wrong", "fresh": True}
+        )
         self.views._live_at = time.monotonic()
         with self.assertRaises(SystemAPIError) as caught:
             await self.views.command(

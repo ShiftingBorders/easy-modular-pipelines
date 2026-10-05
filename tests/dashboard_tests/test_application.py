@@ -28,11 +28,8 @@ WRITE_HEADERS = {"X-Dashboard-Request": "1", "Origin": "http://dashboard.test"}
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_page_success_does_not_change_global_runtime_connection(self):
-        self.app.state.views._live = {
-            "available": False,
-            "fresh": False,
-            "connection_error": "offline",
-        }
+        self.app.state.views._live_available = False
+        self.app.state.views._live_error = "offline"
         for page in ("overview", "experiments", "modules", "compute", "alerts"):
             self.assertEqual(
                 (await self.http.get("/api/system/" + page)).status_code, 200

@@ -74,7 +74,9 @@ class DashboardViews:
         self.settings = validated
         self.system = system
         self.journals = LocalJournals(self.settings)
-        self._live: dict = {}
+        self._live: LiveState | None = None
+        self._live_available: bool | None = None
+        self._live_error: str | None = None
         self._live_at = 0.0
         self._live_lock = asyncio.Lock()
         self._resource_lock = asyncio.Lock()
@@ -452,26 +454,36 @@ class DashboardViews:
 
     async def state(self, *, refresh: bool = False) -> dict:
         if not refresh:
-            snapshot = dict(self._live)
-            if not self._live_at or time.monotonic() - self._live_at > 3:
-                snapshot["fresh"] = False
-            return snapshot
+            return self._live_document(
+                stale=not self._live_at or time.monotonic() - self._live_at > 3
+            )
         async with self._live_lock:
             if time.monotonic() - self._live_at < 0.5:
-                return dict(self._live)
+                return self._live_document()
             try:
                 observed = await self._read_live_state()
-                self._live = observed.model_dump(exclude_unset=True)
-                self._live["available"] = True
+                self._live = observed
+                self._live_available = True
+                self._live_error = None
             except SystemAPIError as error:
-                self._live = {
-                    **self._live,
-                    "fresh": False,
-                    "available": False,
-                    "connection_error": str(error),
-                }
+                self._live_available = False
+                self._live_error = str(error)
             self._live_at = time.monotonic()
-            return dict(self._live)
+            return self._live_document()
+
+    def _live_document(self, *, stale: bool = False) -> dict:
+        """Project the last checked observation with current owner availability."""
+        snapshot = (
+            {} if self._live is None else self._live.model_dump(exclude_unset=True)
+        )
+        if self._live_available is not None:
+            snapshot["available"] = self._live_available
+        if self._live_available is False:
+            snapshot["fresh"] = False
+            snapshot["connection_error"] = self._live_error
+        if stale:
+            snapshot["fresh"] = False
+        return snapshot
 
     async def _read_live_state(self) -> LiveState:
         try:
@@ -490,12 +502,8 @@ class DashboardViews:
                     await self._refresh_resources()
             except Exception as error:  # noqa: BLE001 - A broken source must not stop independent cached reads.
                 if source == "state":
-                    self._live = {
-                        **self._live,
-                        "available": False,
-                        "fresh": False,
-                        "connection_error": str(error),
-                    }
+                    self._live_available = False
+                    self._live_error = str(error)
                 else:
                     self._resource_unavailable = True
                     self._resource_error = str(error)
@@ -1594,12 +1602,12 @@ class DashboardViews:
                 "command_id": command["command_id"],
                 "command": command["command"],
                 "experiment_id": command.get("args", {}).get("experiment_id")
-                or self._live.get("experiment_id"),
+                or (None if self._live is None else self._live.experiment_id),
                 "target": "Runner",
                 "kind": "control",
                 "status": "submitting",
                 "sent_at": datetime.now(UTC).isoformat(),
-                "server_instance_id": self._live.get("server_instance_id"),
+                "server_instance_id": None if self._live is None else self._live.server_instance_id,
                 "args": command.get("args", {}),
                 "polling": False,
             }
