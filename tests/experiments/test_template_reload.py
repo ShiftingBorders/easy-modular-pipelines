@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import yaml
 
 from core.experiments.state import state_from_document, state_to_document
+from core.models.runner_state import PendingRebuild
 from core.primitives.json_files import read_json
 from tests.helpers.reload import candidate, events, trace, version, workspace
 
@@ -357,7 +358,9 @@ class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
             "stable_snapshot_id": pending["snapshot_id"],
             "pending_rebuild": pending,
         }
-        self.assertEqual(state_from_document(root, valid).pending_rebuild, pending)
+        restored = state_from_document(root, valid).pending_rebuild
+        self.assertIsInstance(restored, PendingRebuild)
+        self.assertEqual(restored.model_dump(exclude_unset=True), pending)
         for bad in (
             {},
             {**pending, "extra": True},

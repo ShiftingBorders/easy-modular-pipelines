@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from core.experiments.state import _process_identity_pid
+from core.models.experiment_template import ExperimentTemplate
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import process_running
 from tests.helpers.reload import candidate, events, version, workspace
@@ -198,7 +199,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     gate = controls / "hold-launcher-cleanup"
                     gate.touch()
                     task = asyncio.create_task(
-                        runner._services.prepare_rebuild(state, document)
+                        runner._services.prepare_rebuild(
+                            state, ExperimentTemplate.model_validate(document)
+                        )
                     )
                     try:
                         await wait_for(
@@ -544,7 +547,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     "wait",
                     side_effect=AssertionError("Launcher already exited"),
                 ):
-                    await runner._services.prepare_rebuild(runner._state, document)
+                    await runner._services.prepare_rebuild(
+                        runner._state, ExperimentTemplate.model_validate(document)
+                    )
                 await work.close()
 
     async def test_unconfirmed_participant_stop_rejects_before_launcher_wait_rr10(self):
@@ -574,7 +579,9 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 self.assertRaisesRegex(RuntimeError, "did not stop cleanly"),
             ):
-                await runner._services.prepare_rebuild(runner._state, document)
+                await runner._services.prepare_rebuild(
+                    runner._state, ExperimentTemplate.model_validate(document)
+                )
         self.assertIsNone(launcher.poll())
 
     async def test_slow_resource_checks_keep_unchanged_service_heartbeats_rr06(self):
@@ -932,7 +939,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 runner.resume,
                 runner.step,
                 lambda: runner.run(work.template_path),
-                lambda: runner.rollback(pending["snapshot_id"]),
+                lambda: runner.rollback(pending.snapshot_id),
             ):
                 with self.assertRaises(RuntimeError):
                     await action()
