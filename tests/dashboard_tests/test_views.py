@@ -11,6 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
+from core.models.dashboard_resources import (
+    CollectorHistoryPage,
+    CollectorSample,
+    CollectorStatus,
+)
 from core.models.updates import _update_model
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
@@ -25,6 +30,41 @@ from tests.helpers.dag import wait_until
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resource_models_remain_retained_through_failures_and_json_output(
+        self,
+    ):
+        await self.views._refresh_resources()
+        retained = self.views._resource_status
+        self.assertIsInstance(retained, CollectorStatus)
+        self.assertTrue(
+            all(isinstance(sample, CollectorSample) for sample in retained.latest)
+        )
+        page = CollectorHistoryPage.model_validate(
+            {
+                "samples": self.status["latest"],
+                "cursor": 1,
+                "gap": False,
+                "history_id": retained.history_id,
+            }
+        )
+        self.views._accept_resource_history_page(page)
+        self.assertIs(self.views._history[-1], page.samples[0])
+        before = retained.model_dump(exclude_unset=True)
+        emitted = await self.views.compute({})
+        emitted["metrics"]["cpu"]["attributes"]["external"] = True
+        emitted["collector"]["latest"][0]["resources"]["host_cpu_percent"][
+            "attributes"
+        ]["external"] = True
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+        self.api.read.side_effect = SystemAPIError("timeout", "resource timeout")
+        self.views._resource_at = 0
+        await self.views._refresh_resources()
+        self.assertIs(self.views._resource_status, retained)
+        stale = await self.views.compute({})
+        self.assertEqual(stale["error"], "resource timeout")
+        self.assertFalse(stale["metrics"]["cpu"]["fresh"])
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+
     def test_command_publication_handles_platform_reader_semantics(self):
         """T050/T074: command-state publication survives native reader semantics."""
         self.views._write_commands()

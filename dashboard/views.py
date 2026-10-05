@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import multiprocessing
 import time
@@ -18,6 +19,7 @@ from core.models.dashboard_commands import DashboardCommand, SavedCommandHistory
 from core.models.dashboard_queries import OffsetCursor, PageLimit, PublicationCursor
 from core.models.dashboard_resources import (
     CollectorHistoryPage,
+    CollectorSample,
     CollectorSamples,
     CollectorStatus,
 )
@@ -76,9 +78,13 @@ class DashboardViews:
         self._live_at = 0.0
         self._live_lock = asyncio.Lock()
         self._resource_lock = asyncio.Lock()
-        self._resource_status: dict = {}
+        self._resource_status: CollectorStatus | None = None
+        self._resource_unavailable = False
+        self._resource_error: str | None = None
+        self._resource_history_error: str | None = None
+        self._resource_history_observed = False
         self._resource_at = 0.0
-        self._history: deque[dict] = deque(maxlen=50000)
+        self._history: deque[CollectorSample] = deque(maxlen=50000)
         self._history_id = None
         self._history_cursor = 0
         self._history_gap = False
@@ -491,11 +497,8 @@ class DashboardViews:
                         "connection_error": str(error),
                     }
                 else:
-                    self._resource_status = {
-                        **self._resource_status,
-                        "state": "unavailable",
-                        "error": str(error),
-                    }
+                    self._resource_unavailable = True
+                    self._resource_error = str(error)
             await asyncio.sleep(1)
 
     async def _model(
@@ -1335,7 +1338,9 @@ class DashboardViews:
             if time.monotonic() - self._resource_at < 0.5:
                 return
             try:
-                status = CollectorStatus.model_validate(await self.system.read("resources"))
+                status = CollectorStatus.model_validate(
+                    await self.system.read("resources")
+                )
             except (ValueError, TypeError):
                 error = "Invalid collector status."
             except SystemAPIError as failure:
@@ -1345,9 +1350,8 @@ class DashboardViews:
                 await self._refresh_resource_history()
                 self._resource_at = time.monotonic()
                 return
-            self._resource_status = {
-                **self._resource_status, "state": "unavailable", "error": error,
-            }
+            self._resource_unavailable = True
+            self._resource_error = error
             self._resource_at = time.monotonic()
 
     def _accept_resource_status(self, status: CollectorStatus) -> None:
@@ -1356,10 +1360,15 @@ class DashboardViews:
             self._history_cursor = 0
             self._history_id = status.history_id
             self._history_gap = False
-        self._resource_status = status.model_dump(exclude_unset=True)
+        self._resource_status = status
+        self._resource_unavailable = False
+        self._resource_error = None
+        self._resource_history_error = None
+        self._resource_history_observed = False
         self._resource_observed_at = time.monotonic()
 
     async def _refresh_resource_history(self) -> None:
+        self._resource_history_observed = True
         try:
             for _ in range(5):
                 document = await self.system.read(
@@ -1373,10 +1382,10 @@ class DashboardViews:
                     ) from error
                 if self._accept_resource_history_page(page):
                     break
-            self._resource_status["history_error"] = None
+            self._resource_history_error = None
         except SystemAPIError as failure:
             # History failure does not invalidate fresh instantaneous readings.
-            self._resource_status["history_error"] = str(failure)
+            self._resource_history_error = str(failure)
 
     def _accept_resource_history_page(self, page: CollectorHistoryPage) -> bool:
         """Apply a checked page and report whether this bounded read can stop."""
@@ -1386,71 +1395,36 @@ class DashboardViews:
             self._history_gap = False
             return False
         self._history_gap = (
-            self._history_gap or page.gap
+            self._history_gap
+            or page.gap
             or len(self._history) + len(page.samples) > self._history.maxlen
         )
-        self._history.extend(sample.model_dump(exclude_unset=True) for sample in page.samples)
+        self._history.extend(page.samples)
         previous_cursor = self._history_cursor
         self._history_cursor = page.cursor
         return not page.samples or self._history_cursor == previous_cursor
 
     async def compute(self, params: dict) -> dict:
-        status = dict(self._resource_status)
-        if (
+        observed = self._resource_status
+        state = None if observed is None else observed.state
+        error = None if observed is None else observed.error
+        stale = (
             not self._resource_observed_at
             or time.monotonic() - self._resource_observed_at > 3
-        ):
-            status["state"] = "unavailable"
-            status["error"] = (
-                status.get("error") or "Awaiting a current resource observation."
+        )
+        unavailable = self._resource_unavailable or stale
+        if self._resource_unavailable:
+            state, error = "unavailable", self._resource_error
+        if stale:
+            state, error = (
+                "unavailable",
+                error or "Awaiting a current resource observation.",
             )
+        latest = [] if observed is None else observed.latest
         host = next(
-            (
-                sample
-                for sample in status.get("latest", [])
-                if sample["series_id"].startswith("host:")
-            ),
-            {},
+            (sample for sample in latest if sample.series_id.startswith("host:")), None
         )
-        metrics = {}
-        names = {
-            "cpu": "host_cpu_percent",
-            "ram": "host_memory_percent",
-            "disk": "host_disk_percent",
-        }
-        for key, name in names.items():
-            measured = host.get("resources", {}).get(name, {})
-            fresh = status.get("state") == "running" and host.get("freshness", {}).get(
-                name, {}
-            ).get("fresh", False)
-            metrics[key] = {
-                "value": measured.get("value"),
-                "fresh": fresh,
-                "exceeded": False,
-                "reason": measured.get("attributes", {}).get("reason"),
-                "attributes": measured.get("attributes", {}),
-            }
-        metrics["disk"]["free_bytes"] = (
-            host.get("resources", {}).get("host_disk_free_bytes", {}).get("value")
-        )
-        metrics["internet"] = {
-            direction + "_mbps": host.get("resources", {})
-            .get("internet_" + direction + "_mbps", {})
-            .get("value")
-            for direction in ("receive", "transmit")
-        }
-        metrics["internet"]["interface"] = (
-            host.get("resources", {})
-            .get("internet_receive_mbps", {})
-            .get("attributes", {})
-            .get("interface")
-        )
-        metrics["internet"]["fresh"] = status.get("state") == "running" and all(
-            host.get("freshness", {})
-            .get("internet_" + direction + "_mbps", {})
-            .get("fresh", False)
-            for direction in ("receive", "transmit")
-        )
+        metrics = self._resource_metrics(host, state == "running")
         since = instant(params.get("since"))
         until = instant(params.get("until"))
         if (
@@ -1466,59 +1440,122 @@ class DashboardViews:
         samples = [
             sample
             for sample in self._history
-            if (since is None or (instant(sample["observed_at"]) or 0) >= since)
-            and (until is None or (instant(sample["observed_at"]) or 0) <= until)
+            if (since is None or (instant(sample.observed_at) or 0) >= since)
+            and (until is None or (instant(sample.observed_at) or 0) <= until)
         ]
+        names = {
+            "cpu": "host_cpu_percent",
+            "ram": "host_memory_percent",
+            "disk": "host_disk_percent",
+        }
         history = {
             key: [
                 {
-                    "observed_at": sample["observed_at"],
-                    "value": sample["resources"].get(name, {}).get("value"),
+                    "observed_at": sample.observed_at,
+                    "value": None
+                    if name not in sample.resources
+                    else sample.resources[name].value,
                 }
                 for sample in samples
-                if sample["series_id"].startswith("host:")
+                if sample.series_id.startswith("host:")
             ]
             for key, name in names.items()
         }
-        processes = {}
-        for sample in status.get("latest", []):
-            if sample["series_id"].startswith("host:"):
-                continue
-            values = sample["resources"]
-            processes[sample["series_id"]] = {
-                "rss_bytes": values.get("process_memory_rss_bytes", {}).get("value"),
-                "cpu_percent": values.get("process_cpu_percent", {}).get("value"),
-                "fresh": status.get("state") == "running"
-                and sample.get("fresh", False),
-                "observed_process": values.get("process_cpu_percent", {})
-                .get("attributes", {})
-                .get("observed_process"),
-                "history": [
-                    {
-                        "observed_at": point["observed_at"],
-                        "rss_bytes": point["resources"]
-                        .get("process_memory_rss_bytes", {})
-                        .get("value"),
-                        "cpu_percent": point["resources"]
-                        .get("process_cpu_percent", {})
-                        .get("value"),
-                    }
-                    for point in samples
-                    if point["series_id"] == sample["series_id"]
-                ],
-            }
+        processes = self._resource_processes(latest, samples, state == "running")
+        status = {} if observed is None else observed.model_dump(exclude_unset=True)
+        if unavailable:
+            status.update(state=state, error=error)
+        if self._resource_history_observed:
+            status["history_error"] = self._resource_history_error
         return {
             "metrics": metrics,
             "history": history,
             "processes": processes,
             "collector": status,
-            "observed_at": host.get("observed_at"),
+            "observed_at": None if host is None else host.observed_at,
             "history_id": self._history_id,
             "gap": self._history_gap,
             "error": status.get("error"),
             "journal_error": status.get("journal_error"),
             "history_error": status.get("history_error"),
         }
+
+    def _resource_metrics(self, host: CollectorSample | None, running: bool) -> dict:
+        resources = {} if host is None else host.resources
+        freshness = {} if host is None else host.freshness
+        names = {
+            "cpu": "host_cpu_percent",
+            "ram": "host_memory_percent",
+            "disk": "host_disk_percent",
+        }
+        metrics = {}
+        for key, name in names.items():
+            measured = resources.get(name)
+            attributes = {} if measured is None else copy.deepcopy(measured.attributes)
+            fresh = freshness.get(name)
+            metrics[key] = {
+                "value": None if measured is None else measured.value,
+                "fresh": running and fresh is not None and fresh.fresh,
+                "exceeded": False,
+                "reason": attributes.get("reason"),
+                "attributes": attributes,
+            }
+        free = resources.get("host_disk_free_bytes")
+        metrics["disk"]["free_bytes"] = None if free is None else free.value
+        metrics["internet"] = {}
+        for direction in ("receive", "transmit"):
+            measured = resources.get("internet_" + direction + "_mbps")
+            metrics["internet"][direction + "_mbps"] = (
+                None if measured is None else measured.value
+            )
+        incoming = resources.get("internet_receive_mbps")
+        metrics["internet"]["interface"] = (
+            None if incoming is None else incoming.attributes.get("interface")
+        )
+        metrics["internet"]["fresh"] = running and all(
+            name in freshness and freshness[name].fresh
+            for name in ("internet_receive_mbps", "internet_transmit_mbps")
+        )
+        return metrics
+
+    def _resource_processes(
+        self,
+        latest: list[CollectorSample],
+        samples: list[CollectorSample],
+        running: bool,
+    ) -> dict:
+        processes = {}
+        for sample in latest:
+            if sample.series_id.startswith("host:"):
+                continue
+            memory = sample.resources.get("process_memory_rss_bytes")
+            cpu = sample.resources.get("process_cpu_percent")
+            history = []
+            for point in samples:
+                if point.series_id == sample.series_id:
+                    point_memory = point.resources.get("process_memory_rss_bytes")
+                    point_cpu = point.resources.get("process_cpu_percent")
+                    history.append(
+                        {
+                            "observed_at": point.observed_at,
+                            "rss_bytes": None
+                            if point_memory is None
+                            else point_memory.value,
+                            "cpu_percent": None
+                            if point_cpu is None
+                            else point_cpu.value,
+                        }
+                    )
+            processes[sample.series_id] = {
+                "rss_bytes": None if memory is None else memory.value,
+                "cpu_percent": None if cpu is None else cpu.value,
+                "fresh": running and sample.fresh,
+                "observed_process": None
+                if cpu is None
+                else copy.deepcopy(cpu.attributes.get("observed_process")),
+                "history": history,
+            }
+        return processes
 
     async def command(self, command: dict) -> dict:
         return await self._command(DashboardCommand.model_validate(command))

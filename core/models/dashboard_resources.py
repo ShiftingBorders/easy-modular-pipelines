@@ -40,6 +40,7 @@ class CollectorSample(_Document):
     observed_at: str
     resources: dict[str, CollectorMetric]
     freshness: dict[str, MetricFreshness] = Field(default_factory=dict)
+    fresh: JsonValue = False
 
     @field_validator("observed_at")
     @classmethod
@@ -52,6 +53,10 @@ class CollectorSample(_Document):
 class CollectorStatus(_Document):
     latest: list[CollectorSample]
     history_id: JsonValue = None
+    state: JsonValue = None
+    error: JsonValue = None
+    journal_error: JsonValue = None
+    history_error: JsonValue = None
 
 
 class CollectorHistoryPage(_Document):
