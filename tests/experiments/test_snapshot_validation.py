@@ -9,8 +9,18 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.experiments.restore_inputs import _restored_saved_state
+from core.experiments.snapshot_validation import _validate_snapshot_manifest
 from core.journal.events import LoggingError
 from core.journal.storage import SQLiteEventStore
+from core.models.journal_diagnostics import JournalSnapshotManifest
+from core.models.runner_state import SavedRunnerState
+from core.models.snapshot_documents import (
+    SnapshotFile,
+    SnapshotInventory,
+    SnapshotMetadata,
+    SnapshotPayload,
+)
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
 
@@ -38,6 +48,59 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
         write_json(directory / "manifest.json", manifest)
+
+    async def test_payload_components_and_restored_candidate_remain_models(self):
+        original = read_json(self.archive / "manifest.json")
+        payload = self.runner._snapshots._load_snapshot(self.archive)
+        self.assertIsInstance(payload, SnapshotPayload)
+        self.assertIsInstance(payload.state, SavedRunnerState)
+        self.assertIsInstance(payload.inventory, SnapshotInventory)
+        self.assertIsInstance(payload.journal, JournalSnapshotManifest)
+        self.assertTrue(
+            all(
+                isinstance(item, SnapshotFile)
+                for item in payload.inventory.files.values()
+            )
+        )
+        self.assertEqual(payload.document(), original)
+        before = payload.state.model_dump(exclude_unset=True)
+        restored = _restored_saved_state(payload, payload.state, "continued", "new-run")
+        self.assertIsInstance(restored, SavedRunnerState)
+        self.assertEqual(
+            (restored.experiment_id, restored.run_id, restored.phase),
+            ("continued", "new-run", "restoring"),
+        )
+        self.assertEqual(
+            restored.used_request_ids, sorted(payload.state.used_request_ids)
+        )
+        self.assertEqual(payload.state.model_dump(exclude_unset=True), before)
+        emitted = payload.document()
+        emitted["state"]["last_result"]["external"] = True
+        name = next(iter(payload.inventory.files))
+        emitted["files"][name]["size_bytes"] += 1
+        self.assertEqual(payload.document(), original)
+        self.assertEqual(payload.state.model_dump(exclude_unset=True), before)
+
+    async def test_payload_preserves_legacy_json_omissions_and_light_metadata(self):
+        legacy = read_json(self.archive / "manifest.json")
+        legacy["state"]["schema_version"] = 3
+        for name in ("pending_input", "last_dag_decision", "retained_artifacts"):
+            del legacy["state"][name]
+        legacy = {name: legacy[name] for name in reversed(legacy)}
+        payload = _validate_snapshot_manifest(legacy)
+        self.assertIsNone(payload.state.pending_input)
+        self.assertEqual(payload.document(), legacy)
+        self.assertEqual(list(payload.document()), list(legacy))
+        self.assertNotIn("pending_input", payload.document()["state"])
+        metadata = SnapshotMetadata.model_validate(
+            {
+                "schema_version": 2,
+                "snapshot_id": legacy["snapshot_id"],
+                "experiment_id": legacy["experiment_id"],
+                "state": {},
+            }
+        )
+        self.assertEqual(metadata.state, {})
 
     async def test_validation_copy_never_enters_wal_mode(self):
         """Validation reads and restores its copy without mapped SHM sidecars."""

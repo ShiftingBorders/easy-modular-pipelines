@@ -2,47 +2,57 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from core.experiments.results import read_result
 from core.experiments.state import RunnerState
 from core.journal.storage import SQLiteEventStore
-from core.models.runner_state import LastDecision
-from core.models.snapshot_documents import SnapshotManifest
+from core.models.journal_diagnostics import JournalSnapshotManifest
+from core.models.runner_state import LastDecision, SavedRunnerState
+from core.models.snapshot_documents import (
+    SnapshotInventory,
+    SnapshotManifest,
+    SnapshotPayload,
+)
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 
 
-def _validate_snapshot_manifest(document: JsonObject) -> None:
-    SnapshotManifest.model_validate(document)
+def _validate_snapshot_manifest(document: JsonObject) -> SnapshotPayload:
+    metadata = SnapshotManifest.model_validate(document)
+    inventory = SnapshotInventory.model_validate(
+        {"directories": metadata.directories, "files": metadata.files}
+    )
+    state = SavedRunnerState.model_validate(metadata.state)
+    journal = JournalSnapshotManifest.model_validate(metadata.journal)
+    return SnapshotPayload.model_validate(
+        {
+            "schema_version": metadata.schema_version,
+            "snapshot_id": metadata.snapshot_id,
+            "experiment_id": metadata.experiment_id,
+            "experiment_folder": metadata.experiment_folder,
+            "created_at": metadata.created_at,
+            "sequence": metadata.sequence,
+            "kind": metadata.kind,
+            "label": metadata.label,
+            "state": state,
+            "services": copy_json_object(metadata.services, "snapshot service exports"),
+            "journal": journal,
+            "inventory": inventory,
+            "encoded_document": json.dumps(
+                document, ensure_ascii=False, allow_nan=False
+            ),
+        }
+    )
 
 
 def _validate_snapshot_exports(
-    directory: Path, document: JsonObject, state: RunnerState
+    directory: Path, document: SnapshotPayload, state: RunnerState
 ) -> None:
-    if set(state.services) != {item.service_id for item in state.template.services}:
-        raise ValueError("Snapshot does not describe every service.")
-    exports = copy_json_object(document["services"], "snapshot service exports")
-    if exports.keys() - state.services.keys():
-        raise ValueError("Snapshot exports an unknown service.")
-    for service_id, instance in state.services.items():
-        definition = next(
-            item for item in state.template.services if item.service_id == service_id
-        )
-        if instance.definition != definition:
-            raise ValueError(
-                "Snapshot service settings differ from the applied template."
-            )
+    exports = document.services
+    for service_id in state.services:
         path = exports.get(service_id)
-        if (
-            instance.active_request
-            or instance.pending_requests
-            or instance.freeze_id
-            or instance.prepared_freeze_id
-        ):
-            raise ValueError("Snapshot contains unresolved service work.")
         if path is None:
-            if instance.definition.state_required:
-                raise ValueError("Required service export is missing.")
             continue
         name = require_text(path, "service state path")
         member = directory / "files" / name
@@ -50,7 +60,7 @@ def _validate_snapshot_exports(
             directory
             / "files/shared_data/service_state"
             / service_id
-            / document["snapshot_id"]
+            / document.snapshot_id
         )
         if (
             PureWindowsPath(name).anchor

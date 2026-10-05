@@ -602,18 +602,18 @@ class ExperimentRunner:
 
     async def _prepare_continuation(self) -> tuple[RunnerState, str]:
         manifest = await asyncio.to_thread(
-            self._snapshots.latest_valid, self._continue_source
+            self._snapshots._latest_valid, self._continue_source
         )
-        saved = manifest["state"]
-        if manifest["experiment_id"] != self._requested_id.split(":", 1)[1]:
+        saved = manifest.state
+        if manifest.experiment_id != self._requested_id.split(":", 1)[1]:
             raise ValueError("Continuation snapshot belongs to another experiment.")
-        if saved["phase"] == "completed" or (
-            saved["pending_advance"]
-            and saved["cycle_number"] == saved["template"]["cycles"]
-            and saved["stage_position"] == len(saved["template"]["stages"])
+        if saved.phase == "completed" or (
+            saved.pending_advance
+            and saved.cycle_number == saved.template.cycles
+            and saved.stage_position == len(saved.template.stages)
             and not (
-                saved.get("last_dag_decision") is not None
-                and saved["last_dag_decision"]["decision"]["command"] == "pause"
+                saved.last_dag_decision is not None
+                and saved.last_dag_decision.decision.command == "pause"
             )
         ):
             raise RuntimeError(
@@ -625,11 +625,11 @@ class ExperimentRunner:
         state = RunnerState(
             self._requested_id,
             directory,
-            f"{uuid4()}:{saved['run_id']}",
+            f"{uuid4()}:{saved.run_id}",
             directory / "experiment.yaml",
-            saved["template_revision_id"],
-            saved["template_yaml"],
-            saved["template"],
+            saved.template_revision_id,
+            saved.template_yaml,
+            saved.template,
             "paused",
         )
         state.phase = "restoring"
@@ -648,7 +648,7 @@ class ExperimentRunner:
                 )
             await self._snapshots.restore(
                 state,
-                manifest["snapshot_id"],
+                manifest.snapshot_id,
                 source_directory=self._continue_source,
                 suspend_resources=self._suspend_resources,
             )

@@ -17,7 +17,11 @@ import psutil
 
 from core.experiments.assembler import ExperimentAssembler
 from core.experiments.journal import RunnerJournal
-from core.experiments.restore_inputs import RestorePaths, _restored_state_document
+from core.experiments.restore_inputs import (
+    RestorePaths,
+    _restored_saved_state,
+    _snapshot_state,
+)
 from core.experiments.services import ServiceManager
 from core.experiments.snapshot_validation import (
     _validate_journal_results,
@@ -30,17 +34,27 @@ from core.experiments.state import (
     RunnerStateStore,
     ServiceInstance,
     _restore_state,
-    state_from_document,
     state_to_document,
 )
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
+from core.models.experiment_template import (
+    ExperimentTemplate,
+    ModuleReference,
+    ServiceCallDefinition,
+)
+from core.models.journal_diagnostics import JournalSnapshotManifest
+from core.models.module_manifest import ModuleManifest
 from core.models.process_identity import ProcessIdentity
+from core.models.runner_state import SavedRunnerState
 from core.models.snapshot_documents import (
     STAGE_CONTROL_FILES,
+    RestoredServiceObservation,
     RestoreTransaction,
+    SnapshotFile,
     SnapshotInventory,
+    SnapshotPayload,
 )
 from core.models.updates import _update_model
 from core.primitives.json_files import read_json, write_json
@@ -200,14 +214,14 @@ class ExperimentSnapshots:
         self,
         root: Path,
         directory: Path,
-        document: JsonObject,
+        document: SavedRunnerState,
         exports: dict[str, str],
         kind: str,
         label: str | None,
         logging_config: Path,
-    ) -> JsonObject:
+    ) -> SnapshotPayload:
         """Copy frozen files in a worker with its own client for SQLite backup."""
-        reserve = document["template"]["storage"]["min_snapshot_free_bytes"]
+        reserve = document.template.storage.min_snapshot_free_bytes
         if directory.exists() or not directory.resolve().is_relative_to(
             self._project_root / "snapshots"
         ):
@@ -216,9 +230,38 @@ class ExperimentSnapshots:
             )
         directory.mkdir(parents=True)
         with OperationLogger(logging_config) as logger:
-            journal = logger.export_snapshot(
-                directory / "journal", min_free_bytes=reserve
+            journal = JournalSnapshotManifest.model_validate(
+                logger.export_snapshot(directory / "journal", min_free_bytes=reserve)
             )
+        self._copy_snapshot_payload(root, directory, reserve, document.template_yaml)
+        inventory = self._snapshot_inventory(directory)
+        sequences = [0]
+        for previous in directory.parent.glob("*/manifest.json"):
+            try:
+                sequence = read_json(previous).get("sequence")
+                if type(sequence) is int and 0 < sequence < 9223372036854775807:
+                    sequences.append(sequence)
+            except (OSError, ValueError):
+                continue
+        manifest = SnapshotPayload(
+            schema_version=2,
+            snapshot_id=directory.name,
+            experiment_id=document.experiment_id,
+            experiment_folder=root.name,
+            created_at=datetime.now(UTC).isoformat(),
+            sequence=max(sequences) + 1,
+            kind=kind,
+            label=label,
+            state=document,
+            services=exports,
+            journal=journal,
+            inventory=inventory,
+        )
+        return self._load_snapshot(directory, manifest=manifest)
+
+    def _copy_snapshot_payload(
+        self, root: Path, directory: Path, reserve: int, template_yaml: str
+    ) -> None:
         payload = directory / "files"
         payload.mkdir()
         snapshot_id = directory.name
@@ -264,12 +307,12 @@ class ExperimentSnapshots:
                     self._copy_snapshot_file(
                         path, relative, filename, destination, directory, reserve
                     )
-        (payload / "experiment.yaml").write_text(
-            document["template_yaml"], encoding="utf-8"
-        )
+        (payload / "experiment.yaml").write_text(template_yaml, encoding="utf-8")
+
+    def _snapshot_inventory(self, directory: Path) -> SnapshotInventory:
         directories = []
-        files = {}
-        for top in (payload, directory / "journal"):
+        files: dict[str, SnapshotFile] = {}
+        for top in (directory / "files", directory / "journal"):
             directories.append(top.relative_to(directory).as_posix())
             for item in sorted(top.rglob("*")):
                 relative = item.relative_to(directory).as_posix()
@@ -280,37 +323,12 @@ class ExperimentSnapshots:
                 elif item.is_file():
                     with item.open("rb") as stream:
                         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                    files[relative] = {
-                        "size_bytes": item.stat().st_size,
-                        "sha256": digest,
-                    }
+                    files[relative] = SnapshotFile(
+                        size_bytes=item.stat().st_size, sha256=digest
+                    )
                 else:
                     raise ValueError("Copied snapshot contains a special file.")
-        sequences = [0]
-        for previous in directory.parent.glob("*/manifest.json"):
-            try:
-                sequence = read_json(previous).get("sequence")
-                if type(sequence) is int and 0 < sequence < 9223372036854775807:
-                    sequences.append(sequence)
-            except (OSError, ValueError):
-                continue
-        manifest = {
-            "schema_version": 2,
-            "snapshot_id": snapshot_id,
-            "experiment_id": document["experiment_id"],
-            "experiment_folder": root.name,
-            "created_at": datetime.now(UTC).isoformat(),
-            "sequence": max(sequences) + 1,
-            "kind": kind,
-            "label": label,
-            "state": document,
-            "services": exports,
-            "journal": journal,
-            "directories": sorted(directories),
-            "files": files,
-        }
-        self._validate_snapshot(directory, manifest=manifest)
-        return manifest
+        return SnapshotInventory(directories=sorted(directories), files=files)
 
     def _copy_snapshot_file(
         self,
@@ -352,13 +370,7 @@ class ExperimentSnapshots:
         identities = {
             key: value.service_instance_id for key, value in state.services.items()
         }
-        document = state_to_document(state)
-        document["phase"] = state.phase if kind == "final" else "waiting"
-        document["mode"] = "paused"
-        document["pause_requested"] = False
-        document["stable_snapshot_id"] = snapshot_id
-        for service in document["services"].values():
-            service["freeze_id"] = service["prepared_freeze_id"] = None
+        document = _snapshot_state(state, snapshot_id, kind)
         config = self._journal.write_client_config(
             state,
             {
@@ -433,7 +445,7 @@ class ExperimentSnapshots:
             {"snapshot_id": snapshot_id, "kind": kind, "label": label},
             context={"experiment_id": state.experiment_id, "run_id": state.run_id},
         )
-        write_json(directory / "manifest.json", manifest)
+        write_json(directory / "manifest.json", manifest.document())
         try:
             self._journal.client.record_event(
                 "snapshot.created",
@@ -453,10 +465,11 @@ class ExperimentSnapshots:
         await self._retain_snapshots(directory, state)
         return {
             "valid": True,
-            **{
-                key: manifest[key]
-                for key in ("snapshot_id", "created_at", "sequence", "kind", "label")
-            },
+            "snapshot_id": manifest.snapshot_id,
+            "created_at": manifest.created_at,
+            "sequence": manifest.sequence,
+            "kind": manifest.kind,
+            "label": manifest.label,
         }
 
     async def _retain_snapshots(self, directory: Path, state: RunnerState) -> None:
@@ -486,6 +499,11 @@ class ExperimentSnapshots:
     def _validate_snapshot(
         self, directory: Path, *, manifest: JsonObject | None = None
     ) -> JsonObject:
+        return self._load_snapshot(directory, manifest=manifest).document()
+
+    def _load_snapshot(
+        self, directory: Path, *, manifest: SnapshotPayload | JsonObject | None = None
+    ) -> SnapshotPayload:
         directory = Path(directory)
         if (
             not directory.is_absolute()
@@ -502,19 +520,16 @@ class ExperimentSnapshots:
             or not manifest_path.resolve().is_relative_to(directory)
         ):
             raise ValueError("Snapshot manifest escapes its directory.")
-        document = (
-            read_json(directory / "manifest.json")
-            if manifest is None
-            else copy_json_object(manifest, "snapshot manifest")
-        )
-        _validate_snapshot_manifest(document)
-        self._validate_snapshot_files(directory, document)
-        state = state_from_document(directory / "files", document["state"])
-        if (
-            state.experiment_id != document["experiment_id"]
-            or state.active_attempt is not None
-            or state.template_path != directory / "files" / "experiment.yaml"
-        ):
+        if isinstance(manifest, SnapshotPayload):
+            # Preserve the full-document JSON bound at the persistence boundary.
+            copy_json_object(manifest.document(), "snapshot manifest")
+            payload = manifest
+        else:
+            document = read_json(manifest_path) if manifest is None else manifest
+            payload = _validate_snapshot_manifest(document)
+        self._check_snapshot_inventory(directory, payload.inventory)
+        state = _restore_state(directory / "files", payload.state.model_copy(deep=True))
+        if state.template_path != directory / "files" / "experiment.yaml":
             raise ValueError("Snapshot runner state is inconsistent.")
         yaml_text, template = self._assembler.load_template(state.template_path)
         if yaml_text != state.template_yaml or template != state.template.model_dump(
@@ -522,34 +537,21 @@ class ExperimentSnapshots:
         ):
             raise ValueError("Snapshot template differs from its applied revision.")
         self._validate_snapshot_modules(directory, template)
-        if state.cycle_number > state.template.cycles or state.stage_position > len(
-            state.template.stages
-        ):
-            raise ValueError("Snapshot cursor is outside its DAG.")
-        stage_ids = {item.stage_id for item in state.template.stages}
-        for stage_id, request_id in state.stage_result_ids.items():
-            if stage_id not in stage_ids:
-                raise ValueError("Snapshot result belongs to an unknown DAG node.")
-            UUID(require_text(request_id, "result request ID"))
-        if (
-            state.last_result_id is not None
-            and state.last_result_id not in state.stage_result_ids.values()
-            and (
-                state.pending_input is None
-                or state.last_result_id != state.pending_input.request_id
-            )
-        ):
-            raise ValueError(
-                "Snapshot retained result has no matching journal reference."
-            )
-        if state.last_result_id is None and state.last_result is not None:
-            raise ValueError("Snapshot retained data has no journal reference.")
         for relative in state.retained_artifacts:
             if not (directory / "files" / relative).exists():
                 raise ValueError("Snapshot is missing a retained conditional artifact.")
-        _validate_snapshot_exports(directory, document, state)
-        if read_json(directory / "journal/manifest.json") != document["journal"]:
+        _validate_snapshot_exports(directory, payload, state)
+        if (
+            read_json(directory / "journal/manifest.json")
+            != payload.journal.model_dump()
+        ):
             raise ValueError("Journal manifest differs from the experiment snapshot.")
+        self._validate_snapshot_journal(directory, payload, state)
+        return payload
+
+    def _validate_snapshot_journal(
+        self, directory: Path, payload: SnapshotPayload, state: RunnerState
+    ) -> None:
         # Reuse the journal's public full-content validator on a disposable copy.
         # Never open a journal client against the immutable archived database.
         scratch = self._project_root / "controller/snapshot_validation"
@@ -567,8 +569,8 @@ class ExperimentSnapshots:
                 "min_free_bytes": 0,
                 "open_mode": "existing",
                 "expected_journal": {
-                    key: document["journal"][key]
-                    for key in ("journal_id", "generation")
+                    "journal_id": payload.journal.journal_id,
+                    "generation": payload.journal.generation,
                 },
             }
             # Snapshot exports use DELETE mode. Reading them must not enable WAL:
@@ -583,7 +585,7 @@ class ExperimentSnapshots:
             store = SQLiteEventStore(database, **store_options)
             try:
                 store.complete_restore(
-                    document["journal"],
+                    payload.journal.model_dump(),
                     restoration_id=str(uuid4()),
                     new_generation=str(uuid4()),
                 )
@@ -601,16 +603,6 @@ class ExperimentSnapshots:
                     ):
                         raise
                     time.sleep(0.1)
-        return document
-
-    def _validate_snapshot_files(self, directory: Path, document: JsonObject) -> None:
-        inventory = SnapshotInventory.model_validate(
-            {
-                "files": document["files"],
-                "directories": document["directories"],
-            }
-        )
-        self._check_snapshot_inventory(directory, inventory)
 
     def _check_snapshot_inventory(
         self,
@@ -657,31 +649,46 @@ class ExperimentSnapshots:
             raise ValueError("Snapshot members differ from the inventory.")
 
     def _validate_snapshot_modules(self, directory: Path, template: JsonObject) -> None:
-        checked_modules = {}
+        validated = ExperimentTemplate.model_validate(template)
+        checked_modules: dict[tuple[str, str], tuple[ModuleManifest, str]] = {}
         for role in ("stage", "service"):
-            for definition in template[f"{role}s"]:
-                reference = self._assembler.module_reference(template, definition)
-                key = (reference["name"], reference["version"])
+            definitions = validated.stages if role == "stage" else validated.services
+            for definition in definitions:
+                reference = ModuleReference.model_validate(
+                    self._assembler.module_reference(
+                        template, definition.model_dump(exclude_unset=True)
+                    )
+                )
+                key = (reference.name, reference.version)
                 if key not in checked_modules:
                     module_path = directory / "files/modules" / key[0] / key[1]
                     checked_modules[key] = (
-                        self._assembler.read_module(module_path),
+                        ModuleManifest.model_validate(
+                            self._assembler.read_module(module_path)
+                        ),
                         self._hash_module(key[0], module_path),
                     )
                 metadata, digest = checked_modules[key]
                 if (
-                    metadata["role"]
-                    != ("service" if "service_id" in definition else role)
-                    or (metadata.get("stage_kind") == "conditional")
-                    != ("returns_data" in definition)
-                    or (metadata["name"], metadata["version"]) != key
-                    or digest != reference["hash"]
+                    metadata.role
+                    != (
+                        "service"
+                        if isinstance(definition, ServiceCallDefinition)
+                        else role
+                    )
+                    or (metadata.stage_kind == "conditional")
+                    != ("returns_data" in definition.model_fields_set)
+                    or (metadata.name, metadata.version) != key
+                    or digest != reference.hash
                 ):
                     raise ValueError(
                         "Snapshot module identity or contents differ from its template."
                     )
 
     def latest_valid(self, experiment_directory: Path) -> JsonObject:
+        return self._latest_valid(experiment_directory).document()
+
+    def _latest_valid(self, experiment_directory: Path) -> SnapshotPayload:
         root = Path(experiment_directory)
         if not root.is_absolute() or not root.resolve().is_relative_to(
             self._project_root
@@ -700,10 +707,10 @@ class ExperimentSnapshots:
                 continue
         for _, directory in sorted(candidates, reverse=True):
             try:
-                document = self._validate_snapshot(directory)
+                document = self._load_snapshot(directory)
                 if (
-                    document["experiment_folder"] != root.name
-                    or document["snapshot_id"] != directory.name
+                    document.experiment_folder != root.name
+                    or document.snapshot_id != directory.name
                 ):
                     continue
                 return document
@@ -778,26 +785,28 @@ class ExperimentSnapshots:
                         "Resolve the existing restoration transaction first."
                     )
             archive = self._project_root / "snapshots" / source.name / snapshot_id
-            manifest = await asyncio.to_thread(self._validate_snapshot, archive)
+            manifest = await asyncio.to_thread(self._load_snapshot, archive)
             if (
-                manifest["snapshot_id"] != snapshot_id
-                or manifest["experiment_folder"] != source.name
+                manifest.snapshot_id != snapshot_id
+                or manifest.experiment_folder != source.name
             ):
                 raise ValueError(
                     "Snapshot identity differs from its selected directory."
                 )
             registry = read_json(self._project_root / "experiments.json")
-            if registry.get(manifest["experiment_id"]) != source.name:
+            if registry.get(manifest.experiment_id) != source.name:
                 raise ValueError("Snapshot belongs to another registered experiment.")
             if (
                 source_directory is None
-                and manifest["experiment_id"] != state.experiment_id
+                and manifest.experiment_id != state.experiment_id
             ):
                 raise ValueError("Rollback snapshot belongs to another experiment.")
-            checked = state_from_document(archive / "files", manifest["state"])
+            checked = _restore_state(
+                archive / "files", manifest.state.model_copy(deep=True)
+            )
             self._assembler.check_modules(checked)
             required = (
-                3 * sum(item["size_bytes"] for item in manifest["files"].values())
+                3 * sum(item.size_bytes for item in manifest.inventory.files.values())
                 + state.template.storage.min_snapshot_free_bytes
             )
             if shutil.disk_usage(self._project_root).free < required:
@@ -836,7 +845,7 @@ class ExperimentSnapshots:
                     "action": "restore_experiment",
                     "snapshot_id": snapshot_id,
                     "restoration_id": restoration_id,
-                    "source_experiment_id": manifest["experiment_id"],
+                    "source_experiment_id": manifest.experiment_id,
                 },
                 operation=operation,
             )
@@ -870,7 +879,7 @@ class ExperimentSnapshots:
             return await self._finish_restore(state, transaction, marker)
 
     def _bootstrap_clone_journal(
-        self, state: RunnerState, archive: Path, manifest: JsonObject, target: Path
+        self, state: RunnerState, archive: Path, manifest: SnapshotPayload, target: Path
     ) -> None:
         target.mkdir(parents=True, exist_ok=True)
         (target / "journals").mkdir(exist_ok=True)
@@ -880,7 +889,10 @@ class ExperimentSnapshots:
         )
         write_json(
             target / "runner/journal.json",
-            {key: manifest["journal"][key] for key in ("journal_id", "generation")},
+            {
+                "journal_id": manifest.journal.journal_id,
+                "generation": manifest.journal.generation,
+            },
         )
         self._journal.open(state, create=False)
 
@@ -1035,15 +1047,14 @@ class ExperimentSnapshots:
             endpoint = target / "runner/endpoints" / f"{service_id}.json"
             if not endpoint.is_file():
                 continue
-            announced = read_json(endpoint)
+            announced = RestoredServiceObservation.model_validate(read_json(endpoint))
             current = state.services.get(service_id)
             if (
                 current is not None
-                and announced.get("participant_instance_id")
-                == current.service_instance_id
+                and announced.participant_instance_id == current.service_instance_id
             ):
                 continue
-            instance_id = str(UUID(announced["participant_instance_id"]))
+            instance_id = str(UUID(announced.participant_instance_id))
             artifacts = target / "shared_artifacts/services" / service_id / instance_id
             if (
                 not artifacts.resolve().is_relative_to(target)
@@ -1052,27 +1063,36 @@ class ExperimentSnapshots:
                 raise RuntimeError(
                     "An unaccounted-for restored service cannot be confirmed stopped."
                 )
-            recorded = read_json(artifacts / "process.json")
-            identity = {
-                "experiment_id": state.experiment_id,
-                "participant_id": service_id,
-                "participant_instance_id": instance_id,
-            }
-            if any(
-                announced.get(key) != value or recorded.get(key) != value
-                for key, value in identity.items()
-            ) or recorded.get("process") != announced.get("process"):
+            recorded = RestoredServiceObservation.model_validate(
+                read_json(artifacts / "process.json")
+            )
+            expected = (state.experiment_id, service_id, instance_id)
+            if (
+                any(
+                    (
+                        observation.experiment_id,
+                        observation.participant_id,
+                        observation.participant_instance_id,
+                    )
+                    != expected
+                    for observation in (announced, recorded)
+                )
+                or recorded.process != announced.process
+            ):
                 raise RuntimeError("Restored service ownership cannot be verified.")
             instance = ServiceInstance(service_id, instance_id, definition)
-            instance.process_identity = ProcessIdentity.model_validate(
-                recorded["process"]
-            )
+            instance.process_identity = ProcessIdentity.model_validate(recorded.process)
             instance.endpoint_path = endpoint
             instance.artifacts_directory = artifacts
-            metadata = self._assembler.read_module(
-                target / "modules" / definition.module.name / definition.module.version
+            metadata = ModuleManifest.model_validate(
+                self._assembler.read_module(
+                    target
+                    / "modules"
+                    / definition.module.name
+                    / definition.module.version
+                )
             )
-            instance.implementation = metadata["implementation"]
+            instance.implementation = metadata.implementation
             state.services[service_id] = instance
 
     async def _stage_restore_snapshot(
@@ -1087,7 +1107,7 @@ class ExperimentSnapshots:
         archive = (
             self._project_root / "snapshots" / transaction.source_folder / snapshot_id
         )
-        manifest = await asyncio.to_thread(self._validate_snapshot, archive)
+        manifest = await asyncio.to_thread(self._load_snapshot, archive)
         for path in (cached, replacement):
             if path.exists():
                 if (
@@ -1105,7 +1125,7 @@ class ExperimentSnapshots:
         except BaseException:
             await asyncio.gather(copy_task, return_exceptions=True)
             raise
-        await asyncio.to_thread(self._validate_snapshot, cached)
+        await asyncio.to_thread(self._load_snapshot, cached)
         copy_task = asyncio.create_task(
             asyncio.to_thread(shutil.copytree, cached / "files", replacement)
         )
@@ -1119,14 +1139,17 @@ class ExperimentSnapshots:
             cached / "journal/journal.sqlite",
             replacement / "journals/events.sqlite",
         )
-        document = _restored_state_document(
+        document = _restored_saved_state(
             manifest, transaction.stopped_state, state.experiment_id, transaction.run_id
         )
-        restored = state_from_document(replacement, document)
+        restored = _restore_state(replacement, document)
         self._state_store.save(restored)
         write_json(
             replacement / "runner/journal.json",
-            {key: manifest["journal"][key] for key in ("journal_id", "generation")},
+            {
+                "journal_id": manifest.journal.journal_id,
+                "generation": manifest.journal.generation,
+            },
         )
         transaction = _update_model(transaction, phase="prepared")
         write_json(marker, transaction.model_dump(exclude_unset=True))
@@ -1134,14 +1157,14 @@ class ExperimentSnapshots:
 
     async def _cached_restore_manifest(
         self, transaction: RestoreTransaction, cached: Path, snapshot_id: str
-    ) -> JsonObject:
-        manifest = await asyncio.to_thread(self._validate_snapshot, cached)
+    ) -> SnapshotPayload:
+        manifest = await asyncio.to_thread(self._load_snapshot, cached)
         if (
-            manifest["snapshot_id"] != snapshot_id
-            or manifest["experiment_folder"] != transaction.source_folder
+            manifest.snapshot_id != snapshot_id
+            or manifest.experiment_folder != transaction.source_folder
             or (
                 not transaction.clone
-                and manifest["experiment_id"] != transaction.experiment_id
+                and manifest.experiment_id != transaction.experiment_id
             )
         ):
             raise ValueError("Cached restoration snapshot has a different identity.")
@@ -1180,7 +1203,7 @@ class ExperimentSnapshots:
         transaction: RestoreTransaction,
         marker: Path,
         paths: RestorePaths,
-        manifest: JsonObject,
+        manifest: SnapshotPayload,
         restoration_id: str,
     ) -> RestoreTransaction:
         target, work = paths.target, paths.work
@@ -1190,7 +1213,10 @@ class ExperimentSnapshots:
         vars(state).update(vars(restored))
         if transaction.phase == "files_installed":
             self._journal.complete_restore(
-                state, manifest["journal"], restoration_id, work / "diagnostics"
+                state,
+                manifest.journal.model_dump(),
+                restoration_id,
+                work / "diagnostics",
             )
             transaction = _update_model(transaction, phase="journal_restored")
             write_json(marker, transaction.model_dump(exclude_unset=True))
@@ -1203,7 +1229,7 @@ class ExperimentSnapshots:
         state: RunnerState,
         transaction: RestoreTransaction,
         marker: Path,
-        manifest: JsonObject,
+        manifest: SnapshotPayload,
         snapshot_id: str,
         restoration_id: str,
     ) -> RestoreTransaction:
@@ -1212,16 +1238,21 @@ class ExperimentSnapshots:
         try:
             if await self._services.reconcile(state, state.template) != "ready":
                 raise RuntimeError("Restored services did not become ready.")
-            await self._services.load_states(
-                state, {key: Path(value) for key, value in manifest["services"].items()}
-            )
+            exports: dict[str, Path] = {}
+            for key, value in manifest.services.items():
+                if value is None:
+                    raise TypeError(
+                        "expected str, bytes or os.PathLike object, not NoneType"
+                    )
+                exports[key] = Path(value)
+            await self._services.load_states(state, exports)
             state.phase, state.mode = "waiting", "paused"
             self._journal.client.record_event(
                 "experiment.restored",
                 {
                     "snapshot_id": snapshot_id,
                     "restoration_id": restoration_id,
-                    "source_experiment_id": manifest["experiment_id"],
+                    "source_experiment_id": manifest.experiment_id,
                 },
                 context={"experiment_id": state.experiment_id, "run_id": state.run_id},
             )

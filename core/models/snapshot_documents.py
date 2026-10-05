@@ -1,8 +1,9 @@
 """Snapshot metadata, inventory and restoration marker data contracts."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -12,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from core.models.journal_diagnostics import JournalSnapshotManifest
 from core.models.process_identity import ProcessIdentity
 from core.models.runner_state import SavedRunnerState
 from core.models.values import (
@@ -103,9 +105,7 @@ UTCText = Annotated[Text, BeforeValidator(_utc)]
 SnapshotMember = Annotated[str, BeforeValidator(_snapshot_member)]
 
 
-class SnapshotManifest(BaseModel):
-    """Validate metadata without starting a runner or claiming payload integrity."""
-
+class _SnapshotHeader(BaseModel):
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -118,6 +118,11 @@ class SnapshotManifest(BaseModel):
     sequence: PositiveInteger = Field(le=9223372036854775807)
     kind: Literal["regular", "final"]
     label: Text | None
+
+
+class SnapshotManifest(_SnapshotHeader):
+    """Validate the outer document without claiming file or payload integrity."""
+
     state: JsonValue
     services: JsonValue
     journal: JsonValue
@@ -177,6 +182,101 @@ class SnapshotInventory(BaseModel):
         return document
 
 
+class SnapshotPayload(_SnapshotHeader):
+    """Validated restoration components; filesystem integrity is checked separately.
+
+    Original input JSON is retained for the public document facade, preserving
+    legacy omissions, field order and schema-three migration representation.
+    Runtime operations consume the typed components rather than that JSON.
+    """
+
+    state: SavedRunnerState
+    services: dict[str, Text | None]
+    journal: JournalSnapshotManifest
+    inventory: SnapshotInventory
+    encoded_document: str | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_state_references(self) -> Self:
+        state = self.state
+        if (
+            state.experiment_id != self.experiment_id
+            or state.active_attempt is not None
+        ):
+            raise ValueError("Snapshot runner state is inconsistent.")
+        if state.cycle_number > state.template.cycles or state.stage_position > len(
+            state.template.stages
+        ):
+            raise ValueError("Snapshot cursor is outside its DAG.")
+        stage_ids = {item.stage_id for item in state.template.stages}
+        if state.stage_result_ids.keys() - stage_ids:
+            raise ValueError("Snapshot result belongs to an unknown DAG node.")
+        if (
+            state.last_result_id is not None
+            and state.last_result_id not in state.stage_result_ids.values()
+            and (
+                state.pending_input is None
+                or state.last_result_id != state.pending_input.request_id
+            )
+        ):
+            raise ValueError(
+                "Snapshot retained result has no matching journal reference."
+            )
+        if state.last_result_id is None and state.last_result is not None:
+            raise ValueError("Snapshot retained data has no journal reference.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_service_exports(self) -> Self:
+        state = self.state
+        if set(state.services) != {item.service_id for item in state.template.services}:
+            raise ValueError("Snapshot does not describe every service.")
+        if self.services.keys() - state.services.keys():
+            raise ValueError("Snapshot exports an unknown service.")
+        definitions = {item.service_id: item for item in state.template.services}
+        for service_id, instance in state.services.items():
+            if instance.definition != definitions[service_id]:
+                raise ValueError(
+                    "Snapshot service settings differ from the applied template."
+                )
+            if (
+                instance.active_request
+                or instance.pending_requests
+                or instance.freeze_id
+                or instance.prepared_freeze_id
+            ):
+                raise ValueError("Snapshot contains unresolved service work.")
+            if (
+                self.services.get(service_id) is None
+                and instance.definition.state_required
+            ):
+                raise ValueError("Required service export is missing.")
+        return self
+
+    def document(self) -> JsonObject:
+        if self.encoded_document is not None:
+            return copy_json_object(
+                json.loads(self.encoded_document), "snapshot manifest"
+            )
+        return {
+            "schema_version": self.schema_version,
+            "snapshot_id": self.snapshot_id,
+            "experiment_id": self.experiment_id,
+            "experiment_folder": self.experiment_folder,
+            "created_at": self.created_at,
+            "sequence": self.sequence,
+            "kind": self.kind,
+            "label": self.label,
+            "state": self.state.model_dump(exclude_unset=True),
+            "services": copy_json_object(self.services, "snapshot service exports"),
+            "journal": self.journal.model_dump(),
+            "directories": list(self.inventory.directories),
+            "files": {
+                name: item.model_dump() for name, item in self.inventory.files.items()
+            },
+        }
+
+
 class RestoreTransaction(BaseModel):
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
@@ -207,3 +307,23 @@ class RestoreTransaction(BaseModel):
     @classmethod
     def detach(cls, document: object) -> JsonObject:
         return copy_json_object(document, "restore transaction")
+
+
+class RestoredServiceObservation(BaseModel):
+    """Only the historical ownership fields consumed during interrupted restore.
+
+    Missing fields and their JSON values remain permissive until the operation
+    compares them with its expected identity and validates the process record.
+    """
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
+
+    experiment_id: JsonValue = None
+    participant_id: JsonValue = None
+    participant_instance_id: JsonValue = None
+    process: JsonValue = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def detach(cls, document: object) -> JsonObject:
+        return copy_json_object(document, "restored service observation")
