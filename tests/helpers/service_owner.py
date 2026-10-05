@@ -11,7 +11,7 @@ from core.experiments.assembler import ExperimentAssembler
 from core.experiments.journal import RunnerJournal
 from core.experiments.launch import ModuleLauncher
 from core.experiments.services import ServiceManager
-from core.experiments.state import RunnerStateStore
+from core.experiments.state import RunnerStateStore, _process_identity_document
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
@@ -85,15 +85,14 @@ async def run(options):
             raise RuntimeError(f"Service startup required {action}.")
         write_json(
             controls / "ready.json",
-            {key: item.process_identity for key, item in state.services.items()},
+            {
+                key: _process_identity_document(item.process_identity)
+                for key, item in state.services.items()
+            },
         )
         operation = asyncio.create_task(manager.save_states(state, options.snapshot))
         if options.phase == "before_freeze":
-            service_controls = Path(
-                state.template.model_dump(exclude_unset=True)["services"][0][
-                    "settings"
-                ]["controls"]
-            )
+            service_controls = Path(state.template.services[0].settings["controls"])
 
             def reached():
                 path = service_controls / "trace.jsonl"
