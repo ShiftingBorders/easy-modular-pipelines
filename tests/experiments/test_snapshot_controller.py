@@ -100,7 +100,8 @@ class SnapshotControllerTests(unittest.IsolatedAsyncioTestCase):
             await suspend()
             self.assertTrue(collector._suspended)
             self.assertTrue(
-                collector._process is None or collector._packet.get("journal_closed")
+                collector._process is None
+                or (collector._packet is not None and collector._packet.journal_closed)
             )
             events.append("closed")
 

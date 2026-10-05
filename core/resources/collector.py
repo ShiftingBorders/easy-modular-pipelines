@@ -8,7 +8,12 @@ import time
 from multiprocessing.connection import Connection
 from pathlib import Path
 
-from core.models.resource_messages import CollectorPacket, CollectorSnapshot
+from core.models.resource_messages import (
+    CollectorPacket,
+    CollectorRestart,
+    CollectorSnapshot,
+    ResourceSample,
+)
 from core.primitives.json_values import JsonObject, copy_json_object
 from core.resources.sampling import collect_resources
 from core.resources.state import CollectorSettings, ResourceHistory
@@ -21,11 +26,13 @@ class ResourceCollector:
             raise ValueError("Collector config_path must be absolute.")
         self._settings: CollectorSettings | None = None
         self._history: ResourceHistory | None = None
-        self._snapshot: JsonObject = {
-            "context": {},
-            "logging_config_path": None,
-            "targets": [],
-        }
+        self._snapshot = CollectorSnapshot.model_validate(
+            {
+                "context": {},
+                "logging_config_path": None,
+                "targets": [],
+            }
+        )
         self._revision = 0
         self._suspended = False
         self._closing = False
@@ -39,13 +46,13 @@ class ResourceCollector:
         self._observed = asyncio.Event()
         self._state = "not_started"
         self._error: str | None = None
-        self._packet: JsonObject = {}
-        self._latest: dict[str, JsonObject] = {}
+        self._packet: CollectorPacket | None = None
+        self._latest: dict[str, ResourceSample] = {}
         self._last_received = 0.0
         self._failures = 0
         self._restarts = 0
         self._next_restart: float | None = None
-        self._restart_notice: JsonObject | None = None
+        self._restart_notice: CollectorRestart | None = None
         self._last_success: dict[str, dict[str, tuple[float, str]]] = {}
 
     def update(self, snapshot: JsonObject) -> None:
@@ -53,8 +60,24 @@ class ResourceCollector:
         self._update(CollectorSnapshot.model_validate(snapshot))
 
     def _update(self, snapshot: CollectorSnapshot) -> None:
-        snapshot = snapshot.model_dump(mode="json", exclude_unset=True)
-        if snapshot == self._snapshot:
+        # Windows Path equality ignores spelling/case; the existing wire
+        # comparison distinguishes those changes in the configured path.
+        path = (
+            None
+            if snapshot.logging_config_path is None
+            else str(snapshot.logging_config_path)
+        )
+        previous_path = (
+            None
+            if self._snapshot.logging_config_path is None
+            else str(self._snapshot.logging_config_path)
+        )
+        if (
+            snapshot.context == self._snapshot.context
+            and snapshot.targets == self._snapshot.targets
+            and path == previous_path
+            and snapshot.model_extra == self._snapshot.model_extra
+        ):
             return
         self._snapshot = snapshot
         self._revision += 1
@@ -86,12 +109,16 @@ class ResourceCollector:
                 except Exception as error:  # noqa: BLE001 - Optional monitoring never fails the command loop.
                     self._error = f"{type(error).__name__}: {error}"
                     self._state = "restarting"
-                    self._restart_notice = {
-                        "reason": "collector_restarted",
-                        "error": self._error,
-                        "previous_collector_id": self._packet.get("collector_id"),
-                        "context": dict(self._snapshot["context"]),
-                    }
+                    self._restart_notice = CollectorRestart.model_validate(
+                        {
+                            "reason": "collector_restarted",
+                            "error": self._error,
+                            "previous_collector_id": None
+                            if self._packet is None
+                            else self._packet.collector_id,
+                            "context": dict(self._snapshot.context),
+                        }
+                    )
                 finally:
                     await self._shutdown_worker()
                 if self._closing:
@@ -123,7 +150,7 @@ class ResourceCollector:
             raise RuntimeError("Previous collector termination is unconfirmed.")
         self._state = "starting"
         self._next_restart = None
-        self._packet = {}
+        self._packet = None
         self._stop_worker = False
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe()
@@ -152,7 +179,7 @@ class ResourceCollector:
     async def _send_updates(self) -> None:
         while not self._closing and not self._stop_worker:
             self._wake.clear()
-            snapshot = self._snapshot
+            snapshot = self._snapshot.model_dump(mode="json", exclude_unset=True)
             if self._suspended:
                 snapshot = {"context": {}, "logging_config_path": None, "targets": []}
             await asyncio.to_thread(
@@ -161,7 +188,9 @@ class ResourceCollector:
                     "command": "update",
                     "revision": self._revision,
                     "snapshot": snapshot,
-                    "restart_notice": self._restart_notice,
+                    "restart_notice": None
+                    if self._restart_notice is None
+                    else self._restart_notice.model_dump(exclude_unset=True),
                 },
             )
             try:
@@ -178,14 +207,13 @@ class ResourceCollector:
                 await asyncio.to_thread(self._connection.recv)
             )
             self._last_received = time.monotonic()
-            self._packet = packet.model_dump(exclude_unset=True)
+            self._packet = packet
             self._state = "running"
             self._error = None
             if packet.revision == self._revision:
                 for sample in packet.samples:
-                    document = sample.model_dump(exclude_unset=True)
-                    self._history.append(document)
-                    self._latest[sample.series_id] = document
+                    self._history._append_sample(sample)
+                    self._latest[sample.series_id] = sample
                     successes = self._last_success.setdefault(sample.series_id, {})
                     for name, measurement in sample.resources.items():
                         if measurement.value is not None:
@@ -267,9 +295,11 @@ class ResourceCollector:
             async with asyncio.timeout(self._settings.shutdown_timeout_seconds):
                 while self._process is not None:
                     self._observed.clear()
-                    if self._packet.get(
-                        "revision", -1
-                    ) >= revision and self._packet.get("journal_closed"):
+                    if (
+                        self._packet is not None
+                        and self._packet.revision >= revision
+                        and self._packet.journal_closed
+                    ):
                         return
                     await self._observed.wait()
         except TimeoutError:
@@ -294,10 +324,10 @@ class ResourceCollector:
         )
         latest = []
         for sample in self._latest.values():
-            age = max(0, now - sample["observed_monotonic"])
-            successes = self._last_success.get(sample["series_id"], {})
+            age = max(0, now - sample.observed_monotonic)
+            successes = self._last_success.get(sample.series_id, {})
             freshness = {}
-            for name in sample["resources"]:
+            for name in sample.resources:
                 previous = successes.get(name)
                 freshness[name] = {
                     "last_success_at": None if previous is None else previous[1],
@@ -308,7 +338,7 @@ class ResourceCollector:
                 }
             latest.append(
                 {
-                    **sample,
+                    **sample.model_dump(exclude_unset=True),
                     "age_seconds": age,
                     "fresh": all(item["fresh"] for item in freshness.values()),
                     "freshness": freshness,
@@ -319,7 +349,9 @@ class ResourceCollector:
                 "state": self._state,
                 "error": self._error,
                 "config_path": str(self._config_path),
-                "collector_id": self._packet.get("collector_id"),
+                "collector_id": None
+                if self._packet is None
+                else self._packet.collector_id,
                 "history_id": None
                 if self._history is None
                 else self._history.history_id,
@@ -328,10 +360,14 @@ class ResourceCollector:
                 "restart_in_seconds": None
                 if self._next_restart is None
                 else max(0, self._next_restart - now),
-                "journal_error": self._packet.get("journal_error"),
+                "journal_error": None
+                if self._packet is None
+                else self._packet.journal_error,
                 "journal_closed": self._process is None
-                or self._packet.get("journal_closed", False),
-                "unconfirmed_samples": self._packet.get("unconfirmed_samples", 0),
+                or (self._packet is not None and self._packet.journal_closed),
+                "unconfirmed_samples": 0
+                if self._packet is None
+                else self._packet.unconfirmed_samples,
                 "suspended": self._suspended,
                 "latest": latest,
             },

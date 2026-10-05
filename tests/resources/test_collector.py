@@ -14,6 +14,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
+from core.models.resource_messages import (
+    CollectorPacket,
+    CollectorSnapshot,
+    ResourceSample,
+)
 from core.primitives.processes import process_identity
 from core.resources.collector import ResourceCollector
 from core.resources.state import ResourceHistory
@@ -34,6 +39,26 @@ from tests.helpers.resources import (
 
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_retention_preserves_path_spelling_and_json_equality(self):
+        collector = ResourceCollector(write_settings(self.root))
+        first = {
+            "context": {},
+            "logging_config_path": str(self.root / "Logging.json"),
+            "targets": [],
+            "extra": 1,
+        }
+        collector.update(first)
+        self.assertIsInstance(collector._snapshot, CollectorSnapshot)
+        revision = collector._revision
+        collector.update({**first, "extra": 1.0})
+        self.assertEqual(collector._revision, revision)
+        collector.update(
+            {**first, "logging_config_path": str(self.root / "logging.json")}
+        )
+        self.assertEqual(collector._revision, revision + 1)
+        first["context"]["source"] = "external"
+        self.assertEqual(collector._snapshot.context, {})
+
     async def asyncSetUp(self):
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
@@ -356,6 +381,16 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         collector._connection = Mock(recv=Mock(side_effect=[*packets, EOFError()]))
         with self.assertRaises(EOFError):
             await collector._receive_samples()
+        self.assertIsInstance(collector._packet, CollectorPacket)
+        self.assertTrue(
+            all(
+                isinstance(sample, ResourceSample)
+                for sample in collector._latest.values()
+            )
+        )
+        self.assertTrue(
+            all(isinstance(entry[2], bytes) for entry in collector._history._entries)
+        )
         with patch(
             "core.resources.collector.time", SimpleNamespace(monotonic=lambda: 14)
         ):
@@ -364,6 +399,10 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             status["latest"][0]["freshness"]["cpu"]["last_success_at"], "time-10"
         )
         self.assertFalse(status["latest"][0]["fresh"])
+        latest = next(iter(collector._latest.values()))
+        before = latest.model_dump(exclude_unset=True)
+        status["latest"][0]["resources"]["cpu"]["attributes"]["external"] = True
+        self.assertEqual(latest.model_dump(exclude_unset=True), before)
 
     async def test_suspend_confirms_closure_before_new_journal_generation(self):
         """D: old writes stop before replacement; resume uses the new journal identity."""

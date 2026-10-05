@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from core.models.resource_messages import ResourceSample
 from core.models.resource_settings import CollectorConfiguration
 from core.models.resource_target import ResourceTargetDocument
 from core.primitives.json_files import read_json
@@ -41,13 +42,32 @@ class CollectorSettings:
     def load(cls, path: Path) -> CollectorSettings:
         if not path.is_absolute():
             raise ValueError("Collector settings path must be absolute.")
-        document = CollectorConfiguration.model_validate(read_json(path)).model_dump()
-        configured = Path(document["disk_path"])
-        document["disk_path"] = str(
-            configured if configured.is_absolute() else (path.parent / configured).resolve()
+        configuration = CollectorConfiguration.model_validate(read_json(path))
+        configured = Path(configuration.disk_path)
+        disk_path = str(
+            configured
+            if configured.is_absolute()
+            else (path.parent / configured).resolve()
         )
         # Preserve the public dataclass/asdict contract used by collector IPC clients.
-        return cls(**document)
+        return cls(
+            sample_interval_seconds=configuration.sample_interval_seconds,
+            history_seconds=configuration.history_seconds,
+            max_buffer_bytes=configuration.max_buffer_bytes,
+            stale_after_intervals=configuration.stale_after_intervals,
+            status_interval_seconds=configuration.status_interval_seconds,
+            startup_timeout_seconds=configuration.startup_timeout_seconds,
+            heartbeat_timeout_seconds=configuration.heartbeat_timeout_seconds,
+            shutdown_timeout_seconds=configuration.shutdown_timeout_seconds,
+            restart_delays_seconds=list(configuration.restart_delays_seconds),
+            stable_reset_seconds=configuration.stable_reset_seconds,
+            logging_busy_timeout_seconds=configuration.logging_busy_timeout_seconds,
+            logging_retry_seconds=configuration.logging_retry_seconds,
+            disk_path=disk_path,
+            network_interface=configuration.network_interface,
+            network_reference_address=configuration.network_reference_address,
+            gpu_interval_seconds=configuration.gpu_interval_seconds,
+        )
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,10 @@ class ResourceHistory:
         self._entries.append((now, self._sequence, encoded, size))
         self._bytes += size
         self._prune(now)
+
+    def _append_sample(self, sample: ResourceSample) -> None:
+        """Encode a validated current sample using the existing byte-budget layout."""
+        self.append(sample.model_dump(exclude_unset=True))
 
     def _prune(self, now: float) -> None:
         while self._entries and (
