@@ -7,6 +7,7 @@ from pydantic import (
     AfterValidator,
     BaseModel,
     ConfigDict,
+    Field,
     ValidationInfo,
     field_validator,
     model_validator,
@@ -51,7 +52,7 @@ class ArtifactRegistration(BaseModel):
         return self
 
 
-class ArtifactContext(BaseModel):
+class ArtifactAttemptMetadata(BaseModel):
     model_config = ConfigDict(
         extra="ignore", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -62,6 +63,8 @@ class ArtifactContext(BaseModel):
     module_name: Text
     stage_id: Text
 
+
+class ArtifactContext(ArtifactAttemptMetadata):
     @field_validator("attempt_id", "module_name", "stage_id")
     @classmethod
     def portable_component(cls, value: str, info: ValidationInfo) -> str:
@@ -77,3 +80,19 @@ class ArtifactLocation(BaseModel):
 
     context: ArtifactContext
     path: RelativeArtifactPath
+
+
+class RecordedArtifactLocation(BaseModel):
+    """Dashboard historical lookup; resolved filesystem confinement stays explicit.
+
+    Recorded names may contain nested components and paths may contain harmless
+    parent segments. The dashboard checks their resolved paths within the same
+    existing roots, rather than applying the stricter registration/CLI contract.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
+    )
+
+    context: ArtifactAttemptMetadata
+    path: Annotated[str, Field(strict=True, min_length=1)]

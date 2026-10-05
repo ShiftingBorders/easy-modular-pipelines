@@ -24,6 +24,7 @@ from core.journal.history_cache import (
     acquire_cache_writer,
 )
 from core.journal.logger import OperationLogger
+from core.models.artifacts import ArtifactAttemptMetadata, RecordedArtifactLocation
 from core.models.dashboard_cache import CacheWorkerResult, ModulePublication
 from core.models.dashboard_metadata import (
     CompactTemplate,
@@ -68,6 +69,36 @@ from dashboard.projections import (
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
     return read_json(path, max_bytes=maximum)
+
+
+def _artifact_attempt(
+    cache: JournalHistoryCache | None, entries: list[dict], context: dict
+) -> ArtifactAttemptMetadata:
+    """Read the recorded attempt header without applying portable-path restrictions."""
+    rows = (
+        cache.query(
+            "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
+            (context.get("attempt_id"),),
+        )
+        if cache is not None
+        else []
+    )
+    parameters = json.loads(rows[0][0])["context"] if rows else {}
+    parameters = next(
+        (
+            entry["context"]
+            for entry in reversed(entries)
+            if entry["event_type"] == "attempt.parameters"
+            and entry["context"].get("attempt_id") == context.get("attempt_id")
+        ),
+        parameters,
+    )
+    try:
+        return ArtifactAttemptMetadata.model_validate({**parameters, **context})
+    except (TypeError, ValueError) as error:
+        raise SystemAPIError(
+            "not_found", "The artifact's attempt directory is not recorded.", 404
+        ) from error
 
 
 def cache_experiment(
@@ -1253,50 +1284,18 @@ class LocalJournals:
             )
         directory = dataset["directory"]
         if event["event_type"] == "artifact.recorded":
-            context = event["context"]
-            rows = (
-                cache.query(
-                    "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
-                    (context.get("attempt_id"),),
-                )
-                if cache is not None
-                else []
-            )
-            parameters = json.loads(rows[0][0])["context"] if rows else {}
-            parameters = next(
-                (
-                    entry["context"]
-                    for entry in reversed(entries)
-                    if entry["event_type"] == "attempt.parameters"
-                    and entry["context"].get("attempt_id") == context.get("attempt_id")
-                ),
-                parameters,
-            )
-            context = {**parameters, **context}
-            if any(
-                context.get(key) is None
-                for key in (
-                    "attempt_id",
-                    "cycle_number",
-                    "module_name",
-                    "stage_id",
-                    "attempt_number",
-                )
-            ):
-                raise SystemAPIError(
-                    "not_found",
-                    "The artifact's attempt directory is not recorded.",
-                    404,
-                )
-            relative_directory = f"shared_artifacts/epoch_{context['cycle_number']}/{context['module_name']}/{context['stage_id']}/attempt_{context['attempt_number']}"
+            attempt = _artifact_attempt(cache, entries, event["context"])
+            relative_directory = f"shared_artifacts/epoch_{attempt.cycle_number}/{attempt.module_name}/{attempt.stage_id}/attempt_{attempt.attempt_number}"
             directory = self.safe_path(directory, relative_directory)
             relative_file = event["data"]["path"]
-        if not isinstance(relative_file, str) or not relative_file:
+        try:
+            location = RecordedArtifactLocation(context=attempt, path=relative_file)
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "not_found", "The artifact has no recorded local path.", 404
-            )
+            ) from error
         try:
-            path = self.safe_path(directory, relative_file)
+            path = self.safe_path(directory, location.path)
         except ValueError as error:
             raise SystemAPIError(
                 "invalid_artifact", "The recorded artifact escapes its directory.", 400

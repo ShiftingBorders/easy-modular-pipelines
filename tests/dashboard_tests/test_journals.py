@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.models.artifacts import ArtifactLocation, RecordedArtifactLocation
 from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
@@ -27,6 +28,82 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace
 
 
 class JournalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_historical_artifact_models_preserve_nested_names_and_path_checks(
+        self,
+    ):
+        context = {
+            "attempt_id": "1-0",
+            "cycle_number": 1,
+            "stage_id": "A",
+            "attempt_number": 1,
+            "module_name": "nested/module",
+        }
+        location = RecordedArtifactLocation.model_validate(
+            {"context": context, "path": "sub/../result.txt"}
+        )
+        self.assertEqual(location.context.module_name, "nested/module")
+        self.assertEqual(location.path, "sub/../result.txt")
+        with self.assertRaises(ValueError):
+            ArtifactLocation.model_validate({"context": context, "path": "result.txt"})
+        directory = (
+            self.workspace.directory
+            / "shared_artifacts/epoch_1/nested/module/A/attempt_1"
+        )
+        directory.mkdir(parents=True)
+        (directory / "sub").mkdir()
+        target = directory / "result.txt"
+        target.write_text("recorded", encoding="utf-8")
+        self.workspace.logger.record_artifact(
+            "result.txt", "output", artifact_id="nested-artifact", context=context
+        )
+        recorded = self.workspace.logger.read_events(limit=1000)["events"][-1]["event"]
+        for number, (identifier, path) in enumerate(
+            (
+                ("internal-parent", "sub/../result.txt"),
+                ("escaped-artifact", "../../../../../../outside"),
+                ("empty-path", ""),
+                ("blank-path", "   "),
+                ("null-path", "result\x00.txt"),
+            ),
+            1,
+        ):
+            # Historical records enter through the journal envelope boundary,
+            # retaining path forms no longer emitted by strict registration.
+            event = json.loads(json.dumps(recorded))
+            event.update(
+                event_id=identifier,
+                producer_instance_id="historical-fixture",
+                sequence_number=number,
+            )
+            event["data"].update(artifact_id=identifier, path=path)
+            self.workspace.logger._store.append(event)
+        self.assertEqual(
+            self.reader.artifact("exp-test", "nested-artifact"), target.resolve()
+        )
+        self.assertEqual(
+            self.reader.artifact("exp-test", "internal-parent"), target.resolve()
+        )
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "escaped-artifact")
+        self.assertEqual(
+            (error.exception.code, error.exception.status_code),
+            ("invalid_artifact", 400),
+        )
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "empty-path")
+        self.assertEqual(
+            (error.exception.code, error.exception.status_code), ("not_found", 404)
+        )
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "blank-path")
+        self.assertEqual(str(error.exception), "Recorded artifact file is unavailable.")
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "null-path")
+        self.assertEqual(
+            (error.exception.code, error.exception.status_code),
+            ("invalid_artifact", 400),
+        )
+
     async def asyncSetUp(self):
         tmp = temporary_directory()
         self.addCleanup(cleanup_directory, tmp)
