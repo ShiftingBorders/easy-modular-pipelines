@@ -1038,7 +1038,7 @@ class SQLiteEventStore:
                     result = _command_result_document(request_id, state)
                 self._connection.execute("COMMIT")
                 self._check_health()
-                return result
+                return None if result is None else result.document()
             except BaseException as error:  # noqa: BLE001 - Include interrupted transactions.
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "read command result")
@@ -1299,7 +1299,7 @@ class SQLiteEventStore:
 
     def _read_diagnostics(
         self, directory: str | Path
-    ) -> tuple[JsonObject, list[JsonObject], list[DiagnosticCommand]]:
+    ) -> tuple[DiagnosticManifest, list[JsonObject], list[DiagnosticCommand]]:
         path = Path(directory)
         if not path.is_absolute():
             raise ValueError("Diagnostics must use an absolute directory path.")
@@ -1309,7 +1309,7 @@ class SQLiteEventStore:
 
         validated = DiagnosticManifest.model_validate(manifest)
         events, commands = self._read_diagnostic_records(path, validated)
-        return manifest, events, commands
+        return validated, events, commands
 
     def _read_diagnostic_records(
         self, path: Path, manifest: DiagnosticManifest
@@ -1443,14 +1443,14 @@ class SQLiteEventStore:
         bundle, events, commands = None, [], []
         if diagnostics is not None:
             bundle, events, commands = self._read_diagnostics(diagnostics)
-            if bundle["journal_id"] != identity["journal_id"]:
+            if bundle.journal_id != identity["journal_id"]:
                 raise ValueError("Diagnostic bundle belongs to another journal.")
         prepared_events = _prepare_diagnostic_events(events, self._max_event_bytes)
         parameters = json.dumps(
             {
                 "snapshot": manifest.model_dump(),
                 "new_generation": new_generation,
-                "diagnostics": bundle,
+                "diagnostics": None if bundle is None else bundle.model_dump(),
             },
             sort_keys=True,
             ensure_ascii=True,

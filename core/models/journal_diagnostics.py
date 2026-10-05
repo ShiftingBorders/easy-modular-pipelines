@@ -3,15 +3,18 @@
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import AfterValidator, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from core.models.journal_records import (
+    CommandObservation,
     JournalContext,
+    JournalEntry,
     SQLitePosition,
     UTCText,
     _Document,
 )
 from core.models.values import NonnegativeInteger, Text, UUIDText
+from core.primitives.json_values import JsonObject, copy_json_object
 
 
 def _sha256(value: str) -> str:
@@ -30,6 +33,53 @@ class AuthorObservation(_Document):
     occurred_at: UTCText
     context: JournalContext
     operation_id: Text | None
+
+
+class CommandResultObserver(BaseModel):
+    """Indexed observer metadata, with original event representation retained."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    author: Literal["runner", "participant"]
+    event_id: str
+    entry: JournalEntry
+    observation: AuthorObservation
+    ignored: str | None
+
+    def document(self) -> JsonObject:
+        return {
+            "author": self.author,
+            "event_id": self.event_id,
+            "event": self.entry.document()["event"],
+            "observation": self.observation.model_dump(),
+            "ignored": self.ignored,
+        }
+
+
+class JournalCommandResult(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    request_id: str
+    event_id: str
+    author: Literal["runner", "participant"]
+    result: CommandObservation
+    entry: JournalEntry
+    observations: list[CommandResultObserver]
+    provisional: bool
+
+    def document(self) -> JsonObject:
+        return {
+            "request_id": self.request_id,
+            "event_id": self.event_id,
+            "author": self.author,
+            "outcome": self.result.outcome,
+            "response": copy_json_object(self.result.response, "command response"),
+            "event": self.entry.document()["event"],
+            "observations": [
+                observation.document() for observation in self.observations
+            ],
+            "provisional": self.provisional,
+        }
 
 
 class DiagnosticIdentity(_Document):

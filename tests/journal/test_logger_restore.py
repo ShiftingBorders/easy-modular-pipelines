@@ -18,9 +18,12 @@ from core.journal.events import (
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
+from core.journal.records import _command_result_document
 from core.models.journal_diagnostics import (
     AuthorObservation,
     DiagnosticCommand,
+    DiagnosticManifest,
+    JournalCommandResult,
     JournalSnapshotManifest,
 )
 from core.models.journal_records import CommandObservation
@@ -61,7 +64,9 @@ class JournalRestorationTests(unittest.TestCase):
         public = self.logger.read_command_result("request")
         self.assertIsInstance(public["observations"][0]["observation"], dict)
         self.assertEqual(public["response"], state["runner"]["result"].response)
-        _, _, commands = store._read_diagnostics(self.diagnostics)
+        bundle, _, commands = store._read_diagnostics(self.diagnostics)
+        self.assertIsInstance(bundle, DiagnosticManifest)
+        self.assertEqual(bundle.model_dump(), self.bundle)
         self.assertTrue(commands)
         self.assertTrue(
             all(isinstance(command, DiagnosticCommand) for command in commands)
@@ -71,6 +76,14 @@ class JournalRestorationTests(unittest.TestCase):
         )
         self.assertIsInstance(manifest, JournalSnapshotManifest)
         self.assertEqual(manifest.model_dump(), self.manifest)
+        result = _command_result_document("request", state)
+        self.assertIsInstance(result, JournalCommandResult)
+        self.assertEqual(result.document(), public)
+        emitted = result.document()
+        emitted["response"]["external"] = True
+        emitted["event"]["data"]["response"]["external"] = True
+        self.assertNotIn("external", result.result.response)
+        self.assertEqual(result.document(), public)
 
     def prepare_diagnostics(self, *, shared_response=False):
         parent = self.logger.start_operation("runner", "parent")

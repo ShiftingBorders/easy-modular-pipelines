@@ -17,6 +17,7 @@ from core.journal.events import (
 from core.primitives.json_values import JsonObject
 
 if TYPE_CHECKING:
+    from core.models.journal_diagnostics import JournalCommandResult
     from core.models.journal_records import (
         CommandObservation,
         JournalCheckpoint,
@@ -195,7 +196,12 @@ def _prepare_other_author_result(
     return False, None
 
 
-def _command_result_document(request_id: str, state: dict) -> JsonObject:
+def _command_result_document(request_id: str, state: dict) -> JournalCommandResult:
+    from core.models.journal_diagnostics import (
+        CommandResultObserver,
+        JournalCommandResult,
+    )
+
     effective = state[state["effective_author"]]
     data = effective["result"]
     observations = []
@@ -211,22 +217,21 @@ def _command_result_document(request_id: str, state: dict) -> JsonObject:
         ):
             ignored = _ignored_reason(state["runner"]["result"])
         observations.append(
-            {
-                "author": author,
-                "event_id": entry["event_id"],
-                "event": entry["entry"].document()["event"],
-                "observation": entry["observation"].model_dump(),
-                "ignored": ignored,
-            }
+            CommandResultObserver(
+                author=author,
+                event_id=entry["event_id"],
+                entry=entry["entry"],
+                observation=entry["observation"],
+                ignored=ignored,
+            )
         )
-    result = {
-        "request_id": request_id,
-        "event_id": effective["event_id"],
-        "author": state["effective_author"],
-        "outcome": data.outcome,
-        "response": data.response,
-        "event": effective["entry"].document()["event"],
-        "observations": observations,
-        "provisional": state["runner"] is None,
-    }
+    result = JournalCommandResult(
+        request_id=request_id,
+        event_id=effective["event_id"],
+        author=state["effective_author"],
+        result=data,
+        entry=effective["entry"],
+        observations=observations,
+        provisional=state["runner"] is None,
+    )
     return result
