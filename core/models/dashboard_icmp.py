@@ -15,7 +15,7 @@ from pydantic import (
 )
 
 from core.models.values import Number
-from core.primitives.json_values import JsonObject, copy_json_object
+from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
 
 
 def _host(value: object) -> str:
@@ -106,6 +106,7 @@ class ICMPObservation(_Document):
     observed_at: AwareTimestamp
     session_id: str
     rtt_ms: RTT | None = None
+    revision: JsonValue = None
 
 
 class ICMPIncident(_Document):
@@ -117,6 +118,7 @@ class ICMPIncident(_Document):
     status: Literal["active", "resolved", "closed"]
     started_at: AwareTimestamp
     ended_at: AwareTimestamp | None = None
+    resolution: JsonValue = None
 
 
 class SavedICMPState(_Document):

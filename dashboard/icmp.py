@@ -13,10 +13,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from core.models.dashboard_icmp import (
+    ICMPIncident,
+    ICMPObservation,
     ICMPSettings,
     ICMPWorkerResult,
     SavedICMPState,
 )
+from core.models.updates import _update_model
 
 
 def timestamp() -> str:
@@ -30,14 +33,14 @@ def validate_icmp_settings(document: object) -> dict:
 class ICMPMonitor:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
-        self.settings = {
+        self.settings = ICMPSettings.model_validate({
             "enabled": False,
             "host": "www.google.com",
             "timeout_seconds": 5,
             "interval_seconds": 30,
-        }
-        self.history: list[dict] = []
-        self.incidents: list[dict] = []
+        })
+        self.history: list[ICMPObservation] = []
+        self.incidents: list[ICMPIncident] = []
         self.host_name = socket.gethostname()
         self.session_id = str(uuid4())
         self.storage_error: str | None = None
@@ -84,13 +87,9 @@ class ICMPMonitor:
         self._task = asyncio.create_task(self._run(), name="dashboard-icmp")
 
     def _restore_state(self, document: SavedICMPState) -> None:
-        self.settings = document.settings.model_dump()
-        self.history = [
-            item.model_dump(exclude_unset=True) for item in document.history[-720:]
-        ]
-        self.incidents = [
-            item.model_dump(exclude_unset=True) for item in document.incidents[-200:]
-        ]
+        self.settings = document.settings
+        self.history = document.history[-720:]
+        self.incidents = document.incidents[-200:]
 
     def _write(self, document: dict) -> None:
         temporary = self.directory / f".icmp-{uuid4()}.json"
@@ -104,19 +103,20 @@ class ICMPMonitor:
             temporary.unlink(missing_ok=True)
 
     async def configure(self, document: object) -> dict:
-        settings = ICMPSettings.model_validate(validate_icmp_settings(document))
+        settings = ICMPSettings.model_validate(document)
         return await self._configure(settings)
 
     async def _configure(self, validated: ICMPSettings) -> dict:
-        settings = validated.model_dump()
+        settings = validated
         async with self._lock:
             if self._closing:
                 raise ValueError("ICMP monitor is closing.")
-            incidents = [dict(item) for item in self.incidents]
+            incidents = list(self.incidents)
             if settings != self.settings:
-                for incident in incidents:
-                    if incident.get("status") == "active":
-                        incident.update(
+                for index, incident in enumerate(incidents):
+                    if incident.status == "active":
+                        incidents[index] = _update_model(
+                            incident,
                             status="closed",
                             ended_at=timestamp(),
                             resolution="configuration_changed",
@@ -125,9 +125,13 @@ class ICMPMonitor:
                 asyncio.to_thread(
                     self._write,
                     {
-                        "settings": settings,
-                        "history": self.history,
-                        "incidents": incidents,
+                        "settings": settings.model_dump(),
+                        "history": [
+                            item.model_dump(exclude_unset=True) for item in self.history
+                        ],
+                        "incidents": [
+                            item.model_dump(exclude_unset=True) for item in incidents
+                        ],
                     },
                 )
             )
@@ -153,62 +157,61 @@ class ICMPMonitor:
             (
                 item
                 for item in reversed(self.history)
-                if item.get("host") == self.settings["host"]
+                if item.host == self.settings.host
             ),
             None,
         )
         fresh = bool(
             latest
-            and latest.get("session_id") == self.session_id
-            and latest.get("revision") == self._revision
+            and latest.session_id == self.session_id
+            and latest.revision == self._revision
         )
         if fresh:
             age = (
-                datetime.now(UTC) - datetime.fromisoformat(latest["observed_at"])
+                datetime.now(UTC) - datetime.fromisoformat(latest.observed_at)
             ).total_seconds()
             fresh = (
                 0
                 <= age
-                <= self.settings["interval_seconds"]
-                + self.settings["timeout_seconds"]
+                <= self.settings.interval_seconds
+                + self.settings.timeout_seconds
                 + 10
             )
-        state = "not_configured" if not self.settings["host"] else "disabled"
-        if self.settings["enabled"]:
-            state = latest["status"] if fresh else "waiting"
+        state = "not_configured" if not self.settings.host else "disabled"
+        if self.settings.enabled:
+            state = latest.status if fresh else "waiting"
         return {
-            "settings": dict(self.settings),
+            "settings": self.settings.model_dump(),
             "status": state,
             "probe_host": self.host_name,
             "source": "dashboard_host",
             "fresh": fresh,
             "probing": bool(self._probe_task and not self._probe_task.done()),
-            "latest": latest,
-            "history": self.history[-200:],
-            "incidents": self.incidents,
+            "latest": None if latest is None else latest.model_dump(exclude_unset=True),
+            "history": [item.model_dump(exclude_unset=True) for item in self.history[-200:]],
+            "incidents": [item.model_dump(exclude_unset=True) for item in self.incidents],
             "storage_error": self.storage_error,
         }
 
     async def probe(self) -> dict:
         if self._closing:
             raise ValueError("ICMP monitor is closing.")
-        if not self.settings["enabled"]:
+        if not self.settings.enabled:
             raise ValueError("Enable ICMP monitoring and configure a host first.")
         if self._probe_task is None or self._probe_task.done():
             self._probe_task = asyncio.create_task(
-                self._measure(dict(self.settings), self._revision)
+                self._measure(self.settings, self._revision)
             )
         await asyncio.shield(self._probe_task)
         return self.snapshot()
 
-    async def _measure(self, settings: dict, revision: int) -> None:
-        validated = ICMPSettings.model_validate(settings)
+    async def _measure(self, settings: ICMPSettings, revision: int) -> None:
         started = timestamp()
-        result = await self._probe_worker(validated)
+        result = await self._probe_worker(settings)
         async with self._lock:
             if revision != self._revision:
                 return
-            self._record_probe_result(result, validated, revision, started)
+            self._record_probe_result(result, settings, revision, started)
             await self._persist_observations()
 
     async def _probe_worker(self, settings: ICMPSettings) -> ICMPWorkerResult:
@@ -261,8 +264,50 @@ class ICMPMonitor:
         revision: int,
         started: str,
     ) -> None:
-        result = observed.model_dump(exclude_unset=True)
-        result.update(
+        result = self._probe_observation(observed, settings, revision, started)
+        self.history.append(result)
+        self.history = self.history[-720:]
+        active = next(
+            (item for item in self.incidents if item.status == "active"),
+            None,
+        )
+        if result.status == "no_reply" and active is None:
+            self.incidents.append(
+                ICMPIncident.model_validate(
+                    {
+                        "id": str(uuid4()),
+                        "type": "icmp_no_reply",
+                        "source": "dashboard_host",
+                        "host": settings.host,
+                        "probe_host": self.host_name,
+                        "status": "active",
+                        "started_at": result.observed_at,
+                        "ended_at": None,
+                    }
+                )
+            )
+            self.incidents = self.incidents[-200:]
+        elif result.status == "reply" and active:
+            self.incidents[self.incidents.index(active)] = _update_model(
+                active,
+                status="resolved",
+                ended_at=result.observed_at,
+                resolution="echo_reply",
+            )
+
+    def _probe_observation(
+        self,
+        observed: ICMPWorkerResult,
+        settings: ICMPSettings,
+        revision: int,
+        started: str,
+    ) -> ICMPObservation:
+        values: dict[str, object] = {}
+        for name in ICMPWorkerResult.model_fields:
+            if name in observed.model_fields_set:
+                values[name] = getattr(observed, name)
+        values.update(observed.model_extra or {})
+        values.update(
             host=settings.host,
             probe_host=self.host_name,
             source="dashboard_host",
@@ -272,32 +317,7 @@ class ICMPMonitor:
             revision=revision,
             timeout_seconds=settings.timeout_seconds,
         )
-        self.history.append(result)
-        self.history = self.history[-720:]
-        active = next(
-            (item for item in self.incidents if item.get("status") == "active"),
-            None,
-        )
-        if result["status"] == "no_reply" and active is None:
-            self.incidents.append(
-                {
-                    "id": str(uuid4()),
-                    "type": "icmp_no_reply",
-                    "source": "dashboard_host",
-                    "host": settings.host,
-                    "probe_host": self.host_name,
-                    "status": "active",
-                    "started_at": result["observed_at"],
-                    "ended_at": None,
-                }
-            )
-            self.incidents = self.incidents[-200:]
-        elif result["status"] == "reply" and active:
-            active.update(
-                status="resolved",
-                ended_at=result["observed_at"],
-                resolution="echo_reply",
-            )
+        return ICMPObservation.model_validate(values)
 
     async def _persist_observations(self) -> None:
         try:
@@ -305,9 +325,14 @@ class ICMPMonitor:
                 asyncio.to_thread(
                     self._write,
                     {
-                        "settings": self.settings,
-                        "history": self.history,
-                        "incidents": self.incidents,
+                        "settings": self.settings.model_dump(),
+                        "history": [
+                            item.model_dump(exclude_unset=True) for item in self.history
+                        ],
+                        "incidents": [
+                            item.model_dump(exclude_unset=True)
+                            for item in self.incidents
+                        ],
                     },
                 )
             )
@@ -323,11 +348,11 @@ class ICMPMonitor:
     async def _run(self) -> None:
         while not self._closing:
             self._wake.clear()
-            if self.settings["enabled"]:
+            if self.settings.enabled:
                 await self.probe()
             try:
                 await asyncio.wait_for(
-                    self._wake.wait(), self.settings["interval_seconds"]
+                    self._wake.wait(), self.settings.interval_seconds
                 )
             except TimeoutError:
                 pass

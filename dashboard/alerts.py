@@ -15,6 +15,7 @@ from core.models.dashboard_alerts import (
     NotificationChannels,
     SavedAlertState,
 )
+from core.models.dashboard_icmp import ICMPIncident
 from dashboard.icmp import ICMPMonitor
 from dashboard.notifications import deliver
 from dashboard.projections import instant
@@ -350,7 +351,12 @@ class AlertMonitor:
                                 )
                                 self._notify(incident, recovery=True)
                                 changed = True
-                    for observed in self.icmp.incidents:
+                    for retained in self.icmp.incidents:
+                        observed = (
+                            retained.model_dump(exclude_unset=True)
+                            if isinstance(retained, ICMPIncident)
+                            else retained
+                        )
                         identity = "icmp:" + observed["id"]
                         incident = next(
                             (item for item in self.incidents if item["id"] == identity),
