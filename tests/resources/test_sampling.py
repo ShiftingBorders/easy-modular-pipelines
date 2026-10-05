@@ -10,9 +10,15 @@ from unittest.mock import Mock, patch
 import psutil
 
 from core.models.journal_records import JournalContext
-from core.models.resource_messages import CollectorSnapshot, CollectorUpdate
+from core.models.resource_messages import (
+    CollectorSnapshot,
+    CollectorUpdate,
+    ResourceMeasurement,
+    ResourceSample,
+)
 from core.models.resource_target import ResourceTargetDocument
 from core.primitives.processes import process_identity
+from core.resources.observations import MeasuredResource, ResourceObservation
 from core.resources.sampling import ResourceSampler, _apply_collector_update
 from core.resources.state import ResourceTarget
 from tests.helpers.dag import wait_until
@@ -25,6 +31,60 @@ from tests.helpers.resources import (
 
 
 class SamplerTests(unittest.TestCase):
+    def test_observation_models_retain_measurements_and_public_json_values(self):
+        measurement = self.sampler._measurement(25, "percent", "host", "time")
+        self.assertIsInstance(measurement, MeasuredResource)
+        measurement = ResourceMeasurement.model_validate(measurement.document())
+        context = JournalContext.model_validate({"experiment_id": "experiment"})
+        sample = ResourceSample.model_validate(
+            {
+                "series_id": "host:test",
+                "context": context,
+                "observed_at": "time",
+                "observed_monotonic": 10,
+                "resources": {"cpu": measurement},
+                "extra": {"value": 1.0},
+            }
+        )
+        self.assertIs(sample.context, context)
+        self.assertIs(sample.resources["cpu"], measurement)
+        expected = sample.model_dump(exclude_unset=True)
+        emitted = sample.model_dump(exclude_unset=True)
+        emitted["resources"]["cpu"]["attributes"]["external"] = True
+        self.assertEqual(sample.model_dump(exclude_unset=True), expected)
+        target_model = ResourceTargetDocument.model_validate(
+            {
+                "series_id": self.target.series_id,
+                "identity": self.identity,
+                "context": self.target.context,
+            }
+        )
+        observed = self.sampler._process_observation(target_model)
+        self.assertIsInstance(observed, ResourceObservation)
+        self.assertTrue(
+            all(
+                isinstance(item, MeasuredResource)
+                for item in observed.resources.values()
+            )
+        )
+        self.assertEqual(
+            observed.resources["process_memory_rss_bytes"].attributes[
+                "observed_process"
+            ],
+            self.identity,
+        )
+
+    def test_native_observations_keep_the_original_public_validation_boundary(self):
+        import math
+
+        context = {"custom": "value"}
+        sample = self.sampler._host_sample(context)
+        self.assertIs(sample["context"], context)
+        measurement = self.sampler._measurement(float("nan"), "percent", "host", "time")
+        self.assertTrue(math.isnan(measurement.document()["value"]))
+        with self.assertRaises(ValueError):
+            ResourceMeasurement.model_validate(measurement.document())
+
     def test_child_update_retains_models_and_context_with_original_wire_shape(self):
         path = (Path.cwd() / ".artifacts/tmp/Resource.json").resolve()
         document = {

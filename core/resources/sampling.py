@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -22,12 +23,14 @@ from core.models.resource_messages import (
     CollectorSnapshot,
     CollectorStop,
     CollectorUpdate,
+    ResourceSample,
 )
 from core.models.resource_target import ResourceTargetDocument
 from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from core.primitives.json_values import JsonObject
 from core.primitives.processes import process_identity
+from core.resources.observations import MeasuredResource, ResourceObservation
 from core.resources.state import CollectorSettings, ResourceTarget
 
 
@@ -56,12 +59,21 @@ class ResourceSampler:
         context: JournalContext | JsonObject,
         targets: list[ResourceTarget | ResourceTargetDocument],
     ) -> list[JsonObject]:
+        return [
+            sample.document() for sample in self._sample_observations(context, targets)
+        ]
+
+    def _sample_observations(
+        self,
+        context: JournalContext | JsonObject,
+        targets: list[ResourceTarget | ResourceTargetDocument],
+    ) -> list[ResourceObservation]:
         active = {target.series_id for target in targets}
         self._process_previous = {
             key: value for key, value in self._process_previous.items() if key in active
         }
-        samples = [self._host_sample(context)]
-        samples.extend(self._process_sample(target) for target in targets)
+        samples = [self._host_observation(context)]
+        samples.extend(self._process_observation(target) for target in targets)
         return samples
 
     def _measurement(
@@ -74,14 +86,12 @@ class ResourceSampler:
         reason: str | None = None,
         interval: float | None = None,
         identity: JsonObject | None = None,
-    ) -> JsonObject:
-        return {
-            "value": value,
-            "unit": unit,
-            "kind": "gauge",
-            "scope": scope,
-            "estimated": False,
-            "attributes": {
+    ) -> MeasuredResource:
+        return MeasuredResource(
+            value=value,
+            unit=unit,
+            scope=scope,
+            attributes={
                 "observed_at": observed_at,
                 "interval_seconds": interval,
                 "available": value is not None,
@@ -92,9 +102,14 @@ class ResourceSampler:
                 "boot_id": self.host["boot_id"],
                 "observed_process": identity,
             },
-        }
+        )
 
     def _host_sample(self, context: JournalContext | JsonObject) -> JsonObject:
+        return self._host_observation(context).document()
+
+    def _host_observation(
+        self, context: JournalContext | JsonObject
+    ) -> ResourceObservation:
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
         interval = None if self._host_previous is None else now - self._host_previous
@@ -148,35 +163,36 @@ class ResourceSampler:
                     observed_at,
                     reason=sample.get("reason"),
                 )
-                measured["attributes"].update(sample.get("attributes", {}))
-                measured["attributes"]["source"] = sample.get("attributes", {}).get(
+                attributes = {**measured.attributes, **sample.get("attributes", {})}
+                attributes["source"] = sample.get("attributes", {}).get(
                     "provider", "psutil"
                 )
-                resources[name] = measured
-        return {
-            "series_id": f"host:{self.host['host_id']}:{self.host['boot_id']}",
-            "context": context.model_dump()
-            if isinstance(context, JournalContext)
-            else context,
-            "observed_at": observed_at,
-            "observed_monotonic": now,
-            "resources": resources,
-        }
+                resources[name] = replace(measured, attributes=attributes)
+        return ResourceObservation(
+            series_id=f"host:{self.host['host_id']}:{self.host['boot_id']}",
+            context=context,
+            observed_at=observed_at,
+            observed_monotonic=now,
+            resources=resources,
+        )
 
     def _process_sample(
         self, target: ResourceTarget | ResourceTargetDocument
     ) -> JsonObject:
+        return self._process_observation(target).document()
+
+    def _process_observation(
+        self, target: ResourceTarget | ResourceTargetDocument
+    ) -> ResourceObservation:
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
         cpu, memory, reason, cpu_reason, interval = self._observe_process(target, now)
-        return {
-            "series_id": target.series_id,
-            "context": target.context.model_dump()
-            if isinstance(target, ResourceTargetDocument)
-            else target.context,
-            "observed_at": observed_at,
-            "observed_monotonic": now,
-            "resources": {
+        return ResourceObservation(
+            series_id=target.series_id,
+            context=target.context,
+            observed_at=observed_at,
+            observed_monotonic=now,
+            resources={
                 "process_cpu_percent": self._measurement(
                     cpu,
                     "percent",
@@ -199,7 +215,7 @@ class ResourceSampler:
                     else target.identity,
                 ),
             },
-        }
+        )
 
     def _observe_process(
         self, target: ResourceTarget | ResourceTargetDocument, now: float
@@ -298,7 +314,7 @@ class ResourceWriter:
             self.unconfirmed_samples = 0
             self._reported_losses = 0
 
-    def record(self, sample: JsonObject) -> None:
+    def record(self, sample: ResourceObservation | ResourceSample | JsonObject) -> None:
         if self._source is None:
             return
         if time.monotonic() < self._retry_at:
@@ -307,42 +323,68 @@ class ResourceWriter:
         try:
             if self._client is None:
                 self._open_selected_journal()
-            context = {**sample["context"], "source": "resource_collector"}
-            if self.restart_notice is not None:
-                notice, self.restart_notice = self.restart_notice, None
-                if context.get("experiment_id") is not None and all(
-                    (
-                        notice.context.root
-                        if isinstance(notice, CollectorRestart)
-                        else notice["context"]
-                    ).get(key)
-                    == context.get(key)
-                    for key in ("experiment_id", "run_id")
-                ):
-                    self._client.record_event(
-                        "resources.gap",
-                        notice.model_dump(exclude_unset=True)
-                        if isinstance(notice, CollectorRestart)
-                        else notice,
-                        context=context,
-                    )
-            if self.unconfirmed_samples > self._reported_losses:
-                self._client.record_event(
-                    "resources.gap",
-                    {
-                        "collector_id": self._collector_id,
-                        "unconfirmed_samples": self.unconfirmed_samples,
-                    },
-                    context=context,
-                )
-                self._reported_losses = self.unconfirmed_samples
-            self._client.record_resources(sample["resources"], context=context)
+            sample_context = (
+                sample.context
+                if isinstance(sample, (ResourceObservation, ResourceSample))
+                else sample["context"]
+            )
+            context = {
+                **(
+                    sample_context.root
+                    if isinstance(sample_context, JournalContext)
+                    else sample_context
+                ),
+                "source": "resource_collector",
+            }
+            self._record_gaps(context)
+            resources = (
+                {name: item.document() for name, item in sample.resources.items()}
+                if isinstance(sample, ResourceObservation)
+                else {
+                    name: item.model_dump(exclude_unset=True)
+                    for name, item in sample.resources.items()
+                }
+                if isinstance(sample, ResourceSample)
+                else sample["resources"]
+            )
+            self._client.record_resources(resources, context=context)
             self.error = None
         except Exception as error:  # noqa: BLE001 - Telemetry failure must not escape into DAG policy.
             self.unconfirmed_samples += 1
             self.error = f"{type(error).__name__}: {error}"
             self.close()
             self._retry_at = time.monotonic() + self._settings.logging_retry_seconds
+
+    def _record_gaps(self, context: JsonObject) -> None:
+        """Publish pending losses once; uncertain writes keep the previous policy."""
+        if self.restart_notice is not None:
+            notice, self.restart_notice = self.restart_notice, None
+            notice_context = (
+                notice.context.root
+                if isinstance(notice, CollectorRestart)
+                else notice["context"]
+            )
+            if context.get("experiment_id") is not None and all(
+                notice_context.get(key) == context.get(key)
+                for key in ("experiment_id", "run_id")
+            ):
+                self._client.record_event(
+                    "resources.gap",
+                    notice.model_dump(exclude_unset=True)
+                    if isinstance(notice, CollectorRestart)
+                    else notice,
+                    context=context,
+                )
+        if self.unconfirmed_samples > self._reported_losses:
+            self._client.record_event(
+                "resources.gap",
+                {
+                    "collector_id": self._collector_id,
+                    "unconfirmed_samples": self.unconfirmed_samples,
+                },
+                context=context,
+            )
+            self._reported_losses = self.unconfirmed_samples
 
     def _open_selected_journal(self) -> None:
         settings, _ = _load_logging_settings(self._source)
@@ -414,7 +456,7 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
             now = time.monotonic()
             samples = []
             if now >= next_sample:
-                samples = sampler.sample(snapshot.context, targets)
+                samples = sampler._sample_observations(snapshot.context, targets)
                 # A pending lifecycle change takes precedence over optional writes.
                 for index, sample in enumerate(samples):
                     if connection.poll():
@@ -432,7 +474,7 @@ def collect_resources(connection: Connection, settings: CollectorSettings) -> No
                         "journal_closed": writer._client is None,
                         "journal_error": writer.error,
                         "unconfirmed_samples": writer.unconfirmed_samples,
-                        "samples": samples,
+                        "samples": [sample.document() for sample in samples],
                     }
                 )
                 next_status = time.monotonic() + settings.status_interval_seconds

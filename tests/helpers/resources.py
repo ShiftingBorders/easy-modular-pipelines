@@ -90,7 +90,7 @@ def target(identity: dict, context: dict | None = None) -> dict:
 def controlled_collector(connection, settings, *, controls: str) -> None:
     """Inject one local boundary inside the real spawned collector, without production hooks."""
     root = Path(controls)
-    sample = ResourceSampler.sample
+    sample = ResourceSampler._sample_observations
     record = OperationLogger.record_resources
     opened = OperationLogger.open
 
@@ -114,7 +114,7 @@ def controlled_collector(connection, settings, *, controls: str) -> None:
         return opened(self)
 
     with (
-        patch.object(ResourceSampler, "sample", sample_with_gate),
+        patch.object(ResourceSampler, "_sample_observations", sample_with_gate),
         patch.object(OperationLogger, "record_resources", fail_record),
         patch.object(OperationLogger, "open", fail_open),
     ):

@@ -12,11 +12,52 @@ from unittest.mock import patch
 
 from core.journal.events import LoggingStorageError
 from core.journal.logger import OperationLogger
+from core.models.resource_messages import ResourceSample
 from core.resources.sampling import ResourceWriter
 from tests.helpers.resources import TEMP_ROOT, events, journal, settings
 
 
 class ResourceWriterTests(unittest.TestCase):
+    def test_retained_sample_is_serialized_at_the_logger_boundary(self):
+        sample = ResourceSample.model_validate(
+            {
+                "series_id": "host:test",
+                "observed_at": "time",
+                "observed_monotonic": 10,
+                "context": self.context,
+                "resources": {
+                    "cpu": {
+                        "value": 25,
+                        "unit": "percent",
+                        "kind": "gauge",
+                        "scope": "host",
+                        "estimated": False,
+                        "attributes": {},
+                    }
+                },
+            }
+        )
+        before = sample.model_dump(exclude_unset=True)
+        self.writer.select(self.config)
+        record = OperationLogger.record_resources
+        received = []
+
+        def observe(client, resources, **kwargs):
+            self.assertIsInstance(resources, dict)
+            self.assertEqual(resources, before["resources"])
+            received.append(resources)
+            return record(client, resources, **kwargs)
+
+        with patch.object(OperationLogger, "record_resources", observe):
+            self.writer.record(sample)
+        self.assertEqual(len(received), 1)
+        self.assertIsNone(self.writer.error)
+        self.assertEqual(
+            events(self.reader, "resources.recorded")[0]["data"]["resources"],
+            before["resources"],
+        )
+        self.assertEqual(sample.model_dump(exclude_unset=True), before)
+
     def setUp(self):
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
