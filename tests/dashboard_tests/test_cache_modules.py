@@ -1,14 +1,19 @@
 """Approved I: exact full-history module publications and their read path."""
 
+import hashlib
 import json
+import sqlite3
 import unittest
+from contextlib import ExitStack, closing
 from pathlib import Path
 from unittest.mock import patch
 
 from core.journal.logger import OperationLogger
+from core.models.journal_cache import CacheIdentity, CacheSource
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals, cache_experiment
+from dashboard.module_publication import ModuleDataset, ModuleSource
 from tests.dashboard_tests.helpers import (
     cleanup_directory,
     temporary_directory,
@@ -18,6 +23,49 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace, history
 
 
 class ModulePublicationTests(unittest.TestCase):
+    def test_module_source_models_reach_native_inventory_and_callback_boundaries(self):
+        publication = self.publish()
+        with ExitStack() as resources:
+            datasets, sources = self.reader._module_sources(
+                self.reader.registry(), resources
+            )
+            for dataset in datasets:
+                self.assertIsInstance(dataset, ModuleDataset)
+                self.assertIsInstance(dataset.identity, CacheIdentity)
+                source = sources[dataset.experiment_id]
+                self.assertIsInstance(source, ModuleSource)
+                self.assertIsInstance(source.cache, CacheSource)
+                self.assertIs(dataset.identity, source.cache.identity)
+                self.assertEqual(
+                    source.document(), publication["sources"][dataset.experiment_id]
+                )
+                self.assertEqual(
+                    dataset.document()["identity"], source.cache.identity.model_dump()
+                )
+                self.assertEqual(
+                    dataset.connection.execute("SELECT 1").fetchone(), (1,)
+                )
+
+    def test_corrupt_metadata_keeps_its_existing_publication_read_error_boundary(self):
+        self.publish()
+        key = hashlib.sha256(b"exp-0").hexdigest()
+        with (
+            closing(
+                sqlite3.connect(self.reader.state_directory / f"{key}.cache.sqlite")
+            ) as database,
+            database,
+        ):
+            database.execute("UPDATE metadata SET value='-1' WHERE key='version'")
+        self.assertTrue(self.reader.publish_modules())
+        document = json.loads(
+            (self.reader.state_directory / "modules.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["sources"]["exp-0"]["version"], -1)
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.modules()
+        self.assertEqual(error.exception.code, "cache_unavailable")
+        self.assertEqual(str(error.exception), "Invalid module statistics publication.")
+
     def setUp(self):
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)

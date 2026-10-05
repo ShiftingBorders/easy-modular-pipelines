@@ -56,6 +56,7 @@ from dashboard.cache_dataset import (
     CacheWindow,
     _history_dataset,
 )
+from dashboard.module_publication import ModuleDataset, ModuleSource
 from dashboard.projections import (
     compact_event,
     instant,
@@ -412,7 +413,10 @@ class LocalJournals:
             signature = {
                 "schema_version": 2,
                 "project_root": str(self.project),
-                "sources": sources,
+                "sources": {
+                    identifier: source.document()
+                    for identifier, source in sources.items()
+                },
             }
             previous = (
                 read_object(path, self.settings.max_response_bytes)
@@ -421,8 +425,10 @@ class LocalJournals:
             )
             if all(previous.get(key) == value for key, value in signature.items()):
                 return True
-            complete = all(source["complete"] for source in sources.values())
-            items = module_statistics(models)
+            complete = all(source.complete for source in sources.values())
+            items = module_statistics(
+                [(dataset.document(), dataset.connection) for dataset in models]
+            )
             for item in items:
                 item["complete"] = item["complete"] and complete
             document = {
@@ -444,15 +450,15 @@ class LocalJournals:
 
     def _module_sources(
         self, registry: dict[str, Path], resources: ExitStack
-    ) -> tuple[list[tuple[dict, sqlite3.Connection]], dict[str, dict]]:
+    ) -> tuple[list[ModuleDataset], dict[str, ModuleSource]]:
         models, sources = [], {}
         for identifier, directory in registry.items():
             key = hashlib.sha256(identifier.encode()).hexdigest()
             database = self.state_directory / f"{key}.cache.sqlite"
-            source = {"directory": str(directory), "complete": False}
+            source = ModuleSource(str(directory))
             sources[identifier] = source
             if not database.exists():
-                source["error"] = "Cache is not initialized."
+                source.error = "Cache is not initialized."
                 continue
             try:
                 connection = resources.enter_context(
@@ -472,33 +478,26 @@ class LocalJournals:
                     or Path(configuration["logging"]["db_path"]).resolve()
                     != (directory / "journals/events.sqlite").resolve()
                 ):
-                    source["error"] = "Cache belongs to a different journal."
+                    source.error = "Cache belongs to a different journal."
                     continue
-                source.update(
-                    journal=identity.identity.model_dump(),
-                    file_key=identity.file_key,
-                    cache_schema_version=identity.version,
-                    version=int(metadata.get("version", 0)),
-                    cached_through=json.loads(metadata.get("cached_through", "null")),
-                    complete=metadata.get("ready") == "1",
-                )
+                version = int(metadata.get("version", 0))
+                checkpoint = json.loads(metadata.get("cached_through", "null"))
+                source.cache = identity
+                source.version = version
+                source.cached_through = checkpoint
+                source.complete = metadata.get("ready") == "1"
                 template = connection.execute(
                     "SELECT json_extract(compact,'$.data.template.name') FROM facts WHERE kind='template.applied' AND effective=1 ORDER BY cursor DESC LIMIT 1"
                 ).fetchone()
                 name = template[0] if template and template[0] else identifier
                 models.append(
-                    (
-                        {
-                            "experiment_id": identifier,
-                            "name": name,
-                            "complete": source["complete"],
-                            "identity": source["journal"],
-                        },
-                        connection,
+                    ModuleDataset(
+                        identifier, name, source.complete, identity.identity, connection
                     )
                 )
             except (sqlite3.Error, ValueError, KeyError, OSError) as error:
-                source.update(complete=False, error=str(error))
+                source.complete = False
+                source.error = str(error)
         return models, sources
 
     def registry(self) -> dict[str, Path]:
