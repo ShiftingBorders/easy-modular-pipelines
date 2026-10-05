@@ -1,8 +1,10 @@
 """Approved archive plan A/B/C/E: inputs, stopped state and portable installation."""
 
+import asyncio
 import copy
 import json
 import os
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +12,7 @@ import yaml
 
 from core.experiments.archiver import ExperimentArchiver
 from core.experiments.assembler import ExperimentAssembler
+from core.models.archive_documents import ArchiveFile, ArchiveManifest, ArchiveModule
 from core.models.experiment_template import ExperimentTemplate
 from core.models.updates import _update_model
 from core.primitives.json_files import write_json
@@ -106,6 +109,36 @@ class ArchiveInputTests(ArchiveTestCase):
 
 
 class ArchiveCreationTests(ArchiveTestCase):
+    async def test_archive_inventory_remains_typed_until_public_output(self):
+        created = await self.source_archive(versions=True)
+        with tempfile.TemporaryDirectory(dir=self.w.root) as temporary:
+            retained = await asyncio.to_thread(
+                self.w.importer._unpack, self.w.archive, Path(temporary) / "payload"
+            )
+        self.assertIsInstance(retained, ArchiveManifest)
+        self.assertTrue(
+            all(isinstance(item, ArchiveModule) for item in retained.modules)
+        )
+        self.assertTrue(
+            all(isinstance(item, ArchiveFile) for item in retained.files.values())
+        )
+        self.assertEqual(retained.model_dump(), created["manifest"])
+        reconstructed = ArchiveManifest.model_validate(
+            {
+                **retained.model_dump(),
+                "modules": retained.modules,
+                "files": retained.files,
+            }
+        )
+        self.assertIs(reconstructed.modules[0], retained.modules[0])
+        name = next(iter(retained.files))
+        self.assertIs(reconstructed.files[name], retained.files[name])
+        emitted = retained.model_dump()
+        emitted["modules"][0]["name"] = "external"
+        emitted["files"][name]["size"] += 1
+        self.assertEqual(retained.model_dump(), created["manifest"])
+        self.assert_work_clean()
+
     async def test_incomplete_restore_unconfirmed_requests_and_wrong_identity_are_rejected(
         self,
     ):

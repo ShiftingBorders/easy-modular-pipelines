@@ -5,35 +5,40 @@ from __future__ import annotations
 import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Literal
 
 from core.primitives.json_files import write_json
-from core.primitives.json_values import JsonObject, copy_json_object, require_text
+from core.primitives.json_values import require_text
+
+if TYPE_CHECKING:
+    from core.models.archive_documents import ArchiveModule
+    from core.models.experiment_template import ExperimentTemplate
+    from core.models.journal_records import JournalIdentity
+    from core.models.journal_settings import LoggingConfiguration
 
 
-def _reader_config(settings: JsonObject, identity: JsonObject, folder: Path) -> Path:
-    settings.update(
-        {
-            "open_mode": "existing",
-            "expected_journal": {
-                key: identity[key] for key in ("journal_id", "generation")
-            },
-        }
+def _reader_config(
+    settings: LoggingConfiguration, identity: JournalIdentity, folder: Path
+) -> Path:
+    from core.models.updates import _update_model
+
+    settings = _update_model(
+        settings,
+        open_mode="existing",
+        expected_journal={
+            "journal_id": identity.journal_id,
+            "generation": identity.generation,
+        },
     )
     reader_config = folder / "reader.json"
     write_json(
         reader_config,
         {
-            "logging": settings,
+            "logging": settings.model_dump(mode="json"),
             "operation_context": {"source": "experiment_archiver"},
         },
     )
     return reader_config
-
-
-def _objects(value: object, field: str) -> list[JsonObject]:
-    if not isinstance(value, list):
-        raise TypeError(f"{field} must be an array of objects.")
-    return [copy_json_object(item, field) for item in value]
 
 
 def _path(value: Path) -> Path:
@@ -94,23 +99,28 @@ def _cleanup(
             raise
 
 
-def _modules(template: JsonObject) -> list[dict[str, str]]:
-    modules: dict[tuple[str, str], dict[str, str]] = {}
-    for role in ("stage", "service"):
-        for definition in _objects(template[f"{role}s"], role):
-            if role == "stage" and "service_id" in definition:
+def _modules(template: ExperimentTemplate) -> list[ArchiveModule]:
+    from core.models.archive_documents import ArchiveModule
+    from core.models.experiment_template import StageDefinition
+
+    modules: dict[tuple[str, str], ArchiveModule] = {}
+    roles: tuple[Literal["stage", "service"], ...] = ("stage", "service")
+    for role in roles:
+        definitions = template.stages if role == "stage" else template.services
+        for definition in definitions:
+            if role == "stage" and not isinstance(definition, StageDefinition):
                 continue
-            module = copy_json_object(definition["module"], "module")
-            name = _member(module["name"])
-            version = _member(module["version"])
+            module = template.module_reference(definition)
+            name = _member(module.name)
+            version = _member(module.version)
             if "/" in name or "/" in version:
                 raise ValueError("Module identities must be single path components.")
-            item = {
-                "name": name,
-                "version": version,
-                "hash": require_text(module["hash"], "module.hash").lower(),
-                "role": role,
-            }
+            item = ArchiveModule(
+                name=name,
+                version=version,
+                hash=require_text(module.hash, "module.hash").lower(),
+                role=role,
+            )
             key = (name, version)
             if key in modules and modules[key] != item:
                 raise ValueError("Conflicting definitions of the same module version.")

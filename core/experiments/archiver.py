@@ -22,7 +22,6 @@ from core.experiments.archive_inputs import (
     _cleanup,
     _member,
     _modules,
-    _objects,
     _path,
     _reader_config,
     _validate_member_header,
@@ -30,8 +29,13 @@ from core.experiments.archive_inputs import (
 from core.experiments.assembler import ExperimentAssembler, find_experiment
 from core.experiments.state import RunnerState
 from core.journal.logger import OperationLogger
-from core.models.archive_documents import ArchiveManifest
+from core.models.archive_documents import ArchiveFile, ArchiveManifest, ArchiveModule
 from core.models.archive_settings import ArchiveConfiguration
+from core.models.experiment_template import ExperimentTemplate, ResourceDefinition
+from core.models.journal_records import JournalIdentity
+from core.models.journal_settings import LoggingConfiguration
+from core.models.module_manifest import ModuleManifest
+from core.models.updates import _update_model
 from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
@@ -110,9 +114,9 @@ class ExperimentArchiver:
             operation_id = str(uuid4())
             folder = _path(self._project_root / "controller/archives" / operation_id)
             folder.mkdir(parents=True, exist_ok=False)
-            settings = read_json(repository_root() / "default_settings/logging.json")
-            settings.update(
+            settings = LoggingConfiguration.model_validate(
                 {
+                    **read_json(repository_root() / "default_settings/logging.json"),
                     "db_path": str(folder / "events.sqlite"),
                     "open_mode": "create",
                     "expected_journal": None,
@@ -122,13 +126,16 @@ class ExperimentArchiver:
             write_json(
                 config,
                 {
-                    "logging": settings,
+                    "logging": settings.model_dump(mode="json"),
                     "operation_context": {"source": "experiment_archiver"},
                 },
             )
             logger = OperationLogger(config)
             await asyncio.to_thread(logger.open)
-            identity = logger.get_journal_info()
+            info = logger.get_journal_info()
+            identity = JournalIdentity.model_validate(
+                {"journal_id": info["journal_id"], "generation": info["generation"]}
+            )
             reader_config = _reader_config(settings, identity, folder)
             config = reader_config
             await asyncio.to_thread(
@@ -267,10 +274,10 @@ class ExperimentArchiver:
         except psutil.TimeoutExpired as error:
             raise RuntimeError(f"Experiment process is still alive: {pid}") from error
 
-    def _inventory(self, root: Path) -> tuple[list[str], JsonObject]:
+    def _inventory(self, root: Path) -> tuple[list[str], dict[str, ArchiveFile]]:
         root = _path(root)
         directories: list[str] = []
-        files: JsonObject = {}
+        files: dict[str, ArchiveFile] = {}
         names: set[str] = set()
         pending = [root]
         total = 0
@@ -293,7 +300,7 @@ class ExperimentArchiver:
                     raise ValueError(f"Archive source is not a regular file: {entry}")
         return sorted(directories), files
 
-    def _file_inventory(self, entry: Path, total: int) -> tuple[int, JsonObject]:
+    def _file_inventory(self, entry: Path, total: int) -> tuple[int, ArchiveFile]:
         size = entry.stat().st_size
         total += size
         if total > self._settings.max_unpacked_bytes:
@@ -302,7 +309,7 @@ class ExperimentArchiver:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
             if os.fstat(stream.fileno()).st_size != size:
                 raise ValueError("A source file changed during archiving.")
-        return total, {"size": size, "sha256": digest}
+        return total, ArchiveFile(size=size, sha256=digest)
 
     def _copy(self, source: Path, target: Path) -> None:
         source = _path(source)
@@ -349,20 +356,21 @@ class ExperimentArchiver:
                 "Archive destination must be outside the source experiment."
             )
         await asyncio.to_thread(self._assert_stopped, state)
-        _, template = self._assembler.load_template(
+        _, document = self._assembler.load_template(
             state.template_path, template_yaml=state.template_yaml
         )
-        if template != state.template.model_dump(exclude_unset=True):
+        if document != state.template.model_dump(exclude_unset=True):
             raise ValueError(
                 "Applied template differs from the runner's normalized template."
             )
+        template = ExperimentTemplate.model_validate(document)
         modules = _modules(template)
         # SQLite hash lookups must stay on their owner thread.
         for module in modules:
             registered = self._manager.hash_db.get_module_hash(
-                module["name"], module["version"]
+                module.name, module.version
             )
-            if registered.lower() != module["hash"]:
+            if registered.lower() != module.hash:
                 raise ValueError("A module hash differs from the registered hash.")
         temporary = self._workspace(archive.parent)
         work = Path(temporary.name)
@@ -377,7 +385,7 @@ class ExperimentArchiver:
             # A same-volume hard link publishes the complete file without replacement.
             _path(archive)
             os.link(packed, archive)
-            return {"archive_path": str(archive), "manifest": manifest}
+            return {"archive_path": str(archive), "manifest": manifest.model_dump()}
         except BaseException as error:
             failure = error
             raise
@@ -389,48 +397,47 @@ class ExperimentArchiver:
         state: RunnerState,
         root: Path,
         work: Path,
-        template: JsonObject,
-        modules: list[dict[str, str]],
-    ) -> tuple[Path, JsonObject]:
+        template: ExperimentTemplate,
+        modules: list[ArchiveModule],
+    ) -> tuple[Path, ArchiveManifest]:
         payload = work / "payload"
         payload.mkdir()
         for module in modules:
-            relative = Path("modules") / module["name"] / module["version"]
+            relative = Path("modules") / module.name / module.version
             await asyncio.to_thread(self._copy, root / relative, payload / relative)
-        resources = _objects(template["resources"], "resources")
-        for resource in resources:
-            name = _member(resource["name"])
+        resources = []
+        for resource in template.resources:
+            name = _member(resource.name)
             await asyncio.to_thread(
                 self._copy,
                 root / "shared_data/resources" / name,
                 payload / "resources" / name,
             )
-            resource["path"] = f"resources/{name}"
-        template["resources"] = copy_json_object({"items": resources}, "resources")[
-            "items"
-        ]
+            resources.append(_update_model(resource, path=f"resources/{name}"))
+        template = _update_model(template, resources=resources)
         (payload / "experiment.yaml").write_text(
-            yaml.safe_dump(template, allow_unicode=True, sort_keys=False),
+            yaml.safe_dump(
+                template.model_dump(exclude_unset=True),
+                allow_unicode=True,
+                sort_keys=False,
+            ),
             encoding="utf-8",
         )
         directories, files = await asyncio.to_thread(self._inventory, payload)
-        manifest = copy_json_object(
-            {
-                "schema_version": 2,
-                "archive_id": str(uuid4()),
-                "created_at": datetime.now(UTC).isoformat(),
-                "source_experiment_id": state.experiment_id,
-                "template": "experiment.yaml",
-                "modules": modules,
-                "directories": directories,
-                "files": files,
-            },
-            "archive manifest",
+        manifest = ArchiveManifest(
+            schema_version=2,
+            archive_id=str(uuid4()),
+            created_at=datetime.now(UTC).isoformat(),
+            source_experiment_id=state.experiment_id,
+            template="experiment.yaml",
+            modules=modules,
+            directories=directories,
+            files=files,
         )
-        await asyncio.to_thread(self._validate_payload, payload, manifest)
-        encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False).encode(
-            "utf-8"
-        )
+        await asyncio.to_thread(self._check_payload, payload, manifest)
+        encoded = json.dumps(
+            manifest.model_dump(), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
         if len(encoded) > self._settings.max_manifest_bytes:
             raise StorageCapacityError("Archive manifest exceeds its size limit.")
         (payload / "manifest.json").write_bytes(encoded)
@@ -507,7 +514,7 @@ class ExperimentArchiver:
             if decoder.unused_data or source.read(1):
                 raise ValueError("Trailing data or multiple XZ streams are forbidden.")
 
-    def _unpack(self, archive_path: Path, target: Path) -> JsonObject:
+    def _unpack(self, archive_path: Path, target: Path) -> ArchiveManifest:
         archive = _path(archive_path)
         if not archive.is_file():
             raise FileNotFoundError(archive)
@@ -577,20 +584,16 @@ class ExperimentArchiver:
                         raise ValueError("Invalid archive file padding.")
                     # Preserve executability without granting special permissions.
                     output.chmod((member.mode & 0o111) | 0o600)
-        manifest = read_json(target / "manifest.json")
-        expected = self._validate_payload(target, manifest) | {"manifest.json"}
+        manifest = ArchiveManifest.model_validate(read_json(target / "manifest.json"))
+        expected = self._check_payload(target, manifest) | {"manifest.json"}
         if {name.casefold() for name in expected} != names:
             raise ValueError("Archive entries differ from its manifest inventory.")
         unpacked_tar.unlink()
         return manifest
 
-    def _validate_payload(self, payload: Path, manifest: JsonObject) -> set[str]:
-        return self._check_payload(payload, ArchiveManifest.model_validate(manifest))
-
     def _check_payload(self, payload: Path, manifest: ArchiveManifest) -> set[str]:
         directories = manifest.directories
-        files = {name: info.model_dump() for name, info in manifest.files.items()}
-        manifest = manifest.model_dump()
+        files = manifest.files
         names = [*directories, *files]
         actual_dirs, actual_files = self._inventory(payload)
         actual_files.pop("manifest.json", None)
@@ -601,13 +604,15 @@ class ExperimentArchiver:
             yaml.safe_load(template_path.read_text(encoding="utf-8")), "template"
         )
         _, template = self._assembler.load_template(template_path)
-        modules = _modules(template)
-        if manifest["modules"] != modules:
+        modules = _modules(ExperimentTemplate.model_validate(template))
+        if manifest.modules != modules:
             raise ValueError("Archive modules differ from the applied template.")
         allowed_files = {"experiment.yaml"}
         roots: list[str] = []
         self._validate_payload_modules(payload, modules, roots)
-        self._validate_payload_resources(payload, raw_template, roots)
+        self._validate_payload_resources(
+            payload, ExperimentTemplate.model_validate(raw_template).resources, roots
+        )
         for name in names:
             if name in allowed_files:
                 continue
@@ -621,42 +626,46 @@ class ExperimentArchiver:
         return set(names)
 
     def _validate_payload_modules(
-        self, payload: Path, modules: list[dict[str, str]], roots: list[str]
+        self, payload: Path, modules: list[ArchiveModule], roots: list[str]
     ) -> None:
         for module in modules:
-            relative = f"modules/{module['name']}/{module['version']}"
+            relative = f"modules/{module.name}/{module.version}"
             folder = payload / relative
-            definition = self._assembler.read_module(folder)
-            if any(
-                definition[key] != module[key] for key in ("name", "version", "role")
+            definition = ModuleManifest.model_validate(
+                self._assembler.read_module(folder)
+            )
+            if (definition.name, definition.version, definition.role) != (
+                module.name,
+                module.version,
+                module.role,
             ):
                 raise ValueError(
                     "module.yaml identity or role differs from the template."
                 )
-            if self._manager.module_hash(module["name"], folder) != module["hash"]:
+            if self._manager.module_hash(module.name, folder) != module.hash:
                 raise ValueError("Module content differs from its expected hash.")
             roots.append(relative)
 
     def _validate_payload_resources(
-        self, payload: Path, raw_template: JsonObject, roots: list[str]
+        self, payload: Path, resources: list[ResourceDefinition], roots: list[str]
     ) -> None:
-        for resource in _objects(raw_template["resources"], "resources"):
-            name = _member(resource["name"])
+        for resource in resources:
+            name = _member(resource.name)
             relative = f"resources/{name}"
-            if resource["path"] != relative:
+            if resource.path != relative:
                 raise ValueError(
                     "Archive resources must use portable template-relative paths."
                 )
             source = payload / relative
             if not source.exists():
                 raise FileNotFoundError(source)
-            if resource["hash"] is not None:
+            if resource.hash is not None:
                 if source.is_dir():
                     digest = self._manager.module_hash(name, source)
                 else:
                     with source.open("rb") as stream:
                         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                if digest != require_text(resource["hash"], "resource hash").lower():
+                if digest != require_text(resource.hash, "resource hash").lower():
                     raise ValueError("Static resource differs from its expected hash.")
             roots.append(relative)
 
@@ -668,7 +677,10 @@ class ExperimentArchiver:
             manifest = await asyncio.to_thread(
                 self._unpack, archive_path, Path(temporary.name) / "payload"
             )
-            return {"archive_path": str(_path(archive_path)), "manifest": manifest}
+            return {
+                "archive_path": str(_path(archive_path)),
+                "manifest": manifest.model_dump(),
+            }
         except BaseException as error:
             failure = error
             raise
@@ -702,15 +714,12 @@ class ExperimentArchiver:
             payload = work / "payload"
             manifest = await asyncio.to_thread(self._unpack, archive_path, payload)
             # Reject known conflicts across the whole bundle before the first write.
-            modules = [
-                {key: require_text(value, key) for key, value in item.items()}
-                for item in _objects(manifest["modules"], "modules")
-            ]
+            modules = manifest.modules
             for module in modules:
                 name, version, digest = (
-                    module["name"],
-                    module["version"],
-                    module["hash"],
+                    require_text(module.name, "name"),
+                    require_text(module.version, "version"),
+                    require_text(module.hash, "hash"),
                 )
                 stored = self._manager.hash_db.get_module_hash(name, version)
                 exists = await asyncio.to_thread(
@@ -746,7 +755,7 @@ class ExperimentArchiver:
                     self._copy, payload / "resources", bundle / "resources"
                 )
             receipt = copy_json_object(
-                {"archive_id": manifest["archive_id"], "modules": completed},
+                {"archive_id": manifest.archive_id, "modules": completed},
                 "installation receipt",
             )
             write_json(bundle / "installation.json", receipt)
@@ -772,12 +781,15 @@ class ExperimentArchiver:
 
     async def _install_module(
         self,
-        module: dict[str, str],
+        module: ArchiveModule,
         payload: Path,
         modules_root: Path,
         completed: list[JsonObject],
     ) -> None:
-        name, version = module["name"], module["version"]
+        name, version = (
+            require_text(module.name, "name"),
+            require_text(module.version, "version"),
+        )
         source = payload / "modules" / name / version
         registered = await self._manager.register_module_async(name, version, source)
         entry: JsonObject = {
@@ -795,10 +807,9 @@ class ExperimentArchiver:
             try:
                 staged = Path(local.name) / "module"
                 await asyncio.to_thread(self._copy, source, staged)
-                if (
-                    await asyncio.to_thread(self._manager.module_hash, name, staged)
-                    != module["hash"]
-                ):
+                if await asyncio.to_thread(
+                    self._manager.module_hash, name, staged
+                ) != require_text(module.hash, "hash"):
                     raise ValueError("Installed module hash differs after copying.")
                 if _path(target).exists():
                     raise StorageConflict(
