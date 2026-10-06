@@ -95,16 +95,18 @@ Prefer Pydantic models for structured configuration, persisted state documents, 
 
 ## Testing Guidelines and Approval Workflow
 
-Tests are added only after a feature's implementation is finalized and the maintainer approves the test behavior. Do not infer test cases and immediately implement them.
+Tests are a mandatory stage before implementing a feature or behavior change. First obtain the maintainer's explicit approval of the test plan, then write the approved tests, and only then write the implementation. Do not infer test cases and immediately implement them, or start the implementation while test approval is pending.
 
-When a feature is ready for testing, first create a Markdown test-plan template under `.artifacts/test-plans/`, named for the feature (for example, `.artifacts/test-plans/hash_db_validation.md`). The template must list:
+Before writing tests or implementation code, create a Markdown test-plan template under `.artifacts/test-plans/`, named for the feature (for example, `.artifacts/test-plans/hash_db_validation.md`). The template must list:
 
-- every source file affected by the feature;
+- every source file expected to be affected by the feature;
 - each observable behavior that requires testing;
 - relevant inputs, outputs, errors, boundaries, or side effects;
 - open questions for the maintainer, without prescribing test logic.
 
 The maintainer then describes in natural language how each listed file or behavior should be tested. Review that description together and resolve ambiguities. Write or modify test code only after the maintainer explicitly confirms the plan. Apply this same plan-and-approval workflow to all later test changes; existing approval does not automatically authorize new cases or altered assertions.
+
+Run the approved tests before implementation and confirm that tests for new or corrected behavior fail for the expected reason. Distinguish missing behavior from unrelated environment or test-setup failures. Then implement the behavior and rerun the approved tests and relevant existing regression tests until they pass. For behavior-preserving refactoring, establish passing coverage of the behavior to preserve before changing production code. Do not weaken approved assertions to accommodate the implementation; changes to test behavior still require the maintainer's explicit confirmation.
 
 After approval, place `unittest` tests under `tests/` using names such as
 `test_hashdb.py` and methods such as `test_rejects_invalid_schema`. Keep each

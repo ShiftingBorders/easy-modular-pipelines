@@ -5,6 +5,9 @@ implementation, and a README describing its contract. Start with a stage:
 it accepts one input, performs work, returns one result, and exits.
 Use a [service](python_bridges.md) for work that stays alive across stages.
 
+Before implementing a module, read the
+[module and service behavior contract](module_contract.md).
+
 ## 1. Create a module folder
 
 For example, create `modules/hello/1.0/` in your project:

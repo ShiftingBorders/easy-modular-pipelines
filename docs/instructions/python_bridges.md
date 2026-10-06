@@ -4,6 +4,9 @@ A service runs before and alongside the DAG. It stays alive during pauses and
 can be called from several stage nodes. Use a service for a database, model
 server, background worker, or another resource whose lifetime spans attempts.
 
+Before implementing a service, read the
+[module and service behavior contract](module_contract.md).
+
 Start with [module authoring](modules.md) for directory, configuration, logging,
 and artifact rules. Use the shared `ParticipantServer` instead of implementing
 another transport.

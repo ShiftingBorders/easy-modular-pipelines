@@ -96,6 +96,7 @@ above for now.
 | Run your first experiment | [Quickstart](docs/quickstart.md) |
 | Use commands, configuration and the interactive shell | [CLI reference](docs/cli.md) |
 | Create a stage module | [Module authoring](docs/instructions/modules.md) |
+| Understand module and service obligations | [Module behavior contract](docs/instructions/module_contract.md) |
 | Create a service or external-process proxy | [Service authoring](docs/instructions/python_bridges.md) |
 | Configure and run experiments | [Experiment guide](docs/basic_dag.md) |
 | Understand the experiment YAML | [Template reference](docs/experiment_template.md) |

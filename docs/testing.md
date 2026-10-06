@@ -184,8 +184,15 @@ alongside any validation result rather than relying on an old test count.
 
 ## Changing tests
 
-Follow [AGENTS.md](../AGENTS.md). Before adding or modifying tests, finalize the
-feature and create its Markdown plan under `.artifacts/test-plans/`.
+Follow [AGENTS.md](../AGENTS.md). Before writing tests or implementation code,
+create the feature's Markdown test plan.
 Describe affected files, observable behavior, relevant boundaries and errors,
 and open questions. Write test code only after the maintainer explicitly
 confirms the plan. Existing approval does not authorize new cases automatically.
+
+Write and run the approved tests before implementing the feature or behavior
+change. Confirm that new behavior or regression tests fail for the expected
+reason, then implement the behavior and run the tests again together with
+relevant existing regression tests. For behavior-preserving refactoring,
+establish passing coverage before changing production code. Do not start
+implementation while test approval is pending.
