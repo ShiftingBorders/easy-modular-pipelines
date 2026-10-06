@@ -98,6 +98,22 @@ class SQLiteEventStore:
         diagnostic_context: JsonObject | None = None,
         read_only: bool = False,
     ) -> None:
+        """Validate journal options without filesystem I/O and initialize a closed client.
+
+        Args:
+            db_path: Absolute SQLite journal path.
+            busy_timeout_seconds: SQLite lock wait, greater than zero and at most 60 seconds.
+            max_event_bytes: Maximum encoded event size, or None for no additional cap.
+            open_mode: Create a new journal or open an existing one.
+            min_free_bytes: Required free disk reserve before writing.
+            expected_journal: Required existing journal/generation identity, or None for create.
+            diagnostic_context: Optional context for storage-failure reporting.
+            read_only: Whether to forbid writes and require existing mode.
+
+        Raises:
+            TypeError: Option types violate their contracts.
+            ValueError: Paths, limits, identity, or opening mode are invalid.
+        """
         if type(read_only) is not bool:
             raise TypeError("read_only must be a boolean.")
         if read_only and open_mode != "existing":
@@ -119,7 +135,17 @@ class SQLiteEventStore:
         context: JournalContext,
         read_only: bool,
     ) -> SQLiteEventStore:
-        """Use settings already validated at the configuration-file boundary."""
+        """Use settings already validated at the configuration-file boundary.
+
+        Args:
+            settings: Validated settings used to configure this component.
+            context: Journal/participant coordinates associated with this operation.
+            read_only: Whether the operation uses the read-only execution path.
+
+        Returns:
+            Closed store configured from already validated settings and context,
+            with no file I/O.
+        """
         store = cls.__new__(cls)
         store._configure(settings, context, read_only)
         return store
@@ -130,6 +156,14 @@ class SQLiteEventStore:
         diagnostic_context: JournalContext | JsonObject,
         read_only: bool,
     ) -> None:
+        """Bind validated settings and initialize process ownership and connection state.
+
+        Args:
+            settings: Validated settings used to configure this component.
+            diagnostic_context: Optional context attached to storage-failure
+                diagnostics.
+            read_only: Whether the operation uses the read-only execution path.
+        """
         self._read_only = read_only
         self._immutable_read = False
         self.db_path = settings.db_path
@@ -152,10 +186,17 @@ class SQLiteEventStore:
         )
 
     def _check_process(self) -> None:
+        """Reject a journal client inherited from another process."""
         if os.getpid() != self._process_id:
             raise LoggingStateError("Create a new journal client in this process.")
 
     def _require_open(self, *, writing: bool = False) -> None:
+        """Require an open connection and, for writes, a writable nonfailed client.
+
+        Args:
+            writing: Whether to additionally enforce writable/nonfailed state and
+                the free-space reserve.
+        """
         if writing and self._read_only:
             raise LoggingStateError("This journal client is read-only.")
         if self._connection is None:
@@ -166,7 +207,16 @@ class SQLiteEventStore:
             )
 
     def _check_schema(self, connection: sqlite3.Connection) -> bool:
-        """Recognize exactly one format; never alter a file during validation."""
+        """Recognize exactly one format; never alter a file during validation.
+
+        Args:
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+
+        Returns:
+            True only for an empty/uninitialized database; False for an existing
+            valid journal. Incompatible schemas raise.
+        """
         objects = connection.execute(
             "SELECT type, name, sql FROM sqlite_master "
             "WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
@@ -191,6 +241,12 @@ class SQLiteEventStore:
         return False
 
     def _check_file(self) -> tuple[int, int]:
+        """Verify file identity and SQLite readability without bypassing SQLite's OS locks.
+
+        Returns:
+            Current filesystem device/inode identity after verifying SQLite
+            readability and rejecting replacement.
+        """
         status = self.db_path.stat()
         identity = (status.st_dev, status.st_ino)
         if self._file_identity is not None and identity != self._file_identity:
@@ -213,6 +269,12 @@ class SQLiteEventStore:
         return identity
 
     def _check_health(self, *, writing: bool = False) -> None:
+        """Check journal file, schema, generation, and optional free-space reserve.
+
+        Args:
+            writing: Whether to additionally enforce writable/nonfailed state and
+                the free-space reserve.
+        """
         self._check_file()
         if self._check_schema(self._connection):
             raise LoggingStorageError("The open journal lost its schema.")
@@ -226,6 +288,14 @@ class SQLiteEventStore:
             self._check_free_space(self.db_path.parent, self._min_free_bytes)
 
     def _check_free_space(self, directory: Path, minimum: int) -> None:
+        """Require at least minimum free bytes when a nonzero reserve is configured.
+
+        Args:
+            directory: Absolute operation directory whose contents are inspected or
+                prepared.
+            minimum: Required free filesystem bytes; zero disables the reserve
+                check.
+        """
         if minimum and shutil.disk_usage(directory).free < minimum:
             raise LoggingStorageError(
                 f"Free space at {directory} is below the required {minimum} bytes."
@@ -234,7 +304,15 @@ class SQLiteEventStore:
     def _report_failure(
         self, error: BaseException, action: str, event: JsonObject | None = None
     ) -> None:
-        """One independent best-effort diagnostic; never reenter the primary journal."""
+        """One independent best-effort diagnostic; never reenter the primary journal.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            action: Human-readable action associated with the failure or current
+                policy decision.
+            event: Complete journal event envelope.
+        """
         if self._read_only:
             return
         try:
@@ -306,6 +384,19 @@ class SQLiteEventStore:
     def _storage_failure(
         self, error: BaseException, action: str, event: JsonObject | None = None
     ) -> BaseException:
+        """Mark the client failed and return a diagnosed storage exception for propagation.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            action: Human-readable action associated with the failure or current
+                policy decision.
+            event: Complete journal event envelope.
+
+        Returns:
+            Diagnosed exception marked journal_failed, translating storage/data
+            failures where appropriate and retaining other primary exceptions.
+        """
         self._failed = True
         if isinstance(
             error,
@@ -326,6 +417,14 @@ class SQLiteEventStore:
         return failure
 
     def _rollback(self, connection: sqlite3.Connection, error: BaseException) -> None:
+        """Attempt transaction rollback, annotating cleanup failure on the primary error.
+
+        Args:
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+        """
         try:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -339,6 +438,16 @@ class SQLiteEventStore:
             self._failed = True
 
     def open(self) -> None:
+        """Open and verify the journal, exclusively reserving a new file in create mode.
+
+        Existing journals are checked for identity, schema, and integrity. Writable
+        connections require WAL and FULL synchronization.
+
+        Raises:
+            LoggingStateError: The client belongs to another process or is already open.
+            LoggingConfigurationError: The existing file or schema violates opening rules.
+            LoggingStorageError: Storage, identity, or integrity checks fail.
+        """
         self._check_process()
         with self._lock:
             if self._connection is not None:
@@ -461,6 +570,7 @@ class SQLiteEventStore:
                 raise self._storage_failure(error, "open")
 
     def _initialize_empty_journal(self, connection: sqlite3.Connection) -> None:
+        """Create journal tables and set application/schema identifiers in the transaction."""
         _create_tables(connection)
         connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -472,6 +582,14 @@ class SQLiteEventStore:
         *,
         connection: sqlite3.Connection | None = None,
     ) -> None:
+        """Insert an encoded event on the supplied or owned connection without committing.
+
+        Args:
+            event: Complete journal event envelope.
+            encoded: Validated encoded event JSON retained for exact persistence.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+        """
         writer = self._connection if connection is None else connection
         writer.execute(
             "INSERT INTO events "
@@ -486,6 +604,17 @@ class SQLiteEventStore:
         )
 
     def append(self, event: JsonObject) -> None:
+        """Validate and commit an ordinary event with its corresponding change record.
+
+        Args:
+            event: Complete journal event envelope; managed command results use their
+                dedicated append operation.
+
+        Raises:
+            ValueError: The event is invalid, too large, or is a managed command result.
+            LoggingStateError: The client is closed, read-only, or failed.
+            LoggingStorageError: Publication fails; the commit outcome may be uncertain.
+        """
         self._check_process()
         if self._read_only:
             raise LoggingStateError("This journal client is read-only.")
@@ -510,6 +639,7 @@ class SQLiteEventStore:
                 raise self._storage_failure(error, "append event", snapshot)
 
     def _decode_row(self, row: tuple) -> JournalEntry:
+        """Validate a SQLite event row while retaining its original encoded representation."""
         return _decode_row(row)
 
     def read_events(
@@ -519,6 +649,22 @@ class SQLiteEventStore:
         limit: int = 100,
         view: str = "raw",
     ) -> JsonObject:
+        """Read raw or effective events from one consistent journal boundary.
+
+        Args:
+            checkpoint: Identity-bound exclusive event cursor, or None to start.
+            limit: Maximum event count from 1 to 1000.
+            view: Raw history or effective command-result view.
+
+        Returns:
+            Events, checkpoint, observed boundary, and has_more. Effective pages may
+            be empty while their checkpoint advances past superseded observations.
+
+        Raises:
+            ValueError: Limit, view, or checkpoint syntax is invalid.
+            LoggingStateError: The checkpoint is incompatible or the client is closed.
+            LoggingStorageError: Reading or integrity checks fail.
+        """
         self._check_process()
         parsed = _validated_checkpoint(checkpoint, "cursor")
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -568,6 +714,22 @@ class SQLiteEventStore:
         result: list[JournalEntry],
         page_bytes: int,
     ) -> tuple[list[JournalEntry], int]:
+        """Filter/decode rows up to count/byte limits and return entries with the next cursor.
+
+        Args:
+            rows: Open SQLite cursor owned by the caller.
+            view: Raw or effective journal view; effective suppresses superseded
+                observations.
+            limit: Maximum page item count, from 1 through 1000.
+            after: Exclusive cursor after which records are read.
+            result: Mutable list receiving accepted raw/effective entries within the
+                page budget.
+            page_bytes: Encoded bytes already accumulated in the current page.
+
+        Returns:
+            Accumulated validated entries and the last traversed raw cursor,
+            including rows suppressed by the effective view.
+        """
         for row in rows:
             entry = self._decode_row(row)
             if view == "effective":
@@ -592,7 +754,19 @@ class SQLiteEventStore:
         limit: int = 1000,
         before: int | None = None,
     ) -> JsonObject:
-        """Indexed raw lookup or descending cursor page; never modify the journal."""
+        """Indexed raw lookup or descending cursor page; never modify the journal.
+
+        Args:
+            event_ids: Selected original event IDs, or None to read a descending
+                tail page.
+            limit: Maximum page item count, from 1 through 1000.
+            before: Exclusive upper event cursor for descending tail reads, or None
+                for the latest boundary.
+
+        Returns:
+            Selected original events and a consistent source boundary; missing IDs
+            are not fabricated and byte limits can shorten the batch.
+        """
         self._check_process()
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer from 1 to 1000.")
@@ -641,6 +815,21 @@ class SQLiteEventStore:
         boundary: JournalReadBoundary,
         limit: int,
     ) -> sqlite3.Cursor:
+        """Select original rows by event IDs or a descending cursor page from the boundary.
+
+        Args:
+            event_ids: Selected original event IDs, or None to read a descending
+                tail page.
+            before: Exclusive upper event cursor for descending tail reads, or None
+                for the latest boundary.
+            boundary: Observed journal boundary against which the page/publication
+                is read.
+            limit: Maximum page item count, from 1 through 1000.
+
+        Returns:
+            Open SQLite cursor over matching original rows; the caller must close
+            it.
+        """
         columns = "cursor, event_id, producer_instance_id, sequence_number, event_json"
         if event_ids is not None:
             placeholders = ",".join("?" for _ in event_ids)
@@ -661,6 +850,16 @@ class SQLiteEventStore:
     def _event_entry(
         self, event_id: str, connection: sqlite3.Connection
     ) -> JournalEntry:
+        """Load one referenced event or raise LoggingStorageError if it is missing.
+
+        Args:
+            event_id: Identifier of the referenced source event.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+
+        Returns:
+            Validated original entry for the referenced event ID.
+        """
         row = connection.execute(
             "SELECT cursor, event_id, producer_instance_id, sequence_number, event_json "
             "FROM events WHERE event_id=?",
@@ -673,6 +872,18 @@ class SQLiteEventStore:
     def _effective_entry(
         self, entry: JournalEntry, connection: sqlite3.Connection
     ) -> JournalEntry | None:
+        """Return an entry with current result metadata, or None for a superseded observation.
+
+        Args:
+            entry: Validated journal or working-request record consumed by this
+                operation.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+
+        Returns:
+            An entry with current result metadata, or None for a superseded
+            observation.
+        """
         event = entry.event
         if event.event_type != "command.result":
             return entry._with_result(None, False)
@@ -701,6 +912,18 @@ class SQLiteEventStore:
         observation: JsonObject | None = None,
         connection: sqlite3.Connection | None = None,
     ) -> None:
+        """Append event/result change metadata within the caller's existing transaction.
+
+        Args:
+            event_id: Identifier of the referenced source event.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            result_changed: Whether the considered command outcome changed rather
+                than merely gained confirmation.
+            observation: Validated participant or journal author observation.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+        """
         writer = self._connection if connection is None else connection
         change = {
             "kind": "event" if request_id is None else "command.result",
@@ -735,6 +958,17 @@ class SQLiteEventStore:
     def _decode_change(
         self, row: tuple, connection: sqlite3.Connection
     ) -> JournalChangeEntry:
+        """Validate a stored change and reconstruct its effective and observed entries.
+
+        Args:
+            row: Raw SQLite row decoded against the journal contract.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+
+        Returns:
+            Validated change entry with its effective result, observed event, and
+            original encoded metadata.
+        """
         from core.models.journal_records import JournalChangeData, JournalChangeEntry
 
         cursor, event_id, encoded = row
@@ -769,6 +1003,18 @@ class SQLiteEventStore:
         connection: sqlite3.Connection,
         related: list[JsonValue],
     ) -> None:
+        """Require all referenced command observations to belong to the same request owner.
+
+        Args:
+            change: Journal change containing effective-result metadata and event
+                references.
+            entry: Validated journal or working-request record consumed by this
+                operation.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+            related: Event IDs referenced by the change and checked for common
+                request ownership.
+        """
         for related_id in related:
             event = self._event_entry(related_id, connection).event
             if event.event_type != "command.result":
@@ -802,6 +1048,20 @@ class SQLiteEventStore:
     def read_changes(
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
     ) -> JsonObject:
+        """Read journal changes, including confirmations without newly appended events.
+
+        Args:
+            checkpoint: Identity-bound exclusive change cursor, or None to start.
+            limit: Maximum change count from 1 to 1000.
+
+        Returns:
+            Changes, continuation checkpoint, observed boundary, and has_more.
+
+        Raises:
+            ValueError: Limit or checkpoint syntax is invalid.
+            LoggingStateError: The checkpoint is incompatible or the client is closed.
+            LoggingStorageError: Reading or integrity checks fail.
+        """
         self._check_process()
         parsed = _validated_checkpoint(checkpoint, "change_cursor")
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -831,6 +1091,15 @@ class SQLiteEventStore:
     def _read_change_page(
         self, after: int, limit: int
     ) -> tuple[list[JournalChangeEntry], int]:
+        """Return validated changes and their last cursor under count/byte limits.
+
+        Args:
+            after: Exclusive cursor after which records are read.
+            limit: Maximum page item count, from 1 through 1000.
+
+        Returns:
+            Validated changes and their last cursor under count/byte limits.
+        """
         result = []
         size = 0
         for row in self._connection.execute(
@@ -850,6 +1119,11 @@ class SQLiteEventStore:
         return result, after
 
     def get_journal_info(self) -> JsonObject:
+        """Return journal schema/identity metadata after checking storage health.
+
+        Returns:
+            Journal schema/identity metadata after checking storage health.
+        """
         self._check_process()
         with self._lock:
             self._require_open()
@@ -862,6 +1136,22 @@ class SQLiteEventStore:
     def _load_command_result(
         self, request_id: str, *, connection: sqlite3.Connection | None = None
     ) -> dict | None:
+        """Load and cross-check the result index and referenced observations, or return None.
+
+        Args:
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+
+        Returns:
+            Cross-checked result index with runner/participant entries and effective
+            precedence, or None if no request record exists.
+
+        Raises:
+            LoggingStorageError: The index, observer identity, referenced event, or
+                author precedence is corrupt.
+        """
         reader = self._connection if connection is None else connection
         row = reader.execute(
             "SELECT identity_json, runner_event_id, participant_event_id, "
@@ -921,7 +1211,15 @@ class SQLiteEventStore:
             raise LoggingStorageError("Corrupt command-result index.") from error
 
     def append_command_result(self, event: JsonObject) -> str:
-        """Atomically reconcile a response; duplicate payloads reuse their event ID."""
+        """Atomically reconcile a response; duplicate payloads reuse their event ID.
+
+        Args:
+            event: Complete journal event envelope.
+
+        Returns:
+            Identifier of the event representing the committed command observation
+            under deduplication/precedence rules.
+        """
         self._check_process()
         encoded = encode_event(event, self._max_event_bytes)
         snapshot = json.loads(encoded)
@@ -1027,6 +1325,18 @@ class SQLiteEventStore:
                 raise self._storage_failure(error, "reconcile command", snapshot)
 
     def read_command_result(self, request_id: str) -> JsonObject | None:
+        """Read one command's considered outcome and all indexed observations consistently.
+
+        Args:
+            request_id: Nonempty request identifier associated with journal results.
+
+        Returns:
+            Result and observation metadata, or None when the index has no entry.
+
+        Raises:
+            LoggingStateError: The store is not open in its owning process.
+            LoggingStorageError: Reading or index/reference integrity checks fail.
+        """
         self._check_process()
         require_text(request_id, "request_id")
         with self._lock:
@@ -1048,7 +1358,11 @@ class SQLiteEventStore:
                 raise self._storage_failure(error, "read command result")
 
     def _validate_snapshot_source(self, reader: sqlite3.Connection) -> None:
-        """Validate envelopes and result references inside the selected read view."""
+        """Validate envelopes and result references inside the selected read view.
+
+        Args:
+            reader: Open source SQLite connection used for a consistent read.
+        """
         rows = reader.execute(
             "SELECT cursor, event_id, producer_instance_id, sequence_number, "
             "event_json FROM events ORDER BY cursor"
@@ -1076,7 +1390,16 @@ class SQLiteEventStore:
     def export_snapshot(
         self, destination: str | Path, *, min_free_bytes: int
     ) -> JsonObject:
-        """Export one confirmed read view into a new directory; never reset the source."""
+        """Export one confirmed read view into a new directory; never reset the source.
+
+        Args:
+            destination: Absolute output path for the requested file or directory.
+            min_free_bytes: Additional free-space reserve in bytes for the export.
+
+        Returns:
+            Validated journal snapshot manifest after consistent copying and
+            checksum verification.
+        """
         self._check_process()
         if not isinstance(destination, (str, Path)):
             raise TypeError("Snapshot destination must be a string or Path.")
@@ -1227,7 +1550,17 @@ class SQLiteEventStore:
     def export_diagnostics(
         self, operation_ids: list[str], destination: str | Path
     ) -> JsonObject:
-        """Export operations and referenced facts; caller keeps this outside rollback files."""
+        """Export operations and referenced facts; caller keeps this outside rollback files.
+
+        Args:
+            operation_ids: Root operation IDs whose diagnostic descendants should be
+                exported.
+            destination: Absolute output path for the requested file or directory.
+
+        Returns:
+            Diagnostic manifest with selected operation IDs, event/command counts,
+            source boundary, and records checksum.
+        """
         self._check_process()
         if type(operation_ids) is not list or not operation_ids:
             raise ValueError("operation_ids must be a nonempty list.")
@@ -1304,6 +1637,16 @@ class SQLiteEventStore:
     def _read_diagnostics(
         self, directory: str | Path
     ) -> tuple[DiagnosticManifest, list[JsonObject], list[DiagnosticCommand]]:
+        """Read a manifest and validated records from an absolute diagnostic export directory.
+
+        Args:
+            directory: Absolute operation directory whose contents are inspected or
+                prepared.
+
+        Returns:
+            Validated diagnostic manifest, original event documents, and typed
+            command records.
+        """
         path = Path(directory)
         if not path.is_absolute():
             raise ValueError("Diagnostics must use an absolute directory path.")
@@ -1318,6 +1661,17 @@ class SQLiteEventStore:
     def _read_diagnostic_records(
         self, path: Path, manifest: DiagnosticManifest
     ) -> tuple[list[JsonObject], list[DiagnosticCommand]]:
+        """Verify diagnostic records, unique IDs, checksum, counts, and internal references.
+
+        Args:
+            path: Absolute diagnostic bundle directory containing records.jsonl.
+            manifest: Validated diagnostic manifest with expected checksum and
+                record counts.
+
+        Returns:
+            Validated original events and diagnostic command records after checking
+            checksum, counts, uniqueness, and internal references.
+        """
         events, commands = [], []
         digest = hashlib.sha256()
         event_ids, request_ids = set(), set()
@@ -1373,7 +1727,20 @@ class SQLiteEventStore:
         new_generation: str,
         diagnostics: str | Path | None = None,
     ) -> JsonObject:
-        """Finalize an already restored journal; runner owns the file/process barrier."""
+        """Finalize an already restored journal; runner owns the file/process barrier.
+
+        Args:
+            snapshot_manifest: Journal snapshot manifest to verify before
+                restoration.
+            restoration_id: UUID identifying one idempotent restoration transaction.
+            new_generation: Fresh journal generation UUID published by restoration.
+            diagnostics: Optional absolute diagnostic bundle directory imported
+                during restoration.
+
+        Returns:
+            Committed or replayed restoration result with new journal generation,
+            boundary, snapshot identity, and imported event count.
+        """
         if self._read_only:
             raise LoggingStateError(
                 "A read-only journal cannot finalize a restoration."
@@ -1444,6 +1811,20 @@ class SQLiteEventStore:
         new_generation: str,
         diagnostics: str | Path | None,
     ) -> tuple[list[tuple[JsonObject, str]], list[DiagnosticCommand], str]:
+        """Validate optional diagnostics and return encoded events, commands, and replay parameters.
+
+        Args:
+            manifest: Validated source journal snapshot boundary, identity, and
+                checksum.
+            identity: Expected journal ID and generation before restoration.
+            new_generation: Fresh journal generation UUID published by restoration.
+            diagnostics: Optional absolute diagnostic bundle directory imported
+                during restoration.
+
+        Returns:
+            Prepared event/encoded-JSON pairs, validated diagnostic command records,
+            and canonical parameters used to identify identical restoration replay.
+        """
         bundle, events, commands = None, [], []
         if diagnostics is not None:
             bundle, events, commands = self._read_diagnostics(diagnostics)
@@ -1472,6 +1853,21 @@ class SQLiteEventStore:
         prepared_events: list[tuple[JsonObject, str]],
         commands: list[DiagnosticCommand],
     ) -> tuple[JsonObject, bool]:
+        """Apply or replay journal restoration inside the supplied transaction.
+
+        Args:
+            connection: Open transactional connection to the restored journal.
+            manifest: Validated snapshot journal metadata.
+            identity: Expected pre-restoration journal identity.
+            restoration_id: Unique restoration transaction ID.
+            new_generation: Generation to publish after importing diagnostics.
+            parameters: Canonical restoration parameters used to detect conflicting replay.
+            prepared_events: Validated diagnostic events paired with their encoded JSON.
+            commands: Diagnostic command observations to merge.
+
+        Returns:
+            Restoration result and whether this call newly applied it.
+        """
         info = _read_journal_info(connection)
         actual = {name: info[name] for name in ("journal_id", "generation")}
         if self._expected_journal not in (identity, actual):
@@ -1513,6 +1909,27 @@ class SQLiteEventStore:
         self, previous: tuple, parameters: str, restoration_id: str,
         new_generation: str, actual: JsonObject,
     ) -> JsonObject:
+        """Validate replay parameters and require the recorded restoration to remain current.
+
+        Args:
+            previous: Previously recorded restoration parameters and result.
+            parameters: Canonical JSON string used to verify that replay requests
+                the same restoration.
+            restoration_id: UUID identifying one idempotent restoration transaction.
+            new_generation: Fresh journal generation UUID published by restoration.
+            actual: Observed journal/generation identity after opening the restored
+                database.
+
+        Returns:
+            Previously committed restoration result after matching parameters and
+            confirming it has not been superseded.
+
+        Raises:
+            ValueError: The restoration ID was already used with different
+                parameters.
+            LoggingStorageError: Recorded result fields are corrupt.
+            LoggingStateError: A later restoration has superseded this generation.
+        """
         if previous[0] != parameters:
             raise ValueError(
                 "restoration_id already belongs to another restoration."
@@ -1550,6 +1967,13 @@ class SQLiteEventStore:
     def _check_restored_snapshot(
         self, connection: sqlite3.Connection, manifest: JournalSnapshotManifest
     ) -> None:
+        """Check SQL integrity, journal boundary, and content digest against the snapshot.
+
+        Args:
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+            manifest: Expected journal snapshot boundary and content checksum.
+        """
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
             raise LoggingStorageError("Restored journal failed its integrity check.")
         self._validate_snapshot_source(connection)
@@ -1578,6 +2002,10 @@ class SQLiteEventStore:
 
         Used by snapshot validation after opening an existing read-only journal.
         Real restoration continues to validate through its own write transaction.
+
+        Args:
+            manifest: Validated journal snapshot manifest to compare with copied
+                SQLite contents.
         """
         with self._lock:
             self._require_open()
@@ -1602,6 +2030,21 @@ class SQLiteEventStore:
     def _import_diagnostic_events(
         self, connection: sqlite3.Connection, events: list[tuple[JsonObject, str]]
     ) -> list[JsonObject]:
+        """Insert new diagnostic events, preserving identical IDs and rejecting conflicts.
+
+        Args:
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+            events: Validated events to import into the caller's transaction.
+
+        Returns:
+            Only newly inserted event documents; identical existing IDs are retained
+            without reinsertion.
+
+        Raises:
+            ValueError: An event ID has different content or its producer sequence
+                conflicts with restored history.
+        """
         inserted = []
         for event, encoded in events:
             previous = connection.execute(
@@ -1630,6 +2073,18 @@ class SQLiteEventStore:
     def _import_diagnostic_commands(
         self, connection: sqlite3.Connection, commands: list[DiagnosticCommand]
     ) -> dict[str, tuple[str, bool]]:
+        """Merge command observations and return changed request/effective-result metadata.
+
+        Args:
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+            commands: Validated commands being considered for admission in their
+                submitted order.
+
+        Returns:
+            Changed request IDs mapped to effective event IDs and whether considered
+            outcomes changed.
+        """
         changed_requests = {}
         for record in commands:
             request_id = record.request_id
@@ -1652,6 +2107,16 @@ class SQLiteEventStore:
         self, connection: sqlite3.Connection, inserted: list[JsonObject],
         changed_requests: dict[str, tuple[str, bool]],
     ) -> None:
+        """Record change-feed entries for imported events and updated command results.
+
+        Args:
+            connection: Open SQLite connection; caller owns its lifetime and
+                transaction unless omitted.
+            inserted: Newly imported diagnostic event documents requiring change-
+                feed publication.
+            changed_requests: Request IDs mapped to their effective event and
+                result-change flag.
+        """
         for event in inserted:
             if event["event_type"] != "command.result":
                 self._record_change(event["event_id"], connection=connection)
@@ -1668,6 +2133,14 @@ class SQLiteEventStore:
             )
 
     def _remember_restored_journal(self, result: JsonObject, file_identity: tuple[int, int]) -> None:
+        """Bind the restored file/generation identity and clear the client's failure state.
+
+        Args:
+            result: Committed restoration result containing the new
+                journal/generation identity.
+            file_identity: Filesystem device/inode pair identifying the restored
+                journal file.
+        """
         self._journal_id, self._generation = (
             result["journal_id"],
             result["generation"],
@@ -1679,6 +2152,12 @@ class SQLiteEventStore:
         self._failed = False
 
     def close(self) -> None:
+        """Close the owned SQLite connection, retaining a failed state if closing raises.
+
+        Runs only in the creating process and under the store lock. It is harmless
+        when already closed; a failed close marks the client failed and leaves the
+        owned connection available for later cleanup.
+        """
         self._check_process()
         with self._lock:
             if self._connection is None:

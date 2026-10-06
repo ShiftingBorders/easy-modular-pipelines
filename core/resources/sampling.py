@@ -40,6 +40,12 @@ class ResourceSampler:
     def __init__(
         self, collector_id: str, settings: CollectorSettings | None = None
     ) -> None:
+        """Capture collector/host identity and initialize optional hardware sampling.
+
+        Args:
+            collector_id: Identity attached to produced measurements.
+            settings: Collector settings enabling disk/network sampling, or None.
+        """
         from core.resources.hardware import HardwareSampler
 
         self._hardware = None if settings is None else HardwareSampler(settings)
@@ -51,6 +57,7 @@ class ResourceSampler:
         ] = {}
 
     def reset(self) -> None:
+        """Clear host and process CPU baselines before collecting a new interval."""
         self._host_previous = None
         self._process_previous.clear()
 
@@ -59,6 +66,16 @@ class ResourceSampler:
         context: JournalContext | JsonObject,
         targets: list[ResourceTarget | ResourceTargetDocument],
     ) -> list[JsonObject]:
+        """Collect host and target-process measurements as JSON-ready sample documents.
+
+        Args:
+            context: Journal context for the host sample.
+            targets: Processes with expected identities and their own contexts.
+
+        Returns:
+            Host sample followed by one sample per target; unavailable values carry
+            reasons rather than fabricated zeros.
+        """
         return [
             sample.document() for sample in self._sample_observations(context, targets)
         ]
@@ -68,6 +85,18 @@ class ResourceSampler:
         context: JournalContext | JsonObject,
         targets: list[ResourceTarget | ResourceTargetDocument],
     ) -> list[ResourceObservation]:
+        """Drop obsolete process baselines and return host and target observations.
+
+        Args:
+            context: Validated or JSON journal context attached to the host
+                observation.
+            targets: Process series and expected OS identities to observe after the
+                host sample.
+
+        Returns:
+            Host observation followed by each target's process observation.
+            Baselines for no-longer-selected series are removed first.
+        """
         active = {target.series_id for target in targets}
         self._process_previous = {
             key: value for key, value in self._process_previous.items() if key in active
@@ -87,6 +116,20 @@ class ResourceSampler:
         interval: float | None = None,
         identity: JsonObject | None = None,
     ) -> MeasuredResource:
+        """Build a gauge with availability, interval, collector, and process metadata.
+
+        Args:
+            value: Measured value, or None when unavailable.
+            unit: Measurement unit.
+            scope: Host or process scope.
+            observed_at: Wall-clock observation timestamp.
+            reason: Optional explanation for unavailability.
+            interval: Sampling interval in seconds, when applicable.
+            identity: Observed process identity, when applicable.
+
+        Returns:
+            Resource record with provenance attributes.
+        """
         return MeasuredResource(
             value=value,
             unit=unit,
@@ -105,11 +148,22 @@ class ResourceSampler:
         )
 
     def _host_sample(self, context: JournalContext | JsonObject) -> JsonObject:
+        """Return a serialized host observation, advancing its CPU/network baselines."""
         return self._host_observation(context).document()
 
     def _host_observation(
         self, context: JournalContext | JsonObject
     ) -> ResourceObservation:
+        """Read host CPU, memory, and optional hardware gauges with availability metadata.
+
+        Args:
+            context: Validated or JSON journal context attached to the host
+                observation.
+
+        Returns:
+            Timestamped host CPU/memory and optional hardware gauges. The first CPU
+            interval and unavailable OS observations use None with explicit reasons.
+        """
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
         interval = None if self._host_previous is None else now - self._host_previous
@@ -179,11 +233,22 @@ class ResourceSampler:
     def _process_sample(
         self, target: ResourceTarget | ResourceTargetDocument
     ) -> JsonObject:
+        """Return a serialized observation for the expected process identity."""
         return self._process_observation(target).document()
 
     def _process_observation(
         self, target: ResourceTarget | ResourceTargetDocument
     ) -> ResourceObservation:
+        """Collect identity-checked process CPU and RSS gauges with observation times.
+
+        Args:
+            target: Monitored process series, expected OS identity, and per-process
+                journal context.
+
+        Returns:
+            Timestamped identity-checked CPU-percent and RSS-byte measurements for
+            the target series.
+        """
         observed_at = datetime.now(UTC).isoformat()
         now = time.monotonic()
         cpu, memory, reason, cpu_reason, interval = self._observe_process(target, now)
@@ -220,6 +285,16 @@ class ResourceSampler:
     def _observe_process(
         self, target: ResourceTarget | ResourceTargetDocument, now: float
     ) -> tuple[float | None, int | None, str | None, str | None, float | None]:
+        """Read process counters only when ownership matches before and after sampling.
+
+        Args:
+            target: Expected process identity and series ID.
+            now: Monotonic sampling instant in seconds.
+
+        Returns:
+            CPU percent, RSS bytes, general unavailability reason, CPU-specific
+            reason, and interval seconds. Invalid observations discard the baseline.
+        """
         cpu = memory = None
         reason = cpu_reason = None
         interval = None
@@ -271,7 +346,22 @@ class ResourceSampler:
         now: float,
         cpu_seconds: float,
     ) -> tuple[float | None, str | None, float | None]:
-        """Advance one identity's CPU baseline; interval and counters are seconds."""
+        """Advance one identity's CPU baseline; interval and counters are seconds.
+
+        Args:
+            series_id: Stable resource series whose CPU baseline is updated.
+            identity: Expected complete process identity used to detect PID reuse.
+            observed_identity: JSON form of the expected process identity for
+                comparisons with OS observations.
+            now: Current monotonic observation time in seconds.
+            cpu_seconds: Cumulative user plus system CPU seconds observed for the
+                process.
+
+        Returns:
+            CPU percentage, optional unavailable/reset reason, and elapsed seconds.
+            A new identity establishes a baseline instead of reporting fabricated
+            usage.
+        """
         cpu = interval = None
         reason = "first_interval"
         previous = self._process_previous.get(series_id)
@@ -294,6 +384,13 @@ class ResourceWriter:
     """Optional journal client; uncertain writes are counted and never replayed."""
 
     def __init__(self, settings: CollectorSettings, collector_id: str) -> None:
+        """Initialize optional journal delivery and loss accounting without opening a client.
+
+        Args:
+            settings: Validated settings used to configure this component.
+            collector_id: UUID identifying this collector instance in telemetry
+                records.
+        """
         self._settings = settings
         self._collector_id = collector_id
         self._client: OperationLogger | None = None
@@ -305,6 +402,12 @@ class ResourceWriter:
         self.restart_notice: CollectorRestart | JsonObject | None = None
 
     def select(self, source: Path | str | None) -> None:
+        """Switch the logging config path, closing the old client and resetting losses.
+
+        Args:
+            source: Absolute existing logger-config path to select, or None to
+                disable journal delivery.
+        """
         path = None if source is None else Path(source)
         if path != self._source:
             self.close()
@@ -315,6 +418,14 @@ class ResourceWriter:
             self._reported_losses = 0
 
     def record(self, sample: ResourceObservation | ResourceSample | JsonObject) -> None:
+        """Attempt one journal write, counting failures without replaying uncertain samples.
+
+        Args:
+            sample: Native, validated, or JSON sample containing context and resources.
+
+        Delivery failures update error and unconfirmed_samples and defer reopening
+        according to the configured retry interval.
+        """
         if self._source is None:
             return
         if time.monotonic() < self._retry_at:
@@ -356,7 +467,11 @@ class ResourceWriter:
             self._retry_at = time.monotonic() + self._settings.logging_retry_seconds
 
     def _record_gaps(self, context: JsonObject) -> None:
-        """Publish pending losses once; uncertain writes keep the previous policy."""
+        """Publish pending losses once; uncertain writes keep the previous policy.
+
+        Args:
+            context: Journal/participant coordinates associated with this operation.
+        """
         if self.restart_notice is not None:
             notice, self.restart_notice = self.restart_notice, None
             notice_context = (
@@ -387,6 +502,13 @@ class ResourceWriter:
             self._reported_losses = self.unconfirmed_samples
 
     def _open_selected_journal(self) -> None:
+        """Write a collector-specific logger config and open the selected existing journal.
+
+        Derives an existing-mode collector-specific configuration with the
+        configured lock timeout and writes it beside the selected source config.
+        Opens a new process-local OperationLogger; it does not create a missing
+        experiment journal.
+        """
         settings, _ = _load_logging_settings(self._source)
         settings = _update_model(
             settings,
@@ -405,6 +527,7 @@ class ResourceWriter:
         self._client.open()
 
     def close(self) -> None:
+        """Close the owned logger client and clear its reference even if closing fails."""
         if self._client is not None:
             try:
                 self._client.close()

@@ -20,6 +20,12 @@ ArchiveMember = Annotated[str, BeforeValidator(_member)]
 
 
 class ArchiveFile(BaseModel):
+    """File size in bytes and SHA-256 digest recorded in an archive.
+
+    Args:
+        size: Expected uncompressed file size in bytes.
+        sha256: Expected SHA-256 content digest used when verifying the file.
+    """
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     size: NonnegativeInteger
@@ -29,6 +35,16 @@ class ArchiveFile(BaseModel):
 
 
 class ArchiveModule(BaseModel):
+    """Module identity and role packaged in a portable experiment archive.
+
+    Args:
+        name: Registered module name forming a portable directory component.
+        version: Registered module version forming a portable directory
+            component.
+        hash: Expected SHA-256 module content digest.
+        role: Participant role: stage executes one attempt, service remains
+            available across calls.
+    """
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     name: ArchiveMember
@@ -39,6 +55,15 @@ class ArchiveModule(BaseModel):
     @field_validator("name", "version")
     @classmethod
     def validate_component(cls, value: str) -> str:
+        """Return a single path component, rejecting nested module identities.
+
+        Args:
+            value: Input field/document value before this validator's checks or
+                normalization.
+
+        Returns:
+            A single path component, rejecting nested module identities.
+        """
         if "/" in value:
             raise ValueError("Module identities must be single path components.")
         return value
@@ -76,6 +101,22 @@ def _archive_file_inputs(value: object) -> tuple[object, dict[str, ArchiveFile]]
 
 
 class ArchiveManifest(BaseModel):
+    """Versioned inventory of archive files, directories, and modules.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        archive_id: UUID identifying this portable archive.
+        created_at: ISO 8601 creation timestamp in UTC.
+        source_experiment_id: Identity of the stopped experiment from which this
+            archive was created.
+        template: Applied template member name, fixed to experiment.yaml.
+        modules: Module identities and roles whose code is included in the
+            archive.
+        directories: Portable archive-relative directory member names.
+        files: Portable member names mapped to expected file sizes and SHA-256
+            digests.
+    """
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -92,6 +133,18 @@ class ArchiveManifest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> object:
+        """Copy manifest JSON while retaining validated nested model instances.
+
+        Args:
+            document: Manifest input, optionally containing ArchiveModule or ArchiveFile
+                instances.
+
+        Returns:
+            Detached input with validated nested instances preserved.
+
+        Raises:
+            ValueError: The input violates the JSON object contract.
+        """
         if not isinstance(document, dict):
             return copy_json_object(document, "archive manifest")
         values = dict(document)
@@ -117,6 +170,7 @@ class ArchiveManifest(BaseModel):
 
     @model_validator(mode="after")
     def validate_members(self) -> Self:
+        """Return the manifest after rejecting reserved or case-colliding paths."""
         names = (*self.directories, *self.files)
         if "manifest.json" in names or len({name.casefold() for name in names}) != len(
             names

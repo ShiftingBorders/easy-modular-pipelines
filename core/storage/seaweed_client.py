@@ -41,6 +41,17 @@ class SeaweedDB:
         timeout: float = 60,
         before_upload: Callable[[int], None] | None = None,
     ) -> None:
+        """Validate connection settings and create the owned HTTP client.
+
+        Args:
+            filer_url: HTTP(S) base URL of an existing Filer server.
+            max_archive_gb: Maximum archive size in GB.
+            timeout: HTTP request timeout in seconds.
+            before_upload: Optional callback receiving archive bytes before upload.
+
+        Raises:
+            StorageConfigurationError: Settings or the upload callback are invalid.
+        """
         try:
             settings = FilerConfiguration(
                 filer_url=filer_url, max_archive_gb=max_archive_gb, timeout=timeout,
@@ -63,7 +74,16 @@ class SeaweedDB:
             ) from error
 
     def _module_path(self, module_name: str, module_version: str) -> str:
-        """Validate identity and client state before building a Filer path."""
+        """Validate identity and client state before building a Filer path.
+
+        Args:
+            module_name: Registered module name.
+            module_version: Registered module version.
+
+        Returns:
+            Percent-encoded Filer path for a validated name/version after confirming
+            the HTTP client is open.
+        """
         module_name, module_version = clear_str(module_name, module_version)
         check_input_metadata(module_name, module_version)
         if module_name in {".", ".."} or module_version in {".", ".."}:
@@ -75,7 +95,12 @@ class SeaweedDB:
         )
 
     def _check_response(self, response: httpx.Response) -> None:
-        """Translate server responses into the shared semantic error contract."""
+        """Translate server responses into the shared semantic error contract.
+
+        Args:
+            response: HTTP response from Filer whose status is mapped to shared
+                storage exceptions.
+        """
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
@@ -99,7 +124,20 @@ class SeaweedDB:
             ) from error
 
     def _validate_archive(self, archive: Path) -> tuple[Path, int]:
-        """Validate an upload source and enforce the configured size limit."""
+        """Validate an upload source and enforce the configured size limit.
+
+        Args:
+            archive: Archive file path used by this operation.
+
+        Returns:
+            Validated source Path and its size in bytes after applying the
+            configured archive limit.
+
+        Raises:
+            StorageInputError: The upload source is not a valid file path.
+            StorageIOError: Source metadata cannot be read.
+            StorageCapacityError: Archive size exceeds the configured limit.
+        """
         try:
             archive = Path(archive)
         except TypeError as error:
@@ -121,7 +159,20 @@ class SeaweedDB:
         return archive, archive_size
 
     def check_module_stored(self, module_name: str, module_version: str) -> bool:
-        """Return False only for a missing archive; service failures raise."""
+        """Return False only for a missing archive; service failures raise.
+
+        Args:
+            module_name: Registered module name.
+            module_version: Registered module version.
+
+        Returns:
+            False only for a missing archive; service failures raise.
+
+        Raises:
+            StorageUnavailable: Filer cannot be contacted.
+            StorageError: A nonabsence HTTP or client failure prevents a reliable
+                answer.
+        """
         module_path = self._module_path(module_name, module_version)
         try:
             response = self._client.head(module_path)
@@ -142,7 +193,25 @@ class SeaweedDB:
         module_version: str,
         archive: Path,
     ) -> None:
-        """Upload an archive; an observed existing identity raises StorageConflict."""
+        """Upload an archive; an observed existing identity raises StorageConflict.
+
+        Checks for observed duplicates before upload but does not provide atomic
+        create-if-absent across writers. A transport failure may occur after the
+        remote write committed; no automatic retry is performed.
+
+        Args:
+            module_name: Registered module name.
+            module_version: Registered module version.
+            archive: Archive file path used by this operation.
+
+        Raises:
+            StorageConflict: An archive with this name/version was observed before
+                upload.
+            StorageCapacityError: Archive limits or the before-upload reserve check
+                reject the file.
+            StorageError: Local I/O or remote transport/status prevents completing
+                the upload.
+        """
         if self.check_module_stored(module_name, module_version):
             raise StorageConflict(
                 f"Module {module_name} version {module_version} already exists."
@@ -180,6 +249,22 @@ class SeaweedDB:
         A missing stored archive raises StoredObjectNotFound. Local failures
         raise StorageIOError. Incomplete downloads do not replace an existing
         destination. A cleanup failure is attached to the primary exception.
+
+        Args:
+            module_name: Registered module name.
+            module_version: Registered module version.
+            archive_path: Local download destination; its parent directory must
+                already exist.
+
+        Returns:
+            True after a complete download atomically replaces the destination.
+            Missing archives raise StoredObjectNotFound rather than returning False.
+
+        Raises:
+            StoredObjectNotFound: The remote archive does not exist.
+            StorageInputError: The destination parent is unavailable or the path is
+                invalid.
+            StorageError: Download, local publication, or remote status fails.
         """
         module_path = self._module_path(module_name, module_version)
         try:
@@ -236,7 +321,15 @@ class SeaweedDB:
         return True
 
     def delete_module(self, module_name: str, module_version: str) -> bool:
-        """Return whether the server deleted an archive; 404 means already absent."""
+        """Return whether the server deleted an archive; 404 means already absent.
+
+        Args:
+            module_name: Registered module name.
+            module_version: Registered module version.
+
+        Returns:
+            Whether the server deleted an archive; 404 means already absent.
+        """
         module_path = self._module_path(module_name, module_version)
         try:
             response = self._client.delete(module_path)

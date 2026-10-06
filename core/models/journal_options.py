@@ -14,6 +14,7 @@ from core.primitives.json_values import JsonObject, require_number
 
 @dataclass(frozen=True)
 class JournalOptions:
+    """Validated journal path, opening mode, identity, and storage limits."""
     db_path: Path
     busy_timeout_seconds: float
     max_event_bytes: int | None

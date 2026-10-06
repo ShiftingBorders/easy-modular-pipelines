@@ -11,11 +11,19 @@ from core.resources.state import CollectorSettings
 
 
 class HardwareSampler:
+    """Observe disk capacity and selected-interface network throughput."""
     def __init__(self, settings: CollectorSettings) -> None:
+        """Retain collector settings and initialize the network-counter baseline."""
         self.settings = settings
         self._network_previous: tuple[str, float, int, int] | None = None
 
     def sample(self) -> dict[str, dict]:
+        """Read disk gauges and network rates, retaining a baseline for the next call.
+
+        Returns:
+            Metric dictionaries with values, units, attributes, and unavailability
+            reasons. Network rates are Mbps and are unavailable on the first interval.
+        """
         result = {}
         try:
             if not self.settings.disk_path:
@@ -92,6 +100,18 @@ class HardwareSampler:
     def _disk_metrics(
         self, disk: object, error: BaseException | None
     ) -> dict[str, dict]:
+        """Convert disk usage into byte/percent gauges or unavailable values with a reason.
+
+        Args:
+            disk: Disk-usage observation with total/used/free/percent attributes, or
+                None on failure.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+
+        Returns:
+            Total/used/free byte gauges and percent usage, carrying the configured
+            path and error/unavailability reason.
+        """
         disk_names = {
             "total": "byte",
             "used": "byte",

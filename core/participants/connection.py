@@ -26,6 +26,7 @@ from core.primitives.processes import process_identity
 
 
 class ParticipantConnection:
+    """Authenticated asynchronous participant channel with correlated request futures."""
     def __init__(
         self,
         endpoint_path: Path,
@@ -33,6 +34,16 @@ class ParticipantConnection:
         *,
         role: str = "runner",
     ) -> None:
+        """Initialize an unopened connection for an expected participant identity.
+
+        Args:
+            endpoint_path: Absolute path to the participant's published endpoint JSON.
+            expected_identity: Expected experiment, participant, and instance identity.
+            role: Client role, either runner or module.
+
+        Raises:
+            ValueError: The path is relative, identity is invalid, or role is unsupported.
+        """
         self._endpoint_path = Path(endpoint_path)
         if not self._endpoint_path.is_absolute():
             raise ValueError("endpoint_path must be absolute.")
@@ -51,6 +62,18 @@ class ParticipantConnection:
         ] = asyncio.Queue()
 
     async def connect(self, *, timeout_seconds: float) -> None:
+        """Verify endpoint/process ownership and complete the authenticated handshake.
+
+        Args:
+            timeout_seconds: Total timeout for endpoint reading and connection setup.
+
+        Relative token paths are resolved from the endpoint file's directory.
+        Any prior connection is closed before a new one is opened.
+
+        Raises:
+            ValueError: Endpoint, OS identity, or handshake does not match.
+            TimeoutError: Setup exceeds the supplied timeout.
+        """
         await self.close()
         self._notifications = asyncio.Queue()
         async with asyncio.timeout(timeout_seconds):
@@ -98,6 +121,13 @@ class ParticipantConnection:
                 raise
 
     async def _receive_loop(self) -> None:
+        """Dispatch responses and notifications, failing pending requests on disconnect.
+
+        Routes replies only to their matching pending IDs and permits notifications
+        only for module clients. On disconnect or malformed input it fails all
+        unfinished futures, queues a connection error for notification consumers,
+        and aborts the transport.
+        """
         failure = ConnectionError("Participant connection closed.")
         try:
             while True:
@@ -133,12 +163,18 @@ class ParticipantConnection:
         return (await self._receive_notification()).model_dump(exclude_unset=True)
 
     async def _receive_notification(self) -> ParticipantNotification:
+        """Wait for a module notification or raise the queued connection failure."""
         message = await self._notifications.get()
         if isinstance(message, Exception):
             raise message
         return message
 
     async def send_message(self, message: JsonObject) -> None:
+        """Serialize and flush one framed message under the connection's write lock.
+
+        Args:
+            message: JSON message to encode as one protocol frame.
+        """
         if self._writer is None or self._writer.is_closing():
             raise ConnectionError("Participant connection is not open.")
         async with self._write_lock:
@@ -154,6 +190,23 @@ class ParticipantConnection:
         timeout_seconds: float | None = None,
         deadline_monotonic: float | None = None,
     ) -> JsonObject:
+        """Send a uniquely identified command and await its matching response.
+
+        Args:
+            request_id: UUID that has not previously been used on this connection object.
+            command: Participant command name.
+            args: JSON command arguments.
+            timeout_seconds: Local wait timeout in seconds, or None for no timeout.
+            deadline_monotonic: Absolute monotonic deadline sent to the participant.
+
+        Returns:
+            Validated response serialized with its supplied envelope fields.
+
+        Raises:
+            ValueError: Request identity or arguments are invalid, or the ID was reused.
+            ConnectionError: The connection is closed or fails while waiting.
+            TimeoutError: The local wait exceeds its timeout.
+        """
         response = await self._request(
             request_id,
             command,
@@ -172,6 +225,18 @@ class ParticipantConnection:
         timeout_seconds: float | None = None,
         deadline_monotonic: float | None = None,
     ) -> ParticipantResponse:
+        """Track one request future, send its frame, and return the typed response.
+
+        Args:
+            request_id: Fresh request UUID, consumed even if sending fails.
+            command: Participant command name.
+            args: JSON command arguments to copy before sending.
+            timeout_seconds: Optional local wait timeout in seconds.
+            deadline_monotonic: Optional participant deadline on the monotonic clock.
+
+        Returns:
+            The matching validated participant response.
+        """
         request_id = str(UUID(require_text(request_id, "request_id")))
         if request_id in self._used_ids:
             raise ValueError("A request_id cannot be sent twice.")
@@ -204,11 +269,28 @@ class ParticipantConnection:
     async def query_command_state(
         self, request_id: str, *, timeout_seconds: float
     ) -> JsonObject:
+        """Request current and pending work using a fresh ID and bounded wait.
+
+        Args:
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            timeout_seconds: Local timeout in seconds for connection or response
+                waiting.
+
+        Returns:
+            Correlated participant response describing current and queued work.
+        """
         return await self.request(
             request_id, "command_state", {}, timeout_seconds=timeout_seconds
         )
 
     async def close(self) -> None:
+        """Cancel reception, abort the transport, and clear stream references.
+
+        Cancels and awaits the receive task unless it is the caller, then aborts the
+        owned writer and waits for transport closure. Pending request failures are
+        delivered by the receive-loop cleanup.
+        """
         task, self._receive_task = self._receive_task, None
         if task is not None and task is not asyncio.current_task():
             task.cancel()

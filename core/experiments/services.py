@@ -80,6 +80,14 @@ class ServiceManager:
         *,
         notify_resources: Callable[[], None] | None = None,
     ) -> None:
+        """Initialize supervision queues and bind caller-owned launch/journal/state services.
+
+        Args:
+            launcher: Module preparation service.
+            journal: Runner journal for service intents and accepted outcomes.
+            state_store: Runner checkpoint persistence.
+            notify_resources: Optional callback publishing changed process targets.
+        """
         self._launcher = launcher
         self._journal = journal
         self._state_store = state_store
@@ -103,6 +111,19 @@ class ServiceManager:
         self._closed = False
 
     async def start_all(self, state: RunnerState) -> ServiceAction:
+        """Start declared services in order and wait for readiness at each startup boundary.
+
+        Args:
+            state: Runner state without existing service instances.
+
+        Returns:
+            Ready when all services start, or a pause/stop policy action.
+
+        Raises:
+            RuntimeError: The manager is closed, already monitoring, or already owns services.
+
+        Startup exceptions trigger service shutdown before propagating.
+        """
         if (
             self._closed
             or state.services
@@ -148,6 +169,17 @@ class ServiceManager:
     async def _start_with_recovery(
         self, state: RunnerState, definition: ServiceDefinition
     ) -> ServiceAction:
+        """Start one definition, applying automatic restart policy to launch/connection failure.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+
+        Returns:
+            Ready after startup, or pause/stop from automatic restart policy.
+        """
         try:
             await self._start(state, definition)
         except (OSError, ConnectionError) as error:
@@ -162,7 +194,22 @@ class ServiceManager:
         return "ready"
 
     async def start(self, state: RunnerState, service_id: str) -> ServiceInstance:
-        """Start only the selected service and wait for its first ready heartbeat."""
+        """Start only the selected service and wait for its first ready heartbeat.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+
+        Returns:
+            The selected ready ServiceInstance. An already-ready active instance is
+            reused.
+
+        Raises:
+            RuntimeError: A snapshot barrier, concurrent startup, pending work, or
+                unconfirmed previous shutdown blocks the launch.
+            ValueError: The service ID is not declared.
+        """
         if self._closed or self._snapshot_id is not None:
             raise RuntimeError(
                 "Service start requires an open manager without a snapshot barrier."
@@ -219,6 +266,23 @@ class ServiceManager:
     async def _start(
         self, state: RunnerState, definition: ServiceDefinition
     ) -> ServiceInstance:
+        """Spawn a fresh service instance and require its first successful readiness heartbeat.
+
+        Persists launch intent before spawning and retains process handles even if
+        startup is cancelled. Endpoint processes may be verified children of the
+        launcher. The original startup deadline bounds handshake and readiness
+        together.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+
+        Returns:
+            New service instance after endpoint ownership and the first readiness
+            heartbeat are confirmed.
+        """
         manifest = await self._launcher._assembler._check_module_async(
             state, definition.module, False
         )
@@ -298,6 +362,20 @@ class ServiceManager:
         self, state: RunnerState, definition: ServiceDefinition,
         manifest: ModuleManifest | None = None,
     ) -> tuple[ServiceInstance, Path, PreparedLaunch, JsonObject]:
+        """Prepare a fresh instance/launch and inherit eligible requests from a stopped predecessor.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            manifest: Already checked module manifest, or None to invoke the public
+                preparation hook.
+
+        Returns:
+            New instance, artifact directory, prepared launch, and journal context,
+            in that order.
+        """
         service_id = require_text(definition.service_id, "service_id")
         old = state.services.get(service_id)
         if old is not None and not old.stopped:
@@ -340,6 +418,16 @@ class ServiceManager:
     def _inherit_service_requests(
         self, state: RunnerState, old: ServiceInstance, instance: ServiceInstance
     ) -> None:
+        """Transfer retries and unsent requests, invalidating work pinned to the old instance.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            old: Previously stopped service instance supplying retries and eligible
+                unsent requests.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+        """
         instance.restart_count = old.restart_count
         for entry in old.pending_requests:
             if (entry.model_extra or {}).get("expected_instance") is not None:
@@ -363,6 +451,16 @@ class ServiceManager:
         launch: PreparedLaunch,
         context: JsonObject,
     ) -> None:
+        """Journal effective service parameters and start intent before spawning the process.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            launch: Validated fixed participant launch inputs and runtime paths.
+            context: Journal/participant coordinates associated with this operation.
+        """
         self._journal.client.record_event(
             "service.parameters",
             {
@@ -388,6 +486,17 @@ class ServiceManager:
         context: JsonObject,
         launcher_identity: ProcessIdentity | None,
     ) -> None:
+        """Persist participant and launcher identities beside the instance's runtime artifacts.
+
+        Args:
+            directory: Writable artifact directory assigned to this service
+                instance.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            context: Journal/participant coordinates associated with this operation.
+            launcher_identity: Verified OS identity of the process that launched the
+                service, or None before it is known.
+        """
         write_json(
             directory / "process.json",
             {
@@ -406,6 +515,19 @@ class ServiceManager:
         context: JsonObject,
         launcher_identity: ProcessIdentity | None,
     ) -> None:
+        """Publish confirmed process metadata, journal startup, and save service state.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            directory: Writable service-instance artifact directory containing
+                process.json.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            context: Journal/participant coordinates associated with this operation.
+            launcher_identity: Verified OS identity of the process that launched the
+                service, or None before it is known.
+        """
         self._write_service_process(directory, instance, context, launcher_identity)
         self._journal.client.record_event(
             "service.started",
@@ -427,6 +549,25 @@ class ServiceManager:
         process: subprocess.Popen,
         context: JsonObject,
     ) -> None:
+        """Verify endpoint ancestry, connect, and require readiness before the original deadline.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance_id: UUID of the particular service process launch.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            process: Owned process handle used to observe exit without trusting a
+                bare PID.
+            context: Journal/participant coordinates associated with this operation.
+
+        Raises:
+            ConnectionError: The launched process exits or the first heartbeat does
+                not confirm readiness.
+            TimeoutError: Startup exceeds its original deadline.
+            ValueError: The endpoint process is not owned by the launched process.
+        """
         while time.monotonic() < instance.start_deadline:
             if process.poll() is not None:
                 raise ConnectionError("Service process exited before readiness.")
@@ -485,6 +626,18 @@ class ServiceManager:
     async def wait_ready(
         self, state: RunnerState, *, service_ids: set[str] | None = None
     ) -> ServiceAction:
+        """Observe the readiness barrier while keeping service supervision active.
+
+        Args:
+            state: Runner state containing current service instances.
+            service_ids: Required startup prefix, or None for all declared services.
+
+        Returns:
+            Ready, pause, or stop according to current readiness and service policies.
+
+        Raises:
+            RuntimeError: The manager closes before the barrier completes.
+        """
         required = (
             {definition.service_id for definition in state.template.services}
             if service_ids is None
@@ -517,6 +670,18 @@ class ServiceManager:
     def _readiness_action(
         self, state: RunnerState, required: set[str]
     ) -> ServiceAction | None:
+        """Return the current ready/pause/stop decision, or None while readiness is unresolved.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            required: Service IDs that must exist for the requested readiness
+                barrier.
+
+        Returns:
+            Ready if all required services are present and usable, pause/stop for a
+            blocking policy, or None while startup is unresolved.
+        """
         for instance in state.services.values():
             if instance.manually_stopped:
                 continue
@@ -539,6 +704,17 @@ class ServiceManager:
         return None
 
     async def monitor(self, state: RunnerState) -> Literal["pause", "stop"]:
+        """Supervise heartbeats, queued work, and restarts until a DAG policy action is needed.
+
+        Args:
+            state: Mutable runner state whose service slice is supervised.
+
+        Returns:
+            Pause or stop requested by service policy; ordinary healthy monitoring continues.
+
+        An existing monitor is shared. The owner must resume observation after handling
+        its returned action, including while the DAG remains paused.
+        """
         current = asyncio.current_task()
         if (
             self._monitor_task is not None
@@ -639,6 +815,17 @@ class ServiceManager:
     async def _handle_completed_send(
         self, state: RunnerState, request_id: str, service_id: str, task: asyncio.Task
     ) -> None:
+        """Process a reply or reconnect after a first communication failure.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            service_id: Stable service definition UUID.
+            task: Completed send task whose result or communication failure is being
+                consumed.
+        """
         self._sends.pop(request_id, None)
         instance = state.services[service_id]
         try:
@@ -669,6 +856,13 @@ class ServiceManager:
     def _check_heartbeat_deadline(
         self, service_id: str, instance: ServiceInstance
     ) -> None:
+        """Mark an already-ready service failed when its outstanding probe exceeds grace.
+
+        Args:
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+        """
         probe = self._probes.get(service_id)
         if (
             probe is not None
@@ -684,6 +878,15 @@ class ServiceManager:
     def _schedule_heartbeat(
         self, state: RunnerState, service_id: str, instance: ServiceInstance
     ) -> None:
+        """Journal and send a due heartbeat using startup or steady-state timing limits.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+        """
         if (
             service_id not in self._connecting
             and service_id not in self._probes
@@ -724,6 +927,19 @@ class ServiceManager:
     async def restart(
         self, state: RunnerState, service_id: str, *, automatic: bool
     ) -> ServiceAction:
+        """Stop the previous instance and restart it under manual or automatic retry policy.
+
+        Args:
+            state: Runner state containing the selected service.
+            service_id: Service definition UUID.
+            automatic: Whether to consume automatic restart budget and retry delays.
+
+        Returns:
+            Ready after startup, or pause/stop when policy or shutdown prevents restart.
+
+        Eligible service-owned timed-out requests receive a new request ID after restart;
+        caller-owned DAG calls are not silently replayed.
+        """
         instance = state.services[service_id]
         if instance.manually_stopped:
             if automatic:
@@ -809,6 +1025,23 @@ class ServiceManager:
         retry: WorkingServiceRequest | None,
         waiter: asyncio.Future | None,
     ) -> ServiceAction:
+        """Publish retry exhaustion, resolve any timed-out waiter, and return the blocked action.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            policy: Validated automatic retry and exhaustion policy.
+            retry: Timed-out service-owned request eligible for a fresh request ID
+                after restart.
+            waiter: Existing result future transferred or completed by the restart
+                policy.
+
+        Returns:
+            The exhaustion action retained on the service instance, pause or stop.
+        """
         instance.blocked_action = policy.on_exhausted
         if waiter is not None and not waiter.done():
             waiter.set_result(
@@ -839,6 +1072,19 @@ class ServiceManager:
         retry: WorkingServiceRequest,
         waiter: asyncio.Future | None,
     ) -> None:
+        """Queue a fresh request ID after restart and transfer the original waiter.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            retry: Timed-out service-owned request eligible for a fresh request ID
+                after restart.
+            waiter: Existing result future transferred or completed by the restart
+                policy.
+        """
         replacement = _update_model(
             retry,
             request_id=str(uuid4()),
@@ -877,6 +1123,17 @@ class ServiceManager:
     async def request(
         self, state: RunnerState, service_id: str, command: str, args: JsonObject
     ) -> JsonObject:
+        """Queue service-owned work and wait for its result under active supervision.
+
+        Args:
+            state: Runner state containing the service queue.
+            service_id: Target service UUID.
+            command: Working command name.
+            args: JSON command arguments.
+
+        Returns:
+            Correlated result of the admitted command.
+        """
         request_id = str(uuid4())
         future = self.enqueue(
             state, service_id, request_id, command, args, owner="service"
@@ -888,6 +1145,13 @@ class ServiceManager:
         return await asyncio.shield(future)
 
     async def _send_next(self, state: RunnerState, service_id: str) -> None:
+        """Expire queued requests, persist send ownership, and transmit the next ready request.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+        """
         instance = state.services[service_id]
         if (
             not instance.ready
@@ -950,12 +1214,29 @@ class ServiceManager:
     async def _handle_message(
         self, state: RunnerState, service_id: str, message: JsonObject
     ) -> None:
+        """Validate an incoming service message and apply its observation.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            message: Raw service response to validate before applying any
+                observation.
+        """
         observation = ServiceObservation.model_validate(message)
         await self._handle_observation(state, service_id, observation)
 
     async def _handle_observation(
         self, state: RunnerState, service_id: str, observation: ServiceObservation
     ) -> None:
+        """Journal a matching instance's reply, update service state, and notify waiters.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            observation: Validated participant or journal author observation.
+        """
         instance = state.services[service_id]
         context = {
             "experiment_id": state.experiment_id,
@@ -1004,7 +1285,21 @@ class ServiceManager:
         observation: ServiceObservation,
         context: JsonObject,
     ) -> bool:
-        """Return False when retired work or restart must skip the final state save."""
+        """Return False when retired work or restart must skip the final state save.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            observation: Validated participant or journal author observation.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            True when the caller should persist the updated service state; False for
+            retired work or when a restart takes ownership.
+        """
         request_id = observation.request_id
         active = instance.active_request
         if active is None or active.request_id != request_id:
@@ -1070,7 +1365,21 @@ class ServiceManager:
         request_id: str,
         context: JsonObject,
     ) -> bool:
-        """Return False for an old probe that must skip the caller's final save."""
+        """Return False for an old probe that must skip the caller's final save.
+
+        Args:
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            message: Validated heartbeat observation returned by the participant.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            True after applying the current probe, including a failed/late
+            heartbeat; False for a stale probe that must not trigger a state save.
+        """
         probe = self._probes.get(service_id)
         if probe is None or probe["request_id"] != request_id:
             self._journal.client.record_event(
@@ -1125,6 +1434,22 @@ class ServiceManager:
     async def _handle_timeout(
         self, state: RunnerState, service_id: str, request_id: str
     ) -> Literal["wait", "restart", "stop"]:
+        """Accept a service-owned command timeout once and return wait/restart/stop policy.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+
+        Returns:
+            Wait for pause policy, otherwise restart or stop. Repeated handling does
+            not replace the accepted timeout outcome.
+
+        Raises:
+            ValueError: The request ID does not match the active service work.
+        """
         instance = state.services[service_id]
         active = instance.active_request
         if active is None or active.request_id != request_id:
@@ -1173,6 +1498,17 @@ class ServiceManager:
         *,
         validate_only: bool = False,
     ) -> None:
+        """Establish ownership and shutdown barriers for services changed by a template.
+
+        Args:
+            state: Current runner state and service instances.
+            template: Validated candidate template.
+            validate_only: Check ownership prerequisites without stopping participants.
+
+        Raises:
+            RuntimeError: Launcher identity is unavailable or affected processes cannot
+                be confirmed stopped before their runtime files are rebuilt.
+        """
         desired = {item.service_id: item for item in template.services}
         old_modules = {
             (item.module.name, item.module.version): item.module.hash
@@ -1250,7 +1586,18 @@ class ServiceManager:
                 )
 
     async def _wait_launcher_exit(self, launcher: JsonObject, deadline: float) -> bool:
-        """Return False only when the same launcher outlives the deadline."""
+        """Return False only when the same launcher outlives the deadline.
+
+        Args:
+            launcher: Complete OS identity of the launcher whose exit is being
+                confirmed.
+            deadline: Absolute monotonic deadline in seconds for confirming launcher
+                exit.
+
+        Returns:
+            True once the recorded launcher exited or no longer matches that OS
+            identity; False if the same process remains alive beyond the deadline.
+        """
         while True:
             try:
                 if process_identity(launcher["pid"]) != launcher:
@@ -1276,6 +1623,18 @@ class ServiceManager:
     async def reconcile(
         self, state: RunnerState, template: ExperimentTemplate
     ) -> ServiceAction:
+        """Match service instances to a candidate template and wait for required readiness.
+
+        Args:
+            state: Mutable runner state after affected old instances have stopped.
+            template: Desired validated service definitions.
+
+        Returns:
+            Ready, pause, or stop from startup/readiness policy.
+
+        Raises:
+            RuntimeError: A removed or changed instance has not been stopped first.
+        """
         desired = {item.service_id: item for item in template.services}
         for service_id, instance in list(state.services.items()):
             if service_id not in desired:
@@ -1308,6 +1667,18 @@ class ServiceManager:
         return await self.wait_ready(state)
 
     async def recover(self, state: RunnerState) -> ServiceAction:
+        """Reconcile saved service ownership and work before restoring live supervision.
+
+        Args:
+            state: Persisted runner state describing every declared service.
+
+        Returns:
+            Readiness action; a recovered snapshot barrier keeps the DAG paused.
+
+        Raises:
+            RuntimeError: Ownership is incomplete or previous channels remain open.
+            ValueError: Saved snapshot barriers conflict.
+        """
         if set(state.services) != {item.service_id for item in state.template.services}:
             raise RuntimeError(
                 "Saved service ownership is incomplete; automatic launch is unsafe."
@@ -1361,6 +1732,16 @@ class ServiceManager:
     ) -> Literal["stop"] | None:
         # A failed optional state write can leave an already sent request queued.
         # Consult the mandatory send record before the monitor can dispatch it.
+        """Check journal send evidence before dispatch and stop on unresolved already-sent work.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+
+        Returns:
+            Stop if saved pending work was already sent and has no reconciled
+            accepted outcome; otherwise None.
+        """
         pending_ids = {
             entry.request_id
             for instance in state.services.values()
@@ -1420,6 +1801,19 @@ class ServiceManager:
     async def _recover_instance(
         self, state: RunnerState, service_id: str, instance: ServiceInstance
     ) -> tuple[bool, ServiceAction | None]:
+        """Recover manual-stop, exited, or live instance state without duplicating unknown ownership.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+
+        Returns:
+            A flag indicating whether recovery must return immediately and the
+            associated readiness action, or False and None to continue.
+        """
         if instance.manually_stopped:
             # Finish an interrupted manual stop before allowing explicit
             # start; recovery must never relaunch this service.
@@ -1490,6 +1884,19 @@ class ServiceManager:
     async def _recover_connected_instance(
         self, state: RunnerState, service_id: str, instance: ServiceInstance
     ) -> tuple[bool, ServiceAction | None]:
+        """Reconnect within the retained startup/grace deadline and query current work.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+
+        Returns:
+            An early-return flag and readiness action, or False and None after
+            command reconciliation permits continuing.
+        """
         timeout = instance.definition.heartbeat.grace_seconds
         if not instance.ever_ready:
             if instance.start_deadline is None:
@@ -1544,6 +1951,22 @@ class ServiceManager:
         observed: CommandState,
         context: JsonObject,
     ) -> tuple[bool, ServiceAction | None]:
+        """Compare participant work with the saved active request and stop on unmatched work.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            observed: Validated current/pending command state returned by the
+                participant.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            True and stop for work that has no matching saved owner; otherwise False
+            and None after journal polling.
+        """
         self._journal.client.record_event(
             "service.commands_reconciled",
             observed.model_dump(exclude_unset=True),
@@ -1574,6 +1997,20 @@ class ServiceManager:
     async def save_states(
         self, state: RunnerState, snapshot_id: str
     ) -> dict[str, Path]:
+        """Drain working queues, freeze service writes, and export snapshot state.
+
+        Args:
+            state: Current runner state with ready services.
+            snapshot_id: UUID identifying this snapshot barrier.
+
+        Returns:
+            Service IDs mapped to existing absolute export paths. Successful export
+            leaves services frozen until unfreeze is called.
+
+        Raises:
+            RuntimeError: Work cannot drain, a barrier is already active, or service
+                readiness/instance identity changes during export.
+        """
         UUID(snapshot_id)
         if any(instance.manually_stopped for instance in state.services.values()):
             raise RuntimeError(
@@ -1632,6 +2069,27 @@ class ServiceManager:
         instance: ServiceInstance,
         snapshot_id: str,
     ) -> Path | None:
+        """Freeze one instance and return its confined export path, or None when stateless.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            snapshot_id: UUID identifying the snapshot or active write-freeze
+                barrier.
+
+        Returns:
+            Absolute existing export path inside the allocated output directory, or
+            None for a permitted stateless service.
+
+        Raises:
+            RuntimeError: The instance is unready, changes during export, or fails
+                to confirm freeze/save.
+            ValueError: A required state path is missing or resolves outside the
+                allocated export directory.
+        """
         if not instance.ready:
             raise RuntimeError("Snapshot requires all services to be ready.")
         self._frozen_instances[service_id] = instance.service_instance_id
@@ -1682,6 +2140,17 @@ class ServiceManager:
         *,
         service_ids: set[str] | None = None,
     ) -> None:
+        """Load selected service exports and require fresh readiness from the same instances.
+
+        Args:
+            state: Runner state containing the newly started services.
+            service_states: Service IDs mapped to validated restoration paths.
+            service_ids: Selected service subset, or None for every service.
+
+        Raises:
+            ValueError: Exports target unknown/unselected services or paths are invalid.
+            RuntimeError: State loading fails or a loaded instance restarts before readiness.
+        """
         if service_states.keys() - state.services.keys():
             raise ValueError("State was supplied for unknown services.")
         selected = set(state.services) if service_ids is None else service_ids
@@ -1714,6 +2183,19 @@ class ServiceManager:
             )
 
     async def unfreeze(self, state: RunnerState, snapshot_id: str) -> None:
+        """Require matching frozen instances to resume writes, then clear the snapshot barrier.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            snapshot_id: UUID identifying the snapshot or active write-freeze
+                barrier.
+
+        Raises:
+            ValueError: The snapshot ID does not match the active barrier.
+            RuntimeError: An instance was replaced or cannot confirm resumption of
+                writes.
+        """
         if self._snapshot_id != snapshot_id:
             raise ValueError("No matching service snapshot barrier.")
         for service_id, instance_id in self._frozen_instances.items():
@@ -1753,6 +2235,20 @@ class ServiceManager:
         service_ids: set[str] | None = None,
         preserve_pending: bool = False,
     ) -> JsonObject:
+        """Request shutdown and confirm termination in reverse service order.
+
+        Args:
+            state: Runner state containing owned service instances.
+            service_ids: Optional subset; None stops all current services.
+            preserve_pending: Retain unsent requests for a subsequent restart.
+
+        Returns:
+            Per-service stopped flags and errors. A shutdown acknowledgement alone
+            does not count as confirmed process termination.
+
+        Raises:
+            ValueError: The selection contains an unknown service.
+        """
         selected = set(state.services) if service_ids is None else service_ids
         if selected - state.services.keys():
             raise ValueError("Cannot stop an unknown service.")
@@ -1770,6 +2266,16 @@ class ServiceManager:
         preserve_pending: bool,
         results: JsonObject,
     ) -> None:
+        """Detach supervision, request shutdown, confirm exit, and retire affected requests.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            preserve_pending: Retain unsent requests for restart instead of
+                cancelling the whole queue.
+            results: Mutable per-service shutdown result mapping.
+        """
         instance = state.services[service_id]
         instance.ready = False
         instance.stopping = True
@@ -1825,6 +2331,11 @@ class ServiceManager:
         )
 
     async def _detach_service_tasks(self, service_id: str) -> None:
+        """Cancel one service's send/reconnect/restart tasks and close its channel.
+
+        Args:
+            service_id: Stable service definition UUID.
+        """
         tasks = [
             self._connecting.pop(service_id, None),
         ]
@@ -1848,6 +2359,20 @@ class ServiceManager:
     def _record_service_stop_intent(
         self, state: RunnerState, service_id: str, request_id: str, context: JsonObject
     ) -> str | None:
+        """Journal shutdown intent or write emergency metadata, returning any journal error.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Journal failure message if emergency stop metadata was needed, otherwise
+            None.
+        """
         error_message = None
         try:
             self._journal.client.record_event(
@@ -1876,6 +2401,23 @@ class ServiceManager:
         request_id: str,
         deadline: float,
     ) -> tuple[ParticipantResult | None, str | None]:
+        """Connect to the matching endpoint and return its shutdown response and optional error.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+
+        Returns:
+            Optional validated participant shutdown response and optional diagnostic
+            message. A success reply does not itself confirm process exit.
+        """
         connection = None
         shutdown_response = None
         error_message = None
@@ -1942,6 +2484,22 @@ class ServiceManager:
         deadline: float,
         error_message: str | None,
     ) -> str | None:
+        """Observe termination until deadline and kill only a matching owned process handle.
+
+        Args:
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            process: Owned process handle used to observe exit without trusting a
+                bare PID.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+            error_message: Previously recorded shutdown diagnostic, or None before
+                any error.
+
+        Returns:
+            Most recent diagnostic message, or None. The instance's stopped flag
+            records actual confirmation independently of this message.
+        """
         while not instance.stopped:
             try:
                 if (
@@ -2004,6 +2562,21 @@ class ServiceManager:
         preserve_pending: bool,
         error_message: str | None,
     ) -> str | None:
+        """Retire active and optionally pending requests, returning any journal failure message.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            preserve_pending: Retain unsent requests for restart instead of
+                cancelling the whole queue.
+            error_message: Previously recorded shutdown diagnostic, or None before
+                any error.
+
+        Returns:
+            Previously retained or latest journal failure message, or None.
+        """
         cancelled = [] if preserve_pending else instance.pending_requests[:]
         if not preserve_pending:
             instance.pending_requests.clear()
@@ -2032,6 +2605,19 @@ class ServiceManager:
         context: JsonObject,
         results: JsonObject,
     ) -> None:
+        """Record the accepted stop outcome and state, attaching journal failures to the result.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            shutdown_response: Participant shutdown result, or None when no response
+                was obtained.
+            context: Journal/participant coordinates associated with this operation.
+            results: Mutable per-service shutdown result mapping.
+        """
         try:
             self._journal.client.record_command_result(
                 request_id,
@@ -2060,7 +2646,21 @@ class ServiceManager:
         self._changed.set()
 
     async def reset(self, state: RunnerState) -> None:
-        """Release a stopped generation before binding restored experiment state."""
+        """Release a stopped generation before binding restored experiment state.
+
+        Requires confirmed stops and empty queues, closes communication, and waits
+        for launcher cleanup using handles or verified saved identities. Only then
+        are process tracking and snapshot barriers cleared for a restored
+        generation.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+
+        Raises:
+            RuntimeError: Services/queues are not stopped and empty, launcher
+                ownership is inconsistent, or a launcher still holds runtime files.
+        """
         if any(
             not item.stopped or item.active_request or item.pending_requests
             for item in state.services.values()
@@ -2124,6 +2724,12 @@ class ServiceManager:
         self._closed = False
 
     async def close(self) -> None:
+        """Detach supervision and connections, cancelling waiters without stopping service processes.
+
+        Cancels monitoring, reconnects, sends, and waiter futures and closes all
+        channels. Live launch handles remain tracked for later shutdown/reset; this
+        operation does not terminate participant processes.
+        """
         self._closed = True
         tasks = [
             self._monitor_task,
@@ -2154,6 +2760,12 @@ class ServiceManager:
         self._changed.set()
 
     def _save(self, state: RunnerState) -> None:
+        """Persist service state and journal rebuild ownership before optional state-file publication.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         if state.pending_rebuild is not None:
             # Participant ownership must survive loss of the optional state.json copy.
             self._journal.client.record_event(
@@ -2178,6 +2790,19 @@ class ServiceManager:
         timeout: float | None = None,
         deadline: float | None = None,
     ) -> JsonObject:
+        """Send a service request and attach its command name to the correlated reply.
+
+        Args:
+            service_id: Connected service UUID.
+            request_id: Fresh request UUID.
+            command: Participant command name.
+            args: JSON arguments.
+            timeout: Optional local response timeout in seconds.
+            deadline: Optional absolute monotonic deadline sent to the participant.
+
+        Returns:
+            Response envelope extended with the command name.
+        """
         reply = await self._connections[service_id].request(
             request_id,
             command,
@@ -2195,6 +2820,18 @@ class ServiceManager:
         response: ServiceObservation | JsonObject,
         outcome: str,
     ) -> None:
+        """Journal the owned outcome or caller retirement and resolve its waiting future.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            entry: Validated working queue entry being retired.
+            response: Participant/controller result envelope being processed.
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+        """
         if isinstance(response, ServiceObservation):
             response = response.model_dump(
                 exclude_unset=True,
@@ -2231,6 +2868,24 @@ class ServiceManager:
         owner: str = "caller",
         deadline: float | None = None,
     ) -> asyncio.Future:
+        """Persist fresh working-request admission and return a result future.
+
+        Args:
+            state: Runner state receiving request ownership and queue changes.
+            service_id: Active target service UUID.
+            request_id: UUID never allocated by this runner.
+            command: Working command; control commands use a separate channel.
+            args: JSON arguments copied into the queue.
+            owner: Caller for DAG-owned results or service for manager-owned results.
+            deadline: Optional absolute monotonic deadline including queue wait.
+
+        Returns:
+            Future resolved when the request is retired with a result.
+
+        Raises:
+            RuntimeError: The service is stopped or snapshot admission forbids work.
+            ValueError: Request ID, ownership, or command violates admission rules.
+        """
         instance = state.services[service_id]
         if (
             self._closed
@@ -2282,6 +2937,19 @@ class ServiceManager:
         request_id: str,
         owner: str,
     ) -> None:
+        """Reject control commands, reused IDs, invalid owners, and work outside a snapshot barrier.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            command: Validated command name or envelope selecting the operation.
+            args: JSON command arguments; mutable inputs are detached at the
+                validation boundary.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            owner: Caller for DAG-owned result acceptance, or service for manager-
+                owned requests.
+        """
         require_text(command, "service command")
         if command in ("heartbeat", "shutdown", "command_state", "interrupt"):
             raise ValueError("Control commands do not belong in the working queue.")
@@ -2313,6 +2981,18 @@ class ServiceManager:
         *,
         interrupt: bool = False,
     ) -> bool:
+        """Cancel queued work or mark active work timed out, optionally requesting interruption.
+
+        Args:
+            state: Runner state holding the persistent queue.
+            service_id: Target service UUID.
+            request_id: Queued or active request to cancel.
+            interrupt: Whether to request actual cancellation of already-sent work.
+
+        Returns:
+            True when no matching work remains or interruption is confirmed; False
+            when active work may still run.
+        """
         instance = state.services[service_id]
         for entry in list(instance.pending_requests):
             if entry.request_id == request_id:
@@ -2349,6 +3029,21 @@ class ServiceManager:
         instance: ServiceInstance,
         request_id: str,
     ) -> bool:
+        """Journal/send a targeted interrupt and clear active work only after success.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+
+        Returns:
+            True only after successful participant acknowledgement and clearing the
+            active request; False on refusal or connection/timeout failure.
+        """
         control_id = str(uuid4())
         state.used_request_ids.add(control_id)
         self._journal.client.record_event(
@@ -2377,6 +3072,13 @@ class ServiceManager:
         return False
 
     async def _poll_result(self, state: RunnerState, service_id: str) -> None:
+        """Read journal evidence for active service work and apply its matching result observation.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            service_id: Stable service definition UUID.
+        """
         instance = state.services[service_id]
         active = instance.active_request
         if active is None:

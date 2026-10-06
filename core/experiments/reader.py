@@ -21,22 +21,46 @@ from core.primitives.json_values import JsonObject, copy_json_object, require_te
 
 
 class ExperimentReader:
+    """Read saved project metadata and resolve journaled artifacts within project roots."""
     def __init__(self, project_root: Path) -> None:
+        """Bind a resolved absolute project root without reading project metadata."""
         if not project_root.is_absolute():
             raise ValueError("project_root must be absolute.")
         self._root = project_root.resolve()
 
     def _path(self, base: Path, relative: str) -> Path:
+        """Resolve a path and require it to stay within both its base and the project.
+
+        Args:
+            base: Resolved directory within which the relative path must stay.
+            relative: Path string resolved against base and checked against both
+                base and project root.
+
+        Returns:
+            Resolved absolute path confined to both the supplied base and project
+            root.
+        """
         path = (base / relative).resolve()
         if not path.is_relative_to(base) or not path.is_relative_to(self._root):
             raise ValueError("Metadata path escapes its project directory.")
         return path
 
     def _registry(self) -> JsonObject:
+        """Read the project experiment registry, returning an empty object when absent."""
         path = self._path(self._root, "experiments.json")
         return read_json(path) if path.exists() else {}
 
     def _directory(self, experiment_id: str, registry: JsonObject) -> Path:
+        """Resolve a registered experiment folder within the project's experiments root.
+
+        Args:
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+            registry: Experiment IDs mapped to their project-local folder names.
+
+        Returns:
+            Resolved experiment directory from its validated registry folder.
+        """
         require_text(experiment_id, "experiment_id")
         if experiment_id not in registry:
             raise FileNotFoundError(f"Unknown experiment: {experiment_id}")
@@ -50,6 +74,16 @@ class ExperimentReader:
         return self._path(base, folder)
 
     def inspect_experiment(self, experiment_id: str) -> JsonObject:
+        """Return saved experiment state metadata without claiming current process liveness.
+
+        Args:
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+
+        Returns:
+            Saved experiment state metadata without claiming current process
+            liveness.
+        """
         directory = self._directory(experiment_id, self._registry())
         state = self._read_saved_state(directory, experiment_id)
         return {
@@ -60,6 +94,12 @@ class ExperimentReader:
         }
 
     def list_experiments(self) -> JsonObject:
+        """List registered experiments with saved metadata or per-entry read errors.
+
+        Returns:
+            Items sorted by experiment ID, each with saved-state metadata or an
+            availability error. Saved phase is not a live process observation.
+        """
         registry = self._registry()
         items = []
         for identifier in sorted(registry):
@@ -84,12 +124,37 @@ class ExperimentReader:
     def _read_saved_state(
         self, directory: Path, experiment_id: str
     ) -> SavedStateMetadata:
+        """Read the inspection subset of state.json and verify its experiment identity.
+
+        Args:
+            directory: Resolved experiment root containing runner state and
+                shared_artifacts.
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+
+        Returns:
+            Validated inspection metadata preserving compatible historical extra
+            fields.
+        """
         state = read_json(self._path(directory, "runner/state.json"))
         if state.get("experiment_id") != experiment_id:
             raise ValueError("Saved state belongs to another experiment.")
         return SavedStateMetadata.model_validate(state)
 
     def inspect_snapshot(self, experiment_id: str, snapshot_id: str) -> JsonObject:
+        """Read snapshot metadata and check identity without checking payload integrity.
+
+        Args:
+            experiment_id: Registered experiment identifier.
+            snapshot_id: UUID of a snapshot belonging to that experiment.
+
+        Returns:
+            Snapshot metadata and manifest with integrity marked not_checked.
+
+        Raises:
+            ValueError: Manifest/state identity disagrees with its location.
+            FileNotFoundError: The experiment or requested snapshot is unavailable.
+        """
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
         directory = self._directory(experiment_id, self._registry())
         base = self._path(self._root, "snapshots")
@@ -119,6 +184,16 @@ class ExperimentReader:
         }
 
     def list_snapshots(self, experiment_id: str) -> JsonObject:
+        """List snapshot headers with per-item availability and unchecked integrity.
+
+        Args:
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+
+        Returns:
+            Experiment identity and snapshot metadata entries with independent
+            availability errors; payload integrity is not checked.
+        """
         directory = self._directory(experiment_id, self._registry())
         base = self._path(self._root, "snapshots")
         base = self._path(base, directory.name)
@@ -137,6 +212,15 @@ class ExperimentReader:
     def _artifact_records(
         self, experiment_id: str
     ) -> Iterator[tuple[JsonObject, JsonObject]]:
+        """Read recorded artifacts up to the first observed journal boundary.
+
+        Args:
+            experiment_id: Experiment whose journal is opened read-only.
+
+        Yields:
+            Artifact event and merged attempt context. Closing the iterator releases
+            the owned journal connection.
+        """
         directory = self._directory(experiment_id, self._registry())
         identity = read_json(self._path(directory, "runner/journal.json"))
         store = SQLiteEventStore(
@@ -173,6 +257,17 @@ class ExperimentReader:
     def _artifact_entry(
         self, event: JsonObject, attempts: dict[str, JsonObject]
     ) -> tuple[JsonObject, JsonObject] | None:
+        """Track attempt context and return artifact events with their inherited coordinates.
+
+        Args:
+            event: Complete journal event envelope.
+            attempts: Mutable attempt-ID/context mapping populated from earlier
+                parameter events.
+
+        Returns:
+            Artifact event and merged attempt context, or None for other events.
+            Parameter events update the supplied attempts mapping.
+        """
         context = event["context"]
         # Continuations inherit events with their original experiment
         # IDs. The store checks journal identity; artifact paths are
@@ -187,6 +282,18 @@ class ExperimentReader:
     def _artifact_path(
         self, directory: Path, event: JsonObject, context: JsonObject
     ) -> Path:
+        """Validate recorded artifact coordinates and resolve an existing confined file.
+
+        Args:
+            directory: Resolved experiment root containing runner state and
+                shared_artifacts.
+            event: Complete journal event envelope.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Existing absolute file path confined to the artifact's attempt
+            directory.
+        """
         location = ArtifactLocation.model_validate(
             {"context": context, "path": event["data"].get("path")}
         )
@@ -195,6 +302,18 @@ class ExperimentReader:
     def _resolve_artifact_path(
         self, directory: Path, location: ArtifactLocation
     ) -> Path:
+        """Resolve an attempt-relative artifact path and require an existing regular file.
+
+        Args:
+            directory: Resolved experiment root containing runner state and
+                shared_artifacts.
+            location: Validated attempt coordinates and attempt-relative artifact
+                path.
+
+        Returns:
+            Existing file path resolved under the attempt directory and project
+            root.
+        """
         context = location.context
         attempt = self._path(
             directory,
@@ -207,6 +326,16 @@ class ExperimentReader:
         return path
 
     def list_artifacts(self, experiment_id: str) -> JsonObject:
+        """List journaled artifacts with current file availability and experiment-relative paths.
+
+        Args:
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+
+        Returns:
+            Experiment identity and journaled artifact entries, each with file
+            availability and an experiment-relative path when resolvable.
+        """
         directory = self._directory(experiment_id, self._registry())
         items = []
         with closing(self._artifact_records(experiment_id)) as records:
@@ -229,6 +358,19 @@ class ExperimentReader:
         return {"experiment_id": experiment_id, "items": items}
 
     def get_artifact(self, experiment_id: str, artifact_id: str) -> JsonObject:
+        """Resolve a registered artifact to its current absolute local file path.
+
+        Args:
+            experiment_id: Experiment whose journal and artifact tree are inspected.
+            artifact_id: Artifact identifier recorded in the journal.
+
+        Returns:
+            Experiment/artifact identity and absolute path to the available file.
+
+        Raises:
+            FileNotFoundError: No matching registration or file exists.
+            ValueError: Artifact metadata or filesystem confinement is invalid.
+        """
         require_text(artifact_id, "artifact_id")
         directory = self._directory(experiment_id, self._registry())
         with closing(self._artifact_records(experiment_id)) as records:
@@ -245,6 +387,16 @@ class ExperimentReader:
     def read(
         self, command: str, args: JsonObject, selected_id: str | None
     ) -> JsonObject:
+        """Validate and dispatch a saved-metadata read command.
+
+        Args:
+            command: Supported experiment, snapshot, or artifact stats command.
+            args: JSON arguments validated for that command.
+            selected_id: Current experiment used as the default for snapshot reads.
+
+        Returns:
+            Requested metadata; experiment-list entries include selection flags.
+        """
         handlers = {
             "stats.artifacts": (self.list_artifacts, ExperimentReference),
             "stats.artifact": (self.get_artifact, ArtifactReference),

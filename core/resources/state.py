@@ -21,6 +21,7 @@ from core.primitives.json_values import (
 
 @dataclass(frozen=True)
 class CollectorSettings:
+    """Runtime collector options with a configuration-relative disk path resolved."""
     sample_interval_seconds: float
     history_seconds: float
     max_buffer_bytes: int
@@ -40,6 +41,18 @@ class CollectorSettings:
 
     @classmethod
     def load(cls, path: Path) -> CollectorSettings:
+        """Read and validate collector settings and resolve the monitored disk path.
+
+        Args:
+            path: Absolute configuration file path.
+
+        Returns:
+            Runtime settings; relative disk paths are anchored to the config file.
+
+        Raises:
+            ValueError: The configuration path or settings are invalid.
+            OSError: The configuration cannot be read.
+        """
         if not path.is_absolute():
             raise ValueError("Collector settings path must be absolute.")
         configuration = CollectorConfiguration.model_validate(read_json(path))
@@ -72,12 +85,22 @@ class CollectorSettings:
 
 @dataclass(frozen=True)
 class ResourceTarget:
+    """Internal monitored process identity, series ID, and journal context."""
     series_id: str
     identity: JsonObject
     context: JsonObject
 
     @classmethod
     def from_document(cls, document: JsonObject) -> ResourceTarget:
+        """Validate target JSON and return an internal record with detached dictionaries.
+
+        Args:
+            document: Input JSON document to validate or publish.
+
+        Returns:
+            Internal target record containing validated series identity and detached
+            process/context dictionaries.
+        """
         target = ResourceTargetDocument.model_validate(document)
         return cls(
             target.series_id, target.identity.model_dump(), target.context.model_dump()
@@ -88,6 +111,7 @@ class ResourceHistory:
     """Store encoded samples to keep Python object overhead out of the byte budget."""
 
     def __init__(self, settings: CollectorSettings) -> None:
+        """Initialize an empty history with configured time/byte limits and a fresh ID."""
         self._settings = settings
         self._entries: deque[tuple[float, int, bytes, int]] = deque()
         self._bytes = 0
@@ -96,6 +120,11 @@ class ResourceHistory:
         self.history_id = str(uuid4())
 
     def append(self, sample: JsonObject) -> None:
+        """Encode a sample with a new cursor and enforce time and memory retention limits.
+
+        Args:
+            sample: One resource sample with context, timestamps, and metric values.
+        """
         self._sequence += 1
         encoded = json.dumps(
             {**sample, "cursor": self._sequence}, allow_nan=False, ensure_ascii=False
@@ -117,6 +146,7 @@ class ResourceHistory:
         self.append(sample.model_dump(exclude_unset=True))
 
     def _prune(self, now: float) -> None:
+        """Evict oldest samples exceeding retention seconds or the configured byte budget."""
         while self._entries and (
             self._entries[0][0] < now - self._settings.history_seconds
             or self._bytes > self._settings.max_buffer_bytes
@@ -125,6 +155,18 @@ class ResourceHistory:
             self.evicted += 1
 
     def read(self, *, after: int = 0, limit: int = 100) -> JsonObject:
+        """Read retained samples after a cursor with bounded count and encoded size.
+
+        Args:
+            after: Nonnegative exclusive sample cursor.
+            limit: Maximum sample count, from 1 to 1000.
+
+        Returns:
+            Samples, continuation cursor, history ID, and explicit gap/eviction metadata.
+
+        Raises:
+            ValueError: Cursor or page limit violates its integer bounds.
+        """
         if type(after) is not int or after < 0:
             raise ValueError("after must be a nonnegative integer.")
         if type(limit) is not int or not 1 <= limit <= 1000:

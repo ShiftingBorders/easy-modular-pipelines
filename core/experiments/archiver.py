@@ -61,6 +61,13 @@ class ExperimentArchiver:
         *,
         config_path: Path | None = None,
     ) -> None:
+        """Bind project storage and read archive limits without starting module code.
+
+        Args:
+            project_root: Absolute project directory.
+            module_manager: Caller-owned manager used on its hash database's owner thread.
+            config_path: Absolute archive settings path, or None for repository defaults.
+        """
         self._project_root = _path(project_root)
         self._manager = module_manager
         self._assembler = ExperimentAssembler(self._project_root, module_manager)
@@ -73,11 +80,29 @@ class ExperimentArchiver:
         self._busy = False
 
     async def create(self, state: RunnerState, archive_path: Path) -> JsonObject:
-        """Publish a new tar.xz from a stopped or completed registered experiment."""
+        """Publish a new tar.xz from a stopped or completed registered experiment.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            archive_path: Absolute archive file path on the server filesystem.
+
+        Returns:
+            Archive path and validated manifest, extended with the independent
+            archive operation ID and logger configuration path.
+        """
         return await self._execute(self._create(state, archive_path), "create")
 
     async def inspect(self, archive_path: Path) -> JsonObject:
-        """Fully validate in disposable storage; leave the archive and stores intact."""
+        """Fully validate in disposable storage; leave the archive and stores intact.
+
+        Args:
+            archive_path: Absolute archive file path on the server filesystem.
+
+        Returns:
+            Validated archive manifest and source path, plus operation ID and logger
+            configuration.
+        """
         return await self._execute(self._inspect(archive_path), "inspect")
 
     async def install(self, archive_path: Path, destination: Path) -> JsonObject:
@@ -86,12 +111,31 @@ class ExperimentArchiver:
         Existing identical modules are reused. Conflicts are never overwritten.
         On failure, exception notes report completed registrations/publications;
         remote registration and local publication are not a shared transaction.
+
+        Args:
+            archive_path: Absolute archive file path on the server filesystem.
+            destination: Absolute output path for the requested file or directory.
+
+        Returns:
+            Installation receipt listing completed module steps, destination,
+            template path, and operation journal location.
         """
         return await self._execute(self._install(archive_path, destination), "install")
 
     async def _execute(
         self, operation: Coroutine[None, None, JsonObject], name: str
     ) -> JsonObject:
+        """Serialize one archive operation and await its actual outcome despite cancellation.
+
+        Args:
+            operation: Unstarted archive coroutine executed under exclusive
+                maintenance and audit.
+            name: Archive action name included in the independent operation journal.
+
+        Returns:
+            Logged operation result after the actual action completes, even if the
+            caller was cancelled.
+        """
         if self._busy:
             operation.close()
             raise RuntimeError("An archive operation is already in progress.")
@@ -107,6 +151,21 @@ class ExperimentArchiver:
         operation: Coroutine[None, None, JsonObject],
         name: str,
     ) -> JsonObject:
+        """Run an archive action with a dedicated journal and annotate cleanup failures.
+
+        Creates a separate controller archive journal and records start/completion.
+        A logging failure after the action can occur after files or registrations
+        have already been published; exception notes retain that outcome and journal
+        location. The coroutine and logger are closed on every exit path.
+
+        Args:
+            operation: Unstarted archive coroutine executed under exclusive
+                maintenance and audit.
+            name: Archive action name included in the independent operation journal.
+
+        Returns:
+            The operation's result with operation_id and logging_config_path added.
+        """
         logger = None
         failure = None
         config = None
@@ -191,16 +250,40 @@ class ExperimentArchiver:
                     )
 
     def _space(self, folder: Path, required: int = 0) -> None:
+        """Require free bytes for the operation plus the configured storage reserve.
+
+        Args:
+            folder: Directory on the filesystem whose available capacity is checked.
+            required: Additional operation bytes that must fit beyond the configured
+                reserve.
+        """
         if shutil.disk_usage(folder).free < required + self._settings.min_free_bytes:
             raise StorageCapacityError(f"Insufficient free space at {folder}.")
 
     def _workspace(self, parent: Path) -> tempfile.TemporaryDirectory:
+        """Create an owned temporary workspace beneath a checked parent with free space."""
         parent = _path(parent)
         parent.mkdir(parents=True, exist_ok=True)
         self._space(parent)
         return tempfile.TemporaryDirectory(prefix="experiment-archive-", dir=parent)
 
     def _assert_stopped(self, state: RunnerState) -> None:
+        """Verify registered experiment state and confirm all known writer processes exited.
+
+        Requires terminal runner state, no active attempt or unresolved service
+        requests, and no incomplete restoration. Saved owner, service, stage, and
+        executor identities must not still identify live writers.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+
+        Raises:
+            RuntimeError: Experiment state, unfinished restoration, unresolved
+                service work, or a live writer prevents archiving.
+            ValueError: Registered experiment identity or recorded process metadata
+                is invalid.
+        """
         root = _path(state.experiment_directory)
         if root != find_experiment(self._project_root, state.experiment_id):
             raise ValueError("Experiment identity differs from the project registry.")
@@ -249,6 +332,16 @@ class ExperimentArchiver:
                         self._assert_exited(copy_json_object(data[key], key))
 
     def _assert_exited(self, identity: JsonObject) -> None:
+        """Confirm a complete local process identity has exited or belongs to an old boot.
+
+        Args:
+            identity: Expected complete process identity used to detect PID reuse.
+
+        Raises:
+            ValueError: The process identity is incomplete or invalid.
+            RuntimeError: The same process is still alive or belongs to another host
+                whose shutdown cannot be confirmed.
+        """
         if identity.keys() != {"pid", "created_at_os", "host_id", "boot_id"}:
             raise ValueError("Incomplete process identity.")
         pid = identity["pid"]
@@ -275,6 +368,22 @@ class ExperimentArchiver:
             raise RuntimeError(f"Experiment process is still alive: {pid}") from error
 
     def _inventory(self, root: Path) -> tuple[list[str], dict[str, ArchiveFile]]:
+        """Inventory portable directories and hashed files within member and byte limits.
+
+        Args:
+            root: Absolute payload tree whose member paths and file contents are
+                inventoried.
+
+        Returns:
+            Sorted portable directory names and a mapping of file names to byte
+            sizes and SHA-256 digests.
+
+        Raises:
+            ValueError: A path is unsafe, case-colliding, linked, or not a regular
+                file/directory.
+            StorageCapacityError: The member or total unpacked-byte limit is
+                exceeded.
+        """
         root = _path(root)
         directories: list[str] = []
         files: dict[str, ArchiveFile] = {}
@@ -301,6 +410,16 @@ class ExperimentArchiver:
         return sorted(directories), files
 
     def _file_inventory(self, entry: Path, total: int) -> tuple[int, ArchiveFile]:
+        """Return updated byte total and file size/digest, rejecting oversized or changing input.
+
+        Args:
+            entry: Regular payload file whose size and SHA-256 are being recorded.
+            total: Total uncompressed file bytes counted before this file.
+
+        Returns:
+            Updated byte total and file size/digest, rejecting oversized or changing
+            input.
+        """
         size = entry.stat().st_size
         total += size
         if total > self._settings.max_unpacked_bytes:
@@ -312,6 +431,12 @@ class ExperimentArchiver:
         return total, ArchiveFile(size=size, sha256=digest)
 
     def _copy(self, source: Path, target: Path) -> None:
+        """Copy a checked regular file or directory and reject unavailable source paths.
+
+        Args:
+            source: Source path or input record selected for this operation.
+            target: Destination path or target record selected for this operation.
+        """
         source = _path(source)
         target = _path(target)
         if source.is_dir():
@@ -322,6 +447,12 @@ class ExperimentArchiver:
             raise FileNotFoundError(source)
 
     def _copy_directory(self, source: Path, target: Path) -> None:
+        """Copy an inventoried tree with space checks and compare the resulting inventory.
+
+        Args:
+            source: Source path or input record selected for this operation.
+            target: Destination path or target record selected for this operation.
+        """
         directories, files = self._inventory(source)
         target.mkdir(parents=True, exist_ok=False)
         for name in directories:
@@ -333,6 +464,12 @@ class ExperimentArchiver:
             raise ValueError("Source files changed while copying the archive payload.")
 
     def _copy_file(self, source: Path, target: Path) -> None:
+        """Copy a file within size/space limits and verify its SHA-256 stayed unchanged.
+
+        Args:
+            source: Regular source file whose size/hash is captured before copying.
+            target: Destination file under the owned payload workspace.
+        """
         if source.stat().st_size > self._settings.max_unpacked_bytes:
             raise StorageCapacityError("Source file exceeds the unpacked size limit.")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +484,20 @@ class ExperimentArchiver:
                 )
 
     async def _create(self, state: RunnerState, archive_path: Path) -> JsonObject:
+        """Package a stopped experiment and publish a complete archive without replacement.
+
+        Args:
+            state: Stopped/completed experiment state with confirmed process shutdown.
+            archive_path: Absolute new archive path outside the source experiment.
+
+        Returns:
+            Published archive path and manifest.
+
+        Raises:
+            FileExistsError: The destination exists.
+            RuntimeError: Shutdown or restoration state prevents archiving.
+            ValueError: Applied template, registered hashes, or payload contents disagree.
+        """
         archive = _path(archive_path)
         root = _path(state.experiment_directory)
         if archive.exists():
@@ -400,6 +551,24 @@ class ExperimentArchiver:
         template: ExperimentTemplate,
         modules: list[ArchiveModule],
     ) -> tuple[Path, ArchiveManifest]:
+        """Stage modules/resources and a portable template, validate them, and write the manifest.
+
+        Copies immutable module code and static resources, rewrites resource paths
+        relative to the portable template, then verifies all contents before writing
+        manifest.json.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            root: Absolute source experiment directory.
+            work: Owned temporary workspace for downloaded or prepared files.
+            template: Validated experiment template supplying definitions and
+                policies.
+            modules: Validated module references included in the archive.
+
+        Returns:
+            Staged payload directory and its validated archive manifest.
+        """
         payload = work / "payload"
         payload.mkdir()
         for module in modules:
@@ -444,6 +613,22 @@ class ExperimentArchiver:
         return payload, manifest
 
     def _pack(self, payload: Path, archive: Path) -> None:
+        """Write a USTAR/XZ archive while enforcing member, compressed-size, and free-space limits.
+
+        Uses a temporary uncompressed USTAR file before XZ compression. The
+        destination must be new. Member count, free space, and compressed size are
+        enforced while writing.
+
+        Args:
+            payload: Extracted/staged archive root containing template, modules, and
+                resources.
+            archive: Archive file path used by this operation.
+
+        Raises:
+            StorageCapacityError: Member count, compressed size, or free-space
+                limits are exceeded.
+            OSError: The archive or temporary TAR file cannot be written.
+        """
         directories, files = self._inventory(payload)
         if len(directories) + len(files) > self._settings.max_members:
             raise StorageCapacityError("Too many archive members including manifest.")
@@ -482,7 +667,16 @@ class ExperimentArchiver:
         unpacked.unlink()
 
     def _decompress(self, archive: Path, target: Path) -> None:
-        """Bound both decoder memory and disk use before parsing any tar metadata."""
+        """Bound both decoder memory and disk use before parsing any tar metadata.
+
+        Bounds decoder memory and uncompressed output. Trailing compressed
+        streams/data are rejected; partially written temporary output remains owned
+        by the caller's workspace cleanup.
+
+        Args:
+            archive: Existing XZ archive file.
+            target: New temporary uncompressed TAR file.
+        """
         decoder = lzma.LZMADecompressor(
             format=lzma.FORMAT_XZ,
             memlimit=self._settings.max_decompression_memory_bytes,
@@ -515,6 +709,19 @@ class ExperimentArchiver:
                 raise ValueError("Trailing data or multiple XZ streams are forbidden.")
 
     def _unpack(self, archive_path: Path, target: Path) -> ArchiveManifest:
+        """Extract bounded USTAR/XZ contents and verify their complete manifest inventory.
+
+        Args:
+            archive_path: Absolute existing archive file.
+            target: New extraction directory within the caller-owned workspace.
+
+        Returns:
+            Validated archive manifest after checking every payload member.
+
+        Raises:
+            ValueError: Headers, paths, padding, inventory, or content checks fail.
+            StorageCapacityError: Archive limits or free-space reserves are exceeded.
+        """
         archive = _path(archive_path)
         if not archive.is_file():
             raise FileNotFoundError(archive)
@@ -592,6 +799,24 @@ class ExperimentArchiver:
         return manifest
 
     def _check_payload(self, payload: Path, manifest: ArchiveManifest) -> set[str]:
+        """Verify inventory/template/modules/resources and return the allowed payload member set.
+
+        Args:
+            payload: Extracted/staged archive root containing template, modules, and
+                resources.
+            manifest: Validated snapshot/archive manifest describing expected
+                contents.
+
+        Returns:
+            Exactly the payload member names allowed by the validated template and
+            inventory, excluding manifest.json.
+
+        Raises:
+            ValueError: Inventory, hashes, template references, or allowed member
+                roots disagree.
+            FileNotFoundError: A required payload resource or module file is
+                unavailable.
+        """
         directories = manifest.directories
         files = manifest.files
         names = [*directories, *files]
@@ -628,6 +853,15 @@ class ExperimentArchiver:
     def _validate_payload_modules(
         self, payload: Path, modules: list[ArchiveModule], roots: list[str]
     ) -> None:
+        """Check packaged module identity, role, and hash and append allowed module roots.
+
+        Args:
+            payload: Extracted/staged archive root containing template, modules, and
+                resources.
+            modules: Validated module references included in the archive.
+            roots: Mutable list receiving the portable paths of allowed payload
+                roots.
+        """
         for module in modules:
             relative = f"modules/{module.name}/{module.version}"
             folder = payload / relative
@@ -649,6 +883,16 @@ class ExperimentArchiver:
     def _validate_payload_resources(
         self, payload: Path, resources: list[ResourceDefinition], roots: list[str]
     ) -> None:
+        """Check portable resource paths and optional hashes and append allowed resource roots.
+
+        Args:
+            payload: Extracted/staged archive root containing template, modules, and
+                resources.
+            resources: Validated static resource definitions whose optional hashes
+                are checked.
+            roots: Mutable list receiving the portable paths of allowed payload
+                roots.
+        """
         for resource in resources:
             name = _member(resource.name)
             relative = f"resources/{name}"
@@ -670,6 +914,14 @@ class ExperimentArchiver:
             roots.append(relative)
 
     async def _inspect(self, archive_path: Path) -> JsonObject:
+        """Extract and fully validate an archive in a temporary workspace, returning its manifest.
+
+        Args:
+            archive_path: Absolute archive file path on the server filesystem.
+
+        Returns:
+            Absolute source archive path and the fully checked manifest document.
+        """
         parent = _path(self._project_root / "controller/archive_work")
         temporary = self._workspace(parent)
         failure = None
@@ -688,6 +940,22 @@ class ExperimentArchiver:
             await asyncio.to_thread(_cleanup, temporary, parent, failure)
 
     async def _install(self, archive_path: Path, destination: Path) -> JsonObject:
+        """Validate a bundle, register/install its modules, and publish template/resources.
+
+        Args:
+            archive_path: Absolute source archive path.
+            destination: New absolute directory disjoint from project runtime storage.
+
+        Returns:
+            Archive/module receipt, destination, and installed template path.
+
+        Raises:
+            FileExistsError: The destination already exists.
+            StorageConflict: A registered or installed module has different content.
+            ValueError: Destination or archive validation fails.
+
+        Failures retain completed-step notes; prior registrations are not rolled back.
+        """
         destination = _path(destination)
         if destination.exists():
             raise FileExistsError(destination)
@@ -786,6 +1054,17 @@ class ExperimentArchiver:
         modules_root: Path,
         completed: list[JsonObject],
     ) -> None:
+        """Register one checked module and atomically publish missing local code with progress notes.
+
+        Args:
+            module: Validated archive module reference including its expected hash.
+            payload: Extracted/staged archive root containing template, modules, and
+                resources.
+            modules_root: Absolute project directory containing installed versioned
+                module code.
+            completed: Mutable installation receipt list updated after each
+                completed registration/publication step.
+        """
         name, version = (
             require_text(module.name, "name"),
             require_text(module.version, "version"),

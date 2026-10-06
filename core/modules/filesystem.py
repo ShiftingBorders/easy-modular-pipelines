@@ -84,12 +84,22 @@ class _ModuleWorkspace:
         completion: str,
         destination: Path,
     ) -> None:
+        """Retain a temporary directory and destination details for cleanup diagnostics.
+
+        Args:
+            temporary: Owned TemporaryDirectory whose cleanup is managed by this
+                context.
+            completion: Diagnostic text describing publication already completed
+                before cleanup.
+            destination: Absolute output path for the requested file or directory.
+        """
         self._temporary = temporary
         self._work = temporary.name
         self._completion = completion
         self._destination = destination
 
     def __enter__(self) -> str:
+        """Return the temporary workspace path."""
         return self._work
 
     def __exit__(
@@ -98,6 +108,15 @@ class _ModuleWorkspace:
         failure: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        """Remove the workspace, preserving a primary exception and annotating cleanup errors.
+
+        Args:
+            error_type: Exception type from the context-manager body, or None on
+                normal exit.
+            failure: Primary exception whose identity must survive secondary cleanup
+                failures.
+            traceback: Traceback supplied by the context-manager protocol.
+        """
         try:
             for attempt in range(3):
                 try:

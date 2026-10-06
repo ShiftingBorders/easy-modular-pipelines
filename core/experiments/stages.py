@@ -94,6 +94,7 @@ def _finish_executor_status(status: ExecutorStatus | JsonValue) -> ExecutorStatu
 
 
 class StageRunner:
+    """Execute/recover stage attempts and accept outcomes while the runner owns DAG movement."""
     def __init__(
         self,
         launcher: ModuleLauncher,
@@ -103,6 +104,15 @@ class StageRunner:
         services=None,
         notify_resources: Callable[[], None] | None = None,
     ) -> None:
+        """Bind attempt preparation, journal, state storage, and optional service control.
+
+        Args:
+            launcher: Module launch preparation service.
+            journal: Open runner journal used for intents and accepted results.
+            state_store: Runner checkpoint persistence.
+            services: Optional service manager for DAG service-call nodes.
+            notify_resources: Optional callback publishing changed process targets.
+        """
         self._launcher = launcher
         self._journal = journal
         self._state_store = state_store
@@ -117,6 +127,11 @@ class StageRunner:
         self._notify_resources = notify_resources
 
     def bind_services(self, services) -> None:
+        """Set the service manager used for queued DAG calls and interruption.
+
+        Args:
+            services: Caller-owned ServiceManager handling queued DAG calls.
+        """
         self._services = services
 
     async def execute(
@@ -130,6 +145,17 @@ class StageRunner:
         | None = None,
         recovered: StageAttempt | None = None,
     ) -> StageOutcome:
+        """Execute the selected stage visit, applying retries without advancing the DAG.
+
+        Args:
+            state: Mutable runner state at the selected one-based stage position.
+            manual: Whether to invalidate the selected stage's current result before work.
+            wait_services: Optional readiness callback run before automatic retries.
+            recovered: Existing attempt to reconcile before starting any new work.
+
+        Returns:
+            Final attempt/result and the requested advance, pause, or stop action.
+        """
         definition = state.template.stages[state.stage_position - 1]
         stage_id = definition.stage_id
         input_data = (
@@ -189,7 +215,17 @@ class StageRunner:
         definition: StageDefinition | ServiceCallDefinition,
         response: StageOutcomeResult | None,
     ) -> Literal["advance", "pause", "stop"]:
-        """Select failure policy separately from attempt execution and retries."""
+        """Select failure policy separately from attempt execution and retries.
+
+        Args:
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            response: Participant/controller result envelope being processed.
+
+        Returns:
+            Advance for skip, otherwise the configured pause/stop action. Missing
+            required conditional data always stops after retries are exhausted.
+        """
         if (
             isinstance(definition, StageDefinition)
             and definition.returns_data is True
@@ -201,6 +237,17 @@ class StageRunner:
         return "advance" if action == "skip" else action
 
     def select_input(self, state: RunnerState) -> JsonValue:
+        """Read accepted predecessor or conditional-transfer data for the selected stage.
+
+        Args:
+            state: Runner cursor, accepted result references, and optional pending move input.
+
+        Returns:
+            Accepted application input, or None for no successful predecessor.
+
+        Raises:
+            ValueError: A saved result reference is missing or a move transfer is inconsistent.
+        """
         if state.pending_input is not None:
             transfer = state.pending_input
             return self._read_move_input(state, transfer)
@@ -231,6 +278,22 @@ class StageRunner:
         )
 
     def _read_move_input(self, state: RunnerState, transfer: PendingInput) -> JsonValue:
+        """Require a successful accepted move to the current target and return its payload.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            transfer: Accepted conditional result reference assigned to the current
+                target stage.
+
+        Returns:
+            Application data from the accepted successful move result that names the
+            current target.
+
+        Raises:
+            ValueError: The transfer targets another stage or lacks a matching
+                accepted successful move result.
+        """
         if (
             transfer.stage_id
             != state.template.stages[state.stage_position - 1].stage_id
@@ -256,6 +319,18 @@ class StageRunner:
         return record["response"]["data"]
 
     def _context(self, state: RunnerState, attempt: StageAttempt) -> JsonObject:
+        """Build journal coordinates for an attempt using its current template module reference.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+
+        Returns:
+            Journal context combining experiment/run/template, module identity, and
+            fixed attempt/participant coordinates.
+        """
         definition = next(
             item for item in state.template.stages if item.stage_id == attempt.stage_id
         )
@@ -291,6 +366,19 @@ class StageRunner:
         *,
         execution_id: str | None = None,
     ) -> StageAttempt:
+        """Prepare and journal a new attempt before enqueueing service work or spawning an executor.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            input_data: Accepted JSON input for the new stage visit.
+            execution_id: Stage visit UUID shared by retries, or None to allocate a
+                fresh visit.
+
+        Returns:
+            Newly admitted attempt, including attempts whose deadline expired before
+            execution could start.
+        """
         definition = state.template.stages[state.stage_position - 1]
         module = self._launcher._assembler._module_reference(state.template, definition)
         attempt, instance = self._new_stage_attempt(
@@ -329,6 +417,23 @@ class StageRunner:
         input_data: JsonValue,
         execution_id: str | None,
     ) -> tuple[StageAttempt, ServiceInstance | None]:
+        """Allocate fresh attempt identity, artifact path, participant identity, and queue time.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            module: Validated name/version/hash reference used to locate the node's
+                module.
+            input_data: Accepted JSON input for the new stage visit.
+            execution_id: Stage visit UUID shared by retries, or None to allocate a
+                fresh visit.
+
+        Returns:
+            Fresh StageAttempt and its existing ServiceInstance for service-call
+            nodes, otherwise None.
+        """
         stage_id = definition.stage_id
         number = state.stage_attempt_numbers.get(stage_id, 0) + 1
         attempt_id = str(uuid4())
@@ -378,6 +483,24 @@ class StageRunner:
         module: ModuleReference,
         manifest: ModuleManifest | None = None,
     ) -> tuple[PreparedLaunch, JsonObject]:
+        """Prepare fixed launch inputs and persist the attempt's context.json.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            module: Validated name/version/hash reference used to locate the node's
+                module.
+            manifest: Already checked module manifest, or None to use the public
+                preparation hook.
+
+        Returns:
+            Prepared launch and journal context after persisting fixed runtime
+            inputs to context.json.
+        """
         context = {
             **self._context(state, attempt),
             "template_revision_id": state.template_revision_id,
@@ -426,6 +549,18 @@ class StageRunner:
         launch: PreparedLaunch,
         context: JsonObject,
     ) -> None:
+        """Bind the active attempt and persist parameters/start intent before external execution.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            launch: Validated fixed participant launch inputs and runtime paths.
+            context: Journal/participant coordinates associated with this operation.
+        """
         state.active_attempt = attempt
         state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number
         if attempt.request_id in state.used_request_ids:
@@ -466,6 +601,23 @@ class StageRunner:
         launch: PreparedLaunch,
         deadline: float | None,
     ) -> StageAttempt:
+        """Enqueue the fixed call on the unchanged service instance and retain its result future.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            launch: Validated fixed participant launch inputs and runtime paths.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+
+        Returns:
+            The supplied attempt after attaching a service-result future, or
+            unchanged if the service instance was replaced.
+        """
         if self._services is None:
             raise RuntimeError("Service attempts require a bound ServiceManager.")
         if state.services[instance.service_id] is not instance:
@@ -489,6 +641,21 @@ class StageRunner:
         launch: PreparedLaunch,
         deadline: float | None,
     ) -> StageAttempt:
+        """Write launch.json, spawn the executor, and await its endpoint or journal outcome.
+
+        Args:
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            attempt_id: UUID of the stage attempt being launched or reconciled.
+            directory: Absolute attempt artifact directory receiving launch.json.
+            launch: Validated fixed participant launch inputs and runtime paths.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+
+        Returns:
+            The admitted attempt after spawning and endpoint/result startup
+            reconciliation.
+        """
         launch_path = directory / "launch.json"
         write_json(launch_path, launch.model_dump(mode="json", exclude_unset=True))
         await self._spawn_executor(attempt, attempt_id, launch_path)
@@ -497,6 +664,14 @@ class StageRunner:
     async def _spawn_executor(
         self, attempt: StageAttempt, attempt_id: str, launch_path: Path
     ) -> None:
+        """Start a stage executor through the project uv environment and retain process ownership.
+
+        Args:
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            attempt_id: UUID of the stage attempt being launched or reconciled.
+            launch_path: Absolute JSON path containing executor launch inputs.
+        """
         library_root = repository_root()
         self._unstarted_attempt_id = None
         spawn = asyncio.create_task(
@@ -540,6 +715,20 @@ class StageRunner:
         launch: PreparedLaunch,
         deadline: float | None,
     ) -> StageAttempt:
+        """Wait for the matching endpoint/result and send execute within the startup deadline.
+
+        Args:
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            attempt_id: UUID of the stage attempt being launched or reconciled.
+            launch: Validated fixed participant launch inputs and runtime paths.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+
+        Returns:
+            The supplied attempt once execute was sent or a matching journal result
+            is already available.
+        """
         startup_deadline = time.monotonic() + launch.control_timeout_seconds
         if deadline is not None:
             startup_deadline = min(startup_deadline, deadline)
@@ -582,6 +771,7 @@ class StageRunner:
         raise TimeoutError("Executor startup deadline expired.")
 
     def _deadline(self, attempt: StageAttempt) -> float | None:
+        """Return the attempt's monotonic deadline from queue time, or None when unbounded."""
         return (
             None
             if attempt.timeout_seconds is None
@@ -589,6 +779,13 @@ class StageRunner:
         )
 
     async def _connect(self, attempt: StageAttempt, timeout: float) -> None:
+        """Replace the participant connection and verify identity within timeout seconds.
+
+        Args:
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            timeout: Timeout in seconds for this operation.
+        """
         if self._connection is not None:
             await self._connection.close()
         self._connection = ParticipantConnection(
@@ -603,6 +800,17 @@ class StageRunner:
         response: JsonObject,
         outcome: str,
     ) -> StageOutcomeResult:
+        """Journal the runner's normalized outcome and persist attempt/result observations.
+
+        Args:
+            state: Runner state receiving the accepted request and checkpoint.
+            attempt: Attempt whose result is being accepted.
+            response: Participant or runner-generated result document.
+            outcome: Journal outcome before conditional-result normalization.
+
+        Returns:
+            Accepted typed response; invalid conditional output becomes failure.
+        """
         result, outcome = self._normalize_accepted_response(
             state, attempt, StageOutcomeResult.model_validate(response), outcome
         )
@@ -636,6 +844,21 @@ class StageRunner:
         response: StageOutcomeResult,
         outcome: str,
     ) -> tuple[StageOutcomeResult, str]:
+        """Validate successful conditional output and separate application data from DAG commands.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            response: Participant/controller result envelope being processed.
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+
+        Returns:
+            Normalized application response and final outcome. Invalid conditional
+            decisions become failures; ignored disabled payloads are journaled.
+        """
         definition = state.template.stages[state.stage_position - 1]
         if (
             isinstance(definition, StageDefinition)
@@ -682,6 +905,18 @@ class StageRunner:
     async def _collect_result(
         self, state: RunnerState, attempt: StageAttempt
     ) -> StageOutcomeResult:
+        """Reconcile journal evidence and live observations until an outcome is accepted.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+
+        Returns:
+            Authoritative accepted result, reusing runner evidence when available
+            and preserving timeout precedence over late participant replies.
+        """
         deadline = self._deadline(attempt)
         try:
             while True:
@@ -789,7 +1024,20 @@ class StageRunner:
     async def _observe_executor(
         self, state: RunnerState, attempt: StageAttempt, deadline: float | None
     ) -> bool:
-        """Return True when the result loop must recheck its journal and deadline."""
+        """Return True when the result loop must recheck its journal and deadline.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+
+        Returns:
+            True when newly discovered evidence requires immediately rechecking the
+            journal; False when polling should continue normally.
+        """
         if self._call_future is not None and self._call_future.done():
             if not self._call_future.cancelled():
                 self._call_future.exception()
@@ -838,6 +1086,16 @@ class StageRunner:
         return False
 
     async def interrupt(self, state: RunnerState, reason: str) -> bool:
+        """Cancel the active stage/service call and seek confirmation that its work stopped.
+
+        Args:
+            state: Runner state containing the active attempt and ownership evidence.
+            reason: Reason journaled and sent to the participant.
+
+        Returns:
+            True when work is unstarted or termination is confirmed; False when the
+            available observations cannot establish termination within the deadline.
+        """
         attempt = state.active_attempt
         if attempt is None or self._unstarted_attempt_id == attempt.attempt_id:
             return True
@@ -947,6 +1205,18 @@ class StageRunner:
         ]
         | None = None,
     ) -> StageOutcome | None:
+        """Reconcile the saved active attempt with its original inputs and participant evidence.
+
+        Args:
+            state: Restored runner state with an optional active attempt.
+            wait_services: Optional readiness callback used before a recovered retry.
+
+        Returns:
+            Recovered outcome/action, or None when there is no active attempt.
+
+        Raises:
+            ValueError: Saved attempt coordinates or inputs differ from their fixed context.
+        """
         attempt = state.active_attempt
         if attempt is None:
             return None
@@ -1012,6 +1282,22 @@ class StageRunner:
         ]
         | None,
     ) -> StageOutcome:
+        """Apply unknown-state policy, requiring confirmed interruption before skip or rerun.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            wait_services: Optional readiness callback consulted before starting an
+                automatic/recovered retry.
+
+        Returns:
+            Recovered/rerun attempt outcome and the selected advance, pause, or stop
+            action; skip/rerun require confirmed termination.
+        """
         state.unknown_state_recovery_count += 1
         policy = state.template.unknown_state
         action = (
@@ -1048,6 +1334,19 @@ class StageRunner:
         )
 
     def _prune_artifacts(self, state: RunnerState, attempt: StageAttempt) -> None:
+        """Delete expired attempt directories while preserving conditional result artifacts.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+
+        Raises:
+            ValueError: An expired attempt directory resolves outside the
+                experiment.
+            OSError: An eligible old attempt directory cannot be removed.
+        """
         import shutil
 
         parent = attempt.artifacts_directory.parent
@@ -1079,6 +1378,16 @@ class StageRunner:
                 shutil.rmtree(path)
 
     def termination_confirmed(self, state: RunnerState) -> bool:
+        """Return whether current evidence confirms the active attempt is unstarted or stopped.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+
+        Returns:
+            Whether current evidence confirms the active attempt is unstarted or
+            stopped.
+        """
         attempt = state.active_attempt
         if attempt is None or self._unstarted_attempt_id == attempt.attempt_id:
             return True
@@ -1111,6 +1420,14 @@ class StageRunner:
     def _save_state(self, state: RunnerState, *, checkpoint: bool = True) -> None:
         # Retry/input ownership must survive loss of the optional state.json
         # copy, including a crash between acceptance and the DAG transition.
+        """Journal an optional authoritative checkpoint and publish state.json with I/O diagnostics.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            checkpoint: Whether to journal a new authoritative runner checkpoint
+                before the optional state file.
+        """
         if checkpoint:
             state.checkpoint_id = str(uuid4())
             _record_runner_checkpoint(self._journal.client, state)
@@ -1122,6 +1439,14 @@ class StageRunner:
             )
 
     async def close(self, state: RunnerState | None = None) -> None:
+        """Close attempt communication and reap completed executor processes.
+
+        Args:
+            state: Optional runner state used to distinguish active work and confirm
+                accepted executors exited before snapshot or artifact operations.
+
+        Active executor processes remain tracked; interruption is a separate operation.
+        """
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
@@ -1148,6 +1473,12 @@ class StageRunner:
             await self._wait_accepted_executors(state)
 
     async def _wait_accepted_executors(self, state: RunnerState) -> None:
+        """Recover accepted-result executor identities and wait for remaining writers to exit.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         request_ids = set(state.stage_result_ids.values())
         for transfer in (state.pending_input, state.last_dag_decision):
             if transfer is not None:

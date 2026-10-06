@@ -28,7 +28,16 @@ from core.primitives.json_values import JsonObject, JsonValue, copy_json_object
 
 
 class ModuleLauncher:
+    """Prepare immutable module launches and writable runtime paths for participants."""
     def __init__(self, assembler: ExperimentAssembler, journal: RunnerJournal) -> None:
+        """Bind caller-owned module assembler and runner journal.
+
+        Args:
+            assembler: Caller-owned experiment assembler used to check module code
+                and references.
+            journal: Caller-owned runner journal used for client configurations and
+                accepted results.
+        """
         self._assembler = assembler
         self._journal = journal
 
@@ -42,6 +51,22 @@ class ModuleLauncher:
         *,
         command: str = "start",
     ) -> JsonObject:
+        """Validate launch inputs and materialize runtime directories/configuration.
+
+        Args:
+            state: Current experiment state.
+            definition: Stage, service, or service-call definition with an assigned ID.
+            context: Participant identity and attempt context.
+            artifacts_directory: Absolute new artifact directory for this invocation.
+            input_data: JSON input payload.
+            command: Start command; shutdown uses the participant protocol.
+
+        Returns:
+            JSON launch document with fixed call inputs and absolute runtime paths.
+
+        Raises:
+            ValueError: Inputs are invalid or command is not start.
+        """
         if command != "start":
             raise ValueError("Participant shutdown is a protocol command.")
         validated = LaunchInput.validate_python(
@@ -64,6 +89,19 @@ class ModuleLauncher:
         definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
         inputs: ModulePreparation,
     ) -> PreparedLaunch:
+        """Check the referenced module and return a prepared launch from typed inputs.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            inputs: Validated fixed identity, input payload, and artifact directory
+                for preparation.
+
+        Returns:
+            Prepared launch after checking the typed definition's referenced module.
+        """
         reference = self._assembler._module_reference(state.template, definition)
         module = self._assembler._check_module(
             state,
@@ -79,7 +117,22 @@ class ModuleLauncher:
         inputs: ModulePreparation,
         module: ModuleManifest,
     ) -> PreparedLaunch:
-        """Prepare a launch after the owning async operation checked its module."""
+        """Prepare a launch after the owning async operation checked its module.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+            inputs: Validated fixed identity, input payload, and artifact directory
+                for preparation.
+            module: Validated installed module manifest containing role, start
+                command, and defaults.
+
+        Returns:
+            PreparedLaunch binding the checked manifest, effective settings,
+            argument vector, runtime context, and fixed call.
+        """
         service_call = isinstance(definition, ServiceCallDefinition)
         if service_call and module.role != "service":
             raise ValueError("A service node must reference a service module.")
@@ -122,6 +175,25 @@ class ModuleLauncher:
         owner_id: str,
         settings: JsonObject,
     ) -> tuple[PreparedModuleContext, Path | None]:
+        """Create runtime directories and return module context plus executor logger path.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            inputs: Validated fixed identity, input payload, and artifact directory
+                for preparation.
+            module: Validated installed module manifest containing role, start
+                command, and defaults.
+            service_call: Whether this invocation targets an existing service
+                instead of starting a new process.
+            owner_id: Stable stage/service ID used for persistent module-data
+                ownership.
+            settings: Validated settings used to configure this component.
+
+        Returns:
+            Prepared module runtime context and optional executor logger
+            configuration path.
+        """
         inputs.artifacts_directory.mkdir(parents=True, exist_ok=False)
         module_data = state.experiment_directory / "module_data" / owner_id
         module_data.mkdir(parents=True, exist_ok=True)
@@ -155,6 +227,21 @@ class ModuleLauncher:
         module: ModuleManifest,
         service_call: bool,
     ) -> tuple[Path | None, Path | None]:
+        """Write required module/executor logger configs and return their optional paths.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            context: Journal/participant coordinates associated with this operation.
+            module: Validated installed module manifest containing role, start
+                command, and defaults.
+            service_call: Whether this invocation targets an existing service
+                instead of starting a new process.
+
+        Returns:
+            Module and executor logger-config paths, in that order; either is None
+            when that invocation does not create the corresponding process.
+        """
         logging_config = (
             None
             if service_call
@@ -174,6 +261,17 @@ class ModuleLauncher:
     def _merge_settings(
         self, defaults: JsonObject, overrides: JsonObject
     ) -> JsonObject:
+        """Return a detached recursive dictionary merge, replacing other override values.
+
+        Args:
+            defaults: Module default JSON settings to copy before applying
+                overrides.
+            overrides: Template JSON overrides; dictionaries merge recursively and
+                other values replace defaults.
+
+        Returns:
+            A detached recursive dictionary merge, replacing other override values.
+        """
         result = deepcopy(defaults)
         for key, value in overrides.items():
             if isinstance(value, dict) and isinstance(result.get(key), dict):

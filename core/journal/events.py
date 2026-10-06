@@ -98,6 +98,14 @@ class JournalGenerationChanged(LoggingStateError):
     code = "journal_generation_changed"
 
     def __init__(self, expected: JsonObject, actual: JsonObject) -> None:
+        """Retain detached expected/actual identities and request restarting the read.
+
+        Args:
+            expected: Expected journal/generation identity supplied by the old
+                checkpoint or client.
+            actual: Observed journal/generation identity after opening the restored
+                database.
+        """
         super().__init__("Journal identity or generation changed; restart reading.")
         self.expected = dict(expected)
         self.actual = dict(actual)

@@ -47,15 +47,22 @@ class _ExactMean:
     """Match statistics.mean without retaining historical samples in memory."""
 
     def __init__(self) -> None:
+        """Initialize an exact rational accumulator and zero non-null sample count."""
         self.total = Fraction(0)
         self.count = 0
 
     def step(self, value: float | None) -> None:
+        """Accumulate a non-null value as an exact fraction.
+
+        Args:
+            value: Numeric sample to accumulate; None is ignored.
+        """
         if value is not None:
             self.total += Fraction(value)
             self.count += 1
 
     def finalize(self) -> float | None:
+        """Return the floating-point mean, or None when no non-null values were seen."""
         return float(self.total / self.count) if self.count else None
 
 
@@ -91,6 +98,7 @@ def acquire_cache_writer(path: Path) -> BinaryIO:
 class JournalHistoryCache:
     # Keep the pre-release format at 1. Incompatible development changes require
     # rebuilding the disposable cache, not incrementing this number.
+    """Maintain disposable SQLite projections and a bounded RAM window of journal events."""
     SCHEMA_VERSION = 1
 
     def __init__(
@@ -104,6 +112,18 @@ class JournalHistoryCache:
         max_bytes: int,
         max_events: int = 100000,
     ) -> None:
+        """Validate cache/source parameters without opening files.
+
+        Args:
+            path: Absolute derived-cache database path.
+            config_path: Absolute read-only source logger configuration path.
+            identity: Expected journal and generation identity.
+            file_key: Expected source filesystem device/inode pair.
+            experiment_id: Experiment whose events are cached.
+            window_events: Maximum raw events retained in the active RAM window.
+            max_bytes: Byte budget for the RAM window and each projection working set.
+            max_events: Maximum effective facts loaded for one execution scope.
+        """
         parameters = HistoryCacheParameters.model_validate(
             {
                 "path": path,
@@ -119,6 +139,12 @@ class JournalHistoryCache:
         self._configure(parameters)
 
     def _configure(self, parameters: HistoryCacheParameters) -> None:
+        """Bind validated cache limits and initialize empty RAM and reader state.
+
+        Args:
+            parameters: Validated cache/source identity, absolute paths, and working
+                limits.
+        """
         self.path = parameters.path
         self.config_path = parameters.config_path
         self.identity = parameters.identity
@@ -134,7 +160,12 @@ class JournalHistoryCache:
         self._reading: sqlite3.Connection | None = None
 
     def open(self) -> None:
-        """Create only the disposable cache, never the source journal."""
+        """Create only the disposable cache, never the source journal.
+
+        Opens or recreates disposable derived storage after comparing schema and
+        source identity. It does not repair the primary journal. Any cache
+        replacement and locking remain local to the configured cache path.
+        """
         with self._lock, OperationLogger(self.config_path, read_only=True) as source:
             if self.path.exists():
                 status = self.path.stat()
@@ -234,6 +265,17 @@ class JournalHistoryCache:
             self._opened = True
 
     def _remember(self, entry: dict) -> None:
+        """Replace a RAM entry, retain the newest cursors, and enforce the window byte budget.
+
+        Args:
+            entry: Original source event envelope and SQLite cursor to retain in the
+                RAM window.
+
+        Raises:
+            HistoryCacheLimit: The complete active event window exceeds its byte
+                budget; the window is cleared rather than silently truncated by
+                bytes.
+        """
         event = entry["event"]
         identifier = event["event_id"]
         size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
@@ -265,7 +307,26 @@ class JournalHistoryCache:
         window: bool = True,
         reader_context: dict | None = None,
     ) -> dict:
-        """Advance ingestion, projections and the active window explicitly."""
+        """Advance ingestion, projections and the active window explicitly.
+
+        Args:
+            state: Reader state passed to projection callbacks; it does not
+                authorize mutation of the source journal.
+            compact: Callback reducing source event JSON into exact projection
+                inputs.
+            project: Callback deriving per-scope records and summaries from compact
+                inputs.
+            target: Optional source journal boundary to reach or compare, rather
+                than a filesystem path.
+            window: Whether to refresh the active raw-event RAM window.
+            reader_context: Optional validated reader paths/state to publish with
+                the cache.
+
+        Returns:
+            Published cache progress including completed event/change cursors,
+            observed source boundary, and explicit completeness; a bounded batch may
+            leave work pending.
+        """
         request = HistoryCacheRefresh.model_validate(
             {
                 "state": state,
@@ -284,7 +345,19 @@ class JournalHistoryCache:
         compact: Callable,
         project: Callable,
     ) -> CachePublication:
-        """Refresh a validated request while owning the writer and reader lock."""
+        """Refresh a validated request while owning the writer and reader lock.
+
+        Args:
+            request: Validated refresh target, reader state, and RAM-window options.
+            compact: Callback reducing source event JSON into exact projection
+                inputs.
+            project: Callback deriving per-scope records and summaries from compact
+                inputs.
+
+        Returns:
+            Typed cache publication after the bounded refresh, while holding
+            exclusive writer ownership.
+        """
         with self._lock:
             writer = acquire_cache_writer(self.path)
             try:
@@ -298,6 +371,16 @@ class JournalHistoryCache:
         compact: Callable,
         project: Callable,
     ) -> CachePublication:
+        """Ingest changes, rebuild dirty projections, and publish while owning the cache lock.
+
+        Args:
+            request: Validated target boundary, reader state, and window options.
+            compact: Callback reducing source events to projection inputs.
+            project: Callback deriving records and summaries for one execution scope.
+
+        Returns:
+            Cache publication with the target boundary and actual completed progress.
+        """
         if not self._opened:
             self.open()
         with (
@@ -334,6 +417,25 @@ class JournalHistoryCache:
         deadline: float,
         target: JournalBoundary,
     ) -> tuple[dict, list[dict]]:
+        """Consume source changes in committed batches up to the target or time budget.
+
+        Commits ingestion and its checkpoint together before projection. Reaching
+        the change target is checked against both source event cursor and count, so
+        a checkpoint cannot silently skip uncached events.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+            source: Open read-only logger for the source journal.
+            compact: Callback reducing source event JSON into exact projection
+                inputs.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+            target: Fixed source boundary captured for this worker task.
+
+        Returns:
+            Last consumed change page and a bounded list of changed original entries
+            for refreshing the RAM tail.
+        """
         row = db.execute("SELECT value FROM metadata WHERE key='checkpoint'").fetchone()
         checkpoint = (
             CacheChangeCheckpoint.model_validate(json.loads(row[0])) if row else None
@@ -403,6 +505,20 @@ class JournalHistoryCache:
         change: dict,
         compact: Callable,
     ) -> list[dict]:
+        """Load related observations, update effective-result metadata, and store their facts.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+            source: Open read-only logger for the source journal.
+            change: Source change envelope with effective-result metadata and
+                related event IDs.
+            compact: Callback reducing source event JSON into exact projection
+                inputs.
+
+        Returns:
+            Original entries affected by this change after their compact facts and
+            confirmation metadata are stored.
+        """
         entry = change["entry"]
         related = change["related_event_ids"]
         entries = [entry]
@@ -438,6 +554,15 @@ class JournalHistoryCache:
     def _store_event(
         self, db: sqlite3.Connection, item: dict, metadata: dict, compact: Callable
     ) -> None:
+        """Persist compact event facts and mark affected projection scopes dirty.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+            item: Original journal entry with cursor and event payload.
+            metadata: Metadata associated with the cached record or publication.
+            compact: Callback reducing source event JSON into exact projection
+                inputs.
+        """
         event = item["event"]
         context = event["context"]
         if context.get("experiment_id") not in (None, self.experiment_id):
@@ -512,6 +637,21 @@ class JournalHistoryCache:
     def _project_pending(
         self, db: sqlite3.Connection, state: dict, project: Callable, deadline: float
     ) -> bool:
+        """Rebuild dirty scopes transactionally until clean or the monotonic deadline.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+            state: Reader state passed to projection callbacks; it does not
+                authorize mutation of the source journal.
+            project: Callback deriving per-scope records and summaries from compact
+                inputs.
+            deadline: Absolute monotonic deadline in seconds, or None when
+                unbounded.
+
+        Returns:
+            Whether at least one dirty scope was projected before the working
+            deadline.
+        """
         projected = False
         while True:
             dirty = db.execute("SELECT scope FROM dirty LIMIT 1").fetchone()
@@ -528,6 +668,12 @@ class JournalHistoryCache:
                 return projected
 
     def _refresh_window(self, source: OperationLogger, changed: list[dict]) -> None:
+        """Merge changed events into the active window or load the source tail when empty.
+
+        Args:
+            source: Open read-only logger for the source journal.
+            changed: Original event entries changed by the current ingestion batch.
+        """
         if self.window:
             for item in changed:
                 self._remember(item)
@@ -538,6 +684,15 @@ class JournalHistoryCache:
     def _load_window_tail(
         self, source: OperationLogger, before: int | None, remaining: int
     ) -> None:
+        """Page backwards through raw source events until the requested window is filled.
+
+        Args:
+            source: Open read-only logger for the source journal.
+            before: Exclusive upper event cursor for descending tail reads, or None
+                for the latest boundary.
+            remaining: Maximum number of further source events needed to fill the
+                active window.
+        """
         while remaining:
             tail = source.read_event_batch(limit=min(remaining, 1000), before=before)
             if not tail["events"]:
@@ -550,6 +705,18 @@ class JournalHistoryCache:
     def _publication(
         self, db: sqlite3.Connection, page: dict, changed: bool
     ) -> CachePublication:
+        """Persist publication metadata and return actual ingestion/projection completeness.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+            page: Source page containing changes, continuation checkpoint, and
+                observed boundary.
+            changed: Whether ingestion or projection changed this publication.
+
+        Returns:
+            Publication descriptor with actual complete/cached-through state and the
+            current RAM-window count.
+        """
         complete = (
             not page["has_more"]
             and db.execute("SELECT 1 FROM dirty LIMIT 1").fetchone() is None
@@ -590,6 +757,11 @@ class JournalHistoryCache:
         )
 
     def _publish_cached_boundary(self, db: sqlite3.Connection) -> None:
+        """Record event/change cursors after all ingested facts have completed projections.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+        """
         checkpoint = db.execute(
             "SELECT value FROM metadata WHERE key='checkpoint'"
         ).fetchone()
@@ -611,13 +783,32 @@ class JournalHistoryCache:
         )
 
     def observe(self, target: dict | None = None) -> dict:
-        """Read worker-owned projections and reconstruct the latest source window."""
+        """Read worker-owned projections and reconstruct the latest source window.
+
+        Args:
+            target: Optional source journal boundary to reach or compare, rather
+                than a filesystem path.
+
+        Returns:
+            Observed publication and RAM-window coverage without performing
+            historical projection work.
+        """
         target_model = (
             JournalBoundary.model_validate(target) if target is not None else None
         )
         return self._observe(target_model).model_dump(exclude_unset=True)
 
     def _observe(self, target: JournalBoundary | None) -> CachePublication:
+        """Observe source and cached boundaries and report any gap before the active RAM window.
+
+        Args:
+            target: Optional source journal boundary to reach or compare, rather
+                than a filesystem path.
+
+        Returns:
+            Publication with fresh source boundary, RAM-window endpoints, and any
+            gap between disk coverage and the window.
+        """
         with self._lock, OperationLogger(self.config_path, read_only=True) as source:
             boundary = source.read_event_batch([])["boundary"]
             if target and any(
@@ -666,7 +857,13 @@ class JournalHistoryCache:
             )
 
     def _observe_window(self, source: OperationLogger, boundary: dict) -> None:
-        """Extend a nearby RAM window or rebuild its tail at the captured boundary."""
+        """Extend a nearby RAM window or rebuild its tail at the captured boundary.
+
+        Args:
+            source: Open read-only logger for the source journal.
+            boundary: Observed journal boundary against which the page/publication
+                is read.
+        """
         latest = next(reversed(self.window.values()), None)
         last_cursor = latest["entry"]["cursor"] if latest else None
         if (
@@ -695,6 +892,18 @@ class JournalHistoryCache:
     def _observed_publication(
         self, boundary: dict, target: JournalBoundary | None = None
     ) -> CachePublication:
+        """Read compatible cache progress without creating a cache or claiming unavailable data.
+
+        Args:
+            boundary: Observed journal boundary against which the page/publication
+                is read.
+            target: Optional source journal boundary to reach or compare, rather
+                than a filesystem path.
+
+        Returns:
+            Compatible disk-cache publication, or an incomplete zero-progress
+            descriptor when no usable cache is present.
+        """
         empty = CachePublication.model_validate(
             {
                 "complete": False,
@@ -749,6 +958,16 @@ class JournalHistoryCache:
     def _decode_cached_boundary(
         self, metadata: dict, empty: CachePublication
     ) -> tuple[bool, CacheCheckpoint | None]:
+        """Return compatibility and completed checkpoint after checking source/file identity.
+
+        Args:
+            metadata: Persisted cache metadata keyed by name.
+            empty: Fallback publication carrying a zero-progress checkpoint.
+
+        Returns:
+            Compatibility and completed checkpoint after checking source/file
+            identity.
+        """
         recorded = self._decode_source(metadata.get("source", "{}"))
         if (
             recorded is None
@@ -766,6 +985,7 @@ class JournalHistoryCache:
         return True, CacheCheckpoint.model_validate(cached)
 
     def _decode_source(self, encoded: str) -> CacheSource | None:
+        """Decode source JSON, returning None for incompatible cache metadata."""
         document = json.loads(encoded)
         try:
             return CacheSource.model_validate(document)
@@ -774,7 +994,22 @@ class JournalHistoryCache:
             return None
 
     def read_view(self, version: int, reader: Callable, *args):
-        """One SQLite read snapshot while an independent worker may publish."""
+        """One SQLite read snapshot while an independent worker may publish.
+
+        Args:
+            version: Expected derived-cache publication version.
+            reader: Callback reading against the pinned cache publication.
+            *args: Positional arguments forwarded to reader while the publication is
+                pinned.
+
+        Returns:
+            The reader callback's result from the pinned version. A publication
+            mismatch raises HistoryCacheChanged rather than mixing versions.
+
+        Raises:
+            HistoryCacheChanged: The selected publication changed before or during
+                the pinned read.
+        """
         with (
             self._lock,
             closing(sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True)) as db,
@@ -810,7 +1045,23 @@ class JournalHistoryCache:
         size: int,
         count: int,
     ) -> dict:
-        """Load only indexed ancestry needed for this scope's measurements."""
+        """Load only indexed ancestry needed for this scope's measurements.
+
+        Args:
+            db: Open derived-cache SQLite connection owned by the caller.
+            scope: Encoded execution-scope key used to select compact facts.
+            run_id: Optional logical run restriction for related operation ancestry.
+            size: Already consumed bytes in the projection working set.
+            count: Already consumed record count in the projection working set.
+
+        Returns:
+            Operation IDs mapped to parent-operation metadata needed to avoid
+            double-counting overlapping measurements.
+
+        Raises:
+            HistoryCacheLimit: Required ancestry exceeds the configured projection
+                event/byte working limits.
+        """
         parents = {}
         rows = db.execute(
             """
@@ -849,6 +1100,17 @@ class JournalHistoryCache:
     def _project_scope(
         self, db: sqlite3.Connection, scope: str, state: dict, project: Callable
     ) -> None:
+        """Rebuild derived records for one complete execution scope within working limits.
+
+        Args:
+            db: Open derived-cache connection in the caller's transaction.
+            scope: Encoded execution or command scope key.
+            state: Reader state supplied to the projection callback.
+            project: Callback returning records and a summary for the selected scope.
+
+        Raises:
+            HistoryCacheLimit: The scope exceeds configured byte or event limits.
+        """
         scope_key = json.loads(scope)
         command_scope = isinstance(scope_key, dict)
         run_id, revision, cycle = (None, None, None) if command_scope else scope_key
@@ -932,7 +1194,16 @@ class JournalHistoryCache:
         )
 
     def query(self, sql: str, parameters: tuple = ()) -> list[tuple]:
-        """Query the separate projection database, never the source tables."""
+        """Query the separate projection database, never the source tables.
+
+        Args:
+            sql: Read-only SQL against the disposable projection database.
+            parameters: SQL bound parameters; values are passed separately from the
+                query text.
+
+        Returns:
+            All scalar result rows from the read-only projection query.
+        """
         with self._lock:
             if self._reading is not None:
                 return self._reading.execute(sql, parameters).fetchall()
@@ -945,7 +1216,17 @@ class JournalHistoryCache:
             return db.execute(sql, parameters).fetchall()
 
     def iter_query(self, sql: str, parameters: tuple = ()) -> Iterator[tuple]:
-        """Stream scalar projection statistics with bounded working memory."""
+        """Stream scalar projection statistics with bounded working memory.
+
+        Args:
+            sql: Read-only SQL against the disposable projection database.
+            parameters: SQL bound parameters; values are passed separately from the
+                query text.
+
+        Yields:
+            Scalar SQLite rows while holding the read connection and lock. Close the
+            iterator when stopping early to release them promptly.
+        """
         with (
             self._lock,
             closing(sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True)) as db,
@@ -954,7 +1235,22 @@ class JournalHistoryCache:
             yield from db.execute(sql, parameters)
 
     def events(self, identifiers: list[str]) -> list[dict]:
-        """Hydrate a bounded result without changing active-window membership."""
+        """Hydrate a bounded result without changing active-window membership.
+
+        Args:
+            identifiers: Original event IDs to hydrate without changing active-
+                window membership.
+
+        Returns:
+            Original requested event documents within the byte budget, without
+            moving them into the active RAM window.
+
+        Raises:
+            HistoryCacheLimit: Hydrated payload bytes exceed the configured detail-
+                read budget.
+            HistoryCacheChanged: The source journal identity changes during
+                hydration.
+        """
         result, size = [], 0
         with closing(self.iter_events(identifiers)) as events:
             for event in events:
@@ -967,7 +1263,16 @@ class JournalHistoryCache:
         return result
 
     def iter_events(self, identifiers: list[str]) -> Iterator[dict]:
-        """One read-only source connection, indexed lookups and bounded payloads."""
+        """One read-only source connection, indexed lookups and bounded payloads.
+
+        Args:
+            identifiers: Original event IDs to hydrate without changing active-
+                window membership.
+
+        Yields:
+            Original source event documents for requested IDs. Iteration owns a
+            read-only logger and releases it on completion or close.
+        """
         with self._lock, OperationLogger(self.config_path, read_only=True) as source:
             info = source.get_journal_info()
             if any(info[key] != value for key, value in self.identity):
@@ -1013,6 +1318,7 @@ class JournalHistoryCache:
                 )
 
     def close(self) -> None:
+        """Clear the active RAM window and mark the cache closed under its lock."""
         with self._lock:
             self.window.clear()
             self._window_bytes = 0

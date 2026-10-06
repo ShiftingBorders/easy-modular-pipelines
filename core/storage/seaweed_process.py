@@ -72,6 +72,7 @@ class SeaweedProcess:
         self.filer_url: str | None = None
 
     def _free_space_startstop(self):
+        """Raise StorageCapacityError if the volume's free-space reserve is unavailable."""
         if not self.enough_free_space():
             raise StorageCapacityError(
                 "Not enough free space to start SeaweedFS: "
@@ -92,7 +93,12 @@ class SeaweedProcess:
         self.operating_system = operating_system
 
     def _load_config(self) -> SeaWeedConfig:
-        """Load and validate process and SeaweedFS command arguments."""
+        """Load and validate process and SeaweedFS command arguments.
+
+        Returns:
+            Validated managed-process and server options from the configured JSON
+            file.
+        """
         config_path = self.config_path
         try:
             if not config_path.is_file() or config_path.suffix.lower() != ".json":
@@ -123,7 +129,12 @@ class SeaweedProcess:
         return seaweed_cfg
 
     def start(self) -> None:
-        """Start this instance's SeaweedFS process with Filer enabled."""
+        """Start this instance's SeaweedFS process with Filer enabled.
+
+        Checks the volume and executable, allocates compatible ports, spawns the
+        owned server, and waits for Filer readiness. A failed start attempts to stop
+        the child and retains captured process output in the exception.
+        """
         if self._process is not None and self._process.poll() is None:
             if self.is_available():
                 return
@@ -199,6 +210,16 @@ class SeaweedProcess:
         weed_executable: Path,
         selected_ports: tuple[int, int, int],
     ) -> list[str]:
+        """Build the server argument vector with selected ports and configured options.
+
+        Args:
+            config: Validated process and server settings.
+            weed_executable: SeaweedFS executable path.
+            selected_ports: Master, volume, and Filer HTTP ports, in that order.
+
+        Returns:
+            Arguments for direct subprocess execution without a shell.
+        """
         master_port, volume_port, filer_port = selected_ports
         command = [
             str(weed_executable),
@@ -216,12 +237,18 @@ class SeaweedProcess:
         return command
 
     def _cleanup_failed_start(self, error: BaseException) -> None:
+        """Stop owned resources and attach any cleanup failure to the original error."""
         try:
             self.stop()
         except StorageError as cleanup_error:
             error.add_note(f"SeaweedFS startup cleanup also failed: {cleanup_error}")
 
     def _emergency_stop_debug(self, err: Exception | None) -> None:
+        """Collect process output, stop a failed startup, and raise StorageUnavailable.
+
+        Args:
+            err: Original failure chained to the raised startup diagnostic, or None.
+        """
         failure = StorageUnavailable(
             "SeaweedFS did not become available after startup."
         )
@@ -245,6 +272,17 @@ class SeaweedProcess:
         binded_ip: str,
         filer_port: int,
     ) -> tuple[bool, Exception | None]:
+        """Configure the local HTTP client and poll Filer readiness until timeout.
+
+        Args:
+            master_port: Selected master HTTP port.
+            volume_port: Selected volume HTTP port.
+            binded_ip: Bind address; wildcard addresses map to loopback for the client.
+            filer_port: Selected Filer HTTP port.
+
+        Returns:
+            Readiness flag and an optional startup error.
+        """
         try:
             self.master_port = master_port
             self.volume_port = volume_port
@@ -273,7 +311,12 @@ class SeaweedProcess:
         return False, StorageUnavailable("Failed to start Seaweed after specified time")
 
     def stop(self) -> None:
-        """Stop owned resources; retain a live process handle if termination fails."""
+        """Stop owned resources; retain a live process handle if termination fails.
+
+        Stops only the owned local process and closes the HTTP/output resources.
+        Termination escalates after the configured grace period; cleanup failures
+        propagate instead of claiming successful shutdown.
+        """
         cleanup_error = None
         if self._client is not None:
             try:
@@ -313,6 +356,7 @@ class SeaweedProcess:
             ) from cleanup_error
 
     def _terminate_owned_process(self) -> None:
+        """Terminate the owned child, escalating to kill after the configured timeout."""
         self._process.terminate()
         try:
             self._process.wait(timeout=self.start_stop_timeout)
@@ -321,7 +365,12 @@ class SeaweedProcess:
             self._process.wait(timeout=5)
 
     def _volume_path_exists(self, volume_path: Path) -> None:
-        """Ensure that the configured volume path is an existing directory."""
+        """Ensure that the configured volume path is an existing directory.
+
+        Args:
+            volume_path: Optional replacement absolute volume directory used after
+                stopping the server.
+        """
         try:
             is_directory = volume_path.is_dir()
         except OSError as error:
@@ -334,7 +383,11 @@ class SeaweedProcess:
             )
 
     def _check_availability(self) -> bool:
-        """Return whether this instance's process and Filer are available."""
+        """Return whether this instance's process and Filer are available.
+
+        Returns:
+            Whether this instance's process and Filer are available.
+        """
         if (
             self._process is None
             or self._process.poll() is not None
@@ -358,6 +411,15 @@ class SeaweedProcess:
         return self._check_availability()
 
     def remaining_free_space(self) -> float:
+        """Read free bytes on the volume filesystem after validating its reserve.
+
+        Returns:
+            Available disk space in bytes.
+
+        Raises:
+            StorageConfigurationError: The configured GB reserve is invalid.
+            StorageIOError: Disk usage cannot be inspected.
+        """
         if (
             isinstance(self.volume_min_gb, bool)
             or not isinstance(self.volume_min_gb, (int, float))
@@ -382,7 +444,12 @@ class SeaweedProcess:
         return not free_bytes < required_bytes
 
     def check_upload_space(self, archive_size: int) -> None:
-        """Ensure an upload leaves the configured free-space reserve."""
+        """Ensure an upload leaves the configured free-space reserve.
+
+        Args:
+            archive_size: Incoming archive size in bytes checked against the
+                configured disk reserve.
+        """
         free_bytes = self.remaining_free_space()
         reserved_bytes = self.volume_min_gb * 1024**3
         if free_bytes - archive_size < reserved_bytes:
@@ -392,7 +459,12 @@ class SeaweedProcess:
             )
 
     def restart(self, volume_path: Path | None = None) -> None:
-        """Restart the server; recreate archive clients for the new filer_url."""
+        """Restart the server; recreate archive clients for the new filer_url.
+
+        Args:
+            volume_path: Optional replacement absolute volume directory used after
+                stopping the server.
+        """
         if volume_path is not None:
             try:
                 volume_path = Path(volume_path).resolve()
@@ -408,6 +480,7 @@ class SeaweedProcess:
 
 
 class SeaweedState(Enum):
+    """Managed SeaweedFS process lifecycle states."""
     RUNNING = "RUNNING"
     STOPPED = "STOPPED"
 

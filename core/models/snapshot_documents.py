@@ -106,6 +106,23 @@ SnapshotMember = Annotated[str, BeforeValidator(_snapshot_member)]
 
 
 class _SnapshotHeader(BaseModel):
+    """Snapshot identity, UTC creation time, ordering sequence, and kind.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        snapshot_id: UUID of the snapshot selected or referenced by this
+            document.
+        experiment_id: Experiment identifier associating this document with its
+            execution history.
+        experiment_folder: Portable experiment folder name used to locate this
+            snapshot's owner.
+        created_at: ISO 8601 creation timestamp in UTC.
+        sequence: Positive monotonically ordered snapshot sequence used for
+            newest-first selection.
+        kind: Regular snapshot or final snapshot taken during terminal shutdown.
+        label: Optional nonempty human-readable snapshot label.
+    """
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -121,7 +138,32 @@ class _SnapshotHeader(BaseModel):
 
 
 class SnapshotManifest(_SnapshotHeader):
-    """Validate the outer document without claiming file or payload integrity."""
+    """Validate the outer document without claiming file or payload integrity.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        snapshot_id: UUID of the snapshot selected or referenced by this
+            document.
+        experiment_id: Experiment identifier associating this document with its
+            execution history.
+        experiment_folder: Portable experiment folder name used to locate this
+            snapshot's owner.
+        created_at: ISO 8601 creation timestamp in UTC.
+        sequence: Positive monotonically ordered snapshot sequence used for
+            newest-first selection.
+        kind: Regular snapshot or final snapshot taken during terminal shutdown.
+        label: Optional nonempty human-readable snapshot label.
+        state: Outer saved-state JSON; SnapshotPayload validates the restoration
+            contract separately.
+        services: Outer export mapping retained as JSON until payload
+            validation.
+        journal: Outer journal metadata retained as JSON until payload
+            validation.
+        directories: Outer directory inventory retained as JSON until payload
+            validation.
+        files: Outer file inventory retained as JSON until payload validation.
+    """
 
     state: JsonValue
     services: JsonValue
@@ -132,17 +174,54 @@ class SnapshotManifest(_SnapshotHeader):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> JsonObject:
+        """Return a validated JSON copy of the outer snapshot manifest.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Detached input for subsequent model validation; recognized typed values
+            are retained where the input contract allows them.
+        """
         return copy_json_object(document, "snapshot manifest")
 
 
 class SnapshotRetentionHeader(_SnapshotHeader):
-    """Sort stored candidates without asserting their payload or file integrity."""
+    """Sort stored candidates without asserting their payload or file integrity.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        snapshot_id: UUID of the snapshot selected or referenced by this
+            document.
+        experiment_id: Experiment identifier associating this document with its
+            execution history.
+        experiment_folder: Portable experiment folder name used to locate this
+            snapshot's owner.
+        created_at: ISO 8601 creation timestamp in UTC.
+        sequence: Positive monotonically ordered snapshot sequence used for
+            newest-first selection.
+        kind: Regular snapshot or final snapshot taken during terminal shutdown.
+        label: Optional nonempty human-readable snapshot label.
+    """
 
     model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
 
 
 class SnapshotMetadata(BaseModel):
-    """The legacy inspection subset, without full restoration/inventory requirements."""
+    """The legacy inspection subset, without full restoration/inventory requirements.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        snapshot_id: UUID of the snapshot selected or referenced by this
+            document.
+        experiment_id: Experiment identifier associating this document with its
+            execution history.
+        state: Historical saved-state object used for inspection, without full
+            restoration validation.
+    """
 
     model_config = ConfigDict(
         extra="allow", strict=True, frozen=True, hide_input_in_errors=True
@@ -156,10 +235,26 @@ class SnapshotMetadata(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> JsonObject:
+        """Return a validated JSON copy of snapshot inspection metadata.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Detached input for subsequent model validation; recognized typed values
+            are retained where the input contract allows them.
+        """
         return copy_json_object(document, "snapshot metadata")
 
 
 class SnapshotFile(BaseModel):
+    """Snapshot file size in bytes and recorded SHA-256 digest.
+
+    Args:
+        size_bytes: Nonnegative file size in bytes.
+        sha256: Expected SHA-256 content digest used when verifying the file.
+    """
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     size_bytes: NonnegativeInteger
@@ -167,6 +262,14 @@ class SnapshotFile(BaseModel):
 
 
 class SnapshotInventory(BaseModel):
+    """Portable snapshot member paths and their expected file metadata.
+
+    Args:
+        directories: Portable snapshot-relative directories beneath files or
+            journal.
+        files: Snapshot member paths mapped to expected size and SHA-256
+            metadata.
+    """
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -177,6 +280,15 @@ class SnapshotInventory(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def validate_collisions(cls, document: object) -> object:
+        """Return inventory input after rejecting case-insensitive path collisions.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Inventory input after rejecting case-insensitive path collisions.
+        """
         if isinstance(document, dict):
             directories, files = document.get("directories"), document.get("files")
             if isinstance(directories, list) and isinstance(files, dict):
@@ -194,6 +306,30 @@ class SnapshotPayload(_SnapshotHeader):
     Original input JSON is retained for the public document facade, preserving
     legacy omissions, field order and schema-three migration representation.
     Runtime operations consume the typed components rather than that JSON.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        snapshot_id: UUID of the snapshot selected or referenced by this
+            document.
+        experiment_id: Experiment identifier associating this document with its
+            execution history.
+        experiment_folder: Portable experiment folder name used to locate this
+            snapshot's owner.
+        created_at: ISO 8601 creation timestamp in UTC.
+        sequence: Positive monotonically ordered snapshot sequence used for
+            newest-first selection.
+        kind: Regular snapshot or final snapshot taken during terminal shutdown.
+        label: Optional nonempty human-readable snapshot label.
+        state: Saved runner execution state associated with this document.
+        services: Service IDs mapped to experiment-relative state exports; None
+            represents a stateless export.
+        journal: Journal snapshot manifest identifying schema, boundary,
+            generation, and checksum.
+        inventory: Validated file/directory inventory whose filesystem integrity
+            is checked separately.
+        encoded_document: Original manifest JSON retained for exact public
+            serialization; excluded from model dumps. Defaults to None.
     """
 
     state: SavedRunnerState
@@ -204,6 +340,12 @@ class SnapshotPayload(_SnapshotHeader):
 
     @model_validator(mode="after")
     def validate_state_references(self) -> Self:
+        """Return the payload after checking the saved cursor and result references.
+
+        Raises:
+            ValueError: Experiment identity, attempt state, DAG cursor, or accepted
+                result references are inconsistent with a restorable snapshot.
+        """
         state = self.state
         if (
             state.experiment_id != self.experiment_id
@@ -234,6 +376,12 @@ class SnapshotPayload(_SnapshotHeader):
 
     @model_validator(mode="after")
     def validate_service_exports(self) -> Self:
+        """Return the payload after checking complete, idle service restoration data.
+
+        Raises:
+            ValueError: Services or definitions disagree, work remains unresolved,
+                or an export required by a service definition is absent.
+        """
         state = self.state
         if set(state.services) != {item.service_id for item in state.template.services}:
             raise ValueError("Snapshot does not describe every service.")
@@ -260,6 +408,11 @@ class SnapshotPayload(_SnapshotHeader):
         return self
 
     def document(self) -> JsonObject:
+        """Return original manifest JSON when retained, otherwise serialize typed data.
+
+        Returns:
+            Original manifest JSON when retained, otherwise serialize typed data.
+        """
         if self.encoded_document is not None:
             return copy_json_object(
                 json.loads(self.encoded_document), "snapshot manifest"
@@ -284,6 +437,33 @@ class SnapshotPayload(_SnapshotHeader):
 
 
 class RestoreTransaction(BaseModel):
+    """Persisted restoration phase, source/target identity, and stopped checkpoint.
+
+    Args:
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+        restoration_id: UUID identifying one resumable restoration transaction.
+        experiment_id: Experiment identifier associating this document with its
+            execution history.
+        target_folder: Single folder name identifying the restoration target
+            under the project store.
+        source_folder: Single folder name identifying the source experiment
+            under the project store.
+        snapshot_id: UUID of the snapshot selected or referenced by this
+            document.
+        run_id: Logical run identity within experiment history, retained across
+            the relevant execution scope.
+        clone: Whether restoration creates a continuation from another
+            experiment.
+        phase: Persisted restoration step; ambiguous/interrupted service loading
+            requires recovery handling.
+        preserve_diagnostics: Whether failed-rebuild audit exports/workspace are
+            retained after restoration.
+        stopped_state: Validated pre-restoration runner state proving the
+            participant shutdown barrier.
+        owner: Complete OS identity of the process allowed to advance this
+            restoration.
+    """
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -312,6 +492,16 @@ class RestoreTransaction(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> JsonObject:
+        """Return a validated JSON copy of a restoration transaction marker.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Detached input for subsequent model validation; recognized typed values
+            are retained where the input contract allows them.
+        """
         return copy_json_object(document, "restore transaction")
 
 
@@ -320,6 +510,16 @@ class RestoredServiceObservation(BaseModel):
 
     Missing fields and their JSON values remain permissive until the operation
     compares them with its expected identity and validates the process record.
+
+    Args:
+        experiment_id: Experiment identifier associating this document with its
+            execution history. Defaults to None.
+        participant_id: UUID of the stage or service represented by the
+            participant. Defaults to None.
+        participant_instance_id: UUID distinguishing this particular participant
+            process/attempt from replacements. Defaults to None.
+        process: Full OS identity of the observed process, or None when no
+            process is known. Defaults to None.
     """
 
     model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
@@ -332,4 +532,14 @@ class RestoredServiceObservation(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> JsonObject:
+        """Return a validated JSON copy of an interrupted-restore service observation.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Detached input for subsequent model validation; recognized typed values
+            are retained where the input contract allows them.
+        """
         return copy_json_object(document, "restored service observation")

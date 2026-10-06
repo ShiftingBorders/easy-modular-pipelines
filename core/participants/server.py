@@ -32,6 +32,11 @@ from core.primitives.processes import process_identity, process_running
 
 
 class ParticipantServer:
+    """Serve authenticated runner/module requests and journal participant outcomes.
+
+    The caller owns the logger and application lifecycle. Start and close are
+    explicit; close must be invoked by the owner after a request handler returns.
+    """
     def __init__(
         self,
         endpoint_path: Path,
@@ -43,6 +48,20 @@ class ParticipantServer:
         describe: Callable[[], JsonObject] | None = None,
         control_timeout_seconds: float = 30,
     ) -> None:
+        """Initialize protocol state and bind caller-owned handlers and logger.
+
+        Args:
+            endpoint_path: Absolute destination for the published endpoint document.
+            context: Participant identity and journal context.
+            logger: Open logger owned by the caller.
+            handler: Async application/control request handler.
+            module_handler: Optional async handler for module-client reports.
+            describe: Optional synchronous callback extending command-state data.
+            control_timeout_seconds: Positive handshake and control-reply timeout.
+
+        Raises:
+            ValueError: Endpoint path, identity, or timeout is invalid.
+        """
         self.endpoint_path = Path(endpoint_path)
         if not self.endpoint_path.is_absolute():
             raise ValueError("endpoint_path must be absolute.")
@@ -72,6 +91,12 @@ class ParticipantServer:
         )
 
     async def start(self) -> None:
+        """Listen on loopback and publish this instance's endpoint and secret token.
+
+        Raises:
+            RuntimeError: This instance was started/closed or the endpoint has a live owner.
+            OSError: Token/endpoint publication or listener creation fails.
+        """
         if self._server is not None or self._stopping:
             raise RuntimeError(
                 "Start requires a new, open participant server instance."
@@ -103,6 +128,12 @@ class ParticipantServer:
             raise
 
     def _check_previous_endpoint(self, previous: JsonObject) -> None:
+        """Reject replacement of an endpoint still owned by the recorded live process.
+
+        Args:
+            previous: Previously published endpoint JSON whose process ownership
+                must be checked.
+        """
         identity = previous.get("process")
         if isinstance(identity, dict):
             try:
@@ -122,6 +153,13 @@ class ParticipantServer:
                     raise
 
     async def _send(self, writer: asyncio.StreamWriter, message: JsonObject) -> None:
+        """Write one frame to a connected client under that client's write lock.
+
+        Args:
+            writer: Connected asyncio stream writer owned by the participant server.
+            message: Complete JSON frame to send under the selected client's write
+                lock.
+        """
         entry = self._clients.get(writer)
         if entry is None:
             raise ConnectionError("Participant client disconnected.")
@@ -130,6 +168,13 @@ class ParticipantServer:
             await writer.drain()
 
     async def notify_modules(self, command: str, data: JsonObject) -> None:
+        """Send a notification to module clients, aborting connections that cannot receive it.
+
+        Args:
+            command: Notification name understood by connected module clients, such
+                as cancel.
+            data: JSON payload recorded or sent by this operation.
+        """
         for writer, (role, _) in list(self._clients.items()):
             if role == "module":
                 try:
@@ -147,9 +192,17 @@ class ParticipantServer:
                     writer.transport.abort()
 
     def has_module_client(self) -> bool:
+        """Return whether an authenticated module client is currently connected."""
         return any(role == "module" for role, _ in self._clients.values())
 
     async def _handle_client(self, reader, writer) -> None:
+        """Authenticate a client, admit fresh requests, and clean up its reply tasks.
+
+        Args:
+            reader: Accepted asyncio stream reader used to receive length-prefixed
+                JSON frames.
+            writer: Connected asyncio stream writer owned by the participant server.
+        """
         task = asyncio.current_task()
         self._client_tasks.add(task)
         replies: set[asyncio.Task] = set()
@@ -207,6 +260,13 @@ class ParticipantServer:
             self._client_tasks.discard(task)
 
     async def _reply(self, writer, role: str, request: ParticipantRequest) -> None:
+        """Route a validated request and send its response, retaining handler failures.
+
+        Args:
+            writer: Connected asyncio stream writer owned by the participant server.
+            role: Authenticated client role, runner or module.
+            request: Validated request envelope assigned to this handler.
+        """
         try:
             command = request.command
             if role == "module":
@@ -264,7 +324,15 @@ class ParticipantServer:
     def _start_work(
         self, request: ParticipantRequest
     ) -> asyncio.Task[ParticipantResult]:
-        """Bind queued metadata and its public callback document before execution."""
+        """Bind queued metadata and its public callback document before execution.
+
+        Args:
+            request: Validated request envelope assigned to this handler.
+
+        Returns:
+            Tracked task executing/journaling the request independently of whether
+            its client remains connected.
+        """
         request_id = request.request_id
         self._requests[request_id] = CommandWork(
             request_id=request_id, command=request.command
@@ -278,6 +346,11 @@ class ParticipantServer:
         return job
 
     def _command_state(self) -> JsonObject:
+        """Return described participant state with current and pending command identities.
+
+        Returns:
+            Described participant state with current and pending command identities.
+        """
         response = {
             "result": "success",
             "data": {
@@ -297,6 +370,16 @@ class ParticipantServer:
     async def _handle_control(
         self, request: JsonObject, command: str
     ) -> ParticipantResult:
+        """Run a control handler and journal interrupt/shutdown outcomes.
+
+        Args:
+            request: Detached validated control request.
+            command: Heartbeat, interrupt, or shutdown command name.
+
+        Returns:
+            Validated handler result after cancelling matching work on successful
+            interruption/shutdown. Shutdown also closes admission of new work.
+        """
         if command == "shutdown":
             self._stopping = True
         response = await self._handler(request)
@@ -324,6 +407,12 @@ class ParticipantServer:
     def _observe_work(
         self, request: JsonObject, task: asyncio.Task[ParticipantResult]
     ) -> None:
+        """Record pre-start cancellation, retain task failure, and signal call completion.
+
+        Args:
+            request: Validated request envelope assigned to this handler.
+            task: Working request task whose completion/cancellation is observed.
+        """
         request_id = request["request_id"]
         if task.cancelled():
             # A task cancelled before its first instruction never reaches finally.
@@ -344,12 +433,31 @@ class ParticipantServer:
         self._completed.setdefault(request_id, asyncio.Event()).set()
 
     def has_call(self, request_id: str) -> bool:
+        """Return whether a call is tracked as running, queued, or completed.
+
+        Args:
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+
+        Returns:
+            Whether a call is tracked as running, queued, or completed.
+        """
         completed = self._completed.get(request_id)
         return request_id in self._work or (
             completed is not None and completed.is_set()
         )
 
     def _call_context(self, request: JsonObject) -> JsonObject:
+        """Merge base/call context while preserving server identity and the request ID.
+
+        Args:
+            request: Detached handler request whose execute context may extend base
+                context.
+
+        Returns:
+            Merged journal context with server-owned identity and request ID
+            overriding caller-supplied values.
+        """
         call_context = (
             request["args"].get("context", {})
             if request["command"] == "execute"
@@ -365,6 +473,18 @@ class ParticipantServer:
     async def _run_work(
         self, request: ParticipantRequest, handler_request: JsonObject
     ) -> ParticipantResult:
+        """Serialize application work and journal its outcome before reporting completion.
+
+        Args:
+            request: Validated request with identity and optional queue deadline.
+            handler_request: Corresponding JSON request passed to the application.
+
+        Returns:
+            Validated result, including failures for queue timeout or handler errors.
+
+        The queue deadline bounds lock acquisition; the handler owns stopping its
+        external work. Journal failures are retained and propagated.
+        """
         request_id = request.request_id
         acquired = False
         try:
@@ -431,11 +551,29 @@ class ParticipantServer:
             self._completed.setdefault(request_id, asyncio.Event()).set()
 
     async def wait_completed(self, request_id: str) -> None:
+        """Wait for a request's completion signal and propagate any server failure.
+
+        The completion signal is separate from network reply delivery. After it is
+        set, any retained server/journal failure is re-raised to the lifecycle
+        owner.
+
+        Args:
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+        """
         await self._completed.setdefault(request_id, asyncio.Event()).wait()
         if self._failure is not None:
             raise self._failure
 
     async def close(self) -> None:
+        """Stop admission, drain control replies, and release owned tasks and endpoint files.
+
+        The caller remains responsible for the logger and application resources.
+        A replacement instance's endpoint is preserved.
+
+        Raises:
+            RuntimeError: Called from a reply handler instead of the owning lifecycle.
+        """
         if asyncio.current_task() in self._reply_commands:
             raise RuntimeError(
                 "Close the server from its owner, after the request handler returns."

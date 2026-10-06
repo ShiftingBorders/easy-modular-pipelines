@@ -9,6 +9,19 @@ from core.models.values import PositiveInteger, PositiveNumber, SchemaVersionOne
 
 class ClientConnectionConfiguration(BaseModel):
     # Explicit CLI overrides historically preserve extra fields in the returned dict.
+    """CLI connection settings with timeout, polling, and response limits.
+
+    Args:
+        server_url: HTTP(S) API base URL without credentials, query, or
+            fragment.
+        token_env: Environment-variable name holding the bearer token; None
+            disables token lookup.
+        request_timeout_seconds: Positive HTTP request timeout in seconds.
+        wait_timeout_seconds: Maximum seconds the client waits for command
+            completion.
+        poll_interval_seconds: Seconds between command-result polls.
+        max_response_bytes: Maximum permitted encoded response size in bytes.
+    """
     model_config = ConfigDict(extra="allow", frozen=True, hide_input_in_errors=True)
 
     server_url: Text
@@ -21,6 +34,17 @@ class ClientConnectionConfiguration(BaseModel):
     @field_validator("server_url")
     @classmethod
     def validate_server_url(cls, value: str) -> str:
+        """Return an HTTP(S) base URL without credentials, query, or fragment.
+
+        Args:
+            value: Configured server URL.
+
+        Returns:
+            The unchanged URL after validating its scheme, host, and port.
+
+        Raises:
+            ValueError: The URL contains unsupported components or an invalid port.
+        """
         url = urlsplit(value)
         if (
             url.scheme not in ("http", "https")
@@ -39,6 +63,20 @@ class ClientConnectionConfiguration(BaseModel):
 
 
 class ClientConfiguration(ClientConnectionConfiguration):
-    """The on-disk configuration adds a required version to connection values."""
+    """The on-disk configuration adds a required version to connection values.
+
+    Args:
+        server_url: HTTP(S) API base URL without credentials, query, or
+            fragment.
+        token_env: Environment-variable name holding the bearer token; None
+            disables token lookup.
+        request_timeout_seconds: Positive HTTP request timeout in seconds.
+        wait_timeout_seconds: Maximum seconds the client waits for command
+            completion.
+        poll_interval_seconds: Seconds between command-result polls.
+        max_response_bytes: Maximum permitted encoded response size in bytes.
+        schema_version: Persisted document format version; only the versions
+            declared by this model are accepted.
+    """
 
     schema_version: SchemaVersionOne

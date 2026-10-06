@@ -21,6 +21,7 @@ from core.primitives.json_values import JsonObject
 
 @dataclass(frozen=True)
 class ReloadLayout:
+    """Compared service/stage definitions, preserved prefix, and next DAG position."""
     old_services: dict[str, ServiceDefinition]
     new_services: dict[str, ServiceDefinition]
     changed_services: set[str]
@@ -32,6 +33,7 @@ class ReloadLayout:
 
 @dataclass(frozen=True)
 class ReloadCursor:
+    """Reload cursor decision and stage IDs whose current results remain valid."""
     next_position: int
     stage_position: int
     pending_advance: bool
@@ -41,6 +43,7 @@ class ReloadCursor:
 
 @dataclass
 class ReloadApplication:
+    """Working reload state, audit operation, workspace, and commit/cleanup progress."""
     template: ExperimentTemplate
     template_yaml: str
     previous: ExperimentTemplate

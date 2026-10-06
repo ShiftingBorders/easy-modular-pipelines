@@ -2,4 +2,4 @@
 
 
 class HashMismatch(Exception):
-    pass
+    """Module contents differ from the expected registered or packaged hash."""

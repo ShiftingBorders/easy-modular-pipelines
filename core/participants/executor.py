@@ -23,7 +23,13 @@ from core.primitives.processes import module_process_arguments, process_identity
 
 
 class StageExecutor:
+    """Own one stage child process and report its observed outcome to the journal."""
     def __init__(self, launch_path: Path) -> None:
+        """Initialize an executor for an absolute launch-file path without starting work.
+
+        Args:
+            launch_path: Absolute JSON path containing executor launch inputs.
+        """
         self._launch_path = Path(launch_path)
         if not self._launch_path.is_absolute():
             raise ValueError("launch_path must be absolute.")
@@ -40,10 +46,16 @@ class StageExecutor:
         self._finished = False
 
     async def run(self) -> None:
+        """Read and validate the fixed launch document, then serve its assigned attempt."""
         launch = StageLaunch.model_validate(read_json(self._launch_path))
         await self._run(launch)
 
     async def _run(self, launch: StageLaunch) -> None:
+        """Open the journal and participant server, serve one call, and clean up ownership.
+
+        Args:
+            launch: Validated fixed participant launch inputs and runtime paths.
+        """
         self._launch = launch
         self._context = launch.context
         self._directory = self._launch_path.parent
@@ -80,6 +92,11 @@ class StageExecutor:
                     self._logger.close()
 
     async def _wait_for_call(self, launch: StageLaunch) -> None:
+        """Await the assigned execute call and record failure if admission never arrives.
+
+        Args:
+            launch: Validated fixed participant launch inputs and runtime paths.
+        """
         request_id = launch.context.request_id
         completed = asyncio.create_task(self._server.wait_completed(request_id))
         started = asyncio.create_task(self._started.wait())
@@ -114,6 +131,11 @@ class StageExecutor:
             )
 
     def _describe(self) -> JsonObject:
+        """Return observed child identity, timing, exit, progress, and module state.
+
+        Returns:
+            Observed child identity, timing, exit, progress, and module state.
+        """
         return {
             "process": None
             if self._process_identity is None
@@ -129,6 +151,15 @@ class StageExecutor:
         }
 
     async def _handle_module(self, request: JsonObject) -> JsonObject:
+        """Accept module status/progress/state commands and return an application response.
+
+        Args:
+            request: Runner request for the assigned call or a control operation.
+
+        Returns:
+            Application response acknowledging status/progress/state, or a failed
+            unsupported-command response.
+        """
         command, data = request["command"], request["args"]
         if command == "module_status":
             return {
@@ -144,6 +175,15 @@ class StageExecutor:
         return {"result": "success", "data": {}}
 
     async def _handle_request(self, request: JsonObject) -> JsonObject:
+        """Handle controls or execute the single call matching the fixed launch inputs.
+
+        Args:
+            request: Runner request for the assigned call or a control operation.
+
+        Returns:
+            Heartbeat/control result or the assigned stage's observed execution
+            result; other calls are rejected.
+        """
         command = request["command"]
         if command == "heartbeat":
             return {"result": "success", "data": self._describe()}
@@ -175,6 +215,15 @@ class StageExecutor:
         return await self._execute(request)
 
     async def _execute(self, request: JsonObject) -> JsonObject:
+        """Run the child, capture output, and combine its result with observed exit state.
+
+        Args:
+            request: Assigned execute request with an optional monotonic deadline.
+
+        Returns:
+            Result envelope with execution metadata. Missing/invalid stdout, nonzero
+            exit, interruption, or executor failure produces a failed result.
+        """
         streams = None
         output = bytearray()
         error = None
@@ -236,6 +285,13 @@ class StageExecutor:
         return {**response.model_dump(exclude_unset=True), "execution": execution}
 
     async def _start_process(self) -> None:
+        """Spawn module code with captured streams and publish its OS identity to disk/journal.
+
+        Captures stdout/stderr and retains the spawned process even when awaiting
+        startup is cancelled. Writes process.json and the journal start event after
+        obtaining OS identity; those records allow later recovery to distinguish
+        ownership from a reused PID.
+        """
         argv, environment = module_process_arguments(self._launch.argv)
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(
@@ -281,6 +337,12 @@ class StageExecutor:
         )
 
     async def _interrupt(self, reason: str) -> None:
+        """Request cooperative cancellation, then terminate or kill within shutdown limits.
+
+        Args:
+            reason: Nonempty reason recorded for the template, interruption, or
+                observation.
+        """
         async with self._stop_lock:
             if not self._finished:
                 self._reason = self._reason or reason

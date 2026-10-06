@@ -53,6 +53,15 @@ class ServerError(Exception):
     """A transport/lifecycle failure, distinct from a completed controller response."""
 
     def __init__(self, code: str, message: str, status: int = 503) -> None:
+        """Store a machine-readable transport error code, message, and HTTP status.
+
+        Args:
+            code: Machine-readable failure category used in the returned outcome.
+            message: Human-readable diagnostic to expose when the operation is
+                rejected.
+            status: HTTP status associated with the transport/lifecycle failure, 503
+                by default.
+        """
         super().__init__(message)
         self.code = code
         self.status = status
@@ -62,10 +71,17 @@ class ProjectLock:
     """Hold an OS lock in the controller process, including during parent failure."""
 
     def __init__(self, root: Path) -> None:
+        """Prepare the project lock-file path without acquiring or opening it."""
         self.path = root / "controller/server.lock"
         self.stream: BinaryIO | None = None
 
     def __enter__(self) -> Self:
+        """Acquire the project OS lock without traversing filesystem links and return self.
+
+        Returns:
+            This lock owner after opening the lock file and acquiring the platform
+            OS lock; close releases ownership.
+        """
         for path in (self.path, *self.path.parents):
             if path.is_symlink() or path.is_junction():
                 raise ValueError("The server lock must not traverse filesystem links.")
@@ -84,6 +100,7 @@ class ProjectLock:
         return self
 
     def __exit__(self, *_error: object) -> None:
+        """Close the lock stream, releasing the operating-system lock."""
         if self.stream is not None:
             # Closing releases the OS lock even when cleanup raised an exception.
             self.stream.close()
@@ -564,7 +581,14 @@ def controller_process(
 
 
 class CommandRecord:
+    """Retained request fingerprint, submission time, and optional cached outcome."""
     def __init__(self, command: ServerCommand, chain_id: str | None = None) -> None:
+        """Fingerprint a validated request and initialize pending-result accounting.
+
+        Args:
+            command: Validated command whose normalized JSON is fingerprinted.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+        """
         self.request = command
         document = command.model_dump(exclude_none=True)
         if chain_id is not None:
@@ -588,6 +612,15 @@ class ServerRuntime:
     def __init__(
         self, settings: ServerSettings, *, stop_http: Callable[[], None] | None = None
     ) -> None:
+        """Initialize controller ownership and receipt tracking without starting a process.
+
+        Args:
+            settings: Validated runtime settings.
+            stop_http: Optional owner callback requesting graceful HTTP shutdown.
+
+        Raises:
+            TypeError: The supplied shutdown callback is not callable.
+        """
         self.settings = settings
         if stop_http is not None and not callable(stop_http):
             raise TypeError("stop_http must be a callable or None.")
@@ -619,6 +652,15 @@ class ServerRuntime:
         self._http_closing = False
 
     async def start(self, *, restart_command: ServerCommand | None = None) -> None:
+        """Spawn the controller and await readiness, or execute an admitted lifecycle command.
+
+        Args:
+            restart_command: Previously admitted lifecycle command, or None for startup.
+
+        Raises:
+            RuntimeError: Startup is repeated or a lifecycle command bypasses admission.
+            TimeoutError: Controller readiness exceeds the startup timeout.
+        """
         if restart_command is not None:
             return await self._run_lifecycle_command(restart_command)
         if self._state != "new":
@@ -660,6 +702,12 @@ class ServerRuntime:
             raise
 
     async def _run_lifecycle_command(self, restart_command: ServerCommand) -> None:
+        """Stop/replace the controller or stop HTTP, retaining the lifecycle receipt.
+
+        Args:
+            restart_command: Previously admitted restart, mode-change, or shutdown
+                command.
+        """
         if restart_command is not self._restart_command:
             raise RuntimeError("Admit server lifecycle commands through submit first.")
         previous_id = self._runtime_id
@@ -744,7 +792,12 @@ class ServerRuntime:
                 self._state = "closed"
 
     async def _close_for_lifecycle(self) -> None:
-        """Confirm shutdown before replacing queues, even when the owner is cancelled."""
+        """Confirm shutdown before replacing queues, even when the owner is cancelled.
+
+        Shields the owned shutdown task and waits for its actual outcome before
+        propagating caller cancellation. Failed shutdown records restart_blocked, so
+        no replacement can reuse unconfirmed ownership.
+        """
         shutdown = asyncio.create_task(self.close(restarting=True))
         cancelled = False
         try:
@@ -766,7 +819,12 @@ class ServerRuntime:
                 raise asyncio.CancelledError
 
     async def _start_replacement_runtime(self) -> None:
-        """Open a new runtime only after the previous owner has confirmed exit."""
+        """Open a new runtime only after the previous owner has confirmed exit.
+
+        Allocates a new runtime ID, resets IPC/watchdog/readiness state, and awaits
+        ordinary startup. HTTP-owned command records and server instance identity
+        remain retained across replacement.
+        """
         self._runtime_id = str(uuid4())
         self._reader_stop = threading.Event()
         self._reader_thread = None
@@ -781,6 +839,12 @@ class ServerRuntime:
         await self.start()
 
     def health(self) -> JsonObject:
+        """Return current controller liveness, runtime identity, admission state, and errors.
+
+        Returns:
+            Current controller liveness, runtime identity, admission state, and
+            errors.
+        """
         alive = self._process is not None and self._process.is_alive()
         return {
             "server_instance_id": self.instance_id,
@@ -805,6 +869,11 @@ class ServerRuntime:
         }
 
     def _require_ready(self) -> Queue:
+        """Return the live controller queue or raise ServerError when unavailable.
+
+        Returns:
+            The live controller queue or raise ServerError when unavailable.
+        """
         if (
             self._closing
             or self._restart_command is not None
@@ -819,11 +888,30 @@ class ServerRuntime:
         return self._requests
 
     def _command(self, value: object, *, chain_id: str | None = None) -> JsonObject:
+        """Validate command input and serialize it with an optional chain identity.
+
+        Args:
+            value: Raw command envelope validated before IPC serialization.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+
+        Returns:
+            Detached wire command with optional chain identity, after command
+            validation.
+        """
         return self._command_document(ServerCommand.model_validate(value), chain_id)
 
     def _command_document(
         self, command: ServerCommand, chain_id: str | None
     ) -> JsonObject:
+        """Serialize a validated command, rejecting lifecycle commands inside chains.
+
+        Args:
+            command: Validated command model with defaults and normalized identity.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+
+        Returns:
+            Wire command excluding None fields and including the optional chain ID.
+        """
         if chain_id is not None and command.command.startswith("server."):
             raise ValueError("Runtime lifecycle commands do not accept chains or targets.")
         document = command.model_dump(exclude_none=True)
@@ -832,7 +920,25 @@ class ServerRuntime:
         return document
 
     def submit(self, document: object, *, chain: bool = False) -> JsonObject:
-        """Validate and enqueue without awaiting: disconnect cannot split admission."""
+        """Validate and enqueue without awaiting: disconnect cannot split admission.
+
+        Args:
+            document: Single command or chain input to detach and validate before
+                admission.
+            chain: Whether the input is a command-chain envelope rather than a
+                single command.
+
+        Returns:
+            Immediate command or chain receipt. A matching retained submission
+            reuses the receipt; admission does not imply controller execution or DAG
+            completion.
+
+        Raises:
+            ValueError: Envelope, chain membership, or command identifiers are
+                invalid.
+            ServerError: Mode, retained-ID conflicts, capacity, lifecycle ownership,
+                or controller availability rejects admission.
+        """
         self._prune()
         chain_id, commands, submission = self._normalize_submission(document, chain)
         message = self._submission_document(submission)
@@ -885,6 +991,12 @@ class ServerRuntime:
     def _check_submission_identifiers(
         self, identifiers: list[str], chain_id: str | None
     ) -> None:
+        """Reject duplicate command IDs and conflicts with active reads or retained chains.
+
+        Args:
+            identifiers: Normalized command UUIDs in submitted order.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+        """
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("Command IDs in a chain must be distinct.")
         if any(identifier in self._reads for identifier in identifiers):
@@ -907,6 +1019,17 @@ class ServerRuntime:
     def _is_retained_submission(
         self, identifiers: list[str], records: list[CommandRecord]
     ) -> bool:
+        """Return whether every request matches retained fingerprints, rejecting conflicts.
+
+        Args:
+            identifiers: Normalized command UUIDs in submitted order.
+            records: Prepared command records with request fingerprints for replay
+                comparison.
+
+        Returns:
+            Whether every request matches retained fingerprints, rejecting
+            conflicts.
+        """
         existing = [identifier in self._records for identifier in identifiers]
         if any(existing):
             if not all(existing) or any(
@@ -924,6 +1047,12 @@ class ServerRuntime:
     def _check_submission_mode(self, commands: list[ServerCommand]) -> None:
         # Replaying a retained request retrieves its receipt across mode changes;
         # only new work is subject to the current runtime's admission policy.
+        """Reject new module/service operations incompatible with the current server mode.
+
+        Args:
+            commands: Validated commands being considered for admission in their
+                submitted order.
+        """
         for command in commands:
             name = command.command
             if (
@@ -946,6 +1075,16 @@ class ServerRuntime:
     def _check_submission_capacity(
         self, count: int, chain_id: str | None, priority_stop: bool, lifecycle: bool
     ) -> None:
+        """Check pending/record capacity, reserving admission for stop or lifecycle work.
+
+        Args:
+            count: Number of new command records required by this submission.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+            priority_stop: Whether this is the standalone stop allowed to use
+                reserved admission capacity.
+            lifecycle: Whether admission is for an HTTP-owned runtime lifecycle
+                command.
+        """
         if chain_id is not None and chain_id in self._chains:
             raise ServerError(
                 "chain_id_conflict",
@@ -976,6 +1115,18 @@ class ServerRuntime:
     def _normalize_submission(
         self, document: object, chain: bool
     ) -> tuple[str | None, list[ServerCommand], ServerChain | ServerCommand]:
+        """Detach and validate one command or chain and return its ID, commands, and model.
+
+        Args:
+            document: Single command or chain input to detach and validate before
+                admission.
+            chain: Whether the input is a command-chain envelope rather than a
+                single command.
+
+        Returns:
+            Optional chain UUID, ordered detached validated commands, and the
+            corresponding single-command/chain model.
+        """
         chain_id = None
         if chain:
             validated = (
@@ -997,7 +1148,16 @@ class ServerRuntime:
     def _submission_document(
         self, submission: ServerChain | ServerCommand
     ) -> JsonObject:
-        """Materialize the original wire shape for size checks and IPC."""
+        """Materialize the original wire shape for size checks and IPC.
+
+        Args:
+            submission: Detached validated single command or ordered chain to
+                serialize for IPC.
+
+        Returns:
+            IPC document for the single command or ordered chain, with child chain
+            IDs bound.
+        """
         if isinstance(submission, ServerChain):
             return {
                 "api_version": 1,
@@ -1010,6 +1170,12 @@ class ServerRuntime:
         return self._command_document(submission, None)
 
     def _admit_lifecycle_command(self, commands: list[ServerCommand]) -> None:
+        """Check lifecycle exclusivity, HTTP owner support, and restart readiness.
+
+        Args:
+            commands: Validated commands being considered for admission in their
+                submitted order.
+        """
         if self._restart_command is not None:
             raise ServerError(
                 "shutdown_pending"
@@ -1032,6 +1198,15 @@ class ServerRuntime:
             raise ServerError("restart_blocked", self._restart_blocked, 409)
 
     def _receipt(self, identifiers: list[str], chain_id: str | None) -> JsonObject:
+        """Return a command receipt or a validated aggregate receipt for a chain.
+
+        Args:
+            identifiers: Normalized command UUIDs in submitted order.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+
+        Returns:
+            A command receipt or a validated aggregate receipt for a chain.
+        """
         if chain_id is None:
             return self.result(identifiers[0])
         receipt = ChainReceipt.model_validate(
@@ -1045,9 +1220,30 @@ class ServerRuntime:
         return copy_json_object(receipt.model_dump(exclude_unset=True), "receipt")
 
     def result(self, command_id: str) -> JsonObject:
+        """Read the retained receipt for a command without submitting new work.
+
+        Args:
+            command_id: UUID of the admitted command.
+
+        Returns:
+            Current receipt, including a pending state if no outcome is known.
+
+        Raises:
+            ServerError: The ID is unknown or expired; this does not prove nonexecution.
+            ValueError: The ID is not a UUID.
+        """
         return self._result(command_id).model_dump(exclude_unset=True)
 
     def _result(self, command_id: str) -> CommandReceipt:
+        """Prune expired records and construct the typed receipt for one command UUID.
+
+        Args:
+            command_id: UUID of the retained API command.
+
+        Returns:
+            Current retained CommandReceipt with server/submission metadata,
+            including pending when no outcome is known.
+        """
         identifier = str(UUID(command_id))
         self._prune()
         record = self._records.get(identifier)
@@ -1084,12 +1280,36 @@ class ServerRuntime:
         state: str | None = None,
         command: str | None = None,
     ) -> JsonObject:
+        """List retained commands in submission order with optional filters.
+
+        Args:
+            after: Exclusive retained command UUID cursor, or None for the first page.
+            limit: Page size from 1 to 1000.
+            state: Optional command-state filter.
+            command: Optional exact command-name filter.
+
+        Returns:
+            Items, continuation metadata, and server-instance identity.
+
+        Raises:
+            ServerError: The continuation command is unknown or expired.
+            ValueError: Query arguments are invalid.
+        """
         arguments = CommandListArguments.model_validate(
             {"limit": limit, "state": state, "command": command, "after": after}
         )
         return self._list_commands(arguments)
 
     def _list_commands(self, arguments: CommandListArguments) -> JsonObject:
+        """Page and filter retained records using validated command-history arguments.
+
+        Args:
+            arguments: Validated arguments for the selected read/control operation.
+
+        Returns:
+            Filtered retained command metadata, has_more, optional next_after
+            cursor, and server instance identity.
+        """
         self._prune()
         entries = list(self._records.items())
         if arguments.after is not None:
@@ -1133,6 +1353,20 @@ class ServerRuntime:
         }
 
     async def read(self, name: str, args: JsonObject | None = None) -> JsonObject:
+        """Request a fresh controller read with bounded concurrency and timeout.
+
+        Args:
+            name: Command name starting with stats. or logs.
+            args: Optional JSON read arguments.
+
+        Returns:
+            Controller outcome document; a completed read may itself report failure.
+
+        Raises:
+            ValueError: The command is not a read.
+            ServerError: The controller is unavailable, capacity is exhausted, or
+                the response does not arrive before the read timeout.
+        """
         requests = self._require_ready()
         if not name.startswith(("stats.", "logs.")):
             raise ValueError("Only controller read commands use this channel.")
@@ -1174,6 +1408,11 @@ class ServerRuntime:
                 future.cancel()
 
     def _read_responses(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Forward IPC responses from a dedicated reader thread with runtime identity.
+
+        Args:
+            loop: Owning asyncio event loop receiving thread-safe IPC callbacks.
+        """
         responses = self._responses
         reader_stop = self._reader_stop
         runtime_id = self._runtime_id
@@ -1198,6 +1437,12 @@ class ServerRuntime:
                     pass
 
     async def _watch_process(self) -> None:
+        """Observe controller exit independently of IPC and mark its runtime unavailable.
+
+        Polls the owned process handle independently of the potentially blocked IPC
+        reader. Exit marks only the captured runtime unavailable; a stale watchdog
+        cannot invalidate a replacement runtime.
+        """
         process = self._process
         runtime_id = self._runtime_id
         if process is None:
@@ -1209,6 +1454,13 @@ class ServerRuntime:
         )
 
     def _accept_response(self, message: object, runtime_id: str | None = None) -> None:
+        """Validate a response from the current runtime and dispatch lifecycle/outcome data.
+
+        Args:
+            message: Raw controller IPC message or typed command outcome.
+            runtime_id: Identity of the runtime producing the callback; stale-
+                runtime callbacks are ignored.
+        """
         if self._state == "closed" or (
             runtime_id is not None and runtime_id != self._runtime_id
         ):
@@ -1229,6 +1481,11 @@ class ServerRuntime:
             self._unavailable(f"Invalid controller response: {error}")
 
     def _accept_command_response(self, outcome: ControllerOutcome) -> None:
+        """Resolve a read or retain a bounded result without replacing known outcomes.
+
+        Args:
+            outcome: Validated controller command outcome.
+        """
         identifier = str(UUID(outcome.command_id))
         response, encoded_size = self._bounded_response(outcome, identifier)
         if self._accept_read_response(identifier, response):
@@ -1249,6 +1506,16 @@ class ServerRuntime:
     def _bounded_response(
         self, outcome: ControllerOutcome, identifier: str
     ) -> tuple[ControllerOutcome | RuntimeCommandOutcome, int]:
+        """Return the outcome and byte size, substituting metadata for oversized responses.
+
+        Args:
+            outcome: Validated controller command outcome.
+            identifier: Normalized command UUID used for receipt correlation.
+
+        Returns:
+            The outcome and byte size, substituting metadata for oversized
+            responses.
+        """
         response = outcome.model_dump(exclude_unset=True)
         encoded_size = len(
             json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -1275,6 +1542,18 @@ class ServerRuntime:
         )
 
     def _accept_runtime_response(self, response: JsonObject, kind: object) -> bool:
+        """Apply ready/stopped/error notices and report whether the message was handled.
+
+        Args:
+            response: Private controller lifecycle notification before its
+                specialized validation.
+            kind: Private runtime notification discriminator extracted from the IPC
+                message.
+
+        Returns:
+            True for a handled ready/stopped/error lifecycle message; False when the
+            caller should treat the document as a command outcome.
+        """
         if kind == "ready":
             if self._closing or self._process is None or not self._process.is_alive():
                 return True
@@ -1289,6 +1568,7 @@ class ServerRuntime:
         return False
 
     def _accept_runtime_ready(self, notice: RuntimeReady) -> None:
+        """Store controller/storage metadata and resolve the startup readiness future."""
         self._identity = notice.process
         self._storage = notice.storage
         self._state = "ready"
@@ -1298,6 +1578,16 @@ class ServerRuntime:
     def _accept_read_response(
         self, identifier: str, response: ControllerOutcome | RuntimeCommandOutcome
     ) -> bool:
+        """Resolve a matching unfinished read and return whether a waiter was found.
+
+        Args:
+            identifier: Normalized command UUID used for receipt correlation.
+            response: Participant/controller result envelope being processed.
+
+        Returns:
+            True when a live matching waiter was resolved, otherwise False so
+            command-result handling can continue.
+        """
         waiter = self._reads.get(identifier)
         if waiter is not None and not waiter.done():
             waiter.set_result(response)
@@ -1305,6 +1595,14 @@ class ServerRuntime:
         return False
 
     def _unavailable(self, message: str, runtime_id: str | None = None) -> None:
+        """Fail live reads and mark unfinished command outcomes unknown for this runtime.
+
+        Args:
+            message: Transport/lifecycle failure explaining why fresh reads and
+                pending results are unavailable.
+            runtime_id: Identity of the runtime producing the callback; stale-
+                runtime callbacks are ignored.
+        """
         if self._state == "closed" or (
             runtime_id is not None and runtime_id != self._runtime_id
         ):
@@ -1342,6 +1640,11 @@ class ServerRuntime:
         self._prune()
 
     def _prune(self, *, required: int = 0) -> None:
+        """Evict finished receipts by age/capacity and remove chains with no retained members.
+
+        Args:
+            required: Additional command-record slots to reserve after pruning.
+        """
         now = time.monotonic()
         finished = sorted(
             (
@@ -1364,6 +1667,15 @@ class ServerRuntime:
                 del self._chains[chain_id]
 
     async def close(self, *, restarting: bool = False) -> None:
+        """Stop the owned controller, release IPC, and retain unknown unfinished outcomes.
+
+        Args:
+            restarting: Whether shutdown prepares a replacement runtime while HTTP stays up.
+
+        Raises:
+            RuntimeError: Shutdown required forced termination, the controller exited
+                abnormally, or a previous failure blocks replacement startup.
+        """
         if not restarting and asyncio.current_task() is not self._restart_task:
             self._http_closing = True
             if self._restart_task is not None and not self._restart_task.done():
@@ -1425,6 +1737,14 @@ class ServerRuntime:
     async def _close_runtime_channels(
         self, process: BaseProcess | None, restarting: bool
     ) -> None:
+        """Release watchdog/IPC resources and record a reader that blocks safe restart.
+
+        Args:
+            process: Owned process handle used to observe exit without trusting a
+                bare PID.
+            restarting: Whether channel closure prepares replacement while the HTTP
+                owner remains running.
+        """
         if self._watcher is not None:
             self._watcher.cancel()
             await asyncio.gather(self._watcher, return_exceptions=True)

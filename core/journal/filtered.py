@@ -42,6 +42,15 @@ class FilteredJournal:
     """One caller-owned publisher; no implicit threads, timers or filesystem I/O."""
 
     def __init__(self, config_path: str | Path, view_path: str | Path) -> None:
+        """Initialize a derived-view publisher without opening source or view storage.
+
+        Args:
+            config_path: Absolute configuration path for an existing primary journal.
+            view_path: Absolute path for the disposable filtered SQLite database.
+
+        Raises:
+            ValueError: Either path is relative or contains a null character.
+        """
         self._config_path = Path(config_path)
         self.view_path = Path(view_path)
         for path in (self._config_path, self.view_path):
@@ -57,15 +66,26 @@ class FilteredJournal:
         self._last_error: JsonObject | None = None
 
     def _check_process(self) -> None:
+        """Reject using the publisher from a process other than its creator."""
         if os.getpid() != self._process_id:
             raise LoggingStateError("Create a filtered journal in this process.")
 
     def _require_open(self) -> None:
+        """Require the owning process and an open primary logger."""
         self._check_process()
         if self._logger is None:
             raise LoggingStateError("Filtered journal is closed.")
 
     def open(self) -> None:
+        """Open the primary journal and attempt to open its separate derived database.
+
+        Derived-storage failures are journaled for fallback reads; primary-journal
+        failures propagate to the caller.
+
+        Raises:
+            LoggingStateError: The publisher is already open or belongs to another process.
+            ValueError: The source is not existing-mode or the view aliases primary files.
+        """
         self._check_process()
         with self._lock:
             if self._logger is not None:
@@ -104,6 +124,13 @@ class FilteredJournal:
                 raise
 
     def _open_view(self) -> None:
+        """Create/open the derived database and check schema, integrity, and WAL support.
+
+        Creates missing parent directories and initializes only a newly reserved
+        derived database. Existing files must match the derived schema, pass
+        quick_check, and support WAL/FULL synchronization; the primary journal is
+        never replaced.
+        """
         if self._connection is not None:
             return
         self.view_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +173,7 @@ class FilteredJournal:
             raise
 
     def _check_view(self) -> None:
+        """Require an open derived database with unchanged file identity and valid schema."""
         if self._connection is None:
             raise LoggingStorageError("No derived database is available.")
         status = self.view_path.stat()
@@ -154,6 +182,11 @@ class FilteredJournal:
         _validate_view_schema(self._connection)
 
     def _metadata(self) -> FilteredPublication | None:
+        """Read validated publication metadata, or return None before first publication.
+
+        Returns:
+            Validated publication metadata, or None when no publication row exists.
+        """
         from core.models.journal_cache import FilteredPublication
 
         row = self._connection.execute(
@@ -164,6 +197,12 @@ class FilteredJournal:
         return FilteredPublication.model_validate(json.loads(row[0]))
 
     def _write_entry(self, entry: JournalEntry) -> None:
+        """Upsert one effective entry into the derived database using original event JSON.
+
+        Args:
+            entry: Validated journal or working-request record consumed by this
+                operation.
+        """
         event = entry.event
         self._connection.execute(
             "INSERT INTO filtered_events VALUES (?, ?, ?, ?, ?) "
@@ -180,6 +219,12 @@ class FilteredJournal:
         )
 
     def _report_refresh_failure(self, error: Exception) -> None:
+        """Journal a changed derived-view failure and retain it for fallback metadata.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+        """
         try:
             message = str(error)
         except BaseException:  # noqa: BLE001 - Exception formatting cannot hide the failure.
@@ -200,6 +245,14 @@ class FilteredJournal:
         return None if publication is None else publication.model_dump()
 
     def _refresh(self) -> FilteredPublication | None:
+        """Publish a consistent effective view from a source snapshot or incremental changes.
+
+        Returns:
+            New/current publication metadata, or None after a reported derived failure.
+
+        Raises:
+            LoggingError: The primary journal is unavailable or its identity changes.
+        """
         from core.models.journal_cache import FilteredPublication
 
         self._check_process()
@@ -335,6 +388,7 @@ class FilteredJournal:
             return publication
 
     def _apply_view_change(self, change: JournalChangeEntry) -> None:
+        """Remove superseded entries and upsert the change's effective event."""
         for event_id in change.change.related_event_ids:
             if event_id != change.change.effective_event_id:
                 self._connection.execute(
@@ -346,6 +400,17 @@ class FilteredJournal:
     def _fallback(
         self, checkpoint: FilteredCheckpoint | None, limit: int
     ) -> JsonObject:
+        """Read primary effective events with a synthetic publication-bound checkpoint.
+
+        Args:
+            checkpoint: Identity-bound exclusive journal cursor, or None to start
+                reading.
+            limit: Maximum page item count, from 1 through 1000.
+
+        Returns:
+            Effective source-journal page with a synthetic publication ID and the
+            latest derived-refresh error, if any.
+        """
         base = (
             None
             if checkpoint is None
@@ -376,6 +441,20 @@ class FilteredJournal:
     def read_events(
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
     ) -> JsonObject:
+        """Read a page from the current filtered publication or the primary fallback.
+
+        Args:
+            checkpoint: Previous publication checkpoint, or None to begin reading.
+            limit: Maximum event count from 1 to 1000.
+
+        Returns:
+            Events, boundary, continuation checkpoint, source, and refresh-error metadata.
+
+        Raises:
+            ValueError: Page limit or checkpoint is invalid.
+            JournalGenerationChanged: The checkpoint belongs to another journal generation.
+            LoggingStateError: The publisher is closed or the publication has changed.
+        """
         self._check_process()
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer from 1 to 1000.")
@@ -463,6 +542,17 @@ class FilteredJournal:
     def _read_derived_page(
         self, after: int, limit: int, metadata: FilteredPublication
     ) -> tuple[list[JsonObject], int, bool]:
+        """Return validated entries, next cursor, and has-more under count/byte limits.
+
+        Args:
+            after: Exclusive cursor after which records are read.
+            limit: Maximum page item count, from 1 through 1000.
+            metadata: Validated filtered publication whose identity/boundary
+                constrains the read.
+
+        Returns:
+            Validated entries, next cursor, and has-more under count/byte limits.
+        """
         entries, size = [], 0
         more = False
         for (
@@ -501,7 +591,12 @@ class FilteredJournal:
         return entries, after, more
 
     def run(self, stop_event: threading.Event) -> None:
-        """Block in a caller-owned thread; primary failures propagate to that caller."""
+        """Block in a caller-owned thread; primary failures propagate to that caller.
+
+        Args:
+            stop_event: Caller-owned event requesting termination of the refresh
+                loop.
+        """
         self._check_process()
         if not isinstance(stop_event, threading.Event):
             raise TypeError("stop_event must be a threading.Event.")
@@ -526,6 +621,14 @@ class FilteredJournal:
     def _close_preserving_primary(
         self, primary: BaseException | None, prefix: str
     ) -> None:
+        """Close resources, attaching cleanup failure to the supplied primary exception.
+
+        Args:
+            primary: Existing exception to preserve while attempting resource
+                cleanup, or None.
+            prefix: Diagnostic prefix used when attaching a secondary cleanup
+                exception.
+        """
         try:
             self.close()
         except BaseException as error:
@@ -537,6 +640,12 @@ class FilteredJournal:
                 pass
 
     def close(self) -> None:
+        """Close derived storage and the primary client, preserving the first close failure.
+
+        Attempts to close both the derived connection and primary logger even if the
+        first close fails. Secondary cleanup failures are attached to the first
+        exception, which is then propagated.
+        """
         self._check_process()
         with self._lock:
             failure = None

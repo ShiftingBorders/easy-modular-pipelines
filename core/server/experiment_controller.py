@@ -52,6 +52,7 @@ from core.storage.errors import (
 
 
 class ExperimentController:
+    """Coordinate run-mode commands, independent reads, and resource monitoring."""
     def __init__(
         self,
         project_root: Path,
@@ -64,6 +65,21 @@ class ExperimentController:
         recovery_required: list[str] | None = None,
         module_manager: ModuleManager | None = None,
     ) -> None:
+        """Bind runner, project readers, IPC queues, and collector supervision.
+
+        Args:
+            project_root: Absolute project directory.
+            runner: Experiment runner controlled by admitted commands.
+            requests: Incoming multiprocessing command queue.
+            responses: Outgoing multiprocessing outcome queue.
+            resource_config_path: Collector config path, or None for repository defaults.
+            shutdown_requested: Optional lifecycle event for private shutdown requests.
+            recovery_required: Experiment IDs restricting admission until recovered.
+            module_manager: Optional manager for module/template reads.
+
+        Raises:
+            ValueError: The project root is relative.
+        """
         self._project_root = Path(project_root)
         if not self._project_root.is_absolute():
             raise ValueError("project_root must be absolute.")
@@ -95,6 +111,12 @@ class ExperimentController:
         )
 
     async def serve(self) -> None:
+        """Start intake, command, response, and collector loops, closing on exit.
+
+        Starts a dedicated IPC reader thread plus command, response, and resource-
+        collector tasks. Registers the runner's resource observer before serving,
+        and closes controller-owned tasks/collector if any loop exits.
+        """
         if self._loops or self._closing:
             raise RuntimeError("Controller is already running or closed.")
         # A parent can die halfway through a multiprocessing queue frame. A
@@ -124,6 +146,11 @@ class ExperimentController:
             await self.close()
 
     def _read_request_queue(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Forward blocking queue input from a dedicated thread to the event loop.
+
+        Args:
+            loop: Owning asyncio event loop receiving thread-safe IPC callbacks.
+        """
         try:
             while not self._intake_stop.is_set():
                 try:
@@ -139,10 +166,18 @@ class ExperimentController:
                     pass
 
     def _intake_failed(self, error: Exception) -> None:
+        """Retain an IPC failure and wake the async intake loop to surface it."""
         self._intake_error = error
         self._incoming.put_nowait(None)
 
     async def _receive_requests(self) -> None:
+        """Validate queue input and admit commands/chains or publish intake failures.
+
+        Validates single commands and chains at the IPC boundary. Private shutdown
+        signals the lifecycle owner, reads run independently, and a standalone stop
+        cancels queued control work. Invalid intake produces a rejection even when
+        no valid command ID is available.
+        """
         while not self._closing:
             request = await self._incoming.get()
             if self._intake_error is not None:
@@ -170,12 +205,24 @@ class ExperimentController:
                 )
 
     def _read_chain(self, request: JsonObject) -> list[ControllerCommand]:
+        """Validate a controller chain and return its ordered commands."""
         chain = ControllerChain.model_validate(request)
         return chain.commands
 
     async def _admit_command(
         self, command: ControllerCommand
     ) -> list[ControllerCommand] | None:
+        """Start independent reads or return queued control work, prioritizing stop.
+
+        Args:
+            command: Validated admitted command envelope with ID, arguments, and
+                optional chain identity.
+
+        Returns:
+            None when a read was launched independently; otherwise a one-command
+            list for serial control. Standalone stop first cancels earlier queued
+            work.
+        """
         if command.command.startswith(("stats.", "logs.")):
             task = asyncio.create_task(self._answer_read(command))
             self._reads.add(task)
@@ -186,6 +233,12 @@ class ExperimentController:
         return [command]
 
     async def _cancel_queued_commands(self) -> None:
+        """Cancel active control and queued chain tails for a standalone stop.
+
+        Clears the current chain tail and queued chains and cancels the active
+        control task. Every removed command receives a cancelled outcome instead of
+        silently disappearing from receipt tracking.
+        """
         cancelled = list(self._active_tail)
         self._active_tail.clear()
         while not self._control_queue.empty():
@@ -202,6 +255,12 @@ class ExperimentController:
             )
 
     async def _execute_commands(self) -> None:
+        """Run admitted command chains serially and cancel each failed chain's tail.
+
+        Executes one admitted control command at a time. A failed command cancels
+        the rest of its chain; independent reads are not serialized through this
+        loop.
+        """
         while not self._closing:
             self._active_tail = await self._control_queue.get()
             while self._active_tail and not self._closing:
@@ -222,6 +281,16 @@ class ExperimentController:
     async def _execute_queued_command(
         self, command: ControllerCommand
     ) -> ControllerOutcome | ControllerRejection:
+        """Track the current command and translate standalone-stop cancellation.
+
+        Args:
+            command: Validated admitted command envelope with ID, arguments, and
+                optional chain identity.
+
+        Returns:
+            Correlated outcome, including a cancellation result when standalone stop
+            interrupts the active command.
+        """
         self._current_command = command
         self._active_task = asyncio.create_task(self._execute_command(command))
         try:
@@ -240,6 +309,16 @@ class ExperimentController:
     async def _execute_command(
         self, command: ControllerCommand
     ) -> ControllerOutcome | ControllerRejection:
+        """Execute a command and convert expected failures into correlated API outcomes.
+
+        Args:
+            command: Validated admitted command envelope with ID, arguments, and
+                optional chain identity.
+
+        Returns:
+            Successful controller outcome or an error-classified rejection/outcome.
+            Mandatory journal failures may first enter the runner's failure path.
+        """
         name = command.command
         try:
             return await self._perform_command(command)
@@ -285,6 +364,16 @@ class ExperimentController:
             )
 
     async def _perform_command(self, command: ControllerCommand) -> ControllerOutcome:
+        """Dispatch reads/controls and update recovery admission after confirmed changes.
+
+        Args:
+            command: Validated admitted command envelope with ID, arguments, and
+                optional chain identity.
+
+        Returns:
+            Succeeded outcome containing read/control data and the selected
+            experiment identity after the action.
+        """
         name = command.command
         if name.startswith(("stats.", "logs.")):
             data = await self._read_request(command)
@@ -330,6 +419,19 @@ class ExperimentController:
     async def _execute_control_command(
         self, name: str, args: JsonObject, command: ControllerCommand
     ) -> JsonObject | None:
+        """Validate command arguments, bind journal context, and invoke the runner.
+
+        Args:
+            name: Command name used to select a runner control method.
+            args: JSON command arguments; mutable inputs are detached at the
+                validation boundary.
+            command: Validated admitted command envelope with ID, arguments, and
+                optional chain identity.
+
+        Returns:
+            The runner method's JSON result, or None for control methods without a
+            payload.
+        """
         invocation = ControlInvocation.model_validate(
             {"command": name, "args": args, "target": command.target}
         )
@@ -379,6 +481,15 @@ class ExperimentController:
         return data
 
     async def _read_request(self, request: ControllerCommand) -> JsonObject:
+        """Dispatch validated experiment, module, resource, state, or journal reads.
+
+        Args:
+            request: Validated read command envelope.
+
+        Returns:
+            Requested module, template, experiment, resource, state, or journal
+            data.
+        """
         args = request.args
         name = request.command
         if name in ("stats.modules", "stats.module", "stats.template"):
@@ -445,14 +556,22 @@ class ExperimentController:
         )
 
     async def _answer_read(self, command: ControllerCommand) -> None:
+        """Execute a read independently and enqueue its outcome for publication."""
         await self._publish_response(await self._execute_command(command))
 
     async def _publish_response(
         self, response: ControllerOutcome | ControllerRejection
     ) -> None:
+        """Append an outcome or intake rejection to the local response outbox."""
         self._outbox.put_nowait(response)
 
     async def _write_responses(self) -> None:
+        """Drain the outbox into bounded multiprocessing IPC until closed.
+
+        Serializes local outbox items and retries bounded IPC insertion while the
+        queue is full. Closing stops delivery; this loop does not execute or replay
+        commands.
+        """
         while not self._closing:
             response = await self._outbox.get()
             document = response.model_dump(exclude_unset=True)
@@ -470,6 +589,21 @@ class ExperimentController:
         message: str,
         error: Exception | None = None,
     ) -> ControllerOutcome | ControllerRejection:
+        """Build a failed/cancelled outcome, allowing missing IDs for rejected intake.
+
+        Args:
+            command: Admitted command envelope or rejected raw intake dictionary,
+                possibly lacking a valid UUID.
+            code: Machine-readable failure category used in the returned outcome.
+            message: Human-readable diagnostic to expose when the operation is
+                rejected.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+
+        Returns:
+            Typed failed/cancelled outcome for admitted work, or a permissive intake
+            rejection when the original command ID was invalid.
+        """
         document = {
             "command_id": command.command_id
             if isinstance(command, ControllerCommand)
@@ -497,6 +631,12 @@ class ExperimentController:
         )
 
     async def close(self) -> None:
+        """Stop controller tasks and resource monitoring and detach the runner observer.
+
+        Cancels owned loops, reads, and current command, detaches the resource
+        observer, closes the collector, and joins the intake thread. The outer
+        lifecycle owner remains responsible for stopping/closing the runner.
+        """
         if self._closing:
             return
         self._closing = True

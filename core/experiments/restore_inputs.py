@@ -11,6 +11,7 @@ from core.models.updates import _update_model
 
 @dataclass(frozen=True)
 class RestorePaths:
+    """Target, workspace, cached snapshot, replacement, and prior-file restore paths."""
     target: Path
     work: Path
     cached: Path

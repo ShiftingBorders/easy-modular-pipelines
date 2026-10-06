@@ -19,6 +19,7 @@ from core.primitives.json_values import JsonObject, copy_json_object
 
 
 class _Document(BaseModel):
+    """Detached collector IPC document preserving additional message fields."""
     model_config = ConfigDict(
         extra="allow", strict=True, frozen=True, hide_input_in_errors=True
     )
@@ -26,16 +27,46 @@ class _Document(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> JsonObject:
+        """Return a validated JSON copy of a collector document.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Detached input for subsequent model validation; recognized typed values
+            are retained where the input contract allows them.
+        """
         return copy_json_object(document, "collector document")
 
 
 class CollectorSnapshot(_Document):
+    """Selected journal context, logging configuration, and monitored processes.
+
+    Args:
+        context: Validated journal context identifying the experiment and
+            participant scope.
+        logging_config_path: Logger configuration path for the existing shared
+            journal.
+        targets: Processes to monitor, each with a full expected identity and
+            journal context.
+    """
     context: ResourceContext
     logging_config_path: AbsolutePath | None
     targets: list[ResourceTargetDocument]
 
 
 class CollectorRestart(_Document):
+    """Restart reason, previous collector identity, and diagnostic context.
+
+    Args:
+        reason: Machine-readable explanation for collector replacement.
+        error: Human-readable diagnostic from the failed collector/supervisor.
+        previous_collector_id: Previous collector UUID, or None when no earlier
+            identity is known.
+        context: Validated journal context identifying the experiment and
+            participant scope.
+    """
     reason: Text
     error: str
     previous_collector_id: UUIDText | None
@@ -43,6 +74,16 @@ class CollectorRestart(_Document):
 
 
 class CollectorUpdate(_Document):
+    """Revisioned collector configuration update with an optional restart notice.
+
+    Args:
+        command: IPC discriminator, fixed to update.
+        revision: Nonnegative target revision used to reject obsolete samples.
+        snapshot: Selected journal, context, and monitoring targets for this
+            revision.
+        restart_notice: Optional diagnostic describing why the collector process
+            was replaced. Defaults to None.
+    """
     command: Literal["update"]
     revision: NonnegativeInteger
     snapshot: CollectorSnapshot
@@ -50,10 +91,25 @@ class CollectorUpdate(_Document):
 
 
 class CollectorStop(_Document):
+    """IPC command requesting collector shutdown."""
     command: Literal["stop"]
 
 
 class ResourceMeasurement(_Document):
+    """Gauge value, unit, scope, and estimation metadata for a sampled resource.
+
+    Args:
+        value: Numeric observation, or None when unavailable.
+        unit: Nonempty measurement unit, such as byte, percent, or second.
+        kind: Gauge discriminator; resource sampling does not report additive
+            deltas here.
+        scope: Owner scope of the resource measurement, typically host or
+            process.
+        estimated: Whether the measurement is an estimate rather than a direct
+            observation.
+        attributes: JSON metadata describing the measurement or resource, such
+            as provenance and availability.
+    """
     value: int | float | None
     unit: Text
     kind: Literal["gauge"]
@@ -63,6 +119,19 @@ class ResourceMeasurement(_Document):
 
 
 class ResourceSample(_Document):
+    """Timestamped resource measurements for one monitored series and context.
+
+    Args:
+        series_id: Identity of the monitored resource time series.
+        context: Validated journal context identifying the experiment and
+            participant scope.
+        observed_at: Wall-clock timestamp at which this observation was
+            recorded.
+        observed_monotonic: Local monotonic observation time in seconds, used
+            for age and timeout comparisons.
+        resources: Metric names mapped to observed gauge values and provenance
+            metadata.
+    """
     series_id: Text
     context: ResourceContext
     observed_at: Text
@@ -72,6 +141,16 @@ class ResourceSample(_Document):
     @model_validator(mode="before")
     @classmethod
     def detach(cls, document: object) -> object:
+        """Copy sample JSON while retaining typed context and measurement instances.
+
+        Args:
+            document: Caller-supplied model input before structural validation and
+                detachment.
+
+        Returns:
+            Detached input for subsequent model validation; recognized typed values
+            are retained where the input contract allows them.
+        """
         if not isinstance(document, dict):
             return copy_json_object(document, "collector document")
         values = dict(document)
@@ -102,6 +181,22 @@ class ResourceSample(_Document):
 
 
 class CollectorPacket(_Document):
+    """Collector status, journal delivery state, and a batch of resource samples.
+
+    Args:
+        collector_id: UUID of the collector process instance producing this
+            packet.
+        pid: Operating-system process identifier; additional identity fields are
+            needed to prove ownership.
+        revision: Last target revision applied by the worker; -1 means no update
+            has been applied.
+        journal_closed: Whether the collector has closed its journal writer.
+        journal_error: Latest telemetry journal failure, or None when no error
+            is reported.
+        unconfirmed_samples: Count of samples whose journal delivery is not
+            confirmed and will not be replayed.
+        samples: Ordered resource sample documents carried by the packet/page.
+    """
     collector_id: UUIDText
     pid: PositiveInteger
     revision: Annotated[int, Field(ge=-1)]

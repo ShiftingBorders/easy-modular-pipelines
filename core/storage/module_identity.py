@@ -15,7 +15,7 @@ ALLOWED_CHARACTERS = MODULE_IDENTITY_CHARACTERS
 
 
 class ClearStringErr(Exception):
-    pass
+    """Legacy exception type reserved for string normalization failures."""
 
 
 def clear_str(*args) -> tuple[str, ...]:

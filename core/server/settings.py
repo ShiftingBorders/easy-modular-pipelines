@@ -26,9 +26,15 @@ class ServerSettings:
     """Validated startup values; construction never starts runtime components."""
 
     def __init__(self, document: JsonObject) -> None:
+        """Validate a resolved server configuration document and bind runtime values."""
         self._configure(ServerConfiguration.model_validate(document))
 
     def _configure(self, settings: ServerConfiguration) -> None:
+        """Bind validated options and select the project-local default hash configuration.
+
+        Args:
+            settings: Validated settings used to configure this component.
+        """
         self.project_root = settings.project_root
         self.default_hash_config = settings.hash_config_path is None
         self.hash_config_path = (

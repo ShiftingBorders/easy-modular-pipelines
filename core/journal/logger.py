@@ -44,6 +44,16 @@ class OperationLogger:
     """Create a client from an absolute settings path; open explicitly or in a with block."""
 
     def __init__(self, config_path: str | Path, *, read_only: bool = False) -> None:
+        """Initialize a process-local logger without reading settings or opening storage.
+
+        Args:
+            config_path: Absolute logging configuration path.
+            read_only: Whether to require an existing journal and prohibit event writes.
+
+        Raises:
+            TypeError: Path or read-only flag has an unsupported type.
+            ValueError: The path is relative or contains a null character.
+        """
         if type(read_only) is not bool:
             raise TypeError("read_only must be a boolean.")
         self._read_only = read_only
@@ -65,14 +75,26 @@ class OperationLogger:
         self._journal_info: JsonObject | None = None
 
     def _check_process(self) -> None:
+        """Reject use from a process other than the logger's creator."""
         if os.getpid() != self._process_id:
             raise LoggingStateError("Create a new logger in this process.")
 
     def _require_open(self) -> None:
+        """Reject a closed logger or one whose write outcome became uncertain."""
         if self._store is None or self._failed:
             raise LoggingStateError("Logger is closed or failed; close and reopen it.")
 
     def open(self) -> None:
+        """Load settings and open an identity-checked journal for this process.
+
+        Relative database paths are resolved from the configuration file. Reopening
+        a known path checks the retained file identity and journal generation.
+
+        Raises:
+            LoggingStateError: The logger is already open, belongs to another process,
+                or read-only mode is paired with journal creation.
+            LoggingError: Configuration, storage, or retained identity checks fail.
+        """
         self._check_process()
         with self._lock:
             if self._store is not None:
@@ -168,7 +190,12 @@ class OperationLogger:
             self._failed = False
 
     def close(self) -> None:
-        """Close storage without inventing outcomes for unfinished operations."""
+        """Close storage without inventing outcomes for unfinished operations.
+
+        Runs under process and thread ownership checks. A failed store close keeps
+        the logger failed and retains the connection reference; successful close
+        detaches the store so later use requires an explicit reopen.
+        """
         self._check_process()
         with self._lock:
             if self._store is None:
@@ -182,6 +209,7 @@ class OperationLogger:
             self._producer_instance_id = None
 
     def __enter__(self) -> Self:
+        """Open the logger and return it for a with block."""
         self.open()
         return self
 
@@ -191,6 +219,19 @@ class OperationLogger:
         error: BaseException | None,
         error_traceback: TracebackType | None,
     ) -> bool:
+        """Close the journal, preserving an existing exception, and return False.
+
+        Args:
+            exception_type: Exception type from the context-manager body, or None on
+                normal exit.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            error_traceback: Traceback supplied by the context-manager protocol.
+
+        Returns:
+            False to propagate any body exception; secondary close failures are
+            reported without replacing it.
+        """
         try:
             self.close()
         except BaseException as failure:
@@ -207,6 +248,15 @@ class OperationLogger:
             return self._context.model_dump()
 
     def _merge_context(self, context: JsonObject | None) -> JournalContext:
+        """Merge validated record context while retaining this writer's host/process identity.
+
+        Args:
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Validated merged context retaining the actual writer's host/process
+            identity despite caller overrides.
+        """
         from core.models.journal_records import JournalContext
 
         merged = dict(self._context.root)
@@ -217,6 +267,13 @@ class OperationLogger:
         return JournalContext.model_validate(merged)
 
     def _check_operation(self, operation: Operation, state: str = "started") -> None:
+        """Require an open logger and an operation owned by this session in the expected state.
+
+        Args:
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            state: Required operation-handle lifecycle state, started by default.
+        """
         self._require_open()
         if not isinstance(operation, Operation) or operation._logger is not self:
             raise LoggingStateError("Operation belongs to another logger.")
@@ -236,7 +293,23 @@ class OperationLogger:
         *,
         persist: Callable[[JsonObject], str | None] | None = None,
     ) -> str:
-        """Append under the caller's client lock; retain sequence order across threads."""
+        """Append under the caller's client lock; retain sequence order across threads.
+
+        Increments the producer sequence and creates the complete event envelope. A
+        failed or interrupted persistence operation marks the logger failed because
+        commit status may be uncertain; callers must not blindly replay the write.
+
+        Args:
+            event_type: Journal event category selecting the payload contract.
+            data: JSON payload recorded or sent by this operation.
+            context: Journal/participant coordinates associated with this operation.
+            operation_id: Journal operation identity associated with the event.
+            persist: Optional persistence callback replacing the ordinary store
+                append.
+
+        Returns:
+            Identifier of the committed event.
+        """
         self._require_open()
         if self._read_only:
             raise LoggingStateError("Cannot record events through a read-only logger.")
@@ -280,7 +353,17 @@ class OperationLogger:
     def _get_record_context(
         self, operation: Operation | None, context: JsonObject | None
     ) -> tuple[JournalContext, str | None]:
-        """Resolve explicit context while the caller holds the logger lock."""
+        """Resolve explicit context while the caller holds the logger lock.
+
+        Args:
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Validated event context and optional operation ID after confirming
+            operation/session ownership.
+        """
         self._require_open()
         if operation is not None:
             self._check_operation(operation)
@@ -298,6 +381,18 @@ class OperationLogger:
         *,
         required_context: tuple[str, ...] = (),
     ) -> str:
+        """Validate record context and append an event under the logger lock.
+
+        Args:
+            event_type: Journal event type.
+            data: JSON event payload.
+            operation: Optional local operation supplying identity and context.
+            context: Optional record-specific context overrides.
+            required_context: Context field names that must have non-null values.
+
+        Returns:
+            Identifier of the appended event.
+        """
         self._check_process()
         with self._lock:
             self._require_open()
@@ -315,7 +410,18 @@ class OperationLogger:
         context: JsonObject | None = None,
         attributes: JsonObject | None = None,
     ) -> Operation:
-        """Prepare an operation; its start is persisted only on entering its with block."""
+        """Prepare an operation; its start is persisted only on entering its with block.
+
+        Args:
+            operation_type: Nonempty operation category.
+            operation_name: Nonempty operation display name.
+            context: Journal/participant coordinates associated with this operation.
+            attributes: Additional JSON metadata copied into the operation or event.
+
+        Returns:
+            Unstarted local operation handle; entering its context manager records
+            the start.
+        """
         self._check_process()
         with self._lock:
             self._require_open()
@@ -330,6 +436,12 @@ class OperationLogger:
             )
 
     def _start_operation(self, operation: Operation) -> None:
+        """Record operation start and mark uncertain publication as a failed logger session.
+
+        Args:
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+        """
         self._check_process()
         with self._lock:
             self._check_operation(operation, "created")
@@ -366,7 +478,17 @@ class OperationLogger:
         context: JsonObject | None = None,
         attributes: JsonObject | None = None,
     ) -> Operation:
-        """Persist a start immediately for code that will explicitly call finish_operation."""
+        """Persist a start immediately for code that will explicitly call finish_operation.
+
+        Args:
+            operation_type: Nonempty operation category.
+            operation_name: Nonempty operation display name.
+            context: Journal/participant coordinates associated with this operation.
+            attributes: Additional JSON metadata copied into the operation or event.
+
+        Returns:
+            Started operation handle bound to this logger session.
+        """
         operation = self.operation(
             operation_type,
             operation_name,
@@ -384,7 +506,19 @@ class OperationLogger:
         reason_code: str | None = None,
         attributes: JsonObject | None = None,
     ) -> str:
-        """Persist a terminal event once; durations refer only to this local operation."""
+        """Persist a terminal event once; durations refer only to this local operation.
+
+        Args:
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            status: Terminal operation status selected by the caller.
+            reason_code: Optional machine-readable explanation of the terminal
+                status.
+            attributes: Additional JSON metadata copied into the operation or event.
+
+        Returns:
+            Identifier of the committed terminal operation event.
+        """
         if status not in ("succeeded", "failed", "cancelled"):
             raise ValueError("status must be succeeded, failed, or cancelled.")
         if reason_code is not None:
@@ -430,7 +564,18 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
-        """Persist an application-defined fact, such as a DAG edge or recovery observation."""
+        """Persist an application-defined fact, such as a DAG edge or recovery observation.
+
+        Args:
+            event_type: Journal event category selecting the payload contract.
+            data: JSON payload recorded or sent by this operation.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Identifier of the committed event.
+        """
         require_text(event_type, "event_type")
         payload = copy_json_object({} if data is None else data, "data")
         self._check_process()
@@ -452,7 +597,26 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
-        """Persist the full accepted template, even when no stage starts afterwards."""
+        """Persist the full accepted template, even when no stage starts afterwards.
+
+        Args:
+            template: Validated experiment template supplying definitions and
+                policies.
+            template_yaml: Applied or candidate template YAML retained for audit and
+                publication.
+            template_revision_id: UUID identifying the applied template revision.
+            previous_template_revision_id: Prior template revision UUID, or None for
+                initial application.
+            reason: Nonempty reason recorded for the template, interruption, or
+                observation.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Identifier of the applied-template event containing full YAML and
+            validated template data.
+        """
         require_text(template_revision_id, "template_revision_id")
         require_text(template_yaml, "template_yaml")
         for name, value in (
@@ -486,7 +650,22 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
-        """Confirm complete parameters before the caller is allowed to start a stage."""
+        """Confirm complete parameters before the caller is allowed to start a stage.
+
+        Args:
+            template: Validated experiment template supplying definitions and
+                policies.
+            effective_settings: Actual merged module settings used by the attempt.
+            template_yaml: Applied or candidate template YAML retained for audit and
+                publication.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Identifier of the event recording the attempt's applied template and
+            effective settings.
+        """
         require_text(template_yaml, "template_yaml")
         return self._record(
             "attempt.parameters",
@@ -524,7 +703,23 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
-        """Return the persisted observation ID; identical responses reuse an earlier ID."""
+        """Return the persisted observation ID; identical responses reuse an earlier ID.
+
+        Args:
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+            response: Participant/controller result envelope being processed.
+            author: Runner or participant author; runner acceptance takes
+                precedence.
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            The persisted observation ID; identical responses reuse an earlier ID.
+        """
         payload = _validated_command_result(
             {
                 "request_id": request_id,
@@ -555,6 +750,16 @@ class OperationLogger:
             )
 
     def _read_store[Result](self, call: Callable[[SQLiteEventStore], Result]) -> Result:
+        """Run a store read under process/lock checks and retain fatal journal failures.
+
+        Args:
+            call: Callback receiving the owned SQLite store and returning a read
+                result.
+
+        Returns:
+            The callback's result; journal_failed exceptions also mark the logger
+            failed before propagation.
+        """
         self._check_process()
         with self._lock:
             if self._store is None:
@@ -567,7 +772,16 @@ class OperationLogger:
                 raise
 
     def read_command_result(self, request_id: str) -> JsonObject | None:
-        """Read the authoritative result and all recorded participant observations."""
+        """Read the authoritative result and all recorded participant observations.
+
+        Args:
+            request_id: UUID correlating the admitted request and its eventual
+                outcome.
+
+        Returns:
+            Considered command result and author observations, or None when no
+            result is indexed.
+        """
         return self._read_store(lambda store: store.read_command_result(request_id))
 
     def get_journal_info(self) -> JsonObject:
@@ -577,7 +791,16 @@ class OperationLogger:
     def export_snapshot(
         self, destination: str | Path, *, min_free_bytes: int
     ) -> JsonObject:
-        """Export a journal boundary, not a full experiment or a destructive rollback."""
+        """Export a journal boundary, not a full experiment or a destructive rollback.
+
+        Args:
+            destination: Absolute output path for the requested file or directory.
+            min_free_bytes: Additional free-space reserve in bytes for the export.
+
+        Returns:
+            Manifest describing the copied journal, identity, boundary, and content
+            checksum.
+        """
         return self._read_store(
             lambda store: store.export_snapshot(
                 destination, min_free_bytes=min_free_bytes
@@ -595,7 +818,26 @@ class OperationLogger:
         caused_by_error_id: str | None = None,
         include_traceback: bool = False,
     ) -> str:
-        """Return error_id for propagation; recording an error does not finish an operation."""
+        """Return error_id for propagation; recording an error does not finish an operation.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+            error_code: Optional stable diagnostic code for the recorded failure.
+            error_id: Optional caller-provided error identity, or None to allocate
+                one.
+            caused_by_error_id: Optional preceding error identity linking causal
+                diagnostics.
+            include_traceback: Whether to capture the exception traceback in the
+                journal event.
+
+        Returns:
+            Error_id for propagation; recording an error does not finish an
+            operation.
+        """
         if not isinstance(error, BaseException):
             raise TypeError("error must be an exception instance.")
         if type(include_traceback) is not bool:
@@ -635,7 +877,18 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
-        """Record measurements with explicit units and aggregation semantics."""
+        """Record measurements with explicit units and aggregation semantics.
+
+        Args:
+            resources: Validated static resource definitions whose optional hashes
+                are checked.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Identifier of the committed resource-measurement event.
+        """
         measurements = copy_json_object(resources, "resources")
         if not measurements:
             raise ValueError("resources must contain at least one measurement.")
@@ -670,6 +923,23 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
+        """Record progress in explicitly named units.
+
+        Args:
+            completed: Nonnegative finite amount completed.
+            total: Optional nonnegative total, at least completed.
+            stage: Optional nonempty work description.
+            unit: Nonempty unit name, such as item or fraction.
+            operation: Optional owning operation.
+            context: Optional validated context overrides.
+
+        Returns:
+            Identifier of the committed progress event.
+
+        Raises:
+            ValueError: Values are invalid or completed exceeds total.
+            LoggingError: Logger state or storage prevents recording.
+        """
         require_number(completed, "completed")
         require_text(unit, "unit")
         if stage is not None:
@@ -696,7 +966,24 @@ class OperationLogger:
         operation: Operation | None = None,
         context: JsonObject | None = None,
     ) -> str:
-        """Return artifact_id; register metadata without accessing or accepting the file."""
+        """Return artifact_id; register metadata without accessing or accepting the file.
+
+        Args:
+            path: Artifact path relative to the attempt directory, not the
+                experiment root.
+            purpose: Nonempty description of why the artifact was produced.
+            artifact_id: Optional artifact identity; None lets the logger allocate
+                one.
+            size_bytes: Optional nonnegative artifact size in bytes.
+            content_hash: Optional caller-supplied artifact content hash; no hashing
+                is performed here.
+            operation: Owning journal operation handle, or None for an unscoped
+                record.
+            context: Journal/participant coordinates associated with this operation.
+
+        Returns:
+            Artifact_id; register metadata without accessing or accepting the file.
+        """
         from core.models.artifacts import ArtifactRegistration
 
         parameters = ArtifactRegistration.model_validate({
@@ -725,7 +1012,19 @@ class OperationLogger:
         limit: int = 100,
         view: str = "raw",
     ) -> JsonObject:
-        """Read local committed events, including after a write failure, for reconciliation."""
+        """Read local committed events, including after a write failure, for reconciliation.
+
+        Args:
+            checkpoint: Identity-bound exclusive journal cursor, or None to start
+                reading.
+            limit: Maximum page item count, from 1 through 1000.
+            view: Raw or effective journal view; effective suppresses superseded
+                observations.
+
+        Returns:
+            Event page with continuation checkpoint, observed boundary, and
+            has_more; an effective page may advance past filtered-out observations.
+        """
         return self._read_store(
             lambda store: store.read_events(checkpoint, limit=limit, view=view)
         )
@@ -737,7 +1036,19 @@ class OperationLogger:
         limit: int = 1000,
         before: int | None = None,
     ) -> JsonObject:
-        """Read selected original events or a tail page using existing indexes."""
+        """Read selected original events or a tail page using existing indexes.
+
+        Args:
+            event_ids: Selected original event IDs, or None to read a descending
+                tail page.
+            limit: Maximum page item count, from 1 through 1000.
+            before: Exclusive upper event cursor for descending tail reads, or None
+                for the latest boundary.
+
+        Returns:
+            Original event entries and their observed boundary, selected by IDs or
+            descending cursor tail. The byte limit may shorten the batch.
+        """
         return self._read_store(
             lambda store: store.read_event_batch(event_ids, limit=limit, before=before)
         )
@@ -745,7 +1056,17 @@ class OperationLogger:
     def read_changes(
         self, checkpoint: JsonObject | None = None, *, limit: int = 100
     ) -> JsonObject:
-        """Read committed transitions, including confirmations without a new event."""
+        """Read committed transitions, including confirmations without a new event.
+
+        Args:
+            checkpoint: Identity-bound exclusive journal cursor, or None to start
+                reading.
+            limit: Maximum page item count, from 1 through 1000.
+
+        Returns:
+            Change-feed page including confirmations, checkpoint, source boundary,
+            and has_more.
+        """
         return self._read_store(
             lambda store: store.read_changes(checkpoint, limit=limit)
         )
@@ -753,7 +1074,17 @@ class OperationLogger:
     def export_diagnostics(
         self, operation_ids: list[str], destination: str | Path
     ) -> JsonObject:
-        """Preserve selected operations outside files that runner will restore."""
+        """Preserve selected operations outside files that runner will restore.
+
+        Args:
+            operation_ids: Root operation IDs whose diagnostic descendants should be
+                exported.
+            destination: Absolute output path for the requested file or directory.
+
+        Returns:
+            Manifest for the diagnostic records file, including source boundary,
+            record counts, and checksum.
+        """
         return self._read_store(
             lambda store: store.export_diagnostics(operation_ids, destination)
         )
@@ -764,7 +1095,15 @@ class OperationLogger:
         failure: BaseException,
         action: str,
     ) -> None:
-        """Best-effort diagnostics that must never replace the application's exception."""
+        """Best-effort diagnostics that must never replace the application's exception.
+
+        Args:
+            original: Primary exception to annotate without replacing it.
+            failure: Primary exception whose identity must survive secondary cleanup
+                failures.
+            action: Human-readable action associated with the failure or current
+                policy decision.
+        """
         if self._store is not None and not isinstance(
             failure, (TypeError, ValueError, LoggingStateError)
         ):
@@ -791,6 +1130,15 @@ class Operation:
         context: JournalContext | JsonObject,
         attributes: JsonObject,
     ) -> None:
+        """Initialize a validated local operation handle without writing its start event.
+
+        Args:
+            logger: Owning logger session.
+            operation_type: Nonempty operation category.
+            operation_name: Nonempty operation display name.
+            context: Validated journal context.
+            attributes: JSON attributes copied into the handle.
+        """
         self._logger = logger
         self._operation_type = require_text(operation_type, "operation_type")
         self._operation_name = require_text(operation_name, "operation_name")
@@ -805,6 +1153,7 @@ class Operation:
         self._context_managed = False
 
     def get_operation_id(self) -> str:
+        """Return the unique identifier assigned to this operation handle."""
         return self._operation_id
 
     def get_child_context(self) -> JsonObject:
@@ -817,6 +1166,7 @@ class Operation:
             return context
 
     def __enter__(self) -> Self:
+        """Record the operation start and return its context-managed handle."""
         self._logger._check_process()
         with self._logger._lock:
             self._logger._start_operation(self)
@@ -829,6 +1179,19 @@ class Operation:
         error: BaseException | None,
         error_traceback: TracebackType | None,
     ) -> bool:
+        """Record success, failure, or cancellation while preserving the body exception.
+
+        Args:
+            exception_type: Exception type from the context-manager body, or None on
+                normal exit.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            error_traceback: Traceback supplied by the context-manager protocol.
+
+        Returns:
+            False so exceptions from the with block propagate. Secondary logging
+            failures are attached without replacing the body exception.
+        """
         self._context_managed = False
         if error is None:
             self._logger.finish_operation(self)

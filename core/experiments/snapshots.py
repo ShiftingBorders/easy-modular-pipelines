@@ -79,6 +79,18 @@ class ExperimentSnapshots:
         hash_module: Callable[[str, Path], str],
         notify_resources: Callable[[], None] | None = None,
     ) -> None:
+        """Bind project paths and caller-owned snapshot/restore collaborators.
+
+        Args:
+            project_root: Absolute project directory containing experiments and snapshots.
+            stages: Stage process controller used to establish the writer barrier.
+            services: Service manager used for freezing, exporting, and restoring state.
+            journal: Runner journal whose snapshots and generation are coordinated.
+            state_store: Persisted runner checkpoint reader/writer.
+            assembler: Module and resource integrity checker.
+            hash_module: Callback computing a module content hash from name and directory.
+            notify_resources: Optional callback publishing changed resource targets.
+        """
         root = Path(project_root)
         if not root.is_absolute():
             raise ValueError("project_root must be absolute.")
@@ -93,6 +105,19 @@ class ExperimentSnapshots:
         self._lock = asyncio.Lock()
 
     async def create(self, state: RunnerState, label: str | None = None) -> JsonObject:
+        """Create a regular snapshot at a stage-free boundary and resume service writes.
+
+        Args:
+            state: Current experiment state; no active attempt is allowed.
+            label: Optional nonempty snapshot label.
+
+        Returns:
+            Published snapshot identity, kind, sequence, time, and validity metadata.
+
+        Raises:
+            RuntimeError: A stage is active or service consistency cannot be confirmed.
+            OSError: Available disk space is insufficient or copying fails.
+        """
         if label is not None:
             require_text(label, "snapshot label")
         if state.active_attempt is not None:
@@ -114,7 +139,24 @@ class ExperimentSnapshots:
     async def finalize(
         self, state: RunnerState, *, terminal_phase: str = "stopped"
     ) -> JsonObject:
-        """Export state before shutdown; only complete finalization is restorable."""
+        """Export state before shutdown; only complete finalization is restorable.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            terminal_phase: Terminal runner phase, stopped or completed, to publish
+                after shutdown.
+
+        Returns:
+            Final snapshot metadata, or an invalid snapshot diagnostic when shutdown
+            succeeded but snapshot preparation failed permissibly.
+
+        Raises:
+            ValueError: The terminal phase is neither stopped nor completed.
+            RuntimeError: A stage remains active or service shutdown cannot be
+                confirmed.
+            LoggingError: Required journal publication fails.
+        """
         if terminal_phase not in ("stopped", "completed"):
             raise ValueError("Finalization requires a stopped or completed outcome.")
         if state.active_attempt is not None:
@@ -167,6 +209,25 @@ class ExperimentSnapshots:
         shutdown_failed: bool,
         terminal_phase: str,
     ) -> JsonObject:
+        """Persist snapshot-failure diagnostics and either report a clean stop or re-raise.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            snapshot_id: UUID identifying the snapshot or active write-freeze
+                barrier.
+            failure: Primary exception whose identity must survive secondary cleanup
+                failures.
+            shutdown_failed: Whether participant shutdown itself failed, preventing
+                a successful terminal result.
+            terminal_phase: Terminal runner phase, stopped or completed, to publish
+                after shutdown.
+
+        Returns:
+            Invalid snapshot metadata only when participant shutdown succeeded and
+            the failure is not a mandatory journal/cancellation failure; other
+            failures propagate.
+        """
         diagnostic = (
             self._project_root
             / "controller"
@@ -220,7 +281,23 @@ class ExperimentSnapshots:
         label: str | None,
         logging_config: Path,
     ) -> SnapshotPayload:
-        """Copy frozen files in a worker with its own client for SQLite backup."""
+        """Copy frozen files in a worker with its own client for SQLite backup.
+
+        Args:
+            root: Absolute source experiment directory.
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            document: Detached saved runner state used to build the snapshot
+                payload.
+            exports: Service IDs mapped to experiment-relative exported state paths.
+            kind: Snapshot kind, regular or final.
+            label: Optional nonempty snapshot label.
+            logging_config: Absolute configuration path for the snapshot worker's
+                journal client.
+
+        Returns:
+            Fully inventoried snapshot payload ready for manifest publication.
+        """
         reserve = document.template.storage.min_snapshot_free_bytes
         if directory.exists() or not directory.resolve().is_relative_to(
             self._project_root / "snapshots"
@@ -262,6 +339,16 @@ class ExperimentSnapshots:
     def _copy_snapshot_payload(
         self, root: Path, directory: Path, reserve: int, template_yaml: str
     ) -> None:
+        """Copy restorable experiment files while excluding live controls and old service exports.
+
+        Args:
+            root: Absolute source experiment directory.
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            reserve: Minimum free-space reserve in bytes preserved during copying.
+            template_yaml: Applied or candidate template YAML retained for audit and
+                publication.
+        """
         payload = directory / "files"
         payload.mkdir()
         snapshot_id = directory.name
@@ -310,6 +397,16 @@ class ExperimentSnapshots:
         (payload / "experiment.yaml").write_text(template_yaml, encoding="utf-8")
 
     def _snapshot_inventory(self, directory: Path) -> SnapshotInventory:
+        """Hash copied files and inventory directories, rejecting links and special files.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+
+        Returns:
+            Validated inventory with every portable member path, file byte size, and
+            SHA-256 digest.
+        """
         directories = []
         files: dict[str, SnapshotFile] = {}
         for top in (directory / "files", directory / "journal"):
@@ -339,6 +436,17 @@ class ExperimentSnapshots:
         directory: Path,
         reserve: int,
     ) -> None:
+        """Copy a regular snapshot file with reserve checks, skipping live stage controls.
+
+        Args:
+            path: Filesystem path whose contents or confinement are checked.
+            relative: Source directory path relative to the experiment root.
+            filename: Name of the individual file within its source directory.
+            destination: Absolute output path for the requested file or directory.
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            reserve: Minimum free-space reserve in bytes preserved during copying.
+        """
         if path.is_symlink() or path.is_junction() or not path.is_file():
             raise ValueError("Snapshot sources must be regular files.")
         if (
@@ -365,6 +473,22 @@ class ExperimentSnapshots:
         kind: str,
         label: str | None,
     ) -> JsonObject:
+        """Build a snapshot, verify frozen services, publish its manifest, and apply retention.
+
+        Args:
+            state: Experiment state whose stable snapshot reference is updated on success.
+            snapshot_id: UUID of the snapshot being prepared.
+            exports: Service IDs mapped to exported state paths within the experiment.
+            kind: Regular or final snapshot kind.
+            label: Optional display label.
+
+        Returns:
+            Published snapshot metadata.
+
+        Raises:
+            RuntimeError: Service state changes or write resumption is unconfirmed.
+            LoggingError: Required publication journal records cannot be written.
+        """
         root = state.experiment_directory.resolve()
         directory = self._project_root / "snapshots" / root.name / snapshot_id
         identities = {
@@ -475,7 +599,16 @@ class ExperimentSnapshots:
     async def _retain_snapshots(
         self, directory: Path, state: RunnerState, published: SnapshotPayload
     ) -> None:
-        """Validate retained candidates only; delete other owned UUID directories."""
+        """Validate retained candidates only; delete other owned UUID directories.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            published: Just-published snapshot payload that anchors retention
+                selection.
+        """
         candidates, owned = await _await_read_task(asyncio.create_task(asyncio.to_thread(
             _retention_candidates, directory.parent, published.experiment_id,
             published.experiment_folder,
@@ -510,15 +643,46 @@ class ExperimentSnapshots:
     def _validate_snapshot(
         self, directory: Path, *, manifest: JsonObject | None = None
     ) -> JsonObject:
+        """Fully check a snapshot and return its public manifest document.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            manifest: Validated experiment snapshot payload with state, inventory,
+                and journal metadata.
+
+        Returns:
+            Public snapshot manifest document after full payload and journal
+            validation.
+        """
         return self._load_snapshot(directory, manifest=manifest).document()
 
     async def _read_snapshot(self, directory: Path) -> SnapshotPayload:
+        """Load/validate a snapshot in a worker and await that worker before cancelling."""
         reading = asyncio.create_task(asyncio.to_thread(self._load_snapshot, directory))
         return await _await_read_task(reading)
 
     def _load_snapshot(
         self, directory: Path, *, manifest: SnapshotPayload | JsonObject | None = None
     ) -> SnapshotPayload:
+        """Validate snapshot paths, inventory, applied template, modules, exports, and journal.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            manifest: Already parsed snapshot payload/document, or None to read
+                manifest.json.
+
+        Returns:
+            Validated SnapshotPayload after checking paths, copied files,
+            template/module hashes, exports, and journal results.
+
+        Raises:
+            ValueError: Paths, inventory, template, modules, service exports, or
+                journal references fail validation.
+            OSError: Snapshot files cannot be read.
+            LoggingError: The copied journal fails integrity or identity checks.
+        """
         directory = Path(directory)
         if (
             not directory.is_absolute()
@@ -567,6 +731,16 @@ class ExperimentSnapshots:
     def _validate_snapshot_journal(
         self, directory: Path, payload: SnapshotPayload, state: RunnerState
     ) -> None:
+        """Open the copied journal read-only and verify its contents and saved result references.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            payload: Validated experiment snapshot whose journal boundary/results
+                must match the copied database.
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         settings = state.template.logging
         store = SQLiteEventStore(
             directory / "journal/journal.sqlite",
@@ -592,6 +766,13 @@ class ExperimentSnapshots:
         directory: Path,
         inventory: SnapshotInventory,
     ) -> None:
+        """Require exact unlinked inventory membership and matching file sizes/SHA-256 digests.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            inventory: Validated expected directory/file inventory.
+        """
         files, directories = inventory.files, inventory.directories
         for name in (*directories, *files):
             path = directory / name
@@ -634,6 +815,14 @@ class ExperimentSnapshots:
     def _validate_snapshot_modules(
         self, directory: Path, template: ExperimentTemplate
     ) -> None:
+        """Check snapshot module identities, roles, conditional contracts, and template hashes.
+
+        Args:
+            directory: Absolute snapshot directory containing files, journal, and
+                manifest.json.
+            template: Validated experiment template supplying definitions and
+                policies.
+        """
         checked_modules: dict[tuple[str, str], tuple[ModuleManifest, str]] = {}
         for role in ("stage", "service"):
             definitions = template.stages if role == "stage" else template.services
@@ -666,9 +855,31 @@ class ExperimentSnapshots:
                     )
 
     def latest_valid(self, experiment_directory: Path) -> JsonObject:
+        """Return the newest fully valid snapshot manifest for the experiment directory.
+
+        Args:
+            experiment_directory: Absolute experiment directory within this project.
+
+        Returns:
+            Manifest of the valid candidate with the highest sequence number.
+
+        Raises:
+            FileNotFoundError: No complete valid snapshot is available.
+            ValueError: Experiment or snapshot storage escapes the project.
+        """
         return self._latest_valid(experiment_directory).document()
 
     def _latest_valid(self, experiment_directory: Path) -> SnapshotPayload:
+        """Scan candidates newest-first and return the first fully validated matching payload.
+
+        Args:
+            experiment_directory: Absolute experiment root containing its runtime
+                files.
+
+        Returns:
+            Newest valid matching snapshot payload. Invalid/incomplete candidates
+            are skipped.
+        """
         root = Path(experiment_directory)
         if not root.is_absolute() or not root.resolve().is_relative_to(
             self._project_root
@@ -708,6 +919,25 @@ class ExperimentSnapshots:
         suspend_resources: Callable[[], Awaitable[None]] | None = None,
         resume_transaction: bool = False,
     ) -> RunnerState:
+        """Restore a checked snapshot through a persisted, resumable transaction.
+
+        Args:
+            state: Target experiment state, updated with restored state.
+            snapshot_id: Selected snapshot UUID.
+            source_directory: Another experiment's directory for continuation, or None
+                for rollback within the same experiment.
+            preserve_rebuild_diagnostics: Retain the failed rebuild's audit records/workspace.
+            suspend_resources: Optional async callback closing resource journal writers.
+            resume_transaction: Resume an existing failed transaction for recovery handling.
+
+        Returns:
+            Restored runner state paused after service state loading completes.
+
+        Raises:
+            ValueError: Paths, identities, snapshot contents, or registry entries disagree.
+            RuntimeError: Existing restoration or unconfirmed participant shutdown blocks work.
+            OSError: Space is insufficient or filesystem operations fail.
+        """
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
         target = state.experiment_directory.resolve()
         if target.parent != self._project_root / "experiments":
@@ -861,6 +1091,18 @@ class ExperimentSnapshots:
     def _bootstrap_clone_journal(
         self, state: RunnerState, archive: Path, manifest: SnapshotPayload, target: Path
     ) -> None:
+        """Copy the snapshot journal into a continuation and open its private runner client.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            archive: Fully validated source snapshot directory containing
+                journal/journal.sqlite.
+            manifest: Validated experiment snapshot payload with state, inventory,
+                and journal metadata.
+            target: Absolute continuation experiment directory receiving its private
+                journal.
+        """
         target.mkdir(parents=True, exist_ok=True)
         (target / "journals").mkdir(exist_ok=True)
         shutil.copyfile(
@@ -885,6 +1127,18 @@ class ExperimentSnapshots:
         validate_only: bool = False,
         retry_failed: bool = False,
     ) -> RunnerState:
+        """Advance persisted restoration phases or handle interrupted service loading.
+
+        Args:
+            state: Mutable target experiment state.
+            transaction: Validated restoration marker.
+            marker: Path where phase transitions are persisted.
+            validate_only: Check ownership/paths without advancing restoration.
+            retry_failed: Permit returning after stopping participants from a failed restore.
+
+        Returns:
+            The supplied state with completed restoration changes, or unchanged in validation mode.
+        """
         restoration_id = str(UUID(transaction.restoration_id))
         snapshot_id = str(UUID(transaction.snapshot_id))
         paths = self._check_restore_paths(state, transaction, marker)
@@ -934,6 +1188,24 @@ class ExperimentSnapshots:
     def _check_restore_paths(
         self, state: RunnerState, validated: RestoreTransaction, marker: Path
     ) -> RestorePaths:
+        """Check transaction ownership and confinement and return the restoration path set.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            validated: Validated restoration transaction including its target and
+                owner identity.
+            marker: Absolute path where restoration transaction phases are saved.
+
+        Returns:
+            Confined target/work/cached/replacement/previous paths for the validated
+            transaction.
+
+        Raises:
+            RuntimeError: Another live process still owns the transaction.
+            ValueError: The transaction targets another experiment or a path escapes
+                project storage.
+        """
         owner = validated.owner
         if owner.pid != os.getpid():
             try:
@@ -991,6 +1263,23 @@ class ExperimentSnapshots:
     ) -> RunnerState:
         # An interrupted load is not evidence that it was never executed.
         # Stop its participants, retain diagnostics, and require a new rollback.
+        """Stop previously announced restored services and retain a failed transaction for retry.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            transaction: Validated persisted restoration phase and ownership
+                document.
+            marker: Absolute path where restoration transaction phases are saved.
+            target: Absolute target experiment directory containing the interrupted
+                restored state.
+            retry_failed: Whether to return after stopping an interrupted failed
+                restore so a fresh rollback can proceed.
+
+        Returns:
+            Stopped target state only when retry_failed permits a fresh transaction;
+            otherwise raises to require explicit fresh rollback.
+        """
         if not (target / "runner/state.json").is_file():
             raise RuntimeError(
                 "Restored participant state is missing; termination cannot be confirmed."
@@ -1022,6 +1311,14 @@ class ExperimentSnapshots:
         )
 
     def _restore_announced_services(self, state: RunnerState, target: Path) -> None:
+        """Reconstruct unaccounted service ownership from matching endpoint and process records.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            target: Absolute target experiment directory whose endpoint/process
+                records are reconciled.
+        """
         for definition in state.template.services:
             service_id = definition.service_id
             endpoint = target / "runner/endpoints" / f"{service_id}.json"
@@ -1083,6 +1380,23 @@ class ExperimentSnapshots:
         paths: RestorePaths,
         snapshot_id: str,
     ) -> RestoreTransaction:
+        """Copy and validate snapshot/replacement trees and persist the prepared transaction.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            transaction: Validated persisted restoration phase and ownership
+                document.
+            marker: Absolute path where restoration transaction phases are saved.
+            paths: Validated target/workspace/replacement paths for this
+                restoration.
+            snapshot_id: UUID identifying the snapshot or active write-freeze
+                barrier.
+
+        Returns:
+            Updated transaction in prepared phase after both cached snapshot and
+            replacement files are ready.
+        """
         work, cached, replacement = paths.work, paths.cached, paths.replacement
         archive = (
             self._project_root / "snapshots" / transaction.source_folder / snapshot_id
@@ -1138,6 +1452,19 @@ class ExperimentSnapshots:
     async def _cached_restore_manifest(
         self, transaction: RestoreTransaction, cached: Path, snapshot_id: str
     ) -> SnapshotPayload:
+        """Fully validate cached snapshot contents and require the transaction's source identity.
+
+        Args:
+            transaction: Validated persisted restoration phase and ownership
+                document.
+            cached: Cached snapshot directory inside the restoration workspace.
+            snapshot_id: UUID identifying the snapshot or active write-freeze
+                barrier.
+
+        Returns:
+            Fully checked cached payload matching the transaction's snapshot/source
+            identity.
+        """
         manifest = await self._read_snapshot(cached)
         if (
             manifest.snapshot_id != snapshot_id
@@ -1153,6 +1480,25 @@ class ExperimentSnapshots:
     async def _install_restore_files(
         self, transaction: RestoreTransaction, marker: Path, paths: RestorePaths
     ) -> RestoreTransaction:
+        """Displace old files, publish replacement files, and persist the installed phase.
+
+        Args:
+            transaction: Validated persisted restoration phase and ownership
+                document.
+            marker: Absolute path where restoration transaction phases are saved.
+            paths: Validated target/workspace/replacement paths for this
+                restoration.
+
+        Returns:
+            Transaction in files_installed phase after preserving the previous tree
+            and publishing replacement files.
+
+        Raises:
+            RuntimeError: Source/replacement directories are missing or simultaneous
+                trees make publication ambiguous.
+            OSError: Directory replacement cannot complete within the platform-
+                specific retry allowance.
+        """
         target, previous, replacement = paths.target, paths.previous, paths.replacement
         if not previous.exists():
             if not target.is_dir() or not replacement.is_dir():
@@ -1186,6 +1532,24 @@ class ExperimentSnapshots:
         manifest: SnapshotPayload,
         restoration_id: str,
     ) -> RestoreTransaction:
+        """Load installed runner state and finalize/reopen the restoration's journal generation.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            transaction: Validated persisted restoration phase and ownership
+                document.
+            marker: Absolute path where restoration transaction phases are saved.
+            paths: Validated target/workspace/replacement paths for this
+                restoration.
+            manifest: Validated experiment snapshot payload with state, inventory,
+                and journal metadata.
+            restoration_id: UUID identifying one idempotent restoration transaction.
+
+        Returns:
+            Transaction advanced to journal_restored when needed; state is rebound
+            to the installed checkpoint.
+        """
         target, work = paths.target, paths.work
         restored = self._state_store.load(target)
         if restored.experiment_id != transaction.experiment_id:
@@ -1213,6 +1577,24 @@ class ExperimentSnapshots:
         snapshot_id: str,
         restoration_id: str,
     ) -> RestoreTransaction:
+        """Start services, load exported state, save an idle pause, and complete the transaction.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            transaction: Validated persisted restoration phase and ownership
+                document.
+            marker: Absolute path where restoration transaction phases are saved.
+            manifest: Validated experiment snapshot payload with state, inventory,
+                and journal metadata.
+            snapshot_id: UUID identifying the snapshot or active write-freeze
+                barrier.
+            restoration_id: UUID identifying one idempotent restoration transaction.
+
+        Returns:
+            Complete transaction after state load, fresh readiness, and paused
+            checkpoint publication.
+        """
         transaction = _update_model(transaction, phase="services_starting")
         write_json(marker, transaction.model_dump(exclude_unset=True))
         try:
@@ -1250,6 +1632,12 @@ class ExperimentSnapshots:
         return transaction
 
     async def _cleanup_completed_restore(self, paths: RestorePaths) -> None:
+        """Remove confined cached/previous trees after restoration, preserving trees with links.
+
+        Args:
+            paths: Validated target/workspace/replacement paths for this
+                restoration.
+        """
         previous, cached, work = paths.previous, paths.cached, paths.work
         for path in (previous, cached):
             if (
@@ -1266,6 +1654,12 @@ class ExperimentSnapshots:
 
 
     async def _replace_restore_directory(self, source: Path, target: Path) -> None:
+        """Rename a restoration directory with a bounded retry for Windows sharing errors.
+
+        Args:
+            source: Existing experiment or staged replacement directory to move.
+            target: New location for the displaced or replacement directory.
+        """
         deadline = time.monotonic() + 1
         while True:
             try:

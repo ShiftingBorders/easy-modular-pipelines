@@ -16,10 +16,20 @@ from core.primitives.json_values import JsonObject, copy_json_object, require_te
 
 
 class RunnerJournal:
+    """Own the runner's logger and publish identity-bound client configurations."""
     client: OperationLogger
     reader_config_path: Path | None = None
 
     def open(self, state: RunnerState, *, create: bool) -> None:
+        """Open a new/existing experiment journal and publish its identity and reader config.
+
+        Args:
+            state: Experiment state supplying paths, context, and logging policy.
+            create: Whether to create a new journal instead of checking its saved identity.
+
+        Raises:
+            RuntimeError: The runner journal is already open.
+        """
         if getattr(self, "_opened", False):
             raise RuntimeError("Runner journal is already open.")
         if create:
@@ -48,6 +58,16 @@ class RunnerJournal:
     def write_client_config(
         self, state: RunnerState, context: JsonObject, *, create: bool = False
     ) -> Path:
+        """Write an identity-bound logging configuration and return its absolute path.
+
+        Args:
+            state: Experiment state supplying the journal location and policy.
+            context: Journal context for the future client.
+            create: Whether the client should create a new journal with no expected identity.
+
+        Returns:
+            Path to a new JSON configuration beneath runner/logging.
+        """
         settings = state.template.logging.model_dump(exclude_unset=True)
         settings.update(
             {
@@ -69,6 +89,14 @@ class RunnerJournal:
         template: ExperimentTemplate,
         reason: str,
     ) -> None:
+        """Journal an applied template and update the state's revision and run identity.
+
+        Args:
+            state: Mutable state receiving the applied template and revision.
+            template_yaml: Original template text retained in the journal.
+            template: Validated normalized template.
+            reason: Application reason; initial preserves the existing revision ID.
+        """
         previous = state.template_revision_id
         changed = state.template.model_dump(exclude_unset=True) != template.model_dump(
             exclude_unset=True
@@ -98,6 +126,18 @@ class RunnerJournal:
         restoration_id: str,
         diagnostics_directory: Path | None = None,
     ) -> None:
+        """Finalize journal restoration and reopen the runner with its new generation.
+
+        Args:
+            state: Restored experiment state.
+            journal_manifest: Snapshot journal metadata.
+            restoration_id: Transaction UUID used to derive a repeatable new generation.
+            diagnostics_directory: Optional diagnostic export to retain during restoration.
+
+        Raises:
+            RuntimeError: The runner journal is still open.
+            ValueError: Restored paths escape the experiment or metadata is invalid.
+        """
         if getattr(self, "_opened", False):
             raise RuntimeError("Close the runner journal before restoring it.")
         if not isinstance(journal_manifest, JournalSnapshotManifest):
@@ -153,6 +193,7 @@ class RunnerJournal:
         self.open(state, create=False)
 
     def close(self) -> None:
+        """Close the owned client and clear the published reader-config reference."""
         if not getattr(self, "_opened", False):
             return
         self.client.close()

@@ -20,7 +20,16 @@ from core.resources.state import CollectorSettings, ResourceHistory
 
 
 class ResourceCollector:
+    """Supervise an isolated resource worker and retain bounded sample history."""
     def __init__(self, config_path: Path) -> None:
+        """Initialize collector supervision without reading config or starting a worker.
+
+        Args:
+            config_path: Absolute collector configuration path, loaded by serve.
+
+        Raises:
+            ValueError: The configuration path is relative.
+        """
         self._config_path = Path(config_path)
         if not self._config_path.is_absolute():
             raise ValueError("Collector config_path must be absolute.")
@@ -56,12 +65,23 @@ class ResourceCollector:
         self._last_success: dict[str, dict[str, tuple[float, str]]] = {}
 
     def update(self, snapshot: JsonObject) -> None:
-        """Replace the desired target set without waiting for the collector process."""
+        """Replace the desired target set without waiting for the collector process.
+
+        Args:
+            snapshot: Validated or JSON selection of journal context and monitored
+                process targets.
+        """
         self._update(CollectorSnapshot.model_validate(snapshot))
 
     def _update(self, snapshot: CollectorSnapshot) -> None:
         # Windows Path equality ignores spelling/case; the existing wire
         # comparison distinguishes those changes in the configured path.
+        """Publish a changed target snapshot, advance its revision, and clear old samples.
+
+        Args:
+            snapshot: Validated or JSON selection of journal context and monitored
+                process targets.
+        """
         path = (
             None
             if snapshot.logging_config_path is None
@@ -86,6 +106,14 @@ class ResourceCollector:
         self._wake.set()
 
     async def serve(self) -> None:
+        """Load settings and supervise the worker until closed or cancelled.
+
+        Configuration and monitoring failures are exposed through get_status; worker
+        failures trigger bounded-delay restarts. Cancellation still cleans up the worker.
+
+        Raises:
+            RuntimeError: The collector is already serving or has been closed.
+        """
         if self._serving or self._closing:
             raise RuntimeError("Resource collector is already serving or closed.")
         self._serving = True
@@ -146,6 +174,12 @@ class ResourceCollector:
                 self._error = f"Collector cleanup failed: {error}"
 
     async def _start_worker(self) -> None:
+        """Spawn one collector and start IPC tasks after previous termination is confirmed.
+
+        Requires any previous worker to have confirmed termination. Spawns a daemon
+        with a dedicated pipe and starts update/sample tasks; cancellation waits for
+        process.start to finish before cleanup can release ownership.
+        """
         if self._process is not None:
             raise RuntimeError("Previous collector termination is unconfirmed.")
         self._state = "starting"
@@ -177,6 +211,12 @@ class ResourceCollector:
         ]
 
     async def _send_updates(self) -> None:
+        """Send current target revisions periodically and request stop on loop exit.
+
+        Publishes revisioned snapshots periodically or when signalled. Suspension
+        sends an empty target/journal selection. Loop termination sends the worker's
+        stop command.
+        """
         while not self._closing and not self._stop_worker:
             self._wake.clear()
             snapshot = self._snapshot.model_dump(mode="json", exclude_unset=True)
@@ -202,6 +242,13 @@ class ResourceCollector:
         await asyncio.to_thread(self._connection.send, {"command": "stop"})
 
     async def _receive_samples(self) -> None:
+        """Receive validated worker packets and retain samples for the current revision.
+
+        Every valid packet refreshes worker health, but only samples matching the
+        selected revision enter history/latest values. Per-metric successful
+        observation times are retained separately so unavailable samples do not
+        fabricate freshness.
+        """
         while True:
             packet = CollectorPacket.model_validate(
                 await asyncio.to_thread(self._connection.recv)
@@ -224,6 +271,12 @@ class ResourceCollector:
             self._observed.set()
 
     async def _watch_worker(self) -> None:
+        """Watch process/IPC health and enforce startup and heartbeat timeouts.
+
+        Checks process liveness and IPC task failures independently. Startup and
+        steady-state silence use separate timeouts; sustained healthy operation
+        resets restart backoff.
+        """
         ready_since = None
         while True:
             if not self._process.is_alive():
@@ -248,6 +301,12 @@ class ResourceCollector:
             await asyncio.sleep(self._settings.status_interval_seconds)
 
     async def _shutdown_worker(self) -> None:
+        """Stop the worker and release IPC resources only after confirming process exit.
+
+        Signals stop and seeks exit confirmation before cancelling IPC tasks and
+        releasing the pipe/handle. If termination remains unconfirmed, ownership is
+        retained and restart is withheld.
+        """
         process = self._process
         if process is None:
             return
@@ -272,6 +331,15 @@ class ResourceCollector:
     async def _confirm_worker_exit(
         self, process: multiprocessing.Process, timeout: float
     ) -> bool:
+        """Wait for worker exit, escalating through terminate and kill.
+
+        Args:
+            process: Owned collector process.
+            timeout: Join timeout in seconds for each shutdown phase.
+
+        Returns:
+            Whether the process is confirmed no longer alive.
+        """
         await asyncio.to_thread(process.join, timeout)
         if process.is_alive():
             process.terminate()
@@ -282,7 +350,16 @@ class ResourceCollector:
         return not process.is_alive()
 
     async def suspend_experiment(self) -> None:
-        """Confirm writer closure before a caller replaces an experiment journal."""
+        """Confirm writer closure before a caller replaces an experiment journal.
+
+        Publishes an empty selection and waits until the worker acknowledges the
+        revision and closes its journal writer. This provides the filesystem/journal
+        barrier required by restoration.
+
+        Raises:
+            TimeoutError: The worker does not confirm journal closure before the
+                shutdown timeout.
+        """
         self._suspended = True
         self._revision += 1
         revision = self._revision
@@ -308,11 +385,17 @@ class ResourceCollector:
             ) from None
 
     def resume_experiment(self) -> None:
+        """Resume selected experiment monitoring and publish a fresh revision."""
         self._suspended = False
         self._revision += 1
         self._wake.set()
 
     def get_status(self) -> JsonObject:
+        """Return detached supervision state and latest samples with metric freshness.
+
+        Returns:
+            Detached supervision state and latest samples with metric freshness.
+        """
         now = time.monotonic()
         stale_after = (
             None
@@ -375,11 +458,30 @@ class ResourceCollector:
         )
 
     def read_history(self, *, after: int = 0, limit: int = 100) -> JsonObject:
+        """Read a bounded page of retained collector samples.
+
+        Args:
+            after: Nonnegative exclusive history cursor.
+            limit: Maximum sample count, from 1 to 1000.
+
+        Returns:
+            Samples, continuation cursor, history identity, and retention/gap metadata.
+
+        Raises:
+            RuntimeError: History has not been initialized.
+            ValueError: Cursor or limit is invalid.
+        """
         if self._history is None:
             raise RuntimeError("Resource history is not initialized.")
         return self._history.read(after=after, limit=limit)
 
     async def close(self) -> None:
+        """Cancel supervision, stop the worker, and expose any unconfirmed termination.
+
+        Stops supervision and seeks worker termination. Cleanup failures remain
+        visible in status; termination_unconfirmed is reported when a process handle
+        must remain owned.
+        """
         self._closing = True
         self._wake.set()
         if (

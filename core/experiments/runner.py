@@ -85,6 +85,11 @@ from core.primitives.tasks import _await_read_task
 
 
 class ExperimentRunner:
+    """Own sequential DAG execution, control transitions, snapshots, and recovery.
+
+    Run admission starts background work. Callers observe get_state for experiment
+    completion and explicitly close the runner to release owned runtime resources.
+    """
     def __init__(
         self,
         project_root: Path,
@@ -94,6 +99,19 @@ class ExperimentRunner:
         archive_config_path: Path | None = None,
         control_logger: OperationLogger | None = None,
     ) -> None:
+        """Bind project services and initialize an idle experiment runner.
+
+        Args:
+            project_root: Absolute project directory.
+            module_manager: Caller-owned module/storage manager.
+            notify: Optional synchronous callback receiving published runner state.
+            archive_config_path: Optional absolute archive limits file; defaults to
+                repository settings, which the archiver reads during construction.
+            control_logger: Optional caller-owned logger for control-operation audit.
+
+        Raises:
+            ValueError: The project path or archive configuration is invalid.
+        """
         self._project_root = Path(project_root)
         if not self._project_root.is_absolute():
             raise ValueError("project_root must be absolute.")
@@ -171,6 +189,23 @@ class ExperimentRunner:
         continue_run: bool = False,
         delayed_start: bool = False,
     ) -> JsonObject:
+        """Signal a new run, continuation, or matching existing run without waiting for completion.
+
+        Args:
+            template_path: Absolute template path for a new experiment.
+            experiment_id: Optional new identity, or source identity for continuation.
+            continue_run: Restore a new experiment from the source's latest valid snapshot.
+            delayed_start: Prepare services and pause before the first stage.
+
+        Returns:
+            Experiment identity and a signaled flag; readiness/completion remain observable
+            through runner state.
+
+        Raises:
+            RuntimeError: Current work, maintenance, or unconfirmed shutdown blocks admission.
+            ValueError: Selection or template path is invalid.
+            FileExistsError: A new experiment would reuse a registered identity.
+        """
         if self._closed:
             raise RuntimeError("Runner is closed.")
         if self._state is not None and self._state.pending_rebuild is not None:
@@ -216,6 +251,12 @@ class ExperimentRunner:
         return {"experiment_id": experiment_id, "signaled": True}
 
     async def _reset_run_components(self) -> None:
+        """Detach old services/journal and bind fresh service and snapshot coordination.
+
+        Closes old service channels and the runner journal, creates fresh
+        service/snapshot coordinators, and rebinds stage calls to the new manager.
+        Participant shutdown must already have been confirmed by run admission.
+        """
         await self._services.close()
         self._services = ServiceManager(
             self._launcher,
@@ -240,6 +281,17 @@ class ExperimentRunner:
     def _bind_new_run(
         self, experiment_id: str, template_path: Path | None, source: Path | None, paused: bool
     ) -> None:
+        """Reset selected-run observations and start the background DAG task.
+
+        Args:
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+            template_path: Absolute template path; relative resources resolve from
+                its parent directory.
+            source: Source experiment directory for continuation, or None for a new
+                template run.
+            paused: Whether the new scheduler begins paused after preparation.
+        """
         self._requested_id = experiment_id
         self._template_path = None if template_path is None else Path(template_path)
         self._continue_source = source
@@ -264,6 +316,18 @@ class ExperimentRunner:
     async def _signal_existing_run(
         self, continue_run: bool, experiment_id: str | None
     ) -> JsonObject:
+        """Resume or acknowledge the selected run, rejecting conflicting run admission.
+
+        Args:
+            continue_run: Whether the caller requested a new continuation rather
+                than signalling this run.
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+
+        Returns:
+            Selected experiment ID and signaled=True after optional resume;
+            incompatible selection/continuation raises.
+        """
         if continue_run:
             raise RuntimeError(
                 "Stop the selected experiment before continuing another instance."
@@ -275,6 +339,13 @@ class ExperimentRunner:
         return {"experiment_id": self._requested_id, "signaled": True}
 
     async def _advance_dag(self) -> None:
+        """Coordinate stage completion, readiness, service policy, and finalization in the background.
+
+        Service decisions remain active during stages and pauses. Stage results are
+        checkpointed before cursor changes; final completion waits for snapshot and
+        service shutdown. Background failures enter the failure path, and scheduler
+        helper tasks are cancelled on exit.
+        """
         wake_task = None
         readiness_task = None
         try:
@@ -356,6 +427,12 @@ class ExperimentRunner:
             self._idle.set()
 
     async def _prepare_dag_state(self) -> RunnerState | None:
+        """Prepare/recover selected state and apply pending decisions before scheduling work.
+
+        Returns:
+            Prepared selected state, or None when a recovered/accepted conditional
+            stop completed shutdown instead of scheduling more work.
+        """
         if (
             self._state is not None
             and self._state.last_dag_decision is not None
@@ -403,6 +480,12 @@ class ExperimentRunner:
         return state
 
     def _apply_supervision_result(self, state: RunnerState) -> None:
+        """Apply a service pause/stop decision and keep observation active during pauses.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         action = self._service_task.result()
         if action == "stop":
             raise RuntimeError(
@@ -426,6 +509,16 @@ class ExperimentRunner:
     async def _complete_stage_task(
         self, state: RunnerState
     ) -> Literal["unknown", "stopped", "ready"]:
+        """Accept a finished stage, apply snapshot/conditional policy, and settle step state.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+
+        Returns:
+            Unknown when ownership remains unresolved, stopped after a conditional
+            shutdown, or ready when the scheduler may continue.
+        """
         outcome = self._stage_task.result()
         self._stage_task = None
         self._last_attempt = outcome.attempt
@@ -474,6 +567,14 @@ class ExperimentRunner:
         return "ready"
 
     def _pause_unknown_stage(self, state: RunnerState, outcome: StageOutcome) -> None:
+        """Retain unresolved attempt ownership and pause or fail according to its action.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+        """
         state.mode = self._desired_mode = "paused"
         state.pause_requested = True
         state.phase = "waiting"
@@ -497,6 +598,17 @@ class ExperimentRunner:
         self, state: RunnerState, outcome: StageOutcome, final: bool,
         *, requested: bool = False,
     ) -> None:
+        """Create a requested or policy-triggered snapshot while holding runner maintenance.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+            final: Whether the current boundary ends the final DAG cycle.
+            requested: Whether this snapshot was explicitly requested by the
+                completed node's policy.
+        """
         mode = state.template.snapshots.mode
         if (
             requested
@@ -527,6 +639,16 @@ class ExperimentRunner:
         final: bool,
     ) -> None:
         # The final step also waits for confirmed service shutdown.
+        """Resolve a nonfinal step after successful advancement or report its policy failure.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+            response: Participant/controller result envelope being processed.
+            final: Whether the current boundary ends the final DAG cycle.
+        """
         if self._step_future is not None and not final:
             future, self._step_future = self._step_future, None
             if not future.done():
@@ -546,6 +668,18 @@ class ExperimentRunner:
                     )
 
     def _apply_readiness_result(self, state: RunnerState, action: str) -> bool:
+        """Apply a readiness pause/stop and return whether stage scheduling may proceed.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            action: Ready, pause, or stop result returned by the service readiness
+                barrier.
+
+        Returns:
+            True when readiness permits scheduling, False when the runner was
+            paused. Stop policy raises instead of returning.
+        """
         if action == "stop":
             raise RuntimeError("Service readiness requires experiment stop.")
         if action == "pause":
@@ -563,6 +697,12 @@ class ExperimentRunner:
         return True
 
     async def _complete_dag(self, state: RunnerState) -> None:
+        """Publish a valid final snapshot, confirm service shutdown, and mark completion.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         state.pending_advance = self._pending_advance
         self._maintenance = True
         try:
@@ -597,6 +737,12 @@ class ExperimentRunner:
                 )
 
     def _launch_next_stage(self, state: RunnerState) -> None:
+        """Apply pending cursor/cycle advancement, checkpoint, and schedule the next stage.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         self._idle.clear()
         if self._pending_advance:
             state.pending_input = None
@@ -626,6 +772,17 @@ class ExperimentRunner:
         self._manual = False
 
     async def _prepare_continuation(self) -> tuple[RunnerState, str]:
+        """Restore the latest valid source snapshot into a newly registered paused experiment.
+
+        Selects a fully valid source snapshot with remaining work, allocates a new
+        experiment/run identity, registers the target, and restores through the
+        resource-writer barrier. Source files and journal remain separate from the
+        continuation.
+
+        Returns:
+            Newly restored runner state and ready action; the continuation remains
+            paused.
+        """
         manifest = await _await_read_task(asyncio.create_task(asyncio.to_thread(
             self._snapshots._latest_valid, self._continue_source
         )))
@@ -691,6 +848,12 @@ class ExperimentRunner:
         return state, action
 
     async def _prepare_initial_run(self) -> tuple[RunnerState, str]:
+        """Assemble inputs, create the journal, verify integrity, and start declared services.
+
+        Returns:
+            Assembled state and the readiness/pause/stop action from service
+            startup.
+        """
         state = await self._assembler.assemble(self._template_path, self._requested_id)
         self._state = state
         # Async integrity checks yield before any service is ready. Public startup
@@ -708,6 +871,12 @@ class ExperimentRunner:
         return state, action
 
     async def _prepare_live_run(self) -> tuple[RunnerState, str]:
+        """Check local modules and recover service supervision and snapshot barriers if needed.
+
+        Returns:
+            Existing selected state and the action from module checking and optional
+            live service recovery.
+        """
         state = self._state
         self._pending_advance = state.pending_advance
         await self._assembler._check_modules_async(state)
@@ -724,6 +893,11 @@ class ExperimentRunner:
         return state, action
 
     def _at_dag_end(self) -> bool:
+        """Return whether ordinary final-cycle advancement permits finalization now.
+
+        Returns:
+            Whether ordinary final-cycle advancement permits finalization now.
+        """
         state = self._state
         conditional_pause = (
             state.last_dag_decision is not None
@@ -739,7 +913,14 @@ class ExperimentRunner:
     def _apply_stage_outcome(
         self, outcome: StageOutcome, *, defer_dag: bool = False
     ) -> None:
-        """Retain accepted output and either apply or defer its DAG decision."""
+        """Retain accepted output and either apply or defer its DAG decision.
+
+        Args:
+            outcome: Accepted stage/command outcome that determines the next policy
+                action.
+            defer_dag: Store the accepted DAG decision until the requested snapshot
+                has been published.
+        """
         state = self._state
         response = outcome.result
         stage_id = outcome.attempt.stage_id
@@ -779,6 +960,7 @@ class ExperimentRunner:
             self._apply_dag_decision(state, source)
 
     def _apply_pending_dag_decision(self, state: RunnerState) -> None:
+        """Consume and apply an accepted decision deferred until after snapshot publication."""
         source = state.pending_dag_decision
         if source is None:
             return
@@ -786,7 +968,14 @@ class ExperimentRunner:
         self._apply_dag_decision(state, source)
 
     def _apply_dag_decision(self, state: RunnerState, source: LastDecision) -> None:
-        """Apply an accepted decision after its requested snapshot was published."""
+        """Apply an accepted decision after its requested snapshot was published.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            source: Accepted conditional decision and source result identity to
+                apply exactly once.
+        """
         state.last_dag_decision = source
         command = source.decision.command
         if command == "pause":
@@ -801,6 +990,15 @@ class ExperimentRunner:
     def _apply_conditional_move(
         self, state: RunnerState, source: LastDecision, target: str
     ) -> None:
+        """Capture transferred input and reset target/suffix results and retry budgets.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            source: Accepted conditional decision and its source result/experiment
+                identity.
+            target: Stable UUID of the target node in the applied template.
+        """
         position = next(
             index
             for index, item in enumerate(state.template.stages, 1)
@@ -822,7 +1020,11 @@ class ExperimentRunner:
         self._pending_advance = False
 
     def _retain_input_artifacts(self, data: JsonValue) -> None:
-        """Protect experiment-relative artifact references carried through a jump."""
+        """Protect experiment-relative artifact references carried through a jump.
+
+        Args:
+            data: JSON payload recorded or sent by this operation.
+        """
         state = self._state
         root = state.experiment_directory.resolve()
         artifacts = root / "shared_artifacts"
@@ -849,7 +1051,12 @@ class ExperimentRunner:
         state.retained_artifacts = sorted(retained)
 
     async def _stop_from_stage(self, *, recovering: bool = False) -> None:
-        """Use ordinary shutdown without cancelling or awaiting this DAG task."""
+        """Use ordinary shutdown without cancelling or awaiting this DAG task.
+
+        Args:
+            recovering: Whether shutdown is finishing a previously accepted
+                conditional stop during recovery.
+        """
         future, self._step_future = self._step_future, None
         try:
             if recovering:
@@ -876,6 +1083,12 @@ class ExperimentRunner:
     def _retire_accepted_service_requests(self, state: RunnerState) -> None:
         # A crash may leave completed snapshot calls in saved queues.
         # Preserve their accepted outcomes before stopping unresolved work.
+        """Remove saved queue entries already accepted by the runner before recovered shutdown.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         for instance in state.services.values():
             requests = list(instance.pending_requests)
             if instance.active_request is not None:
@@ -890,6 +1103,13 @@ class ExperimentRunner:
                     instance.pending_requests.remove(request)
 
     async def pause(self) -> None:
+        """Request a pause and wait for startup and the current attempt boundary.
+
+        Services remain supervised while paused.
+
+        Raises:
+            RuntimeError: No active experiment remains to pause.
+        """
         if self._task is None or self._task.done():
             raise RuntimeError("There is no active experiment to pause.")
         self._desired_mode = "paused"
@@ -906,6 +1126,12 @@ class ExperimentRunner:
         self._save_state()
 
     async def resume(self) -> None:
+        """Resume normal DAG scheduling after checking maintenance, attempts, and services.
+
+        Raises:
+            RuntimeError: No active experiment exists or unresolved work/service state
+                prevents safe resumption.
+        """
         if self._task is None:
             raise RuntimeError("There is no experiment to resume.")
         await self._ready.wait()
@@ -947,6 +1173,16 @@ class ExperimentRunner:
         self._wake.set()
 
     async def step(self) -> JsonObject:
+        """Execute one stage visit from an idle pause and wait for its boundary.
+
+        Returns:
+            Attempt ID, accepted result, and phase. A final step also waits for final
+            snapshot publication, service shutdown, and DAG-task exit.
+
+        Raises:
+            RuntimeError: The runner is not at an eligible pause, required services are
+                absent/stopped, or stage/service policy prevents completing the step.
+        """
         if self._maintenance:
             raise RuntimeError("Wait for snapshot or restoration before stepping.")
         if self._task is None:
@@ -995,9 +1231,28 @@ class ExperimentRunner:
             raise
 
     async def stop(self) -> JsonObject:
+        """Interrupt work, shut down owned services, and finalize a snapshot when applicable.
+
+        Returns:
+            Current runner state including termination confirmation and snapshot status.
+
+        Raises:
+            RuntimeError: Participant shutdown fails or cannot be confirmed.
+        """
         return await self._stop(finalize_snapshot=True)
 
     async def _stop(self, *, finalize_snapshot: bool) -> JsonObject:
+        """Cancel control tasks, establish participant shutdown, and publish terminal state.
+
+        Args:
+            finalize_snapshot: Whether eligible ordinary shutdown creates a final snapshot.
+
+        Returns:
+            Current runner state after confirmed shutdown.
+
+        Raises:
+            RuntimeError: Stage or service shutdown remains failed/unconfirmed.
+        """
         self._stop_requested = True
         await self._cancel_control_tasks()
         if self._state is not None:
@@ -1089,6 +1344,12 @@ class ExperimentRunner:
         return self.get_state()
 
     async def _cancel_control_tasks(self) -> None:
+        """Cancel service-control, maintenance, and DAG tasks other than the current task.
+
+        Awaits cancellation of other service-control, maintenance, and DAG tasks.
+        Skipping the current task avoids cancelling or awaiting the shutdown
+        operation itself.
+        """
         if (
             self._service_control_task is not None
             and self._service_control_task is not asyncio.current_task()
@@ -1118,6 +1379,20 @@ class ExperimentRunner:
         position: int | None = None,
         experiment_id: str | None = None,
     ) -> JsonObject:
+        """Repeat the paused current stage or create a paused run from an experiment's template.
+
+        Args:
+            scope: Stage or experiment scope.
+            position: One-based current stage position, required only for stage rerun.
+            experiment_id: Optional source experiment for experiment rerun.
+
+        Returns:
+            Completed step data for a stage, or run admission data for an experiment.
+
+        Raises:
+            ValueError: Scope, source selection, or position is invalid.
+            RuntimeError: Maintenance or current runner state prevents rerun.
+        """
         if self._maintenance:
             raise RuntimeError("Wait for snapshot or restoration before rerunning.")
         if scope != "stage":
@@ -1144,6 +1419,14 @@ class ExperimentRunner:
         return await self.step()
 
     def _require_idle_service_control(self, state: RunnerState, message: str) -> None:
+        """Require an idle pause with no concurrent control, maintenance, or active attempt.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            message: Human-readable diagnostic to expose when the operation is
+                rejected.
+        """
         if (
             self._maintenance
             or self._service_retrying
@@ -1159,6 +1442,17 @@ class ExperimentRunner:
             raise RuntimeError(message)
 
     async def start_service(self, position: int) -> JsonObject:
+        """Start the selected service at an idle pause and wait for readiness.
+
+        Args:
+            position: One-based position in the template's service list.
+
+        Returns:
+            Service/instance IDs, readiness, and manual-stop status.
+
+        Raises:
+            RuntimeError: The runner is not eligible for isolated service control.
+        """
         state = self._require_active()
         self._require_idle_service_control(
             state,
@@ -1182,6 +1476,17 @@ class ExperimentRunner:
             self._wake.set()
 
     async def stop_service(self, position: int) -> JsonObject:
+        """Persist manual-stop intent and confirm the selected service has stopped.
+
+        Args:
+            position: One-based position in the template's service list.
+
+        Returns:
+            Service/instance IDs and stopped/manual-stop flags.
+
+        Raises:
+            RuntimeError: The runner is not at an eligible idle pause or shutdown fails.
+        """
         state = self._require_active()
         self._require_idle_service_control(
             state,
@@ -1223,6 +1528,18 @@ class ExperimentRunner:
             self._wake.set()
 
     async def retry(self, position: int) -> JsonObject:
+        """Manually restart one failed service while the experiment is paused.
+
+        Args:
+            position: One-based position in the template's service list.
+
+        Returns:
+            Service identity, new instance identity, and resulting readiness action.
+
+        Raises:
+            RuntimeError: Maintenance, another retry, manual stop, or ownership state
+                prevents retry; a failed retry may fail the experiment.
+        """
         if self._maintenance:
             raise RuntimeError(
                 "Wait for snapshot or restoration before retrying a service."
@@ -1265,6 +1582,15 @@ class ExperimentRunner:
             self._wake.set()
 
     def move(self, position: int) -> None:
+        """Move the paused DAG pointer and clear any conditional input assignment.
+
+        Args:
+            position: One-based stage position within the applied DAG.
+
+        Raises:
+            ValueError: Position is outside the DAG.
+            RuntimeError: The experiment is not idle/paused or maintenance is active.
+        """
         if self._maintenance:
             raise RuntimeError(
                 "Wait for snapshot or restoration before moving the cursor."
@@ -1284,6 +1610,19 @@ class ExperimentRunner:
         self._save_state()
 
     def reset_retries(self, kind: ModuleRole, position: int) -> JsonObject:
+        """Reset a stage or service retry counter while paused.
+
+        Args:
+            kind: Stage or service selection.
+            position: One-based position in the corresponding template list.
+
+        Returns:
+            Selected definition ID with previous and current counter values.
+
+        Raises:
+            ValueError: Kind/position is invalid or the selected service has not started.
+            RuntimeError: Current runner/maintenance state prevents resetting retries.
+        """
         if self._maintenance:
             raise RuntimeError(
                 "Wait for snapshot or restoration before resetting retries."
@@ -1324,11 +1663,38 @@ class ExperimentRunner:
     async def replace(
         self, kind: ModuleRole, position: int, module: JsonObject, settings: JsonObject
     ) -> JsonObject:
+        """Reject the currently unsupported module-replacement operation.
+
+        Args:
+            kind: Requested stage or service kind.
+            position: Requested one-based definition position.
+            module: Requested replacement module reference.
+            settings: Requested replacement settings.
+
+        Raises:
+            NotImplementedError: Direct module replacement is not implemented.
+        """
         raise NotImplementedError(
             "Module replacement requires protected rebuilds and snapshots."
         )
 
     async def reload_template(self, template_path: Path | None = None) -> JsonObject:
+        """Apply changed stage/service definitions at an idle pause with protective recovery.
+
+        Args:
+            template_path: Absolute candidate YAML path, or None to reread the selected
+                experiment's template. Relative resources use that file's directory.
+
+        Returns:
+            Applied revision, snapshot, cursor, and definition-change metadata.
+
+        Raises:
+            RuntimeError: Current state lacks an idle pause with ready services.
+            ValueError: YAML, definitions, or immutable template fields are invalid.
+
+        The reload is audited and remains paused; failure after detachment attempts
+        restoration from the protective snapshot.
+        """
         logger = (
             self._journal.client
             if self._journal.reader_config_path is not None
@@ -1432,6 +1798,18 @@ class ExperimentRunner:
     async def _apply_template(
         self, template_yaml: str, template: ExperimentTemplate
     ) -> JsonObject:
+        """Plan, protect, publish, and commit a candidate template within the active reload audit.
+
+        Args:
+            template_yaml: Applied or candidate template YAML retained for audit and
+                publication.
+            template: Validated experiment template supplying definitions and
+                policies.
+
+        Returns:
+            Reload result updated with changes, protective snapshot, committed
+            revision, and preserved cursor information.
+        """
         state = self._require_active()
         operation = self._reload_operation
         if operation is None or not self._maintenance:
@@ -1480,6 +1858,24 @@ class ExperimentRunner:
         operation: Operation,
         result: JsonObject,
     ) -> ReloadApplication:
+        """Compare definitions and journaled progress to plan a reload workspace and cursor.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            template_yaml: Applied or candidate template YAML retained for audit and
+                publication.
+            template: Validated experiment template supplying definitions and
+                policies.
+            operation: Active reload journal operation that owns all audit records
+                for this change.
+            result: Mutable public reload result populated as planning/publication
+                completes.
+
+        Returns:
+            ReloadApplication containing compared definitions, preservation/rewind
+            decisions, new IDs, and an owned workspace path.
+        """
         layout = _reload_layout(
             state.template, template, state.stage_position, self._pending_advance
         )
@@ -1516,6 +1912,12 @@ class ExperimentRunner:
         )
 
     def _audit_reload_definitions(self, application: ReloadApplication) -> None:
+        """Journal per-definition changes and append compact changes to the reload result.
+
+        Args:
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         for role, old_entries, new_entries in (
             ("stage", application.previous.stages, application.template.stages),
             ("service", application.previous.services, application.template.services),
@@ -1561,6 +1963,14 @@ class ExperimentRunner:
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
         # Validate the dedicated full-template event before any filesystem/process effects.
+        """Prevalidate the applied-template event and journal the old/candidate templates.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         encode_event(
             {
                 "schema_version": 2,
@@ -1605,6 +2015,14 @@ class ExperimentRunner:
         )
 
     def _audit_reload_progress(self, state: RunnerState, application: ReloadApplication) -> None:
+        """Journal preserved/invalidated results, retry counters, and planned cursor movement.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         application.logger.record_event(
             "reload.progress",
             {
@@ -1639,6 +2057,18 @@ class ExperimentRunner:
     async def _prepare_reload_snapshot(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
+        """Stage candidate files, snapshot the paused run, and stop changed services.
+
+        Checks ownership prerequisites and stages candidate files before detaching
+        the paused scheduler. It then publishes a protective snapshot and a durable
+        pending_rebuild intent before stopping changed services.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         await self._services.prepare_rebuild(
             state, application.template, validate_only=True
         )
@@ -1687,6 +2117,14 @@ class ExperimentRunner:
     def _isolate_reload_service_data(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
+        """Move stale data aside for new IDs or changed module names and audit transfer plans.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         for sid, definition in application.layout.new_services.items():
             previous = application.layout.old_services.get(sid)
             application.logger.record_event(
@@ -1741,6 +2179,19 @@ class ExperimentRunner:
     async def _publish_reload_dag(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
+        """Publish candidate files and update template/cursor/results while preserving valid prefix data.
+
+        Publishes staged module/template files, switches the candidate revision/run
+        identity, and retains only valid-prefix result/retry references. Conditional
+        input is kept only if both endpoints and the selected cursor remain
+        compatible.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         await self._assembler.rebuild(
             state,
             application.template_yaml,
@@ -1810,6 +2261,19 @@ class ExperimentRunner:
     async def _transfer_reload_services(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
+        """Reconcile candidate services, restore eligible exports, and audit resulting instances.
+
+        Loads prior exports only for changed services whose stable ID and module
+        name match. Unchanged services must retain their instance IDs. Fresh
+        readiness is required before commit, and every transfer/preservation
+        decision is audited.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         if await self._services.reconcile(state, application.template) != "ready":
             raise RuntimeError("Reloaded services did not become ready.")
         transfer = {
@@ -1874,6 +2338,14 @@ class ExperimentRunner:
     def _commit_reload(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
+        """Journal the applied revision and checkpoint an idle pause with no pending rebuild.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         application.logger.record_template_applied(
             application.template.model_dump(exclude_unset=True),
             template_yaml=application.template_yaml,
@@ -1905,6 +2377,21 @@ class ExperimentRunner:
     async def _handle_reload_failure(
         self, state: RunnerState, application: ReloadApplication, error: BaseException
     ) -> None:
+        """Audit failed reload and attempt protective rollback, preserving unresolved recovery state.
+
+        Ordinary post-intent failures attempt restoration of the protective snapshot
+        while preserving audit evidence. Cancellation and mandatory journal failure
+        retain pending recovery instead of treating the partially published tree as
+        a valid final state.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+        """
         if state.pending_rebuild is None or application.committed:
             await self._handle_detached_reload_failure(state, application, error)
             return
@@ -1970,6 +2457,16 @@ class ExperimentRunner:
                 await self._fail(error, {})
 
     async def _handle_detached_reload_failure(self, state: RunnerState, application: ReloadApplication, error: BaseException) -> None:
+        """Fail a detached uncommitted reload unless original services and snapshot barriers remain healthy.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+        """
         if (
             application.detached
             and not application.committed
@@ -1999,6 +2496,14 @@ class ExperimentRunner:
             await self._fail(error, {})
 
     async def _cleanup_reload_application(self, state: RunnerState, application: ReloadApplication) -> None:
+        """Resume paused scheduling/resource observation and remove only completed owned workspaces.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            application: Reload plan and mutable progress/audit state shared by
+                reload stages.
+        """
         if state.pending_rebuild is None and state.phase == "waiting":
             self._desired_mode = "paused"
             self._recover_live = False
@@ -2033,6 +2538,20 @@ class ExperimentRunner:
 
 
     async def snapshot(self, label: str | None = None) -> JsonObject:
+        """Publish a manual snapshot from an idle pause with no concurrent maintenance.
+
+        Args:
+            label: Optional nonempty snapshot label.
+
+        Returns:
+            Published snapshot metadata.
+
+        Raises:
+            RuntimeError: A stage, service control, or maintenance operation prevents
+                snapshotting, or a service is manually stopped.
+
+        Operational snapshot failure enters the runner's failure/shutdown path.
+        """
         if label is not None:
             require_text(label, "snapshot label")
         state = self._require_active()
@@ -2074,7 +2593,17 @@ class ExperimentRunner:
         archive_path: Path,
         experiment_id: str | None = None,
     ) -> JsonObject:
-        """Export a stopped selection or an explicitly identified stopped experiment."""
+        """Export a stopped selection or an explicitly identified stopped experiment.
+
+        Args:
+            archive_path: Absolute archive file path on the server filesystem.
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+
+        Returns:
+            Portable archive manifest/path and independent archive-operation audit
+            metadata.
+        """
         state = self._state
         if experiment_id is not None:
             require_text(experiment_id, "experiment_id")
@@ -2092,13 +2621,30 @@ class ExperimentRunner:
         return await self._run_archive(self._archiver.create(state, archive_path))
 
     async def inspect_archive(self, archive_path: Path) -> JsonObject:
-        """Validate a portable archive without changing the selected experiment."""
+        """Validate a portable archive without changing the selected experiment.
+
+        Args:
+            archive_path: Absolute archive file path on the server filesystem.
+
+        Returns:
+            Fully validated archive metadata and independent inspection-operation
+            audit metadata.
+        """
         return await self._run_archive(self._archiver.inspect(archive_path))
 
     async def install_archive(
         self, archive_path: Path, destination: Path
     ) -> JsonObject:
-        """Install checked inputs while no DAG owns the local module store."""
+        """Install checked inputs while no DAG owns the local module store.
+
+        Args:
+            archive_path: Absolute archive file path on the server filesystem.
+            destination: Absolute output path for the requested file or directory.
+
+        Returns:
+            Installed template/resource destination, module registration receipt,
+            and operation audit metadata.
+        """
         return await self._run_archive(
             self._archiver.install(archive_path, destination)
         )
@@ -2106,6 +2652,15 @@ class ExperimentRunner:
     async def _run_archive(
         self, operation: Coroutine[None, None, JsonObject]
     ) -> JsonObject:
+        """Run an archive action under exclusive maintenance after confirmed DAG shutdown.
+
+        Args:
+            operation: Unstarted archive coroutine whose lifetime is owned by this
+                admission wrapper.
+
+        Returns:
+            The admitted archive coroutine's actual result.
+        """
         if (
             self._closed
             or self._maintenance
@@ -2130,6 +2685,20 @@ class ExperimentRunner:
             self._wake.set()
 
     async def rollback(self, snapshot_id: str) -> JsonObject:
+        """Restore a selected snapshot and reactivate the experiment in paused mode.
+
+        Args:
+            snapshot_id: Snapshot UUID belonging to the selected experiment.
+
+        Returns:
+            Experiment/snapshot identity and paused mode.
+
+        Raises:
+            RuntimeError: Active work, pending recovery, or missing resource barrier blocks
+                restoration.
+            ValueError: Snapshot identity or contents are invalid.
+            FileNotFoundError: The requested snapshot is unavailable.
+        """
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
         if self._closed or self._state is None:
             raise RuntimeError("Select an experiment before rollback.")
@@ -2210,6 +2779,12 @@ class ExperimentRunner:
                 self._resume_resources()
 
     async def _activate_restored_state(self, state: RunnerState) -> None:
+        """Reset scheduler observations and bind a paused DAG task to restored state.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         if self._task is not None and not self._task.done():
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
@@ -2229,6 +2804,19 @@ class ExperimentRunner:
         )
 
     async def recover(self, experiment_id: str) -> None:
+        """Select saved state and reconcile journal, restoration, and live participant evidence.
+
+        Args:
+            experiment_id: Registered experiment to recover without creating a new run.
+
+        Raises:
+            FileNotFoundError: The experiment is not registered.
+            ValueError: Saved identities, paths, or applied template are inconsistent.
+            RuntimeError: Another owner is live or unresolved ownership prevents recovery.
+
+        Recovery starts paused; already terminal experiments with stopped participants
+        remain terminal instead of automatically relaunching work.
+        """
         await self._prepare_recovery_selection(experiment_id)
         registry = read_json(self._project_root / "experiments.json")
         try:
@@ -2308,6 +2896,12 @@ class ExperimentRunner:
                 self._resume_resources()
 
     async def _prepare_recovery_selection(self, experiment_id: str) -> None:
+        """Check recovery admission and detach only a matching paused unknown attempt.
+
+        Args:
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+        """
         if self._closed or self._maintenance:
             raise RuntimeError("Runner is closed or already restoring an experiment.")
         if (
@@ -2336,6 +2930,19 @@ class ExperimentRunner:
     async def _load_recovery_state(
         self, root: Path, experiment_id: str, transaction: JsonObject | None
     ) -> RunnerState:
+        """Load transaction/file/journal state and verify template consistency and prior ownership.
+
+        Args:
+            root: Absolute root of the experiment or payload being processed.
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+            transaction: Validated persisted restoration phase and ownership
+                document.
+
+        Returns:
+            Reconstructed runner state after checking experiment/template identity
+            and excluding a live previous owner.
+        """
         if transaction is not None and transaction.get("phase") != "complete":
             state = state_from_document(root, transaction["stopped_state"])
         else:
@@ -2385,6 +2992,15 @@ class ExperimentRunner:
     def _adopt_recovery_checkpoint(
         self, state: RunnerState, root: Path, latest: JsonObject | None
     ) -> None:
+        """Adopt authoritative journal progress while preserving compatible later service observations.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            root: Absolute root of the experiment or payload being processed.
+            latest: Latest authoritative journal checkpoint, or None when no newer
+                checkpoint exists.
+        """
         if latest is not None and (
             latest["checkpoint_id"] != state.checkpoint_id
             or state.pending_rebuild is not None
@@ -2404,6 +3020,12 @@ class ExperimentRunner:
             vars(state).update(vars(committed))
 
     async def _recover_interrupted_rebuild(self, state: RunnerState) -> None:
+        """Reconcile service ownership and restore the protective snapshot with reload diagnostics.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+        """
         if self._resource_observer is not None and self._suspend_resources is None:
             raise RuntimeError(
                 "Reload recovery requires a resource restoration barrier."
@@ -2454,6 +3076,15 @@ class ExperimentRunner:
     ) -> None:
         # The accepted result can be newer than the queue checkpoint.
         # Retire it without issuing a conflicting cancellation outcome.
+        """Remove already accepted service work after verifying its saved participant ownership.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            sid: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+        """
         requests = [*instance.pending_requests]
         if instance.active_request is not None:
             requests.append(instance.active_request)
@@ -2497,6 +3128,15 @@ class ExperimentRunner:
     def _recover_launched_attempt(
         self, state: RunnerState, root: Path, launched: JsonObject
     ) -> None:
+        """Reconstruct a journaled launch missing from the checkpoint using original attempt files.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            root: Absolute root of the experiment or payload being processed.
+            launched: Committed start-context evidence used to reconstruct a missing
+                attempt.
+        """
         if (
             state.active_attempt is not None
             and state.active_attempt.attempt_id == launched["attempt_id"]
@@ -2535,6 +3175,14 @@ class ExperimentRunner:
         state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number
 
     async def _start_recovered_dag(self, state: RunnerState, experiment_id: str) -> None:
+        """Keep terminal stopped state or launch paused recovery scheduling and await readiness.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            experiment_id: Registered experiment identifier used to select saved
+                state or history.
+        """
         self._pending_advance = state.pending_advance
         self._stop_requested = False
         self._termination_confirmed = True
@@ -2563,6 +3211,15 @@ class ExperimentRunner:
     async def _recover_service_process(
         self, state: RunnerState, sid: str, instance: ServiceInstance
     ) -> None:
+        """Reconcile persisted/announced service process identity and determine whether it exited.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            sid: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+        """
         process_file = (
             state.experiment_directory
             / "shared_artifacts/services"
@@ -2636,6 +3293,24 @@ class ExperimentRunner:
     ) -> None:
         # Before readiness, process.json still names the
         # launcher; the endpoint may name its child service.
+        """Verify live child ancestry and persist participant/launcher identities before shutdown.
+
+        A live endpoint child must descend from the saved launcher and retain its OS
+        identity across ancestry inspection. Both identities are persisted before
+        shutdown so a second recovery can wait for launcher cleanup without re-
+        proving live ancestry.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+            sid: Stable service definition UUID.
+            instance: Current service instance whose ownership/queue/lifecycle is
+                being handled.
+            process_file: Path to the instance process/launcher ownership record.
+            announced: Endpoint document advertising a participant and its OS
+                identity.
+            record: Optional previously persisted process/ownership document.
+        """
         launched = instance.process_identity
         declared = announced.get("process")
         if (
@@ -2721,6 +3396,18 @@ class ExperimentRunner:
             )
 
     async def _fail(self, error: Exception, context: JsonObject) -> None:
+        """Stop owned work, retain shutdown errors, and publish failed state or emergency diagnostics.
+
+        Retains the primary failure, attempts both stage and service shutdown, and
+        exposes unconfirmed termination separately. Failed journal publication falls
+        back to an emergency controller file; a pending step is completed with the
+        original exception.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            context: Journal/participant coordinates associated with this operation.
+        """
         self._error = {"type": type(error).__name__, "message": str(error)}
         self._stop_requested = True
         await self._cancel_control_tasks()
@@ -2788,6 +3475,12 @@ class ExperimentRunner:
             self._notify(self.get_state())
 
     def _require_active(self) -> RunnerState:
+        """Return selected active state, rejecting terminal experiments and pending rebuilds.
+
+        Returns:
+            Selected active state, rejecting terminal experiments and pending
+            rebuilds.
+        """
         if self._state is not None and self._state.pending_rebuild is not None:
             raise RuntimeError(
                 "Recover the unfinished template reload before controlling the DAG."
@@ -2801,6 +3494,13 @@ class ExperimentRunner:
         return self._state
 
     def _save_state(self) -> None:
+        """Journal the authoritative checkpoint and publish state, resources, and notifications.
+
+        Assigns a fresh checkpoint and current OS owner identity, writes the
+        authoritative journal checkpoint, then attempts the optional state.json
+        copy. State-file I/O errors are journaled; required journal failures
+        propagate.
+        """
         self._state.pending_advance = self._pending_advance
         self._state.checkpoint_id = str(uuid4())
         self._state.owner_identity = ProcessIdentity.model_validate(
@@ -2832,13 +3532,22 @@ class ExperimentRunner:
         suspend: Callable[[], Awaitable[None]] | None = None,
         resume: Callable[[], None] | None = None,
     ) -> None:
-        """Report target changes; the application controller owns their observation."""
+        """Report target changes; the application controller owns their observation.
+
+        Args:
+            observer: Optional callback receiving detached process-target snapshots.
+            suspend: Optional async callback that closes resource writers before
+                restoration.
+            resume: Optional callback resuming resource observation after
+                restoration.
+        """
         self._resource_observer = observer
         self._suspend_resources = suspend
         self._resume_resources = resume
         self._publish_resources()
 
     def _publish_resources(self) -> None:
+        """Notify the optional resource observer, retaining failures without changing DAG policy."""
         if self._resource_observer is None:
             return
         try:
@@ -2848,7 +3557,12 @@ class ExperimentRunner:
             self._resource_error = f"{type(error).__name__}: {error}"
 
     def get_resource_snapshot(self) -> JsonObject:
-        """Describe actual targets without sampling the OS or exposing mutable state."""
+        """Describe actual targets without sampling the OS or exposing mutable state.
+
+        Returns:
+            Context, logger config path, and identity-checked target descriptions;
+            terminal/restoring or unbound state yields an empty selection.
+        """
         state = self._state
         path = self._journal.reader_config_path
         if (
@@ -2930,6 +3644,13 @@ class ExperimentRunner:
         }
 
     def get_state(self) -> JsonObject:
+        """Return execution state, participant observations, and current control errors.
+
+        Returns:
+            Current cursor, mode/phase, service observations, accepted result,
+            snapshot/reload metadata, and explicit termination/error indicators.
+            Completion is withheld while finalization still runs.
+        """
         state = self._state
         attempt = (
             state.active_attempt
@@ -3006,6 +3727,19 @@ class ExperimentRunner:
         *,
         limit: int = 100,
     ) -> JsonObject:
+        """Read raw journal events for the selected experiment.
+
+        Args:
+            experiment_id: Selected experiment identifier.
+            checkpoint: Previous journal checkpoint, or None to begin reading.
+            limit: Maximum event count from 1 to 1000.
+
+        Returns:
+            Event page with checkpoint and observed journal boundary.
+
+        Raises:
+            FileNotFoundError: The requested experiment is not selected.
+        """
         if self._state is None or experiment_id != self._state.experiment_id:
             raise FileNotFoundError(
                 "The selected experiment journal is not open in this runner."
@@ -3015,6 +3749,11 @@ class ExperimentRunner:
         )
 
     async def close(self) -> None:
+        """Detach runner tasks and channels and release saved ownership.
+
+        Participant shutdown is a separate stop operation; closing does not
+        establish that external processes have terminated.
+        """
         self._closed = True
         self._publish_resources()
         if (

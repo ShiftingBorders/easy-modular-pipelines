@@ -31,6 +31,7 @@ from core.storage.errors import StorageConflict, StorageError, StoredObjectNotFo
 
 
 class MaintenanceController:
+    """Serialize module mutations while serving bounded concurrent maintenance reads."""
     def __init__(
         self,
         manager: ModuleManager,
@@ -42,6 +43,17 @@ class MaintenanceController:
         recovery_required: list[str],
         project_root: Path,
     ) -> None:
+        """Bind caller-owned storage, logger, IPC queues, and shutdown coordination.
+
+        Args:
+            manager: Module manager used for registration and inspection.
+            logger: Open controller logger owned by the caller.
+            requests: Incoming multiprocessing command queue.
+            responses: Outgoing multiprocessing response queue.
+            shutdown_requested: Event shared with the controller lifecycle owner.
+            recovery_required: Experiments that must be recovered before module mutation.
+            project_root: Absolute project path for experiment and template reads.
+        """
         self._manager = manager
         self._experiment_reader = ExperimentReader(project_root)
         self._assembler = ExperimentAssembler(project_root, manager)
@@ -67,6 +79,11 @@ class MaintenanceController:
 
     def _read_requests(self, loop: asyncio.AbstractEventLoop) -> None:
         # A partial IPC frame must not hold event-loop shutdown hostage.
+        """Forward blocking IPC reads to the event loop from a dedicated thread.
+
+        Args:
+            loop: Owning asyncio event loop receiving thread-safe IPC callbacks.
+        """
         try:
             while not self._intake_stop.is_set():
                 try:
@@ -79,6 +96,12 @@ class MaintenanceController:
                 loop.call_soon_threadsafe(self._incoming.put_nowait, error)
 
     async def serve(self) -> None:
+        """Start intake, serial mutation, and read workers and await their lifetimes.
+
+        Starts one serial mutation worker and four read workers alongside intake. It
+        awaits their lifetimes; the lifecycle owner calls close to cancel reads and
+        wait for an active mutation safely.
+        """
         if self._tasks or self._closing:
             raise RuntimeError("Maintenance controller is already running or closed.")
         self._intake_thread = threading.Thread(
@@ -99,6 +122,12 @@ class MaintenanceController:
         await asyncio.gather(*self._tasks)
 
     async def _receive(self) -> None:
+        """Validate incoming commands and route shutdown, reads, and mutation chains.
+
+        Routes stats.state directly, queues other reads under their own capacity
+        bound, and admits ordered mutation chains. Private shutdown signals the
+        owner and ends intake.
+        """
         while not self._closing:
             request = await self._incoming.get()
             if isinstance(request, Exception):
@@ -119,12 +148,19 @@ class MaintenanceController:
             await self._commands.put(commands)
 
     async def _admit_command_read(self, command: ControllerCommand) -> None:
+        """Answer state immediately or enqueue another maintenance read."""
         if command.command == "stats.state":
             await self._publish(await self._execute(command))
         else:
             await self._admit_read(command)
 
     async def _admit_read(self, request: ControllerCommand) -> None:
+        """Enqueue a read without blocking, publishing a failure when capacity is exhausted.
+
+        Args:
+            request: Validated maintenance read envelope awaiting bounded-queue
+                admission.
+        """
         try:
             self._read_commands.put_nowait(request)
         except asyncio.QueueFull:
@@ -137,6 +173,12 @@ class MaintenanceController:
             )
 
     async def _work(self, *, read_only: bool = False) -> None:
+        """Execute serial command chains, cancelling their remaining commands after failure.
+
+        Args:
+            read_only: Use the independent read queue rather than the serial
+                mutation queue.
+        """
         if read_only:
             return await self._work_reads()
         while not self._closing:
@@ -165,6 +207,7 @@ class MaintenanceController:
                     self._idle.set()
 
     async def _work_reads(self) -> None:
+        """Consume admitted reads until controller shutdown is requested."""
         while not self._closing and not self._shutdown_requested.is_set():
             command = await self._read_commands.get()
             if self._shutdown_requested.is_set():
@@ -173,6 +216,16 @@ class MaintenanceController:
         return
 
     async def _execute(self, command: ControllerCommand) -> ControllerOutcome:
+        """Validate and execute a command, translating operation errors into outcomes.
+
+        Args:
+            command: Validated admitted maintenance command with ID and chain
+                identity.
+
+        Returns:
+            Correlated typed outcome after translating validation, storage, and
+            journal failures to protocol error codes.
+        """
         try:
             invocation = MaintenanceInvocation.model_validate(
                 {
@@ -208,6 +261,18 @@ class MaintenanceController:
     async def _execute_request(
         self, command: ControllerCommand, invocation: MaintenanceInvocation
     ) -> ControllerOutcome:
+        """Dispatch a validated maintenance invocation and construct its command outcome.
+
+        Args:
+            command: Validated admitted maintenance command with ID and chain
+                identity.
+            invocation: Validated command arguments and target after boundary
+                validation.
+
+        Returns:
+            Succeeded outcome with read/module data, or a failed outcome for
+            mode/recovery restrictions.
+        """
         name, args = invocation.command, invocation.args
         if name in (
             "stats.experiments",
@@ -272,6 +337,20 @@ class MaintenanceController:
     async def _execute_module_command(
         self, command: ControllerCommand, name: str, args: JsonObject
     ) -> JsonObject:
+        """Journal and perform module registration, validation, or removal.
+
+        Args:
+            command: Validated admitted maintenance command with ID and chain
+                identity.
+            name: Maintenance command name selecting module add, validation, or
+                removal.
+            args: JSON command arguments; mutable inputs are detached at the
+                validation boundary.
+
+        Returns:
+            Module reference/installation status, validation metadata, or removal
+            status, depending on the admitted action.
+        """
         self._logger.record_event(
             "module.command_started",
             {"command": command.model_dump(exclude_unset=True)},
@@ -317,6 +396,21 @@ class MaintenanceController:
         message: str,
         error: Exception | None = None,
     ) -> ControllerOutcome:
+        """Build a correlated failed/cancelled outcome including exception notes.
+
+        Args:
+            command: Validated admitted maintenance command with ID and chain
+                identity.
+            code: Machine-readable failure category used in the returned outcome.
+            message: Human-readable diagnostic to expose when the operation is
+                rejected.
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+
+        Returns:
+            Failed or cancelled outcome retaining command/chain identity, error
+            code, message, and exception notes.
+        """
         return ControllerOutcome.model_validate(
             {
                 "command_id": command.command_id,
@@ -336,6 +430,11 @@ class MaintenanceController:
         )
 
     async def _publish(self, response: ControllerOutcome) -> None:
+        """Send an outcome through bounded IPC until accepted, closed, or parent exit.
+
+        Args:
+            response: Participant/controller result envelope being processed.
+        """
         document = response.model_dump(exclude_unset=True)
         while not self._closing:
             try:
@@ -348,6 +447,12 @@ class MaintenanceController:
                 continue
 
     async def close(self) -> None:
+        """Cancel reads, let active mutation finish, and stop intake and worker tasks.
+
+        Requests shutdown, cancels and awaits read workers, then waits for the
+        active serial mutation to become idle before cancelling remaining tasks.
+        Storage ownership stays with the caller until these operations finish.
+        """
         if self._closing:
             return
         self._shutdown_requested.set()

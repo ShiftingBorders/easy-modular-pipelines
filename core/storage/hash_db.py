@@ -43,12 +43,15 @@ class HashDB:
         self._load_db(config.db_path, schema)
 
     def _load_db_config(self, config_path: Path) -> dict:
+        """Read JSON configuration and resolve its paths from the containing file."""
         return _load_db_config(config_path)
 
     def _validate_config(self, config: object) -> HashDBConfig:
+        """Validate hash database settings and check their filesystem conditions."""
         return _validate_config(config)
 
     def _validate_schema_file(self, schema_path: Path) -> dict:
+        """Read and validate the configured SQLite table schema document."""
         return _validate_schema_file(schema_path)
 
     def _validate_db_schema(
@@ -97,10 +100,22 @@ class HashDB:
         return SchemaValidationStatus.mismatch
 
     def _create_table(self, db: sqlite3.Connection, db_schema: dict[str, str]):
+        """Create the MAIN table using the validated column declarations.
+
+        Args:
+            db: Open caller-owned SQLite connection receiving the MAIN table.
+            db_schema: Expected MAIN table column declarations and constraints.
+        """
         return _create_table(db, db_schema)
 
     def _load_db(self, db_file_path: Path | str, db_schema):
-        """Open storage and validate its schema before any persistent changes."""
+        """Open storage and validate its schema before any persistent changes.
+
+        Args:
+            db_file_path: SQLite database path selected by the validated hash
+                configuration.
+            db_schema: Expected MAIN table column declarations and constraints.
+        """
         self._connection_closed = True
         try:
             if str(db_file_path) != ":memory:":
@@ -190,6 +205,15 @@ class HashDB:
         return ModuleAddResult.module_added
 
     def list_module_hashes(self) -> list[dict[str, str]]:
+        """Read registered module references ordered by name and version.
+
+        Returns:
+            Dictionaries containing name, version, and hash for each registration.
+
+        Raises:
+            StorageClosedError: The database connection is closed.
+            StorageError: SQLite cannot complete the read.
+        """
         if self._connection_closed:
             raise StorageClosedError("Cannot list modules: HashDB is closed.")
         try:
@@ -289,7 +313,14 @@ class HashDB:
         self._connection_closed = True
 
     def _raise_storage_error(self, error: sqlite3.Error, operation: str) -> NoReturn:
-        """Translate known driver failures without hiding programming mistakes."""
+        """Translate known driver failures without hiding programming mistakes.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+            operation: Human-readable action included in the translated storage
+                error.
+        """
         if isinstance(error, (sqlite3.ProgrammingError, sqlite3.InterfaceError)):
             raise error
         code = getattr(error, "sqlite_errorcode", 0) & 0xFF

@@ -18,6 +18,11 @@ class MeasuredResource:
     estimated: bool = False
 
     def document(self) -> JsonObject:
+        """Return the resource gauge in the journal measurement envelope.
+
+        Returns:
+            The resource gauge in the journal measurement envelope.
+        """
         return {
             "value": self.value,
             "unit": self.unit,
@@ -30,6 +35,7 @@ class MeasuredResource:
 
 @dataclass(frozen=True)
 class ResourceObservation:
+    """One host or process sample with wall-clock and monotonic observation times."""
     series_id: str
     context: JournalContext | JsonObject
     observed_at: str
@@ -37,6 +43,13 @@ class ResourceObservation:
     resources: dict[str, MeasuredResource]
 
     def document(self) -> JsonObject:
+        """Serialize context and resource measurements into the collector sample envelope.
+
+        Returns:
+            Sample envelope with timestamps, serialized context, and resource
+            measurement dictionaries; this does not itself perform transport
+            validation.
+        """
         return {
             "series_id": self.series_id,
             "context": self.context.model_dump()

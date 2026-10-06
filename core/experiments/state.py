@@ -91,6 +91,19 @@ class StageAttempt:
         effective_settings: JsonObject,
         timeout_seconds: float | None,
     ) -> None:
+        """Validate fixed attempt inputs and initialize unstarted execution state.
+
+        Args:
+            attempt_id: Unique attempt UUID.
+            stage_id: Template node UUID.
+            stage_execution_id: Visit identity shared by retries of the same stage visit.
+            cycle_number: One-based DAG cycle.
+            attempt_number: One-based attempt count for the node.
+            artifacts_directory: Absolute writable artifact directory.
+            input_data: JSON application input.
+            effective_settings: Detached settings for this attempt.
+            timeout_seconds: Attempt duration limit, or None for no limit.
+        """
         parameters = AttemptParameters(
             attempt_id=attempt_id,
             stage_id=stage_id,
@@ -105,6 +118,12 @@ class StageAttempt:
         self._configure(parameters)
 
     def _configure(self, parameters: AttemptParameters) -> None:
+        """Bind validated fixed inputs and reset all process/result observations.
+
+        Args:
+            parameters: Validated construction parameters used to initialize the
+                instance.
+        """
         self.attempt_id = parameters.attempt_id
         self.stage_id = parameters.stage_id
         self.stage_execution_id = parameters.stage_execution_id
@@ -149,6 +168,15 @@ class ServiceInstance:
         service_instance_id: str,
         definition: ServiceDefinition | JsonObject,
     ) -> None:
+        """Validate service and instance UUIDs against the supplied service definition.
+
+        Args:
+            service_id: Stable service definition UUID.
+            service_instance_id: UUID distinguishing this service launch from prior
+                instances.
+            definition: Validated stage/service definition with assigned stable
+                identity.
+        """
         self._configure(
             ServiceParameters(
                 service_id=service_id,
@@ -158,6 +186,12 @@ class ServiceInstance:
         )
 
     def _configure(self, parameters: ServiceParameters) -> None:
+        """Initialize an unstarted service instance with empty queues and lifecycle state.
+
+        Args:
+            parameters: Validated construction parameters used to initialize the
+                instance.
+        """
         self.service_id = parameters.service_id
         self.service_instance_id = parameters.service_instance_id
         self.definition = parameters.definition
@@ -220,6 +254,18 @@ class RunnerState:
         template: ExperimentTemplate | JsonObject,
         mode: RunnerMode,
     ) -> None:
+        """Validate experiment identity, template, paths, and mode before initializing state.
+
+        Args:
+            experiment_id: Experiment identifier.
+            experiment_directory: Absolute experiment directory.
+            run_id: Logical execution-history identity.
+            template_path: Absolute applied-template path.
+            template_revision_id: Applied template revision UUID.
+            template_yaml: Original template text.
+            template: Validated model or template JSON.
+            mode: Initial running or paused mode.
+        """
         self._configure(
             StateParameters(
                 experiment_id=experiment_id,
@@ -234,6 +280,12 @@ class RunnerState:
         )
 
     def _configure(self, parameters: StateParameters) -> None:
+        """Initialize an idle runner with validated inputs and empty execution history.
+
+        Args:
+            parameters: Validated construction parameters used to initialize the
+                instance.
+        """
         self.template = parameters.template
         self.experiment_id = parameters.experiment_id
         self.experiment_directory = parameters.experiment_directory
@@ -280,6 +332,15 @@ class StageOutcome:
         result: StageOutcomeResult | JsonObject | None,
         action: Literal["advance", "pause", "stop"],
     ) -> None:
+        """Bind an attempt to a validated optional result and requested runner action.
+
+        Args:
+            attempt: Stage attempt carrying fixed inputs, identity, timing, and
+                execution observations.
+            result: Accepted typed/JSON result, or None when no outcome can be
+                established.
+            action: Advance, pause, or stop requested of the owning DAG scheduler.
+        """
         if not isinstance(attempt, StageAttempt):
             raise TypeError("attempt must be a StageAttempt.")
         if action not in ("advance", "pause", "stop"):
@@ -295,6 +356,20 @@ class RunnerStateStore:
     """Read and publish state.json; filesystem errors are reported to its caller."""
 
     def load(self, experiment_directory: Path) -> RunnerState:
+        """Read and reconstruct runner state from an absolute experiment directory.
+
+        Args:
+            experiment_directory: Absolute experiment root containing its runtime
+                files.
+
+        Returns:
+            Validated reconstructed runner state with paths anchored to the selected
+            experiment root.
+
+        Raises:
+            ValueError: The root is relative or saved state is invalid.
+            OSError: The state file cannot be read.
+        """
         root = Path(experiment_directory)
         if not root.is_absolute():
             raise ValueError("experiment_directory must be absolute.")
@@ -303,6 +378,17 @@ class RunnerStateStore:
         )
 
     def save(self, state: RunnerState) -> None:
+        """Validate a state round-trip and publish state.json within the experiment root.
+
+        Args:
+            state: Runner state providing the selected template, cursor, and
+                participant ownership.
+
+        Raises:
+            ValueError: State cannot round-trip through its persisted contract or
+                the destination escapes the experiment.
+            OSError: Publication of state.json fails.
+        """
         root = state.experiment_directory.resolve()
         document = state_to_document(state)
         state_from_document(root, document)
