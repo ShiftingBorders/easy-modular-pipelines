@@ -263,6 +263,7 @@ class RunnerState:
         self.owner_identity: ProcessIdentity | None = None
         self.pending_input: PendingInput | None = None
         self.last_dag_decision: LastDecision | None = None
+        self.pending_dag_decision: LastDecision | None = None
         self.retained_artifacts: list[str] = []
 
 
@@ -407,10 +408,14 @@ def state_to_document(state: RunnerState) -> JsonObject:
         "pending_rebuild",
         "pending_input",
         "last_dag_decision",
+        "pending_dag_decision",
         "owner_identity",
     ):
         model = getattr(state, name)
         document[name] = None if model is None else model.model_dump(exclude_unset=True)
+    if state.pending_dag_decision is None:
+        # Legacy checkpoints retain their exact set of fields.
+        document.pop("pending_dag_decision", None)
     template_path = state.template_path.resolve()
     document["template_path"] = (
         template_path.relative_to(root).as_posix()
@@ -544,6 +549,7 @@ def _restore_state(root: Path, document: SavedRunnerState) -> RunnerState:
     state.owner_identity = document.owner_identity
     state.pending_input = document.pending_input
     state.last_dag_decision = document.last_dag_decision
+    state.pending_dag_decision = document.pending_dag_decision
     state.retained_artifacts = document.retained_artifacts
     return state
 

@@ -391,6 +391,7 @@ class SavedRunnerState(_Document):
     owner_identity: ProcessIdentity | None
     pending_input: PendingInput | None
     last_dag_decision: LastDecision | None
+    pending_dag_decision: LastDecision | None = None
     retained_artifacts: list[Text]
 
     @model_validator(mode="before")
@@ -447,7 +448,9 @@ class SavedRunnerState(_Document):
         ):
             raise ValueError("Saved runtime definitions require assigned IDs.")
         identifiers = {item.stage_id for item in stages}
-        for transfer in (self.pending_input, self.last_dag_decision):
+        for transfer in (
+            self.pending_input, self.last_dag_decision, self.pending_dag_decision
+        ):
             if transfer is not None and transfer.source_stage_id not in identifiers:
                 raise ValueError("Saved transition refers to an unknown source stage.")
         if self.pending_input is not None:
@@ -463,3 +466,16 @@ class SavedRunnerState(_Document):
             decision = self.last_dag_decision.decision
             if decision.command == "move" and decision.stage_id not in identifiers:
                 raise ValueError("Saved move targets an unknown stage.")
+        if self.pending_dag_decision is not None:
+            pending = self.pending_dag_decision
+            if (
+                self.active_attempt is not None
+                or self.last_dag_decision is not None
+                or self.last_result_id != pending.request_id
+                or self.stage_result_ids.get(pending.source_stage_id) != pending.request_id
+                or self.stage_position > len(stages)
+                or stages[self.stage_position - 1].stage_id != pending.source_stage_id
+            ):
+                raise ValueError("Pending DAG command requires its accepted source result.")
+            if pending.decision.command == "move" and pending.decision.stage_id not in identifiers:
+                raise ValueError("Pending DAG move targets an unknown stage.")

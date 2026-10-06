@@ -70,6 +70,16 @@ class ModuleLauncher:
             reference,
             "returns_data" in definition.model_fields_set,
         )
+        return self._prepare_checked(state, definition, inputs, module)
+
+    def _prepare_checked(
+        self,
+        state: RunnerState,
+        definition: StageDefinition | ServiceCallDefinition | ServiceDefinition,
+        inputs: ModulePreparation,
+        module: ModuleManifest,
+    ) -> PreparedLaunch:
+        """Prepare a launch after the owning async operation checked its module."""
         service_call = isinstance(definition, ServiceCallDefinition)
         if service_call and module.role != "service":
             raise ValueError("A service node must reference a service module.")

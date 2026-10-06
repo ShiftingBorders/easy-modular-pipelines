@@ -17,6 +17,28 @@ from tests.helpers.reload import candidate, events, trace, version, workspace
 
 
 class TemplateReloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_policy_reload_preserves_results_without_retroactive_snapshot(self):
+        work = await self.make_run()
+        runner = work.runner
+        await runner.step()
+        before = dict(runner._state.stage_result_ids)
+        document = candidate(work)
+        document["stages"][0]["snapshot_after"] = False
+        result = await runner.reload_template(work.files.write_template(document))
+        self.assertFalse(result["changed"])
+        self.assertEqual(work.manifests(), [])
+        document["stages"][0]["snapshot_after"] = True
+        result = await runner.reload_template(work.files.write_template(document))
+        self.assertTrue(result["changed"])
+        self.assertEqual(runner._state.stage_result_ids, before)
+        self.assertTrue(runner._state.template.stages[0].snapshot_after)
+        starts = [item for item in trace(runner) if item["event"] == "start"]
+        self.assertEqual([item["stage_id"] for item in starts], [work.stages[0]["stage_id"]])
+        # Reload still creates its protective snapshot; the policy change does
+        # not create a retroactive regular checkpoint after the old stage result.
+        self.assertEqual(len(work.manifests()), 1)
+        self.assertEqual(len(events(runner, "template.applied")), 2)
+
     async def make_run(self, *, cycles=2):
         work = workspace(cycles=cycles)
         self.addAsyncCleanup(work.close)

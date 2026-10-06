@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import os
 import shutil
-import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -24,6 +23,7 @@ from core.experiments.restore_inputs import (
 )
 from core.experiments.services import ServiceManager
 from core.experiments.snapshot_validation import (
+    _retention_candidates,
     _validate_journal_results,
     _validate_snapshot_exports,
     _validate_snapshot_manifest,
@@ -41,7 +41,6 @@ from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
 from core.models.experiment_template import (
     ExperimentTemplate,
-    ModuleReference,
     ServiceCallDefinition,
 )
 from core.models.journal_diagnostics import JournalSnapshotManifest
@@ -60,6 +59,7 @@ from core.models.updates import _update_model
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 from core.primitives.processes import process_identity
+from core.primitives.tasks import _await_read_task
 
 
 class ExperimentSnapshots:
@@ -98,7 +98,7 @@ class ExperimentSnapshots:
         if state.active_attempt is not None:
             raise RuntimeError("A snapshot requires a stage-free boundary.")
         async with self._lock:
-            self._assembler.check_modules(state)
+            await self._assembler._check_modules_async(state)
             if (
                 shutil.disk_usage(state.experiment_directory).free
                 < state.template.storage.min_snapshot_free_bytes
@@ -462,7 +462,7 @@ class ExperimentSnapshots:
             self._journal.client.record_error(
                 error, context={"experiment_id": state.experiment_id}
             )
-        await self._retain_snapshots(directory, state)
+        await self._retain_snapshots(directory, state, manifest)
         return {
             "valid": True,
             "snapshot_id": manifest.snapshot_id,
@@ -472,20 +472,31 @@ class ExperimentSnapshots:
             "label": manifest.label,
         }
 
-    async def _retain_snapshots(self, directory: Path, state: RunnerState) -> None:
-        valid = []
-        for path in directory.parent.glob("*/manifest.json"):
+    async def _retain_snapshots(
+        self, directory: Path, state: RunnerState, published: SnapshotPayload
+    ) -> None:
+        """Validate retained candidates only; delete other owned UUID directories."""
+        candidates, owned = await _await_read_task(asyncio.create_task(asyncio.to_thread(
+            _retention_candidates, directory.parent, published.experiment_id,
+            published.experiment_folder,
+        )))
+        retained = {directory}
+        for _, path in candidates:
+            if len(retained) >= state.template.snapshots.keep:
+                break
+            if path == directory:
+                continue
             try:
-                entry = await asyncio.to_thread(self._validate_snapshot, path.parent)
-                valid.append((entry["sequence"], path.parent))
+                payload = await self._read_snapshot(path)
+                if (
+                    payload.snapshot_id == path.name
+                    and payload.experiment_id == published.experiment_id
+                    and payload.experiment_folder == published.experiment_folder
+                ):
+                    retained.add(path)
             except (OSError, ValueError, TypeError, KeyError, LoggingError):
                 continue
-        valid.sort(reverse=True)
-        retained = {directory}
-        for _, path in valid:
-            if len(retained) < state.template.snapshots.keep:
-                retained.add(path)
-        for _, path in valid:
+        for path in owned:
             if path in retained:
                 continue
             if (
@@ -500,6 +511,10 @@ class ExperimentSnapshots:
         self, directory: Path, *, manifest: JsonObject | None = None
     ) -> JsonObject:
         return self._load_snapshot(directory, manifest=manifest).document()
+
+    async def _read_snapshot(self, directory: Path) -> SnapshotPayload:
+        reading = asyncio.create_task(asyncio.to_thread(self._load_snapshot, directory))
+        return await _await_read_task(reading)
 
     def _load_snapshot(
         self, directory: Path, *, manifest: SnapshotPayload | JsonObject | None = None
@@ -536,7 +551,7 @@ class ExperimentSnapshots:
             exclude_unset=True
         ):
             raise ValueError("Snapshot template differs from its applied revision.")
-        self._validate_snapshot_modules(directory, template)
+        self._validate_snapshot_modules(directory, ExperimentTemplate.model_validate(template))
         for relative in state.retained_artifacts:
             if not (directory / "files" / relative).exists():
                 raise ValueError("Snapshot is missing a retained conditional artifact.")
@@ -552,57 +567,25 @@ class ExperimentSnapshots:
     def _validate_snapshot_journal(
         self, directory: Path, payload: SnapshotPayload, state: RunnerState
     ) -> None:
-        # Reuse the journal's public full-content validator on a disposable copy.
-        # Never open a journal client against the immutable archived database.
-        scratch = self._project_root / "controller/snapshot_validation"
-        if not scratch.resolve().is_relative_to(self._project_root):
-            raise ValueError("Snapshot validation path escapes the project.")
-        scratch.mkdir(parents=True, exist_ok=True)
-        temporary = tempfile.TemporaryDirectory(dir=scratch)
+        settings = state.template.logging
+        store = SQLiteEventStore(
+            directory / "journal/journal.sqlite",
+            busy_timeout_seconds=settings.busy_timeout_seconds,
+            max_event_bytes=settings.max_event_bytes,
+            min_free_bytes=0,
+            open_mode="existing",
+            expected_journal={
+                "journal_id": payload.journal.journal_id,
+                "generation": payload.journal.generation,
+            },
+            read_only=True,
+        )
         try:
-            database = Path(temporary.name) / "journal.sqlite"
-            shutil.copyfile(directory / "journal/journal.sqlite", database)
-            settings = state.template.logging
-            store_options = {
-                "busy_timeout_seconds": settings.busy_timeout_seconds,
-                "max_event_bytes": settings.max_event_bytes,
-                "min_free_bytes": 0,
-                "open_mode": "existing",
-                "expected_journal": {
-                    "journal_id": payload.journal.journal_id,
-                    "generation": payload.journal.generation,
-                },
-            }
-            # Snapshot exports use DELETE mode. Reading them must not enable WAL:
-            # its mapped SHM file can remain delete-pending after close on Windows.
-            store = SQLiteEventStore(database, **store_options, read_only=True)
-            try:
-                store.open()
-                _validate_journal_results(state, store)
-            finally:
-                store.close()
-            # Restore through a separate writer without opening a live WAL client.
-            store = SQLiteEventStore(database, **store_options)
-            try:
-                store.complete_restore(
-                    payload.journal.model_dump(),
-                    restoration_id=str(uuid4()),
-                    new_generation=str(uuid4()),
-                )
-            finally:
-                store.close()
+            store._open_snapshot()
+            store._check_snapshot_contents(payload.journal)
+            _validate_journal_results(state, store)
         finally:
-            for attempt in range(10):
-                try:
-                    temporary.cleanup()
-                    break
-                except OSError as error:
-                    if (
-                        getattr(error, "winerror", None) not in (32, 145)
-                        or attempt == 9
-                    ):
-                        raise
-                    time.sleep(0.1)
+            store.close()
 
     def _check_snapshot_inventory(
         self,
@@ -648,17 +631,14 @@ class ExperimentSnapshots:
         if observed_files != set(files) or observed_directories != set(directories):
             raise ValueError("Snapshot members differ from the inventory.")
 
-    def _validate_snapshot_modules(self, directory: Path, template: JsonObject) -> None:
-        validated = ExperimentTemplate.model_validate(template)
+    def _validate_snapshot_modules(
+        self, directory: Path, template: ExperimentTemplate
+    ) -> None:
         checked_modules: dict[tuple[str, str], tuple[ModuleManifest, str]] = {}
         for role in ("stage", "service"):
-            definitions = validated.stages if role == "stage" else validated.services
+            definitions = template.stages if role == "stage" else template.services
             for definition in definitions:
-                reference = ModuleReference.model_validate(
-                    self._assembler.module_reference(
-                        template, definition.model_dump(exclude_unset=True)
-                    )
-                )
+                reference = template.module_reference(definition)
                 key = (reference.name, reference.version)
                 if key not in checked_modules:
                     module_path = directory / "files/modules" / key[0] / key[1]
@@ -785,7 +765,7 @@ class ExperimentSnapshots:
                         "Resolve the existing restoration transaction first."
                     )
             archive = self._project_root / "snapshots" / source.name / snapshot_id
-            manifest = await asyncio.to_thread(self._load_snapshot, archive)
+            manifest = await self._read_snapshot(archive)
             if (
                 manifest.snapshot_id != snapshot_id
                 or manifest.experiment_folder != source.name
@@ -804,7 +784,7 @@ class ExperimentSnapshots:
             checked = _restore_state(
                 archive / "files", manifest.state.model_copy(deep=True)
             )
-            self._assembler.check_modules(checked)
+            await self._assembler._check_modules_async(checked)
             required = (
                 3 * sum(item.size_bytes for item in manifest.inventory.files.values())
                 + state.template.storage.min_snapshot_free_bytes
@@ -1107,7 +1087,7 @@ class ExperimentSnapshots:
         archive = (
             self._project_root / "snapshots" / transaction.source_folder / snapshot_id
         )
-        manifest = await asyncio.to_thread(self._load_snapshot, archive)
+        manifest = await self._read_snapshot(archive)
         for path in (cached, replacement):
             if path.exists():
                 if (
@@ -1125,7 +1105,7 @@ class ExperimentSnapshots:
         except BaseException:
             await asyncio.gather(copy_task, return_exceptions=True)
             raise
-        await asyncio.to_thread(self._load_snapshot, cached)
+        await self._read_snapshot(cached)
         copy_task = asyncio.create_task(
             asyncio.to_thread(shutil.copytree, cached / "files", replacement)
         )
@@ -1158,7 +1138,7 @@ class ExperimentSnapshots:
     async def _cached_restore_manifest(
         self, transaction: RestoreTransaction, cached: Path, snapshot_id: str
     ) -> SnapshotPayload:
-        manifest = await asyncio.to_thread(self._load_snapshot, cached)
+        manifest = await self._read_snapshot(cached)
         if (
             manifest.snapshot_id != snapshot_id
             or manifest.experiment_folder != transaction.source_folder

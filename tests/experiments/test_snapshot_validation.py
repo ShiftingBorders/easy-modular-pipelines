@@ -102,44 +102,47 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(metadata.state, {})
 
-    async def test_validation_copy_never_enters_wal_mode(self):
-        """Validation reads and restores its copy without mapped SHM sidecars."""
+    async def test_validation_reads_immutable_archive_without_copy_or_restore(self):
+        """Read the archived journal without changing it or creating sidecars."""
         original_open = SQLiteEventStore.open
-        original_restore = SQLiteEventStore.complete_restore
         scratch = self.w.root / "controller/snapshot_validation"
+        database = self.archive / "journal/journal.sqlite"
         before = file_inventory(self.archive)
-        opened, restored = [], []
+        opened = []
 
         def observe_open(store):
             original_open(store)
-            if store.db_path.parent.parent == scratch:
+            if store.db_path == database:
                 opened.append(store.db_path)
+                self.assertTrue(store._read_only)
+                self.assertTrue(store._immutable_read)
                 self.assertEqual(
                     store._connection.execute("PRAGMA journal_mode").fetchone(),
                     ("delete",),
                 )
                 self.assertEqual(
                     {path.name for path in store.db_path.parent.iterdir()},
-                    {"journal.sqlite"},
+                    {"journal.sqlite", "manifest.json"},
                 )
-
-        def observe_restore(store, *args, **kwargs):
-            result = original_restore(store, *args, **kwargs)
-            if store.db_path.parent.parent == scratch:
-                restored.append(result)
-                self.assertFalse(store.db_path.with_name("journal.sqlite-shm").exists())
-                self.assertFalse(store.db_path.with_name("journal.sqlite-wal").exists())
-            return result
 
         with (
             patch.object(SQLiteEventStore, "open", observe_open),
-            patch.object(SQLiteEventStore, "complete_restore", observe_restore),
+            patch.object(
+                SQLiteEventStore, "complete_restore",
+                side_effect=AssertionError("Validation must not restore the journal"),
+            ) as restore,
+            patch(
+                "core.experiments.snapshots.shutil.copyfile",
+                side_effect=AssertionError("Validation must not copy the journal"),
+            ),
         ):
             manifest = self.runner._snapshots._validate_snapshot(self.archive)
-        self.assertEqual(len(opened), 1)
-        self.assertEqual(len(restored), 1)
-        self.assertEqual(restored[0]["snapshot_id"], manifest["journal"]["snapshot_id"])
-        self.assertFalse(opened[0].parent.exists())
+        self.assertEqual(opened, [database])
+        self.assertEqual(manifest["snapshot_id"], self.snapshot["snapshot_id"])
+        restore.assert_not_called()
+        self.assertFalse(scratch.exists())
+        self.assertFalse(database.with_name("journal.sqlite-shm").exists())
+        self.assertFalse(database.with_name("journal.sqlite-wal").exists())
         self.assertEqual(file_inventory(self.archive), before)
 
     async def test_manifest_schema_identity_cursor_and_applied_template_are_checked(
@@ -272,7 +275,7 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             os.rmdir(link)
 
-    async def test_latest_valid_and_retention_ignore_incomplete_and_corrupt_archives(
+    async def test_latest_valid_skips_corruption_and_retention_removes_old_archives(
         self,
     ):
         """C4/C5: a broken latest archive cannot replace the last usable checkpoint."""
@@ -291,8 +294,8 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.archive.exists())
         self.assertTrue(self.w.archive(retained["snapshot_id"]).is_dir())
         self.assertTrue(self.w.archive(preceding["snapshot_id"]).is_dir())
-        self.assertTrue(newer_path.is_dir())
-        self.assertTrue((pending / "partial").is_file())
+        self.assertFalse(newer_path.exists())
+        self.assertFalse(pending.exists())
         (self.w.archive(retained["snapshot_id"]) / "manifest.json").unlink()
         (self.w.archive(preceding["snapshot_id"]) / "manifest.json").unlink()
         with self.assertRaises(FileNotFoundError):
@@ -311,6 +314,24 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
             )["snapshot_id"],
             older_time["snapshot_id"],
         )
+
+    async def test_retention_does_not_validate_the_published_or_deleted_snapshot_twice(self):
+        preceding = await self.runner.snapshot("preceding")
+        old = self.archive
+        (old / "files/experiment.yaml").write_bytes(b"corrupt old snapshot")
+        load = self.runner._snapshots._load_snapshot
+        checked = []
+
+        def read(directory, **kwargs):
+            self.assertNotEqual(directory, old, "A deleted snapshot must not be validated")
+            checked.append(directory)
+            return load(directory, **kwargs)
+
+        with patch.object(self.runner._snapshots, "_load_snapshot", side_effect=read):
+            latest = await self.runner.snapshot("latest")
+        self.assertEqual(checked.count(self.w.archive(latest["snapshot_id"])), 1)
+        self.assertEqual(checked.count(self.w.archive(preceding["snapshot_id"])), 1)
+        self.assertFalse(old.exists())
 
     async def test_invalid_selection_is_rejected_before_changing_experiment_files(self):
         """F1/B2: bad labels, IDs and corrupt candidates leave the selected data intact."""

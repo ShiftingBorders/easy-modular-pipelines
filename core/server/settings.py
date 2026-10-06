@@ -54,6 +54,7 @@ class ServerSettings:
         self.max_request_bytes = settings.max_request_bytes
         self.max_response_bytes = settings.max_response_bytes
         self.max_cache_bytes = settings.max_cached_result_bytes
+        self.module_hashing = settings.module_hashing
 
 
 def load_server_settings(

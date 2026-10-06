@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from uuid import UUID
 
 from core.experiments.results import read_result
 from core.experiments.state import RunnerState
@@ -14,8 +15,41 @@ from core.models.snapshot_documents import (
     SnapshotInventory,
     SnapshotManifest,
     SnapshotPayload,
+    SnapshotRetentionHeader,
 )
+from core.primitives.json_files import read_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
+
+
+def _retention_candidates(
+    parent: Path, experiment_id: str, experiment_folder: str
+) -> tuple[list[tuple[int, Path]], list[Path]]:
+    """Enumerate owned UUID folders; metadata only orders candidates to retain."""
+    candidates: list[tuple[int, Path]] = []
+    owned: list[Path] = []
+    for path in parent.iterdir():
+        if path.is_symlink() or path.is_junction() or not path.is_dir():
+            continue
+        try:
+            if str(UUID(path.name)) != path.name:
+                continue
+        except ValueError:
+            continue
+        owned.append(path)
+        manifest = path / "manifest.json"
+        if manifest.is_symlink() or manifest.is_junction():
+            continue
+        try:
+            header = SnapshotRetentionHeader.model_validate(read_json(manifest))
+            if (
+                header.snapshot_id == path.name
+                and header.experiment_id == experiment_id
+                and header.experiment_folder == experiment_folder
+            ):
+                candidates.append((header.sequence, path))
+        except (OSError, ValueError, TypeError):
+            continue
+    return sorted(candidates, reverse=True), owned
 
 
 def _validate_snapshot_manifest(document: JsonObject) -> SnapshotPayload:
@@ -72,7 +106,9 @@ def _validate_snapshot_exports(
 
 
 def _validate_journal_results(state: RunnerState, store: SQLiteEventStore) -> None:
-    for transfer in (state.pending_input, state.last_dag_decision):
+    for transfer in (
+        state.pending_input, state.last_dag_decision, state.pending_dag_decision
+    ):
         if transfer is None:
             continue
         record = read_result(

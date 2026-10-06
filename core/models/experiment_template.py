@@ -18,7 +18,7 @@ from pydantic import (
 )
 
 from core.models.journal_settings import JournalLimits
-from core.models.values import Number, PositiveInteger, PositiveNumber, Text
+from core.models.values import Boolean, Number, PositiveInteger, PositiveNumber, Text
 from core.modules.validation import _validate_module_hash
 from core.primitives.json_values import (
     JsonObject,
@@ -95,6 +95,7 @@ class StageDefinition(_TemplateValue):
     timeout_seconds: PositiveNumber | None
     errors: ErrorPolicy
     returns_data: OptionalBoolean = None
+    snapshot_after: Boolean = False
 
 
 class ServiceCallDefinition(_TemplateValue):
@@ -103,6 +104,7 @@ class ServiceCallDefinition(_TemplateValue):
     settings: SettingsObject
     timeout_seconds: PositiveNumber | None
     errors: ErrorPolicy
+    snapshot_after: Boolean = False
 
 
 class ServiceDefinition(_TemplateValue):

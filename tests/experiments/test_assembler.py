@@ -15,6 +15,7 @@ from uuid import UUID
 import yaml
 
 from core.experiments.assembler import ExperimentAssembler, find_experiment
+from core.models.experiment_template import ServiceCallDefinition, StageDefinition
 from core.storage.errors import StorageUnavailable
 from tests.helpers.dag import DagWorkspace, wait_until
 
@@ -34,6 +35,88 @@ class ExperimentAssemblerTests(unittest.IsolatedAsyncioTestCase):
         text, result = self.assembler.load_template(self.path)
         self.assertEqual(text, self.path.read_text(encoding="utf-8"))
         self.assertEqual(result, self.template)
+
+    def test_snapshot_after_is_optional_strict_boolean_for_stage_and_service_calls(self):
+        stage = self.template["stages"][0]
+        call = {key: value for key, value in stage.items() if key != "module"}
+        call["service_id"] = stage["stage_id"]
+        for model, document in ((StageDefinition, stage), (ServiceCallDefinition, call)):
+            self.assertFalse(model.model_validate(document).snapshot_after)
+            self.assertNotIn("snapshot_after", model.model_validate(document).model_dump(exclude_unset=True))
+            for value in (True, False):
+                with self.subTest(model=model.__name__, value=value):
+                    self.assertEqual(model.model_validate({**document, "snapshot_after": value}).snapshot_after, value)
+            for value in (0, 1, "true", None):
+                with self.subTest(model=model.__name__, value=value), self.assertRaises((ValueError, TypeError)):
+                    model.model_validate({**document, "snapshot_after": value})
+
+    async def test_module_file_check_yields_and_keeps_hash_db_on_owner_thread(self):
+        state = await self.assembler.assemble(self.path, "async-integrity")
+        definition = state.template.stages[0]
+        entered, release = threading.Event(), threading.Event()
+        owner = threading.get_ident()
+        reading = self.assembler._read_module_hash
+        registered = self.workspace.hashes.get_module_hash
+        threads = []
+
+        def read(*args):
+            threads.append(threading.get_ident())
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("The event loop did not release the reader")
+            return reading(*args)
+
+        def registration(*args):
+            self.assertEqual(threading.get_ident(), owner)
+            return registered(*args)
+
+        with (
+            patch.object(self.assembler, "_read_module_hash", side_effect=read),
+            patch.object(self.workspace.hashes, "get_module_hash", side_effect=registration),
+        ):
+            checking = asyncio.create_task(self.assembler._check_module_async(
+                state, definition.module, False
+            ))
+            try:
+                await wait_until(entered.is_set)
+                for _ in range(4):
+                    await asyncio.sleep(0.01)
+                self.assertFalse(checking.done())
+            finally:
+                release.set()
+                await checking
+        self.assertTrue(threads)
+        self.assertTrue(all(thread != owner for thread in threads))
+
+    async def test_cancelled_module_check_joins_reader_before_returning(self):
+        state = await self.assembler.assemble(self.path, "cancel-integrity")
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        reading = self.assembler._read_module_hash
+
+        def read(*args):
+            entered.set()
+            try:
+                if not release.wait(10):
+                    raise TimeoutError("Reader was not released")
+                return reading(*args)
+            finally:
+                finished.set()
+
+        with patch.object(self.assembler, "_read_module_hash", side_effect=read):
+            checking = asyncio.create_task(self.assembler._check_module_async(
+                state, state.template.stages[0].module, False
+            ))
+            try:
+                await wait_until(entered.is_set)
+                checking.cancel()
+                await asyncio.sleep(0.02)
+                self.assertFalse(checking.done())
+                self.assertFalse(finished.is_set())
+            finally:
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await checking
+        self.assertTrue(finished.is_set())
 
     def test_rejects_missing_and_unknown_template_fields(self):
         """A1: absent mandatory controls and unknown fields do not create a build."""

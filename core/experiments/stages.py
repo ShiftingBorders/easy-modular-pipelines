@@ -39,8 +39,13 @@ from core.models.experiment_template import (
     ServiceCallDefinition,
     StageDefinition,
 )
+from core.models.module_manifest import ModuleManifest
 from core.models.participant_identity import ParticipantIdentity
-from core.models.participant_launch import AttemptContextObservation, PreparedLaunch
+from core.models.participant_launch import (
+    AttemptContextObservation,
+    ModulePreparation,
+    PreparedLaunch,
+)
 from core.models.participant_observations import (
     ExecutorCommandState,
     ExecutorCommandStateResponse,
@@ -291,8 +296,11 @@ class StageRunner:
         attempt, instance = self._new_stage_attempt(
             state, definition, module, input_data, execution_id
         )
+        manifest = await self._launcher._assembler._check_module_async(
+            state, module, "returns_data" in definition.model_fields_set
+        )
         launch, context = self._write_attempt_context(
-            state, attempt, definition, module
+            state, attempt, definition, module, manifest
         )
         await self._bind_attempt_intent(state, attempt, instance, launch, context)
         if state.pending_input is not None or attempt.attempt_number > 1:
@@ -368,6 +376,7 @@ class StageRunner:
         attempt: StageAttempt,
         definition: StageDefinition | ServiceCallDefinition,
         module: ModuleReference,
+        manifest: ModuleManifest | None = None,
     ) -> tuple[PreparedLaunch, JsonObject]:
         context = {
             **self._context(state, attempt),
@@ -376,15 +385,24 @@ class StageRunner:
             "module_version": module.version,
             "module_hash": module.hash,
         }
-        launch = PreparedLaunch.model_validate(
-            self._launcher.prepare(
-                state,
-                definition.model_dump(exclude_unset=True),
-                context,
-                attempt.artifacts_directory,
-                attempt.input_data,
+        if (
+            manifest is None
+            or getattr(self._launcher.prepare, "__func__", None) is not ModuleLauncher.prepare
+        ):
+            # Preserve the public synchronous preparation hook for library callers.
+            launch = PreparedLaunch.model_validate(
+                self._launcher.prepare(
+                    state, definition.model_dump(exclude_unset=True), context,
+                    attempt.artifacts_directory, attempt.input_data,
+                )
             )
-        )
+        else:
+            inputs = ModulePreparation(
+                context=ParticipantIdentity.model_validate(context),
+                artifacts_directory=attempt.artifacts_directory,
+                input_data=attempt.input_data,
+            )
+            launch = self._launcher._prepare_checked(state, definition, inputs, manifest)
         attempt.endpoint_path = launch.endpoint_path
         attempt.effective_settings = launch.effective_settings
         runtime_context = _update_model(

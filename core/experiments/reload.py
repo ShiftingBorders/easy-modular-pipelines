@@ -64,16 +64,26 @@ class ReloadApplication:
 
 def _definition_fingerprint(
     definition: StageDefinition | ServiceCallDefinition | ServiceDefinition | None,
+    *,
+    ignore_snapshot_policy: bool = False,
 ) -> str:
     """Retain JSON equality, including omitted defaults and numeric spelling."""
-    return json.dumps(
-        None if definition is None else definition.model_dump(exclude_unset=True),
-        sort_keys=True,
-    )
+    document = None if definition is None else definition.model_dump(exclude_unset=True)
+    if (
+        document is not None
+        and isinstance(definition, (StageDefinition, ServiceCallDefinition))
+        and (ignore_snapshot_policy or not definition.snapshot_after)
+    ):
+        document.pop("snapshot_after", None)
+    return json.dumps(document, sort_keys=True)
 
 
 def _template_fingerprint(template: ExperimentTemplate) -> str:
-    return json.dumps(template.model_dump(exclude_unset=True), sort_keys=True)
+    document = template.model_dump(exclude_unset=True)
+    for definition in document["stages"]:
+        if not definition.get("snapshot_after", False):
+            definition.pop("snapshot_after", None)
+    return json.dumps(document, sort_keys=True)
 
 
 def _reload_layout(
@@ -93,7 +103,9 @@ def _reload_layout(
     old_stages, new_stages = previous.stages, candidate.stages
     prefix = 0
     for before, after in zip(old_stages, new_stages):
-        if _definition_fingerprint(before) != _definition_fingerprint(after) or (
+        if _definition_fingerprint(before, ignore_snapshot_policy=True) != _definition_fingerprint(
+            after, ignore_snapshot_policy=True
+        ) or (
             isinstance(before, ServiceCallDefinition)
             and before.service_id in changed_services
         ):

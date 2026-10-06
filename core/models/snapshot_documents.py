@@ -135,6 +135,12 @@ class SnapshotManifest(_SnapshotHeader):
         return copy_json_object(document, "snapshot manifest")
 
 
+class SnapshotRetentionHeader(_SnapshotHeader):
+    """Sort stored candidates without asserting their payload or file integrity."""
+
+    model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
+
+
 class SnapshotMetadata(BaseModel):
     """The legacy inspection subset, without full restoration/inventory requirements."""
 

@@ -81,6 +81,7 @@ from core.primitives.json_values import (
     require_text,
 )
 from core.primitives.processes import process_identity
+from core.primitives.tasks import _await_read_task
 
 
 class ExperimentRunner:
@@ -370,6 +371,12 @@ class ExperimentRunner:
             state, action = await self._prepare_live_run()
         if action == "stop":
             raise RuntimeError("Service startup or recovery requires experiment stop.")
+        if state.pending_dag_decision is not None:
+            self._apply_pending_dag_decision(state)
+            self._save_state()
+            if state.last_dag_decision.decision.command == "stop":
+                await self._stop_from_stage()
+                return
         if action == "pause":
             self._desired_mode = "paused"
         state.mode = self._desired_mode
@@ -433,17 +440,33 @@ class ExperimentRunner:
             state.stage_result_origins.pop(outcome.attempt.stage_id, None)
             raise RuntimeError("Stage execution requires experiment stop.")
         response = outcome.result
-        self._apply_stage_outcome(outcome)
-        final = self._at_dag_end()
+        definition = next(
+            item for item in state.template.stages
+            if item.stage_id == outcome.attempt.stage_id
+        )
+        requested_snapshot = (
+            state.template.snapshots.mode == "after_epoch"
+            and definition.snapshot_after
+            and outcome.attempt.outcome == "succeeded"
+            and response is not None
+            and response.result == "success"
+        )
+        self._apply_stage_outcome(outcome, defer_dag=requested_snapshot)
         state.phase = "waiting"
         self._save_state()
+        if requested_snapshot:
+            await self._snapshot_stage_boundary(state, outcome, False, requested=True)
+            self._apply_pending_dag_decision(state)
+            self._save_state()
+        final = self._at_dag_end()
         if (
             state.last_dag_decision is not None
             and state.last_dag_decision.decision.command == "stop"
         ):
             await self._stop_from_stage()
             return "stopped"
-        await self._snapshot_stage_boundary(state, outcome, final)
+        if not requested_snapshot:
+            await self._snapshot_stage_boundary(state, outcome, final)
         self._idle.set()
         self._finish_stage_step(state, outcome, response, final)
         if state.mode == "running" or final:
@@ -471,11 +494,13 @@ class ExperimentRunner:
                 )
 
     async def _snapshot_stage_boundary(
-        self, state: RunnerState, outcome: StageOutcome, final: bool
+        self, state: RunnerState, outcome: StageOutcome, final: bool,
+        *, requested: bool = False,
     ) -> None:
         mode = state.template.snapshots.mode
         if (
-            outcome.action == "advance"
+            requested
+            or outcome.action == "advance"
             and not final
             and (
                 mode == "after_stage"
@@ -601,9 +626,9 @@ class ExperimentRunner:
         self._manual = False
 
     async def _prepare_continuation(self) -> tuple[RunnerState, str]:
-        manifest = await asyncio.to_thread(
+        manifest = await _await_read_task(asyncio.create_task(asyncio.to_thread(
             self._snapshots._latest_valid, self._continue_source
-        )
+        )))
         saved = manifest.state
         if manifest.experiment_id != self._requested_id.split(":", 1)[1]:
             raise ValueError("Continuation snapshot belongs to another experiment.")
@@ -611,6 +636,10 @@ class ExperimentRunner:
             saved.pending_advance
             and saved.cycle_number == saved.template.cycles
             and saved.stage_position == len(saved.template.stages)
+            and not (
+                saved.pending_dag_decision is not None
+                and saved.pending_dag_decision.decision.command is not None
+            )
             and not (
                 saved.last_dag_decision is not None
                 and saved.last_dag_decision.decision.command == "pause"
@@ -664,14 +693,16 @@ class ExperimentRunner:
     async def _prepare_initial_run(self) -> tuple[RunnerState, str]:
         state = await self._assembler.assemble(self._template_path, self._requested_id)
         self._state = state
+        # Async integrity checks yield before any service is ready. Public startup
+        # must remain starting instead of exposing the constructor's idle phase.
+        state.mode = self._desired_mode
+        state.phase = "starting"
         self._journal.open(state, create=True)
         self._journal.record_template(
             state, state.template_yaml, state.template, "initial"
         )
-        self._assembler.check_modules(state)
-        self._assembler.check_resources(state)
-        state.mode = self._desired_mode
-        state.phase = "starting"
+        await self._assembler._check_modules_async(state)
+        await self._assembler._check_resources_async(state)
         self._save_state()
         action = await self._services.start_all(state)
         return state, action
@@ -679,7 +710,7 @@ class ExperimentRunner:
     async def _prepare_live_run(self) -> tuple[RunnerState, str]:
         state = self._state
         self._pending_advance = state.pending_advance
-        self._assembler.check_modules(state)
+        await self._assembler._check_modules_async(state)
         action = "ready"
         if self._recover_live:
             action = await self._services.recover(state)
@@ -705,13 +736,16 @@ class ExperimentRunner:
             and not conditional_pause
         )
 
-    def _apply_stage_outcome(self, outcome: StageOutcome) -> None:
-        """Commit output and its cursor decision together at a stage boundary."""
+    def _apply_stage_outcome(
+        self, outcome: StageOutcome, *, defer_dag: bool = False
+    ) -> None:
+        """Retain accepted output and either apply or defer its DAG decision."""
         state = self._state
         response = outcome.result
         stage_id = outcome.attempt.stage_id
         state.active_attempt = None
         state.last_dag_decision = None
+        state.pending_dag_decision = None
         self._pending_advance = outcome.action == "advance"
         if outcome.action == "pause":
             state.mode = self._desired_mode = "paused"
@@ -738,14 +772,28 @@ class ExperimentRunner:
                 "decision": decision,
             }
         )
-        state.last_dag_decision = source
         self._retain_input_artifacts(response.data)
-        command = decision.command
+        if defer_dag:
+            state.pending_dag_decision = source
+        else:
+            self._apply_dag_decision(state, source)
+
+    def _apply_pending_dag_decision(self, state: RunnerState) -> None:
+        source = state.pending_dag_decision
+        if source is None:
+            return
+        state.pending_dag_decision = None
+        self._apply_dag_decision(state, source)
+
+    def _apply_dag_decision(self, state: RunnerState, source: LastDecision) -> None:
+        """Apply an accepted decision after its requested snapshot was published."""
+        state.last_dag_decision = source
+        command = source.decision.command
         if command == "pause":
             state.mode = self._desired_mode = "paused"
             state.pause_requested = True
         elif command == "move":
-            target = decision.stage_id
+            target = source.decision.stage_id
             if target is None:
                 raise ValueError("Conditional move requires a target stage.")
             self._apply_conditional_move(state, source, target)
@@ -1229,6 +1277,7 @@ class ExperimentRunner:
         state.stage_position = position
         state.pending_input = None
         state.last_dag_decision = None
+        state.pending_dag_decision = None
         if state.last_result_id not in state.stage_result_ids.values():
             state.last_result = state.last_result_id = None
         self._pending_advance = False
@@ -1771,8 +1820,7 @@ class ExperimentRunner:
             and definition.module.name
             == application.layout.old_services[sid].module.name
         }
-        manifest = await asyncio.to_thread(
-            self._snapshots._validate_snapshot,
+        manifest = await self._snapshots._read_snapshot(
             self._project_root
             / "snapshots"
             / state.experiment_directory.name
@@ -1780,7 +1828,7 @@ class ExperimentRunner:
         )
         exports = {
             sid: Path(path)
-            for sid, path in manifest["services"].items()
+            for sid, path in manifest.services.items()
             if sid in transfer
         }
         await self._services.load_states(state, exports, service_ids=transfer)

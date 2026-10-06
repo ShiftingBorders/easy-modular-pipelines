@@ -140,6 +140,36 @@ calling application. Use absolute paths for library configuration and filesystem
 arguments. Serialize mutations of the same name/version across callers and
 keep the source stable during hashing and packaging.
 
+Hashing settings are validated by `ModuleHashingSettings` from
+`core.models.module_settings`. Pass the model through the optional keyword
+`hashing_settings` when constructing `ModuleManager`. The server accepts the
+same settings in the `module_hashing` object in its configuration:
+
+```json
+{
+  "module_hashing": {
+    "hash_small_file_threshold_bytes": 65536,
+    "hash_chunk_size_bytes": 65536,
+    "hash_max_workers": 2
+  }
+}
+```
+
+Files at or below the small-file threshold are read in one bounded operation;
+larger files are read in blocks of `hash_chunk_size_bytes`. A zero threshold
+disables whole-file reads for nonempty files. The threshold is a nonnegative
+integer; the block size is positive. Both are capped at 64 MiB. The worker count
+is a positive integer capped at 32; `1` uses sequential file hashing. Boolean
+values are rejected for these integer settings.
+
+Only one hashing operation per manager owns a file pool at a time. Its pending
+queue is bounded by twice the worker count, and every reader is joined before
+the operation finishes. The module digest format and ignore rules are unchanged,
+so changing these performance settings does not require registering a new
+module version. Runtime module checks await file workers while HashDB access
+remains on its owning thread. More workers can help large files but may slow
+down trees containing many small files; tune the settings for the storage device.
+
 Expected storage failures derive from `core.storage.errors.StorageError`:
 
 | Exception | Meaning |

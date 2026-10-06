@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import shutil
 from pathlib import Path
+from threading import Event
 from uuid import uuid4
 
 import yaml
@@ -28,6 +28,7 @@ from core.models.experiment_template import (
     StageDefinition,
 )
 from core.models.module_manifest import ModuleManifest
+from core.modules.hashing import _hash_file
 from core.modules.manager import ModuleManager
 from core.modules.manifest import _read_module_manifest, read_module_manifest
 from core.primitives.json_values import (
@@ -35,6 +36,7 @@ from core.primitives.json_values import (
     copy_json_object,
     require_text,
 )
+from core.primitives.tasks import _await_read_task
 
 
 def find_experiment(project_root: Path, experiment_id: str) -> Path:
@@ -191,7 +193,7 @@ class ExperimentAssembler:
 
     async def assemble(self, template_path: Path, experiment_id: str) -> RunnerState:
         require_text(experiment_id, "experiment_id")
-        _, validated = self._load_template(template_path)
+        _, validated = await asyncio.to_thread(self._load_template, template_path)
         return await self._assemble(Path(template_path), experiment_id, validated)
 
     async def _assemble(
@@ -260,6 +262,7 @@ class ExperimentAssembler:
         ):
             (directory / name).mkdir(parents=True, exist_ok=True)
         copied: dict[tuple[str, str], ModuleManifest] = {}
+        checked: dict[Path, tuple[ModuleManifest, str]] = {}
         copy_task = None
         try:
             for role, entries in (
@@ -269,17 +272,19 @@ class ExperimentAssembler:
                 for item in entries:
                     if isinstance(item, ServiceCallDefinition):
                         continue
-                    key, source, target, manifest = self._module_copy_inputs(
-                        item.module, role, directory, copied
-                    )
+                    inputs = asyncio.create_task(asyncio.to_thread(
+                        self._module_copy_inputs, item.module, role, directory, dict(copied)
+                    ))
+                    key, source, target, manifest = await _await_read_task(inputs)
                     if key not in copied:
                         copy_task = asyncio.create_task(
                             asyncio.to_thread(shutil.copytree, source, target)
                         )
                         await asyncio.shield(copy_task)
                         copied[key] = manifest
-                    self._check_module(
-                        state, item.module, "returns_data" in item.model_fields_set
+                    await self._check_module_async(
+                        state, item.module, "returns_data" in item.model_fields_set,
+                        checked=checked,
                     )
             for resource in template.resources:
                 source = Path(resource.path)
@@ -378,14 +383,7 @@ class ExperimentAssembler:
         await self._rebuild_modules(
             candidate, staged, template, workspace, prepare_only
         )
-        checking_resources = asyncio.create_task(
-            asyncio.to_thread(self.check_resources, candidate)
-        )
-        try:
-            await asyncio.shield(checking_resources)
-        finally:
-            # Cancellation must not leave a reader running during restoration.
-            await asyncio.gather(checking_resources, return_exceptions=True)
+        await self._check_resources_async(candidate)
         if prepare_only:
             (workspace / "experiment.yaml").write_text(template_yaml, encoding="utf-8")
         else:
@@ -402,6 +400,7 @@ class ExperimentAssembler:
     ) -> None:
         root = candidate.experiment_directory
         seen = set()
+        checked: dict[Path, tuple[ModuleManifest, str]] = {}
         for role, entries in (
             ("stage", template.stages),
             ("service", template.services),
@@ -415,7 +414,10 @@ class ExperimentAssembler:
                 target = root / "modules" / key[0] / key[1]
                 prepared = workspace / "modules" / key[0] / key[1]
                 if prepare_only:
-                    source = self._rebuild_module_source(root, target, key, role)
+                    inspecting = asyncio.create_task(asyncio.to_thread(
+                        self._rebuild_module_source, root, target, key, role
+                    ))
+                    source = await _await_read_task(inspecting)
                     if not target.exists() and key not in seen:
                         prepared.parent.mkdir(parents=True, exist_ok=True)
                         copying = asyncio.create_task(
@@ -425,11 +427,12 @@ class ExperimentAssembler:
                             await asyncio.shield(copying)
                         finally:
                             await asyncio.gather(copying, return_exceptions=True)
-                    self._check_module(
-                        candidate if target.exists() else staged, reference, conditional
+                    await self._check_module_async(
+                        candidate if target.exists() else staged, reference, conditional,
+                        checked=checked,
                     )
                 else:
-                    self._publish_rebuild_module(
+                    await self._publish_rebuild_module(
                         root,
                         target,
                         prepared,
@@ -437,6 +440,7 @@ class ExperimentAssembler:
                         staged,
                         reference,
                         conditional,
+                        checked,
                     )
                 seen.add(key)
 
@@ -465,7 +469,7 @@ class ExperimentAssembler:
             raise ValueError(f"Module identity/role differs from template: {key}.")
         return source
 
-    def _publish_rebuild_module(
+    async def _publish_rebuild_module(
         self,
         root: Path,
         target: Path,
@@ -474,14 +478,26 @@ class ExperimentAssembler:
         staged: RunnerState,
         reference: ModuleReference,
         conditional: bool,
+        checked: dict[Path, tuple[ModuleManifest, str]],
     ) -> None:
         if not target.exists():
-            self._check_module(staged, reference, conditional)
+            await self._check_module_async(staged, reference, conditional, checked=checked)
             if not target.parent.resolve().is_relative_to(root):
                 raise ValueError("Module destination escapes the experiment.")
             target.parent.mkdir(parents=True, exist_ok=True)
             prepared.replace(target)
-        self._check_module(candidate, reference, conditional)
+            # Rename preserves the verified immutable contents within this operation.
+            if prepared in checked:
+                checked[target] = checked.pop(prepared)
+        await self._check_module_async(candidate, reference, conditional, checked=checked)
+
+    async def _check_modules_async(self, state: RunnerState) -> None:
+        checked: dict[Path, tuple[ModuleManifest, str]] = {}
+        for definition in (*state.template.stages, *state.template.services):
+            await self._check_module_async(
+                state, state.template.module_reference(definition),
+                "returns_data" in definition.model_fields_set, checked=checked,
+            )
 
     def check_modules(self, state: RunnerState) -> None:
         self._check_modules(state, state.template)
@@ -518,18 +534,60 @@ class ExperimentAssembler:
         module: ModuleReference,
         returns_data: bool,
     ) -> ModuleManifest:
-        name, version, expected_hash = module.name, module.version, module.hash
-        directory = state.experiment_directory / "modules" / name / version
-        if not directory.resolve().is_relative_to(state.experiment_directory.resolve()):
-            raise ValueError("Module code escapes the experiment.")
+        directory = self._module_directory(state.experiment_directory, module)
         manifest = _read_module_manifest(directory)
+        actual = self._module_manager.module_hash(module.name, target_folder=directory)
+        self._check_module_integrity(module, returns_data, manifest, actual)
+        return manifest
+
+    async def _check_module_async(
+        self,
+        state: RunnerState,
+        module: ModuleReference,
+        returns_data: bool,
+        *,
+        checked: dict[Path, tuple[ModuleManifest, str]] | None = None,
+    ) -> ModuleManifest:
+        """Read files in a worker; compare with caller-owned HashDB on this thread."""
+        directory = self._module_directory(state.experiment_directory, module)
+        result = None if checked is None else checked.get(directory)
+        if result is None:
+            cancelled = Event()
+            reading = asyncio.create_task(asyncio.to_thread(
+                self._read_module_hash, directory, module.name, cancelled
+            ))
+            result = await _await_read_task(reading, cancelled)
+            if checked is not None:
+                checked[directory] = result
+        manifest, actual = result
+        self._check_module_integrity(module, returns_data, manifest, actual)
+        return manifest
+
+    def _module_directory(self, root: Path, module: ModuleReference) -> Path:
+        name, version = module.name, module.version
+        directory = root / "modules" / name / version
+        if not directory.resolve().is_relative_to(root.resolve()):
+            raise ValueError("Module code escapes the experiment.")
+        return directory
+
+    def _read_module_hash(
+        self, directory: Path, name: str, cancelled: Event
+    ) -> tuple[ModuleManifest, str]:
+        manifest = _read_module_manifest(directory)
+        digest = self._module_manager._module_hash(name, directory, cancelled)
+        return manifest, digest
+
+    def _check_module_integrity(
+        self, module: ModuleReference, returns_data: bool,
+        manifest: ModuleManifest, actual: str,
+    ) -> None:
+        name, version, expected_hash = module.name, module.version, module.hash
         conditional = manifest.stage_kind == "conditional"
         if conditional != returns_data:
             raise ValueError(
                 "Conditional stages require returns_data in the template; "
                 "ordinary stages and services must omit it."
             )
-        actual = self._module_manager.module_hash(name, target_folder=directory)
         registered = self._module_manager.hash_db.get_module_hash(name, version)
         if (
             not registered
@@ -538,8 +596,6 @@ class ExperimentAssembler:
         ):
             raise ValueError(f"Module integrity check failed: {name} / {version}")
 
-        return manifest
-
     def check_resources(self, state: RunnerState) -> None:
         self._check_resources(
             state.experiment_directory,
@@ -547,20 +603,37 @@ class ExperimentAssembler:
         )
 
     def _check_resources(
-        self, directory: Path, resources: list[ResourceDefinition]
+        self, directory: Path, resources: list[ResourceDefinition],
+        cancelled: Event | None = None,
     ) -> None:
+        cancellation = cancelled if cancelled is not None else Event()
         for resource in resources:
             if resource.hash is None:
                 continue
             name, expected_hash = resource.name, resource.hash
             path = directory / "shared_data" / "resources" / name
             if path.is_dir():
-                actual = self._module_manager.module_hash(name, target_folder=path)
+                actual = self._module_manager._module_hash(name, path, cancellation)
             else:
-                with path.open("rb") as stream:
-                    actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                actual = _hash_file(
+                    path, self._module_manager.hashing_settings,
+                    cancellation,
+                ).hex()
             if actual.lower() != expected_hash.lower():
                 raise ValueError(f"Resource integrity check failed: {name}")
+
+    async def _check_resources_async(self, state: RunnerState) -> None:
+        cancelled = Event()
+        if getattr(self.check_resources, "__func__", None) is not ExperimentAssembler.check_resources:
+            # Existing library hooks keep their state-based contract and run in
+            # a worker, as before. Their readers must also finish on cancellation.
+            reading = asyncio.create_task(asyncio.to_thread(self.check_resources, state))
+        else:
+            resources = [item.model_copy(deep=True) for item in state.template.resources]
+            reading = asyncio.create_task(asyncio.to_thread(
+                self._check_resources, state.experiment_directory, resources, cancelled
+            ))
+        await _await_read_task(reading, cancelled)
 
 
 def _publish_registry(

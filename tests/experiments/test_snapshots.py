@@ -1,6 +1,7 @@
 """Approved snapshots.md B/E/F/H: real mixed-service DAG and rollback."""
 
 import asyncio
+import copy
 import os
 import subprocess
 import unittest
@@ -20,6 +21,38 @@ from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
 
 
 class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_after_adds_only_marked_epoch_boundaries(self):
+        for mode, first_count, second_count in (
+            ("off", 0, 0), ("after_stage", 1, 2), ("after_epoch", 1, 1),
+        ):
+            with self.subTest(mode=mode):
+                work = SnapshotWorkspace(services=False, mode=mode)
+                try:
+                    work.stages[0]["snapshot_after"] = True
+                    runner = await work.launch()
+                    await runner.step()
+                    self.assertEqual(len(work.manifests()), first_count)
+                    await runner.step()
+                    self.assertEqual(len(work.manifests()), second_count)
+                finally:
+                    await work.close()
+
+    async def test_snapshot_after_applies_to_successful_service_call_nodes(self):
+        work = self.w
+        work.template["snapshots"]["mode"] = "after_epoch"
+        call = copy.deepcopy(work.stages[0])
+        del call["module"]
+        call.update(service_id=work.socket["service_id"], settings={}, snapshot_after=True)
+        work.template["stages"] = [call, work.stages[-1]]
+        runner = await work.launch()
+        result = await runner.step()
+        self.assertEqual(result["result"]["result"], "success")
+        manifests = work.manifests()
+        self.assertEqual(len(manifests), 1)
+        saved = manifests[0]["state"]
+        self.assertEqual(saved["stage_result_ids"][call["stage_id"]], runner._state.last_result_id)
+        self.assertTrue(runner._state.services[work.socket["service_id"]].ready)
+
     async def test_restore_phases_retain_models_and_leave_previous_states_unchanged(
         self,
     ):

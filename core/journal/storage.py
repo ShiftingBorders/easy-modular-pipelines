@@ -131,6 +131,7 @@ class SQLiteEventStore:
         read_only: bool,
     ) -> None:
         self._read_only = read_only
+        self._immutable_read = False
         self.db_path = settings.db_path
         self._timeout = float(settings.busy_timeout_seconds)
         self._max_event_bytes = settings.max_event_bytes
@@ -372,7 +373,10 @@ class SQLiteEventStore:
                     previous_identity = (status.st_dev, status.st_ino)
                 connection = sqlite3.connect(
                     self.db_path.as_uri()
-                    + ("?mode=ro" if self._read_only else "?mode=rw"),
+                    + (
+                        "?mode=ro&immutable=1" if self._immutable_read
+                        else "?mode=ro" if self._read_only else "?mode=rw"
+                    ),
                     timeout=self._timeout,
                     isolation_level=None,
                     check_same_thread=False,
@@ -1557,6 +1561,43 @@ class SQLiteEventStore:
             raise ValueError("Restored journal does not match the snapshot boundary.")
         if _content_digest(connection) != manifest.content_sha256:
             raise ValueError("Restored journal does not match the snapshot contents.")
+
+    def _open_snapshot(self) -> None:
+        """Open an immutable export without WAL/SHM or recovery-file writes.
+
+        The snapshot owner guarantees no writers and retains the path until close.
+        Ordinary read-only clients keep their existing live-journal behavior.
+        """
+        if not self._read_only:
+            raise LoggingStateError("Snapshot inspection requires a read-only journal.")
+        self._immutable_read = True
+        self.open()
+
+    def _check_snapshot_contents(self, manifest: JournalSnapshotManifest) -> None:
+        """Check immutable export content in one read transaction, without restoring.
+
+        Used by snapshot validation after opening an existing read-only journal.
+        Real restoration continues to validate through its own write transaction.
+        """
+        with self._lock:
+            self._require_open()
+            if not self._read_only:
+                raise LoggingStateError("Snapshot inspection requires a read-only journal.")
+            try:
+                self._check_health()
+                connection = self._connection
+                connection.execute("BEGIN")
+                info = _read_journal_info(connection)
+                actual = {name: info[name] for name in ("journal_id", "generation")}
+                expected = {"journal_id": manifest.journal_id, "generation": manifest.generation}
+                if actual != expected:
+                    raise JournalGenerationChanged(expected, actual)
+                self._check_restored_snapshot(connection, manifest)
+                connection.execute("ROLLBACK")
+                self._check_health()
+            except BaseException as error:
+                self._rollback(self._connection, error)
+                raise
 
     def _import_diagnostic_events(
         self, connection: sqlite3.Connection, events: list[tuple[JsonObject, str]]

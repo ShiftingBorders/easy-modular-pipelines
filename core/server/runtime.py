@@ -403,6 +403,7 @@ async def controller_main(
                 hashes,
                 storage,
                 settings.project_root / "controller/module_work",
+                hashing_settings=settings.module_hashing,
             )
             shutdown_requested = asyncio.Event()
             runner = None

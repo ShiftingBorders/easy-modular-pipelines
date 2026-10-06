@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from core.models.module_settings import ModuleHashingSettings
 from core.models.values import (
     AbsolutePath,
     PositiveInteger,
@@ -39,6 +40,7 @@ class ServerConfiguration(BaseModel):
     max_request_bytes: PositiveInteger
     max_response_bytes: PositiveInteger
     max_cached_result_bytes: PositiveInteger
+    module_hashing: ModuleHashingSettings = Field(default_factory=ModuleHashingSettings)
 
     @field_validator("filer_url")
     @classmethod

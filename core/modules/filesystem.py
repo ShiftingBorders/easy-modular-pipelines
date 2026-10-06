@@ -6,6 +6,11 @@ from pathlib import Path
 from types import TracebackType
 
 
+def _raise_walk_error(error: OSError) -> None:
+    """Preserve traversal failures instead of hashing an incomplete tree."""
+    raise error
+
+
 def _backup_existing_folder(target: Path) -> Path | None:
     backup_folder = None
     if target.exists():

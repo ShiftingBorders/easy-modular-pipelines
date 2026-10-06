@@ -1,20 +1,24 @@
 """Manager operations."""
 
 import asyncio
-import hashlib
 import lzma
+import os
 import shutil
 import tarfile
 import tempfile
 from pathlib import Path, PureWindowsPath
+from threading import Event, Lock
 
+from core.models.module_settings import ModuleHashingSettings
 from core.modules.errors import HashMismatch
 from core.modules.filesystem import (
     _backup_existing_folder,
     _cleanup_registration,
     _ModuleWorkspace,
+    _raise_walk_error,
     _restore_previous_folder,
 )
+from core.modules.hashing import _check_hash_cancelled, _hash_files
 from core.modules.manifest import read_module_manifest
 from core.modules.validation import (
     _normalize_path,
@@ -54,6 +58,8 @@ class ModuleManager:
         module_db: ModuleDatabase,
         temp_folder: str | Path,
         ignore_folders: set[str | Path] | None = None,
+        *,
+        hashing_settings: ModuleHashingSettings | None = None,
     ) -> None:
         storage_path = _normalize_path(module_storage_path)
         temporary_path = _normalize_path(temp_folder)
@@ -89,6 +95,13 @@ class ModuleManager:
         self.hash_db = hash_db
         self.module_db = module_db
         self.temp_folder = temporary_path.resolve()
+        self.hashing_settings = (
+            ModuleHashingSettings()
+            if hashing_settings is None
+            else ModuleHashingSettings.model_validate(hashing_settings)
+        )
+        # One file pool at a time per manager, including callers in other workers.
+        self._hash_lock = Lock()
 
     def list_modules(self) -> JsonObject:
         return {"items": self.hash_db.list_module_hashes()}
@@ -257,20 +270,27 @@ class ModuleManager:
             ignored_folders.add(ignored_path.resolve())
 
         files: list[Path] = []
-        folders = [folder_path]
-        while folders:
-            folder = folders.pop()
+        for folder_name, children, filenames in os.walk(
+            folder_path, followlinks=False, onerror=_raise_walk_error
+        ):
+            folder = Path(folder_name)
             if any(
                 ignored == folder or ignored in folder.parents
                 for ignored in ignored_folders
             ):
+                children.clear()
                 continue
-            for entry in folder.iterdir():
+            children[:] = [
+                name for name in children
+                if not (folder / name).is_symlink()
+                and not (folder / name).is_junction()
+                and (folder / name).resolve() not in ignored_folders
+            ]
+            for name in filenames:
+                entry = folder / name
                 if entry.is_symlink() or entry.is_junction():
                     continue
-                if entry.is_dir():
-                    folders.append(entry)
-                elif entry.is_file():
+                if entry.is_file():
                     files.append(entry.relative_to(folder_path))
         return sorted(files, key=lambda path: path.as_posix())
 
@@ -356,6 +376,15 @@ class ModuleManager:
         interpreted from the module folder. Files must remain unchanged while
         the hash is being computed.
         """
+        return self._module_hash(module_name, target_folder)
+
+    def _module_hash(
+        self,
+        module_name: str,
+        target_folder: str | Path | None = None,
+        cancelled: Event | None = None,
+    ) -> str:
+        """Hash in a caller's worker, joining every file reader before returning."""
         module_name = self._validate_module_folder(
             module_name, require_exists=False
         ).name
@@ -365,21 +394,15 @@ class ModuleManager:
         else:
             module_folder = self._validate_module_folder(module_name)
 
-        files = self._collect_module_files(module_folder)
-
-        hasher = hashlib.sha256()
-        for relative_path in files:
-            encoded_path = relative_path.as_posix().encode("UTF-8")
-            file_hasher = hashlib.sha256()
-            with (module_folder / relative_path).open("rb") as file:
-                while chunk := file.read(65536):
-                    file_hasher.update(chunk)
-
-            # Length-prefixed names and fixed-size digests delimit each file.
-            hasher.update(len(encoded_path).to_bytes(8, "big"))
-            hasher.update(encoded_path)
-            hasher.update(file_hasher.digest())
-        return hasher.hexdigest()
+        cancellation = cancelled if cancelled is not None else Event()
+        while not self._hash_lock.acquire(timeout=0.05):
+            _check_hash_cancelled(cancellation)
+        try:
+            _check_hash_cancelled(cancellation)
+            files = self._collect_module_files(module_folder)
+            return _hash_files(module_folder, files, self.hashing_settings, cancellation)
+        finally:
+            self._hash_lock.release()
 
     def register_module(
         self,

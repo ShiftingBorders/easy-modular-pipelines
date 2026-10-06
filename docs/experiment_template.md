@@ -255,6 +255,31 @@ experiment root. Do not resolve configuration paths from process cwd.
 automatic snapshots, not finalization snapshots. Manual snapshots require an
 idle pause. Stateful services must export complete state.
 
+Stage nodes and service-call nodes may set `snapshot_after: true` outside
+`settings`. The optional field defaults to `false` and accepts only a boolean.
+With `after_epoch`, a successful marked node creates an additional snapshot
+after its result is accepted and before its DAG command (`move`, `pause`, or
+`stop`) is applied. The regular cycle-boundary policy remains enabled.
+With `after_stage` or `off`, the flag is ignored. Failures, retries, and skips
+do not trigger the additional snapshot. Put the flag on each DAG call, not on
+the service's startup definition in `services`.
+
+A snapshot before a DAG command retains both the accepted result and the
+pending command. Restoration applies that command without executing the
+completed node again. A requested snapshot and a scheduled snapshot of the same
+state are combined; finalization after `stop` still creates its mandatory final
+snapshot because participant shutdown produces a different state.
+
+Changing only `snapshot_after` during template reload preserves existing node
+results. The new policy applies to future executions and does not create a
+snapshot retroactively. An omitted flag and explicit `false` are equivalent;
+other definition changes retain their existing invalidation rules.
+
+Retention validates candidates selected for the latest `keep` usable restoration
+points. Older snapshot directories outside that set are removed without content
+validation, including corrupt or incomplete snapshots. Rollback and continuation
+still fully validate their selected snapshot.
+
 `storage.min_snapshot_free_bytes` is a nonnegative disk reserve.
 The four configurable logging fields are explicit:
 

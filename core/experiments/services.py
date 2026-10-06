@@ -35,7 +35,9 @@ from core.models.experiment_template import (
     ServiceCallDefinition,
     ServiceDefinition,
 )
-from core.models.participant_launch import PreparedLaunch
+from core.models.module_manifest import ModuleManifest
+from core.models.participant_identity import ParticipantIdentity
+from core.models.participant_launch import ModulePreparation, PreparedLaunch
 from core.models.participant_observations import (
     CommandState,
     CommandStateResponse,
@@ -217,8 +219,11 @@ class ServiceManager:
     async def _start(
         self, state: RunnerState, definition: ServiceDefinition
     ) -> ServiceInstance:
+        manifest = await self._launcher._assembler._check_module_async(
+            state, definition.module, False
+        )
         instance, directory, launch, context = self._prepare_service_start(
-            state, definition
+            state, definition, manifest
         )
         service_id = instance.service_id
         instance_id = instance.service_instance_id
@@ -290,7 +295,8 @@ class ServiceManager:
             self._changed.set()
 
     def _prepare_service_start(
-        self, state: RunnerState, definition: ServiceDefinition
+        self, state: RunnerState, definition: ServiceDefinition,
+        manifest: ModuleManifest | None = None,
     ) -> tuple[ServiceInstance, Path, PreparedLaunch, JsonObject]:
         service_id = require_text(definition.service_id, "service_id")
         old = state.services.get(service_id)
@@ -306,15 +312,22 @@ class ServiceManager:
             / service_id
             / instance_id
         )
-        launch = PreparedLaunch.model_validate(
-            self._launcher.prepare(
-                state,
-                definition.model_dump(exclude_unset=True),
-                context,
-                directory,
-                None,
+        if (
+            manifest is None
+            or getattr(self._launcher.prepare, "__func__", None) is not ModuleLauncher.prepare
+        ):
+            launch = PreparedLaunch.model_validate(
+                self._launcher.prepare(
+                    state, definition.model_dump(exclude_unset=True), context,
+                    directory, None,
+                )
             )
-        )
+        else:
+            inputs = ModulePreparation(
+                context=ParticipantIdentity.model_validate(context),
+                artifacts_directory=directory, input_data=None,
+            )
+            launch = self._launcher._prepare_checked(state, definition, inputs, manifest)
         instance = ServiceInstance(service_id, instance_id, definition)
         instance.implementation = launch.module.implementation
         instance.artifacts_directory = directory

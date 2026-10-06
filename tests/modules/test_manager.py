@@ -16,12 +16,15 @@ import unittest
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import httpx
 
+from core.models.module_settings import ModuleHashingSettings
 from core.modules.errors import HashMismatch
+from core.modules.hashing import _hash_file
 from core.modules.manager import ModuleManager
 from core.storage.contracts import ModuleAddResult
 from core.storage.errors import (
@@ -774,6 +777,75 @@ class StorageFailureTests(ModuleManagerTestCase):
 
 
 class FileAndPackageTests(ModuleManagerTestCase):
+    def test_file_reader_uses_configured_chunk_and_small_file_threshold(self):
+        path = self.source / "read-boundary.bin"
+        original_open = Path.open
+        sizes = []
+
+        def open_recorded(file, *args, **kwargs):
+            stream = original_open(file, *args, **kwargs)
+            proxy = MagicMock(wraps=stream)
+            proxy.__enter__.return_value = proxy
+            proxy.__exit__.side_effect = stream.__exit__
+
+            def read(size):
+                sizes.append(size)
+                return stream.read(size)
+
+            proxy.read.side_effect = read
+            return proxy
+
+        settings = ModuleHashingSettings(
+            hash_small_file_threshold_bytes=4, hash_chunk_size_bytes=3,
+            hash_max_workers=1,
+        )
+        for content, expected_reads in ((b"abcd", [5]), (b"abcdefghij", [3, 3, 3, 1, 1])):
+            with self.subTest(content=content):
+                path.write_bytes(content)
+                sizes.clear()
+                with patch.object(Path, "open", autospec=True, side_effect=open_recorded):
+                    result = _hash_file(path, settings, Event())
+                self.assertEqual(result, hashlib.sha256(content).digest())
+                self.assertEqual(sizes, expected_reads)
+
+    def test_hash_settings_preserve_existing_digest_across_file_boundaries(self):
+        for name, content in (
+            ("at-threshold.bin", b"a" * 32),
+            ("over-threshold.bin", b"b" * 33),
+            ("large.bin", bytes(range(256)) * 512),
+        ):
+            (self.source / name).write_bytes(content)
+        expected = hashlib.sha256()
+        for relative in self.manager._collect_module_files(self.source):
+            encoded = relative.as_posix().encode("utf-8")
+            expected.update(len(encoded).to_bytes(8, "big"))
+            expected.update(encoded)
+            expected.update(hashlib.sha256((self.source / relative).read_bytes()).digest())
+        for threshold in (0, 32, 131072):
+            for chunk in (17, 65536):
+                for workers in (1, 4):
+                    with self.subTest(threshold=threshold, chunk=chunk, workers=workers):
+                        manager = ModuleManager(
+                            self.storage, self.hashes, self.archives, self.work,
+                            hashing_settings=ModuleHashingSettings(
+                                hash_small_file_threshold_bytes=threshold,
+                                hash_chunk_size_bytes=chunk,
+                                hash_max_workers=workers,
+                            ),
+                        )
+                        self.assertEqual(manager.module_hash("demo", self.source), expected.hexdigest())
+
+    def test_hash_settings_reject_invalid_numbers_and_unknown_fields(self):
+        for field, values in (
+            ("hash_small_file_threshold_bytes", (-1, True, "32", None, 67108865)),
+            ("hash_chunk_size_bytes", (0, -1, False, "32", None, 67108865)),
+            ("hash_max_workers", (0, -1, True, "2", None, 33)),
+            ("unknown", (1,)),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    ModuleHashingSettings.model_validate({field: value})
+
     def test_hash_ignores_creation_order_location_and_metadata(self):
         """FILE-01."""
         other = self.root / "other"

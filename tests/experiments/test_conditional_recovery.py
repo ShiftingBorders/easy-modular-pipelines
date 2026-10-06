@@ -16,6 +16,49 @@ SOURCE = Path(__file__).resolve().parents[1] / "helpers/conditional_stage.py"
 
 
 class ConditionalRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_after_retains_commands_before_application_and_rollback(self):
+        for command in ("move", "pause", "stop"):
+            with self.subTest(command=command):
+                work = self.make_work()
+                try:
+                    skipped, target, tail = work.stages
+                    payload = {"trail": ["accepted before command"]}
+                    decision = {"command": command, "data": payload}
+                    if command == "move":
+                        decision["stage_id"] = target["stage_id"]
+                    condition = self.condition(work, {"decision": decision})
+                    condition["snapshot_after"] = True
+                    work.template["snapshots"]["mode"] = "after_epoch"
+                    runner = await self.launch(work, [condition, skipped, target, tail])
+                    await runner.step()
+                    regular = [item for item in work.manifests() if item["kind"] == "regular"]
+                    self.assertEqual(len(regular), 1)
+                    saved = regular[0]["state"]
+                    pending = saved["pending_dag_decision"]
+                    self.assertEqual(pending["decision"]["command"], command)
+                    self.assertEqual(pending["source_stage_id"], condition["stage_id"])
+                    self.assertEqual(saved["stage_position"], 1)
+                    self.assertEqual(saved["last_result_id"], pending["request_id"])
+                    self.assertIsNone(saved["last_dag_decision"])
+                    self.assertIsNone(runner._state.pending_dag_decision)
+                    await runner.rollback(regular[0]["snapshot_id"])
+                    await asyncio.wait_for(runner._ready.wait(), 60)
+                    self.assertIsNone(runner._state.pending_dag_decision)
+                    starts = [item for item in trace(runner) if item["event"] == "start"]
+                    self.assertEqual([item["stage_id"] for item in starts], [condition["stage_id"]])
+                    if command == "move":
+                        self.assertEqual(runner._state.stage_position, 3)
+                        result = await runner.step()
+                        self.assertEqual(result["result"]["data"]["input"], payload)
+                    elif command == "pause":
+                        self.assertEqual(runner._state.mode, "paused")
+                        self.assertEqual(runner._state.stage_position, 1)
+                        self.assertTrue(runner._state.pending_advance)
+                    else:
+                        self.assertEqual(runner.get_state()["phase"], "stopped")
+                finally:
+                    await work.close()
+
     def make_work(self):
         work = SnapshotWorkspace(services=False, cycles=1)
         self.addAsyncCleanup(work.close)
