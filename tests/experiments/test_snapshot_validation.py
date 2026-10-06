@@ -1,0 +1,428 @@
+"""Approved snapshots.md A/B/C/F: real files and strict archive validation."""
+
+import copy
+import hashlib
+import os
+import shutil
+import unittest
+from datetime import UTC, datetime
+from unittest.mock import patch
+from uuid import uuid4
+
+from core.experiments.restore_inputs import _restored_saved_state
+from core.experiments.snapshot_validation import _validate_snapshot_manifest
+from core.journal.events import LoggingError
+from core.journal.storage import SQLiteEventStore
+from core.models.journal_diagnostics import JournalSnapshotManifest
+from core.models.runner_state import SavedRunnerState
+from core.models.snapshot_documents import (
+    SnapshotFile,
+    SnapshotInventory,
+    SnapshotMetadata,
+    SnapshotPayload,
+)
+from core.primitives.json_files import read_json, write_json
+from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
+
+
+class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.w = SnapshotWorkspace(services=False, keep=2)
+        self.w.template["storage"]["min_snapshot_free_bytes"] = 1
+        self.addAsyncCleanup(self.w.close)
+        self.runner = await self.w.launch()
+        await self.runner.step()
+        self.snapshot = await self.runner.snapshot("valid")
+        self.archive = self.w.archive(self.snapshot["snapshot_id"])
+
+    def clone(self):
+        destination = self.w.root / "validation" / str(uuid4())
+        shutil.copytree(self.archive, destination)
+        return destination
+
+    def rewrite_inventory(self, directory, relative):
+        manifest = read_json(directory / "manifest.json")
+        path = directory / relative
+        manifest["files"][relative] = {
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        write_json(directory / "manifest.json", manifest)
+
+    async def test_payload_components_and_restored_candidate_remain_models(self):
+        original = read_json(self.archive / "manifest.json")
+        payload = self.runner._snapshots._load_snapshot(self.archive)
+        self.assertIsInstance(payload, SnapshotPayload)
+        self.assertIsInstance(payload.state, SavedRunnerState)
+        self.assertIsInstance(payload.inventory, SnapshotInventory)
+        self.assertIsInstance(payload.journal, JournalSnapshotManifest)
+        self.assertTrue(
+            all(
+                isinstance(item, SnapshotFile)
+                for item in payload.inventory.files.values()
+            )
+        )
+        self.assertEqual(payload.document(), original)
+        before = payload.state.model_dump(exclude_unset=True)
+        restored = _restored_saved_state(payload, payload.state, "continued", "new-run")
+        self.assertIsInstance(restored, SavedRunnerState)
+        self.assertEqual(
+            (restored.experiment_id, restored.run_id, restored.phase),
+            ("continued", "new-run", "restoring"),
+        )
+        self.assertEqual(
+            restored.used_request_ids, sorted(payload.state.used_request_ids)
+        )
+        self.assertEqual(payload.state.model_dump(exclude_unset=True), before)
+        emitted = payload.document()
+        emitted["state"]["last_result"]["external"] = True
+        name = next(iter(payload.inventory.files))
+        emitted["files"][name]["size_bytes"] += 1
+        self.assertEqual(payload.document(), original)
+        self.assertEqual(payload.state.model_dump(exclude_unset=True), before)
+
+    async def test_payload_preserves_legacy_json_omissions_and_light_metadata(self):
+        legacy = read_json(self.archive / "manifest.json")
+        legacy["state"]["schema_version"] = 3
+        for name in ("pending_input", "last_dag_decision", "retained_artifacts"):
+            del legacy["state"][name]
+        legacy = {name: legacy[name] for name in reversed(legacy)}
+        payload = _validate_snapshot_manifest(legacy)
+        self.assertIsNone(payload.state.pending_input)
+        self.assertEqual(payload.document(), legacy)
+        self.assertEqual(list(payload.document()), list(legacy))
+        self.assertNotIn("pending_input", payload.document()["state"])
+        metadata = SnapshotMetadata.model_validate(
+            {
+                "schema_version": 2,
+                "snapshot_id": legacy["snapshot_id"],
+                "experiment_id": legacy["experiment_id"],
+                "state": {},
+            }
+        )
+        self.assertEqual(metadata.state, {})
+
+    async def test_validation_reads_immutable_archive_without_copy_or_restore(self):
+        """Read the archived journal without changing it or creating sidecars."""
+        original_open = SQLiteEventStore.open
+        scratch = self.w.root / "controller/snapshot_validation"
+        database = self.archive / "journal/journal.sqlite"
+        before = file_inventory(self.archive)
+        opened = []
+
+        def observe_open(store):
+            original_open(store)
+            if store.db_path == database:
+                opened.append(store.db_path)
+                self.assertTrue(store._read_only)
+                self.assertTrue(store._immutable_read)
+                self.assertEqual(
+                    store._connection.execute("PRAGMA journal_mode").fetchone(),
+                    ("delete",),
+                )
+                self.assertEqual(
+                    {path.name for path in store.db_path.parent.iterdir()},
+                    {"journal.sqlite", "manifest.json"},
+                )
+
+        with (
+            patch.object(SQLiteEventStore, "open", observe_open),
+            patch.object(
+                SQLiteEventStore, "complete_restore",
+                side_effect=AssertionError("Validation must not restore the journal"),
+            ) as restore,
+            patch(
+                "core.experiments.snapshots.shutil.copyfile",
+                side_effect=AssertionError("Validation must not copy the journal"),
+            ),
+        ):
+            manifest = self.runner._snapshots._validate_snapshot(self.archive)
+        self.assertEqual(opened, [database])
+        self.assertEqual(manifest["snapshot_id"], self.snapshot["snapshot_id"])
+        restore.assert_not_called()
+        self.assertFalse(scratch.exists())
+        self.assertFalse(database.with_name("journal.sqlite-shm").exists())
+        self.assertFalse(database.with_name("journal.sqlite-wal").exists())
+        self.assertEqual(file_inventory(self.archive), before)
+
+    async def test_manifest_schema_identity_cursor_and_applied_template_are_checked(
+        self,
+    ):
+        """A2/A4/C1: structurally valid JSON still must describe one consistent run."""
+        original = read_json(self.archive / "manifest.json")
+        changes = [
+            (("schema_version",), True),
+            (("schema_version",), 1),
+            (("snapshot_id",), "invalid"),
+            (("sequence",), 0),
+            (("sequence",), True),
+            (("kind",), "partial"),
+            (("created_at",), "2026-01-01T01:00:00+01:00"),
+            (("state", "active_attempt"), {}),
+            (("state", "experiment_id"), "foreign"),
+            (("state", "cycle_number"), 3),
+            (("state", "template_path"), "../experiment.yaml"),
+            (("state", "template", "name"), "edited"),
+            (("state", "last_result"), {"wrong": True}),
+        ]
+        for keys, value in changes:
+            with self.subTest(keys=keys, value=value):
+                manifest = copy.deepcopy(original)
+                parent = manifest
+                for key in keys[:-1]:
+                    parent = parent[key]
+                parent[keys[-1]] = value
+                with self.assertRaises((ValueError, TypeError, KeyError)):
+                    self.runner._snapshots._validate_snapshot(
+                        self.archive, manifest=manifest
+                    )
+        self.assertEqual(read_json(self.archive / "manifest.json"), original)
+
+    async def test_missing_extra_changed_files_and_invalid_journal_are_rejected(self):
+        """C1/C2: checksum, inventory and actual journal validation are independent."""
+        for mutation in (
+            "missing",
+            "extra",
+            "changed",
+            "module",
+            "journal",
+            "result",
+            "directory",
+            "control",
+        ):
+            with self.subTest(mutation=mutation):
+                directory = self.clone()
+                if mutation == "missing":
+                    (directory / "files/experiment.yaml").unlink()
+                elif mutation == "extra":
+                    (directory / "files/shared_data/extra").write_bytes(b"extra")
+                elif mutation == "directory":
+                    (directory / "files/shared_data/extra").mkdir()
+                elif mutation == "changed":
+                    (directory / "files/experiment.yaml").write_bytes(b"changed")
+                elif mutation == "module":
+                    relative = "files/modules/stage-1/1/main.py"
+                    with (directory / relative).open("a", encoding="utf-8") as stream:
+                        stream.write("\n# modified after registration\n")
+                    self.rewrite_inventory(directory, relative)
+                elif mutation == "control":
+                    manifest = read_json(directory / "manifest.json")
+                    relative = (
+                        next(
+                            key
+                            for key in manifest["files"]
+                            if key.endswith("/received.json")
+                        ).rsplit("/", 1)[0]
+                        + "/executor.lock.fake.token"
+                    )
+                    (directory / relative).write_bytes(b"runtime-only token")
+                    self.rewrite_inventory(directory, relative)
+                elif mutation == "journal":
+                    relative = "journal/journal.sqlite"
+                    (directory / relative).write_bytes(b"not a sqlite database")
+                    self.rewrite_inventory(directory, relative)
+                else:
+                    manifest = read_json(directory / "manifest.json")
+                    manifest["state"]["last_result_id"] = str(uuid4())
+                    write_json(directory / "manifest.json", manifest)
+                with self.assertRaises(
+                    (ValueError, TypeError, KeyError, OSError, LoggingError)
+                ):
+                    self.runner._snapshots._validate_snapshot(directory)
+
+    async def test_unsafe_member_names_case_collisions_and_runtime_files_are_rejected(
+        self,
+    ):
+        """C3/B5: archive metadata cannot introduce host paths or runtime controls."""
+        for name in (
+            "../outside",
+            "/absolute",
+            "C:/outside",
+            "files/../outside",
+            "files\\shared_data\\outside",
+            "files/shared_data/name.",
+            "files/runner/state.json",
+            "files/shared_artifacts/services/control",
+        ):
+            with self.subTest(name=name):
+                manifest = read_json(self.archive / "manifest.json")
+                manifest["files"][name] = {"size_bytes": 0, "sha256": "0" * 64}
+                with self.assertRaises(ValueError):
+                    self.runner._snapshots._validate_snapshot(
+                        self.archive, manifest=manifest
+                    )
+        manifest = read_json(self.archive / "manifest.json")
+        manifest["directories"].append("FILES")
+        with self.assertRaisesRegex(ValueError, "collide"):
+            self.runner._snapshots._validate_snapshot(self.archive, manifest=manifest)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction boundary")
+    async def test_actual_junction_is_rejected_without_touching_its_target(self):
+        """C3: a real Windows junction must never be traversed as snapshot payload."""
+        import _winapi
+
+        directory = self.clone()
+        outside = self.w.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep"
+        sentinel.write_bytes(b"untouched")
+        link = directory / "files/shared_data/linked"
+        _winapi.CreateJunction(str(outside), str(link))
+        try:
+            with self.assertRaises(ValueError):
+                self.runner._snapshots._validate_snapshot(directory)
+            self.assertEqual(sentinel.read_bytes(), b"untouched")
+        finally:
+            os.rmdir(link)
+
+    async def test_latest_valid_skips_corruption_and_retention_removes_old_archives(
+        self,
+    ):
+        """C4/C5: a broken latest archive cannot replace the last usable checkpoint."""
+        newer = await self.runner.snapshot("newer")
+        newer_path = self.w.archive(newer["snapshot_id"])
+        (newer_path / "files/experiment.yaml").write_bytes(b"corrupt")
+        pending = newer_path.parent / str(uuid4())
+        pending.mkdir()
+        (pending / "partial").write_bytes(b"unfinished")
+        latest = self.runner._snapshots.latest_valid(
+            self.runner._state.experiment_directory
+        )
+        self.assertEqual(latest["snapshot_id"], self.snapshot["snapshot_id"])
+        preceding = await self.runner.snapshot("preceding")
+        retained = await self.runner.snapshot("retained")
+        self.assertFalse(self.archive.exists())
+        self.assertTrue(self.w.archive(retained["snapshot_id"]).is_dir())
+        self.assertTrue(self.w.archive(preceding["snapshot_id"]).is_dir())
+        self.assertFalse(newer_path.exists())
+        self.assertFalse(pending.exists())
+        (self.w.archive(retained["snapshot_id"]) / "manifest.json").unlink()
+        (self.w.archive(preceding["snapshot_id"]) / "manifest.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.runner._snapshots.latest_valid(self.runner._state.experiment_directory)
+
+    async def test_sequence_order_survives_backwards_wall_clock(self):
+        """C4: choosing the latest snapshot does not depend on clock monotonicity."""
+        with patch("core.experiments.snapshots.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2000, 1, 1, tzinfo=UTC)
+            older_time = await self.runner.snapshot("clock moved backwards")
+        self.assertLess(older_time["created_at"], self.snapshot["created_at"])
+        self.assertGreater(older_time["sequence"], self.snapshot["sequence"])
+        self.assertEqual(
+            self.runner._snapshots.latest_valid(
+                self.runner._state.experiment_directory
+            )["snapshot_id"],
+            older_time["snapshot_id"],
+        )
+
+    async def test_retention_does_not_validate_the_published_or_deleted_snapshot_twice(self):
+        preceding = await self.runner.snapshot("preceding")
+        old = self.archive
+        (old / "files/experiment.yaml").write_bytes(b"corrupt old snapshot")
+        load = self.runner._snapshots._load_snapshot
+        checked = []
+
+        def read(directory, **kwargs):
+            self.assertNotEqual(directory, old, "A deleted snapshot must not be validated")
+            checked.append(directory)
+            return load(directory, **kwargs)
+
+        with patch.object(self.runner._snapshots, "_load_snapshot", side_effect=read):
+            latest = await self.runner.snapshot("latest")
+        self.assertEqual(checked.count(self.w.archive(latest["snapshot_id"])), 1)
+        self.assertEqual(checked.count(self.w.archive(preceding["snapshot_id"])), 1)
+        self.assertFalse(old.exists())
+
+    async def test_invalid_selection_is_rejected_before_changing_experiment_files(self):
+        """F1/B2: bad labels, IDs and corrupt candidates leave the selected data intact."""
+        before = file_inventory(
+            self.runner._state.experiment_directory / "shared_artifacts"
+        )
+        for label in ("", 0, {}):
+            with self.subTest(label=label), self.assertRaises((TypeError, ValueError)):
+                await self.runner.snapshot(label)
+        for identifier in ("bad-id", str(uuid4())):
+            with (
+                self.subTest(identifier=identifier),
+                self.assertRaises((ValueError, FileNotFoundError)),
+            ):
+                await self.runner.rollback(identifier)
+        (self.archive / "files/experiment.yaml").write_bytes(b"damaged")
+        with self.assertRaises(ValueError):
+            await self.runner.rollback(self.snapshot["snapshot_id"])
+        self.assertEqual(
+            file_inventory(
+                self.runner._state.experiment_directory / "shared_artifacts"
+            ),
+            before,
+        )
+        self.assertEqual(self.runner.get_state()["phase"], "waiting")
+
+    async def test_insufficient_space_does_not_publish_a_new_snapshot(self):
+        """B2/B4: simulate disk exhaustion without filling the host disk."""
+        usage = shutil.disk_usage(self.w.root)
+        actual_usage = shutil.disk_usage
+
+        def available_space(path):
+            if path == self.runner._state.experiment_directory:
+                return type(usage)(usage.total, usage.total, 0)
+            return actual_usage(path)
+
+        with (
+            patch(
+                "core.experiments.snapshots.shutil.disk_usage",
+                side_effect=available_space,
+            ),
+            self.assertRaises(OSError),
+        ):
+            await self.runner.snapshot("no space")
+        self.assertEqual(
+            [item["snapshot_id"] for item in self.w.manifests()],
+            [self.snapshot["snapshot_id"]],
+        )
+
+    async def test_required_exports_and_service_definitions_must_match_snapshot(self):
+        """C2: required RAM state, service settings and export ownership are validated."""
+        w = SnapshotWorkspace()
+        self.addAsyncCleanup(w.close)
+        runner = await w.launch()
+        snapshot = await runner.snapshot()
+        archive = w.archive(snapshot["snapshot_id"])
+        original = read_json(archive / "manifest.json")
+        sid = w.socket["service_id"]
+        for fault in ("missing", "foreign", "commands", "definition", "queue"):
+            with self.subTest(fault=fault):
+                manifest = copy.deepcopy(original)
+                if fault == "missing":
+                    manifest["services"].pop(sid)
+                elif fault == "foreign":
+                    manifest["services"][sid] = "../outside"
+                elif fault == "commands":
+                    manifest["services"][w.commands["service_id"]] = manifest[
+                        "services"
+                    ][sid]
+                elif fault == "definition":
+                    manifest["state"]["services"][sid]["definition"]["settings"][
+                        "different"
+                    ] = True
+                else:
+                    manifest["state"]["services"][sid]["pending_requests"] = [
+                        {"request_id": str(uuid4())}
+                    ]
+                with self.assertRaises((ValueError, TypeError, KeyError)):
+                    runner._snapshots._validate_snapshot(archive, manifest=manifest)
+
+    async def test_snapshot_from_another_experiment_is_refused_before_replacement(self):
+        """F1: selecting a valid archive from another experiment cannot authorize rollback."""
+        other = SnapshotWorkspace(services=False)
+        self.addAsyncCleanup(other.close)
+        runner = await other.launch()
+        foreign = await runner.snapshot()
+        location = self.archive.parent / foreign["snapshot_id"]
+        shutil.copytree(other.archive(foreign["snapshot_id"]), location)
+        root = self.runner._state.experiment_directory
+        before = file_inventory(root / "shared_artifacts")
+        with self.assertRaises(ValueError):
+            await self.runner.rollback(foreign["snapshot_id"])
+        self.assertEqual(file_inventory(root / "shared_artifacts"), before)
+        self.assertEqual(self.runner.get_state()["phase"], "waiting")

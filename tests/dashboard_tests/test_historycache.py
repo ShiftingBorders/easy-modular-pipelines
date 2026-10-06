@@ -11,15 +11,25 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from core.historycache import (
+from core.journal.history_cache import (
     HistoryCacheBusy,
     HistoryCacheChanged,
     HistoryCacheLimit,
     JournalHistoryCache,
     acquire_cache_writer,
 )
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
+from core.models.dashboard_metadata import RecordedReaderLogging
+from core.models.journal_cache import (
+    CacheCheckpoint,
+    CacheIdentity,
+    CachePublication,
+    CacheReaderContext,
+    CacheSource,
+    JournalBoundary,
+)
 from dashboard.api_client import SystemAPIError
+from dashboard.cache_dataset import CachedDataset, CacheReader, CacheWindow
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
 from tests.dashboard_tests.helpers import (
@@ -31,6 +41,123 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace
 
 
 class HistoryCacheTests(unittest.TestCase):
+    def test_reader_logging_model_preserves_recorded_file_values_and_reuse(self):
+        dataset = self.build()
+        state = copy.deepcopy(dataset["state"])
+        logging = state["template"]["logging"]
+        logging["historical_option"] = {"enabled": True}
+        # Full logger option validation still belongs to opening the materialized file.
+        logging["busy_timeout_seconds"] = "historical-invalid-value"
+        recorded = RecordedReaderLogging.model_validate(logging)
+        self.assertEqual(recorded.root, logging)
+        database = dataset["directory"] / "journals/events.sqlite"
+        path = self.reader._reader_configuration(
+            "exp-test", state, database, dataset["identity"]
+        )
+        expected = {
+            "logging": {
+                **logging,
+                "db_path": str(database),
+                "open_mode": "existing",
+                "expected_journal": dataset["identity"],
+            },
+            "operation_context": {"source": "dashboard", "experiment_id": "exp-test"},
+        }
+        self.assertEqual(
+            path.read_text(encoding="utf-8"), json.dumps(expected, ensure_ascii=False)
+        )
+        before = path.stat().st_mtime_ns
+        self.assertEqual(
+            self.reader._reader_configuration(
+                "exp-test", state, database, dataset["identity"]
+            ),
+            path,
+        )
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        for value in (None, "invalid", []):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    TypeError, "Recorded logging settings are missing"
+                ),
+            ):
+                RecordedReaderLogging.model_validate(value)
+
+    def test_cached_dataset_retains_models_and_detaches_public_metadata(self):
+        loaded = self.build()
+        owned = self.reader._snapshots["exp-test"]
+        self.assertIsInstance(owned, CachedDataset)
+        self.assertIsInstance(self.reader._cache["exp-test"], CacheReader)
+        self.assertIsInstance(self.reader._windows["exp-test"], CacheWindow)
+        self.assertIsInstance(owned.publication, CachePublication)
+        self.assertIs(owned.source.identity, loaded["cache"].identity)
+        loaded["state"]["template"]["name"] = "caller change"
+        loaded["entries"][0]["event_type"] = "caller change"
+        self.assertNotEqual(owned.context.state["template"]["name"], "caller change")
+        self.assertNotEqual(owned.entries[0]["event_type"], "caller change")
+
+        cached = self.reader.cached("exp-test")
+        retained = self.reader._read_snapshots["exp-test"][1]
+        self.assertIsInstance(retained.source, CacheSource)
+        self.assertIsInstance(retained.context, CacheReaderContext)
+        self.assertIsInstance(retained.publication.cached_through, CacheCheckpoint)
+        original = retained.publication.model_dump(exclude_unset=True)
+        with patch.object(
+            self.reader,
+            "_load_cached_snapshot",
+            side_effect=AssertionError("Reconstructed unchanged cache metadata"),
+        ):
+            self.assertEqual(cached, self.reader.cached("exp-test"))
+            cached["identity"]["journal_id"] = "caller change"
+            cached["cached_through"]["cursor"] = -1
+            cached["state"]["template"]["name"] = "caller change"
+            current = self.reader.cached("exp-test")
+        self.assertIs(retained, self.reader._read_snapshots["exp-test"][1])
+        self.assertIs(current["cache"], retained.reader)
+        self.assertEqual(retained.publication.model_dump(exclude_unset=True), original)
+        self.assertEqual(current["identity"], retained.source.identity.model_dump())
+        self.assertGreaterEqual(current["cached_through"]["cursor"], 0)
+        self.assertNotEqual(current["state"]["template"]["name"], "caller change")
+
+    def test_private_publication_keeps_models_and_public_observe_is_detached_json(self):
+        dataset = self.build()
+        cache = dataset["cache"]
+        self.assertIsInstance(cache.identity, CacheIdentity)
+        target = JournalBoundary.model_validate(dataset["target_boundary"])
+        publication = cache._observe(target)
+        self.assertIsInstance(publication, CachePublication)
+        self.assertIsInstance(publication.cached_through, CacheCheckpoint)
+        self.assertIsInstance(publication.target_boundary, JournalBoundary)
+        published = cache.observe(dataset["target_boundary"])
+        self.assertEqual(published, publication.model_dump(exclude_unset=True))
+        published["cached_through"]["cursor"] = -1
+        self.assertGreaterEqual(publication.cached_through.cursor, 0)
+        with closing(sqlite3.connect(cache.path)) as database:
+            encoded = database.execute(
+                "SELECT value FROM metadata WHERE key='source'"
+            ).fetchone()[0]
+        source = cache._decode_source(encoded)
+        self.assertIsInstance(source, CacheSource)
+        self.assertEqual(source.identity, cache.identity)
+
+    def test_typed_cache_source_preserves_uuid_spelling_and_copies_json_fields(self):
+        cache = self.build()["cache"]
+        identity = CacheIdentity(
+            journal_id=cache.identity.journal_id.upper(),
+            generation=cache.identity.generation.upper(),
+        )
+        file_key = list(cache.file_key)
+        source = CacheSource(
+            version=1,
+            identity=identity,
+            file_key=file_key,
+            experiment_id=cache.experiment_id,
+        )
+        self.assertIs(source.identity, identity)
+        self.assertEqual(source.model_dump()["identity"], identity.model_dump())
+        file_key[0] = 0
+        self.assertEqual(source.file_key, list(cache.file_key))
+
     def test_replaced_reader_configuration_cannot_reuse_an_old_ram_event(self):
         """T005/T031/T071: detail identity is checked even when the payload is in RAM."""
         dataset = self.build()
@@ -81,6 +208,7 @@ class HistoryCacheTests(unittest.TestCase):
         """T027/T028/T055: a newer observed tail cannot be labelled fully cached."""
         first = self.build()
         self.assertTrue(self.reader.cached("exp-test")["complete"])
+        retained = self.reader._read_snapshots["exp-test"][1]
         self.workspace.logger.record_error(ValueError("not yet projected"))
         observed = self.reader.load("exp-test", force=True, build=False)
         current = self.reader.cached("exp-test")
@@ -89,6 +217,11 @@ class HistoryCacheTests(unittest.TestCase):
         self.assertEqual(current["target_boundary"], observed["boundary"])
         self.assertGreater(
             current["target_boundary"]["cursor"], current["cached_through"]["cursor"]
+        )
+        self.assertIs(retained, self.reader._read_snapshots["exp-test"][1])
+        self.assertTrue(retained.publication.complete)
+        self.assertEqual(
+            retained.publication.target_boundary.model_dump(), first["target_boundary"]
         )
         self.build()
         self.assertTrue(self.reader.cached("exp-test")["complete"])

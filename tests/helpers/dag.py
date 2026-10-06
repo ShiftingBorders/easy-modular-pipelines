@@ -21,12 +21,14 @@ from uuid import uuid4
 import httpx
 import yaml
 
-from core.experimentcontroller import ExperimentController
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import process_identity, read_json
-from core.seaweed import SeaweedDB
+from core.experiments.runner import ExperimentRunner
+from core.models.process_identity import ProcessIdentity
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json
+from core.primitives.processes import process_identity
+from core.server.experiment_controller import ExperimentController
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 TEMP_ROOT = REPOSITORY / ".artifacts" / "tmp" / "dag-tests"
@@ -59,13 +61,19 @@ def process_running(pid: int) -> bool:
             kernel.CloseHandle(handle)
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
 
 
-def terminate_owned(identity: dict) -> None:
+def terminate_owned(identity: ProcessIdentity | dict) -> None:
+    if isinstance(identity, ProcessIdentity):
+        identity = identity.model_dump()
     pid = identity["pid"]
-    if not process_running(pid) or process_identity(pid) != identity:
+    try:
+        if not process_running(pid) or process_identity(pid) != identity:
+            return
+    except (FileNotFoundError, ProcessLookupError):
+        # Linux may remove the process between the running and identity reads.
         return
     if os.name == "nt":
         from ctypes import wintypes
@@ -92,12 +100,16 @@ def terminate_owned(identity: dict) -> None:
         finally:
             kernel.CloseHandle(handle)
     else:
-        descriptor = os.pidfd_open(pid)
         try:
-            if process_identity(pid) == identity:
-                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-        finally:
-            os.close(descriptor)
+            descriptor = os.pidfd_open(pid)
+            try:
+                if process_identity(pid) == identity:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            finally:
+                os.close(descriptor)
+        except (FileNotFoundError, ProcessLookupError):
+            # An already exited process needs no further cleanup.
+            return
 
 
 class DagWorkspace:
@@ -127,7 +139,7 @@ class DagWorkspace:
         client = httpx.Client(
             base_url="http://filer.test", transport=httpx.MockTransport(self._filer)
         )
-        with patch("core.seaweed.httpx.Client", return_value=client):
+        with patch("core.storage.seaweed_client.httpx.Client", return_value=client):
             self.archives = SeaweedDB("http://filer.test")
         self.manager = ModuleManager(
             self.root / "modules", self.hashes, self.archives, self.root / "work"

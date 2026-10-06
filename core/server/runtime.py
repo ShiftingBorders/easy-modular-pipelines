@@ -1,0 +1,1767 @@
+"""One controller process and two queues behind the independent HTTP server."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import multiprocessing
+import os
+import signal
+import tempfile
+import threading
+import time
+import tomllib
+from collections import OrderedDict
+from collections.abc import Callable
+from contextlib import ExitStack
+from datetime import UTC, datetime
+from multiprocessing.process import BaseProcess
+from multiprocessing.queues import Queue
+from pathlib import Path
+from queue import Empty, Full
+from typing import TYPE_CHECKING, BinaryIO, Self
+from uuid import UUID, uuid4
+
+from core.models.server_arguments import CommandListArguments
+from core.models.server_commands import (
+    ControllerOutcome,
+    RuntimeCommandOutcome,
+    RuntimeReady,
+    RuntimeStopped,
+    ServerChain,
+    ServerCommand,
+)
+from core.models.server_receipts import ChainReceipt, CommandReceipt
+from core.models.updates import _update_model
+from core.primitives.file_lock import _lock_open_stream
+from core.primitives.json_files import read_json, write_json
+from core.primitives.json_values import (
+    JsonObject,
+    copy_json_object,
+    require_text,
+)
+from core.server.settings import DEFAULT_CONFIG, ServerSettings
+
+if TYPE_CHECKING:
+    from core.experiments.state import RunnerState
+    from core.journal.logger import OperationLogger
+
+
+class ServerError(Exception):
+    """A transport/lifecycle failure, distinct from a completed controller response."""
+
+    def __init__(self, code: str, message: str, status: int = 503) -> None:
+        """Store a machine-readable transport error code, message, and HTTP status.
+
+        Args:
+            code: Machine-readable failure category used in the returned outcome.
+            message: Human-readable diagnostic to expose when the operation is
+                rejected.
+            status: HTTP status associated with the transport/lifecycle failure, 503
+                by default.
+        """
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+class ProjectLock:
+    """Hold an OS lock in the controller process, including during parent failure."""
+
+    def __init__(self, root: Path) -> None:
+        """Prepare the project lock-file path without acquiring or opening it."""
+        self.path = root / "controller/server.lock"
+        self.stream: BinaryIO | None = None
+
+    def __enter__(self) -> Self:
+        """Acquire the project OS lock without traversing filesystem links and return self.
+
+        Returns:
+            This lock owner after opening the lock file and acquiring the platform
+            OS lock; close releases ownership.
+        """
+        for path in (self.path, *self.path.parents):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError("The server lock must not traverse filesystem links.")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.path.open("a+b")
+        try:
+            if stream.seek(0, os.SEEK_END) == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            _lock_open_stream(stream)
+        except BaseException:
+            stream.close()
+            raise
+        self.stream = stream
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        """Close the lock stream, releasing the operating-system lock."""
+        if self.stream is not None:
+            # Closing releases the OS lock even when cleanup raised an exception.
+            self.stream.close()
+            self.stream = None
+
+
+def write_initial_config(path: Path, text: str) -> None:
+    """Publish a complete initial file without replacing a user's existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".prepare-", dir=path.parent) as work:
+        staged = Path(work) / "config"
+        with staged.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(staged, path)
+
+
+def prepare_work_directory(settings: ServerSettings) -> tuple[Path, Path | None]:
+    """Prepare missing project files under the caller's ProjectLock, before opening DBs."""
+    from core.storage.hash_config import HashDBConfig
+    from core.storage.seaweed_config import SeaWeedConfig
+
+    expected_schema = read_json(DEFAULT_CONFIG.with_name("hash_db_schema.json"))
+    if list(expected_schema.items()) != [
+        ("Mname", "VARCHAR(255) NOT NULL"),
+        ("MVersion", "VARCHAR(255) NOT NULL"),
+        ("MHash", "VARCHAR(255) NOT NULL"),
+    ]:
+        raise ValueError("The bundled HashDB schema is invalid.")
+    config_path = settings.hash_config_path
+    new_config = not config_path.exists()
+    if new_config:
+        if not settings.default_hash_config:
+            raise FileNotFoundError(
+                f"Explicit HashDB configuration does not exist: {config_path}"
+            )
+        db_path = config_path.parent / "modules.db"
+        schema_path = config_path.parent / "schema.json"
+        if db_path.exists():
+            raise ValueError(
+                "HashDB exists without its configuration; restore config.json first."
+            )
+    else:
+        document = read_json(config_path)
+        for key in ("schema_path", "db_path"):
+            configured = config_path.parent / Path(require_text(document.get(key), key))
+            for path in (configured, *configured.parents):
+                if path.is_symlink() or path.is_junction():
+                    raise ValueError(
+                        f"HashDB paths must not traverse filesystem links: {path}"
+                    )
+            document[key] = str(configured.resolve())
+        validated = HashDBConfig.model_validate(document)
+        db_path, schema_path = validated.db_path, validated.schema_path
+    if schema_path.exists() and list(read_json(schema_path).items()) != list(
+        expected_schema.items()
+    ):
+        raise ValueError(f"Incompatible HashDB schema: {schema_path}")
+    if not new_config and not schema_path.is_file():
+        raise FileNotFoundError(f"Missing HashDB schema: {schema_path}")
+    seaweed_root = None
+    seaweed_document = None
+    if settings.filer_url is None:
+        seaweed_root, seaweed_config, seaweed_document = _read_local_seaweed(
+            settings, db_path
+        )
+        SeaWeedConfig.model_validate(seaweed_document)
+        filer_config = _validate_local_storage_paths(seaweed_root, seaweed_document)
+    paths = [
+        config_path,
+        schema_path,
+        db_path,
+        settings.project_root / "modules",
+        settings.project_root / "experiments",
+        settings.project_root / "controller/module_work",
+    ]
+    if seaweed_root is not None:
+        paths.extend(
+            seaweed_root / name
+            for name in (
+                "master",
+                "volume",
+                "filer",
+                "config/seaweed.json",
+                "config/filer.toml",
+            )
+        )
+    for target in paths:
+        for path in (target, *target.parents):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError(
+                    f"Project storage must not traverse filesystem links: {path}"
+                )
+    # All configuration checks precede new persistent configuration/data files.
+    for name in ("modules", "experiments", "controller/module_work"):
+        (settings.project_root / name).mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if new_config:
+        if not schema_path.exists():
+            write_initial_config(
+                schema_path, json.dumps(expected_schema, indent=2) + "\n"
+            )
+        write_initial_config(
+            config_path,
+            json.dumps(
+                {
+                    "schema_path": "schema.json",
+                    "db_path": "modules.db",
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+    if seaweed_root is not None:
+        for name in ("config", "master", "volume", "filer"):
+            (seaweed_root / name).mkdir(parents=True, exist_ok=True)
+        if not seaweed_config.exists():
+            write_initial_config(
+                seaweed_config, json.dumps(seaweed_document, indent=2) + "\n"
+            )
+        if not filer_config.exists():
+            write_initial_config(
+                filer_config, '[leveldb2]\nenabled = true\ndir = "../filer"\n'
+            )
+    return db_path, seaweed_root
+
+
+def _read_local_seaweed(
+    settings: ServerSettings, db_path: Path
+) -> tuple[Path, Path, JsonObject]:
+    seaweed_root = db_path.parent.parent / "seaweedfs"
+    if (
+        seaweed_root == db_path.parent
+        or seaweed_root in db_path.parent.parents
+        or db_path.parent in seaweed_root.parents
+    ):
+        raise ValueError("HashDB and SeaweedFS must use distinct sibling directories.")
+    seaweed_config = seaweed_root / "config/seaweed.json"
+    if seaweed_config.exists():
+        seaweed_document = read_json(seaweed_config)
+    else:
+        seaweed_document = read_json(settings.seaweed_config_path)
+        for key in ("dir", "master.dir", "volume.dir.idx"):
+            if key in seaweed_document["start_args"]:
+                raise ValueError(
+                    f"Local storage manages {key}; remove it from SeaweedFS defaults."
+                )
+        seaweed_document["start_args"]["master.dir"] = "../master"
+    return seaweed_root, seaweed_config, seaweed_document
+
+
+def _validate_local_storage_paths(
+    seaweed_root: Path, seaweed_document: JsonObject
+) -> Path:
+    if seaweed_document["start_args"].get("master.dir") != "../master":
+        raise ValueError("Local SeaweedFS requires master.dir=../master.")
+    if any(key in seaweed_document["start_args"] for key in ("dir", "volume.dir.idx")):
+        raise ValueError("Local SeaweedFS volume paths are managed by the server.")
+    filer_config = seaweed_root / "config/filer.toml"
+    if filer_config.exists():
+        filer = tomllib.loads(filer_config.read_text(encoding="utf-8"))
+        if filer != {"leveldb2": {"enabled": True, "dir": "../filer"}}:
+            raise ValueError(
+                "Local filer.toml must use only leveldb2 with dir=../filer."
+            )
+    return filer_config
+
+
+def recovery_candidates(project_root: Path) -> list[str]:
+    """A new owner must explicitly recover unfinished or unreadable previous runs."""
+    import psutil
+
+    from core.experiments.assembler import find_experiment
+    from core.experiments.state import RunnerStateStore
+    from core.primitives.processes import process_identity
+
+    registry = project_root / "experiments.json"
+    if not registry.exists():
+        return []
+    candidates = []
+    local = process_identity(os.getpid())
+    for experiment_id in read_json(registry):
+        try:
+            root = find_experiment(project_root, experiment_id)
+            transaction = (
+                project_root / "controller/restore_transactions" / f"{root.name}.json"
+            )
+            if transaction.exists() and read_json(transaction).get("phase") not in (
+                "complete",
+                "failed",
+            ):
+                candidates.append(experiment_id)
+                continue
+            if (
+                not (root / "runner/state.json").exists()
+                and not (root / "journals/events.sqlite").exists()
+                and not (root / "executor.lock.json").exists()
+                and not any((root / "shared_artifacts").rglob("process.json"))
+            ):
+                # Assembler-only drafts have never started an executor or services.
+                continue
+            state = RunnerStateStore().load(root)
+            if not _needs_recovery(state, root, local):
+                continue
+        except (OSError, ValueError, TypeError, KeyError, psutil.Error):
+            pass
+        candidates.append(experiment_id)
+    return candidates
+
+
+def _needs_recovery(state: RunnerState, root: Path, local: JsonObject) -> bool:
+    import psutil
+
+    from core.primitives.processes import process_identity
+
+    if state.pending_rebuild is not None:
+        return True
+    if (
+        state.phase == "idle"
+        and state.owner_identity is None
+        and state.active_attempt is None
+        and not state.services
+    ):
+        return False
+    if (
+        state.phase in ("stopped", "completed", "failed")
+        and state.active_attempt is None
+        and all(instance.stopped for instance in state.services.values())
+    ):
+        identities = [
+            None if state.owner_identity is None else state.owner_identity.model_dump(),
+            *(
+                None
+                if instance.process_identity is None
+                else instance.process_identity.model_dump()
+                for instance in state.services.values()
+            ),
+        ]
+        lock = root / "executor.lock.json"
+        if lock.exists():
+            identities.append(
+                copy_json_object(read_json(lock).get("executor"), "executor identity")
+            )
+        alive = False
+        for identity in identities:
+            if identity is None:
+                continue
+            if identity["host_id"] != local["host_id"]:
+                alive = True
+                break
+            if identity["boot_id"] != local["boot_id"]:
+                continue
+            pid = identity["pid"]
+            if type(pid) is not int or pid <= 0:
+                raise ValueError("Invalid saved process identity.")
+            try:
+                process = psutil.Process(pid)
+                if process_identity(pid) == identity:
+                    process.wait(timeout=0)
+            except (
+                psutil.NoSuchProcess,
+                ProcessLookupError,
+                FileNotFoundError,
+            ):
+                continue
+            except psutil.TimeoutExpired:
+                alive = True
+                break
+        if not alive:
+            return False
+    return True
+
+
+async def controller_main(
+    settings: ServerSettings, requests: Queue, responses: Queue, instance_id: str
+) -> None:
+    """Create all thread-bound dependencies inside their owning process/event loop."""
+    from core.experiments.runner import ExperimentRunner
+    from core.journal.logger import OperationLogger
+    from core.modules.manager import ModuleManager
+    from core.primitives.processes import process_identity
+    from core.server.experiment_controller import ExperimentController
+    from core.server.maintenance_controller import MaintenanceController
+    from core.storage.hash_db import HashDB
+    from core.storage.seaweed_client import SeaweedDB
+    from core.storage.seaweed_process import SeaweedProcess
+
+    with ExitStack() as stack:
+        stack.enter_context(ProjectLock(settings.project_root))
+        db_path, seaweed_root = prepare_work_directory(settings)
+        logger = _open_control_journal(settings, instance_id, stack, OperationLogger)
+        try:
+            process_resources = stack.enter_context(ExitStack())
+            hashes = HashDB(settings.hash_config_path)
+            stack.callback(hashes.close_connection)
+            if seaweed_root is not None:
+                seaweed = SeaweedProcess(
+                    seaweed_root / "volume",
+                    settings.seaweed_min_free_gb,
+                    seaweed_root / "config/seaweed.json",
+                )
+                process_resources.callback(seaweed.stop)
+                await asyncio.to_thread(seaweed.start)
+                storage = SeaweedDB(
+                    seaweed.filer_url,
+                    max_archive_gb=seaweed.max_archive_gb,
+                    before_upload=seaweed.check_upload_space,
+                )
+            else:
+                storage = SeaweedDB(settings.filer_url)
+            stack.callback(storage.close)
+            # A reachable storage service may legitimately have no modules yet.
+            await asyncio.to_thread(storage.check_module_stored, "startup_probe", "1")
+            manager = ModuleManager(
+                settings.project_root / "modules",
+                hashes,
+                storage,
+                settings.project_root / "controller/module_work",
+                hashing_settings=settings.module_hashing,
+            )
+            shutdown_requested = asyncio.Event()
+            runner = None
+            if settings.server_mode == "maintenance":
+                controller = MaintenanceController(
+                    manager,
+                    logger,
+                    requests,
+                    responses,
+                    project_root=settings.project_root,
+                    shutdown_requested=shutdown_requested,
+                    recovery_required=recovery_candidates(settings.project_root),
+                )
+            else:
+                runner = ExperimentRunner(
+                    settings.project_root,
+                    manager,
+                    archive_config_path=settings.archive_config_path,
+                    control_logger=logger,
+                )
+                controller = ExperimentController(
+                    settings.project_root,
+                    runner,
+                    requests,
+                    responses,
+                    module_manager=manager,
+                    resource_config_path=settings.resource_config_path,
+                    shutdown_requested=shutdown_requested,
+                    recovery_required=recovery_candidates(settings.project_root),
+                )
+            serving = asyncio.create_task(controller.serve())
+            try:
+                await asyncio.sleep(0)
+                if serving.done():
+                    await serving
+                    raise RuntimeError("Controller stopped during startup.")
+                identity = process_identity(os.getpid())
+                logger.record_event(
+                    "server.controller_started",
+                    {"runtime_id": instance_id, "process": identity},
+                )
+                responses.put_nowait(
+                    {
+                        "_runtime": "ready",
+                        "process": identity,
+                        "storage": {
+                            "initialized": True,
+                            "hash_db_path": str(db_path),
+                            "seaweed_path": None
+                            if seaweed_root is None
+                            else str(seaweed_root),
+                            "filer_url": seaweed.filer_url
+                            if seaweed_root is not None
+                            else settings.filer_url,
+                            "checked_at": datetime.now(UTC).isoformat(),
+                        },
+                    }
+                )
+                parent = multiprocessing.parent_process()
+                while not shutdown_requested.is_set():
+                    if serving.done():
+                        await serving
+                        raise RuntimeError("Controller stopped unexpectedly.")
+                    if parent is not None and not parent.is_alive():
+                        logger.record_event("server.parent_lost", {})
+                        break
+                    await asyncio.sleep(0.1)
+            finally:
+                try:
+                    await controller.close()
+                finally:
+                    try:
+                        if runner is not None:
+                            await runner.stop()
+                    finally:
+                        if runner is not None:
+                            await runner.close()
+                        await asyncio.gather(serving, return_exceptions=True)
+            logger.record_event("server.controller_stopped", {})
+            responses.put_nowait({"_runtime": "stopped"})
+        except Exception as error:
+            try:
+                logger.record_error(error, include_traceback=True)
+            except Exception as logging_error:  # noqa: BLE001 - Preserve the startup/shutdown failure.
+                error.add_note(f"Server lifecycle logging also failed: {logging_error}")
+            raise
+
+
+def _open_control_journal(
+    settings: ServerSettings,
+    instance_id: str,
+    stack: ExitStack,
+    logger_type: type[OperationLogger],
+) -> OperationLogger:
+    directory = settings.project_root / "controller/server" / instance_id
+    logging_settings = read_json(DEFAULT_CONFIG.with_name("logging.json"))
+    logging_settings.update(
+        {
+            "db_path": str(directory / "events.sqlite"),
+            "open_mode": "create",
+            "expected_journal": None,
+        }
+    )
+    logging_config = directory / "logging.json"
+    write_json(
+        logging_config,
+        {
+            "logging": logging_settings,
+            "operation_context": {"source": "server_controller"},
+        },
+    )
+    logger = stack.enter_context(logger_type(logging_config))
+    identity = logger.get_journal_info()
+    logging_settings.update(
+        {
+            "open_mode": "existing",
+            "expected_journal": {
+                key: identity[key] for key in ("journal_id", "generation")
+            },
+        }
+    )
+    write_json(
+        directory / "reader.json",
+        {
+            "logging": logging_settings,
+            "operation_context": {"source": "server_controller"},
+        },
+    )
+    return logger
+
+
+def controller_process(
+    settings: ServerSettings, requests: Queue, responses: Queue, instance_id: str
+) -> None:
+    """Spawn entry point; only the two queues cross the application boundary."""
+    # The HTTP owner handles console Ctrl+C and requests an orderly shutdown
+    # through the queue; the child must not race that request on Windows.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        asyncio.run(controller_main(settings, requests, responses, instance_id))
+    except BaseException as error:
+        try:
+            responses.put(
+                {"_runtime": "error", "message": f"{type(error).__name__}: {error}"},
+                timeout=1,
+            )
+        except Full:
+            pass
+        raise
+    finally:
+        requests.close()
+        responses.close()
+        parent = multiprocessing.parent_process()
+        if parent is not None and parent.is_alive():
+            responses.join_thread()
+        else:
+            responses.cancel_join_thread()
+
+
+class CommandRecord:
+    """Retained request fingerprint, submission time, and optional cached outcome."""
+    def __init__(self, command: ServerCommand, chain_id: str | None = None) -> None:
+        """Fingerprint a validated request and initialize pending-result accounting.
+
+        Args:
+            command: Validated command whose normalized JSON is fingerprinted.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+        """
+        self.request = command
+        document = command.model_dump(exclude_none=True)
+        if chain_id is not None:
+            document["chain_id"] = chain_id
+        encoded = json.dumps(
+            document, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+        self.fingerprint = hashlib.sha256(encoded).hexdigest()
+        self.chain_id = chain_id
+        self.command = command.command
+        self.is_stop = command.command == "stop" and self.chain_id is None
+        self.submitted_at = datetime.now(UTC).isoformat()
+        self.finished_at: float | None = None
+        self.response: ControllerOutcome | RuntimeCommandOutcome | None = None
+        self.size = 0
+
+
+class ServerRuntime:
+    """Server-owned process and bounded command results; clients never own either."""
+
+    def __init__(
+        self, settings: ServerSettings, *, stop_http: Callable[[], None] | None = None
+    ) -> None:
+        """Initialize controller ownership and receipt tracking without starting a process.
+
+        Args:
+            settings: Validated runtime settings.
+            stop_http: Optional owner callback requesting graceful HTTP shutdown.
+
+        Raises:
+            TypeError: The supplied shutdown callback is not callable.
+        """
+        self.settings = settings
+        if stop_http is not None and not callable(stop_http):
+            raise TypeError("stop_http must be a callable or None.")
+        self._stop_http = stop_http
+        self.instance_id = str(uuid4())
+        self._process: BaseProcess | None = None
+        self._requests: Queue | None = None
+        self._responses: Queue | None = None
+        self._watcher: asyncio.Task | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._reader_stop = threading.Event()
+        self._ready: asyncio.Future | None = None
+        self._records: OrderedDict[str, CommandRecord] = OrderedDict()
+        self._chains: dict[str, list[str]] = {}
+        self._reads: dict[
+            str, asyncio.Future[ControllerOutcome | RuntimeCommandOutcome]
+        ] = {}
+        self._cache_bytes = 0
+        self._state = "new"
+        self._error: str | None = None
+        self._closing = False
+        self._last_response_at: str | None = None
+        self._identity: JsonObject | None = None
+        self._storage: JsonObject | None = None
+        self._runtime_id = str(uuid4())
+        self._restart_task: asyncio.Task | None = None
+        self._restart_command: ServerCommand | None = None
+        self._restart_blocked: str | None = None
+        self._http_closing = False
+
+    async def start(self, *, restart_command: ServerCommand | None = None) -> None:
+        """Spawn the controller and await readiness, or execute an admitted lifecycle command.
+
+        Args:
+            restart_command: Previously admitted lifecycle command, or None for startup.
+
+        Raises:
+            RuntimeError: Startup is repeated or a lifecycle command bypasses admission.
+            TimeoutError: Controller readiness exceeds the startup timeout.
+        """
+        if restart_command is not None:
+            return await self._run_lifecycle_command(restart_command)
+        if self._state != "new":
+            raise RuntimeError("Server runtime has already started.")
+        self._state = "starting"
+        context = multiprocessing.get_context("spawn")
+        capacity = self.settings.max_pending + self.settings.max_reads + 4
+        self._requests = context.Queue(capacity)
+        self._responses = context.Queue(capacity)
+        self._ready = asyncio.get_running_loop().create_future()
+        self._process = context.Process(
+            target=controller_process,
+            args=(self.settings, self._requests, self._responses, self._runtime_id),
+            name="experiment-controller",
+        )
+        try:
+            self._process.start()
+            # A killed queue writer can leave get() stuck inside a partial frame.
+            # Keep that reader out of asyncio's executor so it cannot hold HTTP
+            # shutdown hostage; the independent watchdog still observes exit.
+            self._reader_thread = threading.Thread(
+                target=self._read_responses,
+                args=(asyncio.get_running_loop(),),
+                name="controller-response-reader",
+                daemon=True,
+            )
+            self._reader_thread.start()
+            self._watcher = asyncio.create_task(self._watch_process())
+            await asyncio.wait_for(
+                asyncio.shield(self._ready), self.settings.startup_timeout
+            )
+        except BaseException as error:
+            if not self._ready.done():
+                self._ready.cancel()
+            try:
+                await self.close()
+            except Exception as cleanup_error:  # noqa: BLE001 - Preserve the startup failure.
+                error.add_note(f"Runtime cleanup also failed: {cleanup_error}")
+            raise
+
+    async def _run_lifecycle_command(self, restart_command: ServerCommand) -> None:
+        """Stop/replace the controller or stop HTTP, retaining the lifecycle receipt.
+
+        Args:
+            restart_command: Previously admitted restart, mode-change, or shutdown
+                command.
+        """
+        if restart_command is not self._restart_command:
+            raise RuntimeError("Admit server lifecycle commands through submit first.")
+        previous_id = self._runtime_id
+        shutdown_requested = restart_command.command == "server.shutdown"
+        mode = restart_command.args.get("mode", self.settings.server_mode)
+        response = ControllerOutcome.model_validate(
+            {
+                "command_id": restart_command.command_id,
+                "chain_id": None,
+                "experiment_id": None,
+                "state": "succeeded",
+                "result": "success",
+                "data": None,
+                "error": None,
+            }
+        )
+        try:
+            unchanged = (
+                restart_command.command == "server.mode"
+                and mode == self.settings.server_mode
+                and self._state == "ready"
+                and self._process is not None
+                and self._process.is_alive()
+            )
+            if not unchanged:
+                await self._close_for_lifecycle()
+                if self._http_closing:
+                    raise asyncio.CancelledError
+                if shutdown_requested:
+                    # The owner must drain accepted HTTP requests before
+                    # exiting, including a client waiting for this result.
+                    self._stop_http()
+                    self._http_closing = True
+                else:
+                    self.settings.server_mode = mode
+                    await self._start_replacement_runtime()
+            response = _update_model(
+                response,
+                data=(
+                    {
+                        "runtime_id": self._runtime_id,
+                        "runtime_stopped": True,
+                        "http_shutdown_requested": True,
+                    }
+                    if shutdown_requested
+                    else {
+                        "previous_runtime_id": previous_id,
+                        "runtime_id": self._runtime_id,
+                        "server_mode": self.settings.server_mode,
+                        "changed": not unchanged,
+                        "controller": self._identity,
+                    }
+                ),
+            )
+        except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - Lifecycle failures are retained command outcomes.
+            cancelled = isinstance(error, asyncio.CancelledError)
+            error_message = "HTTP server is stopping." if cancelled else str(error)
+            response = _update_model(
+                response,
+                state="cancelled" if cancelled else "failed",
+                result="fail",
+                error={
+                    "code": "command_cancelled"
+                    if cancelled
+                    else (
+                        "server_shutdown_failed"
+                        if shutdown_requested
+                        else "runtime_restart_failed"
+                    ),
+                    "message": error_message,
+                    "details": {"notes": list(getattr(error, "__notes__", []))},
+                },
+            )
+            self._error = error_message
+        finally:
+            # A closed controller must not hide the HTTP-owned receipt.
+            if self._state == "closed":
+                self._state = "unavailable"
+            self._accept_response(response)
+            self._restart_command = None
+            if shutdown_requested and response.state == "succeeded":
+                self._state = "closed"
+
+    async def _close_for_lifecycle(self) -> None:
+        """Confirm shutdown before replacing queues, even when the owner is cancelled.
+
+        Shields the owned shutdown task and waits for its actual outcome before
+        propagating caller cancellation. Failed shutdown records restart_blocked, so
+        no replacement can reuse unconfirmed ownership.
+        """
+        shutdown = asyncio.create_task(self.close(restarting=True))
+        cancelled = False
+        try:
+            while True:
+                try:
+                    await asyncio.shield(shutdown)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if shutdown.cancelled():
+                        raise
+        except Exception as error:
+            self._restart_blocked = (
+                self._restart_blocked or f"Runtime shutdown was not confirmed: {error}"
+            )
+            raise
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _start_replacement_runtime(self) -> None:
+        """Open a new runtime only after the previous owner has confirmed exit.
+
+        Allocates a new runtime ID, resets IPC/watchdog/readiness state, and awaits
+        ordinary startup. HTTP-owned command records and server instance identity
+        remain retained across replacement.
+        """
+        self._runtime_id = str(uuid4())
+        self._reader_stop = threading.Event()
+        self._reader_thread = None
+        self._watcher = None
+        self._ready = None
+        self._identity = None
+        self._storage = None
+        self._last_response_at = None
+        self._error = None
+        self._closing = False
+        self._state = "new"
+        await self.start()
+
+    def health(self) -> JsonObject:
+        """Return current controller liveness, runtime identity, admission state, and errors.
+
+        Returns:
+            Current controller liveness, runtime identity, admission state, and
+            errors.
+        """
+        alive = self._process is not None and self._process.is_alive()
+        return {
+            "server_instance_id": self.instance_id,
+            "runtime_id": self._runtime_id,
+            "server_mode": self.settings.server_mode,
+            "storage_initialization": self._storage,
+            "state": (
+                "shutting_down"
+                if self._restart_command.command == "server.shutdown"
+                else "restarting"
+            )
+            if self._restart_command is not None
+            else self._state,
+            "controller_alive": alive,
+            "controller": self._identity,
+            "last_response_at": self._last_response_at,
+            "pending_commands": sum(
+                record.response is None for record in self._records.values()
+            ),
+            "error": self._error,
+            "restart_blocked": self._restart_blocked,
+        }
+
+    def _require_ready(self) -> Queue:
+        """Return the live controller queue or raise ServerError when unavailable.
+
+        Returns:
+            The live controller queue or raise ServerError when unavailable.
+        """
+        if (
+            self._closing
+            or self._restart_command is not None
+            or self._state != "ready"
+            or self._process is None
+            or not self._process.is_alive()
+            or self._requests is None
+        ):
+            raise ServerError(
+                "controller_unavailable", self._error or "Controller is not available."
+            )
+        return self._requests
+
+    def _command(self, value: object, *, chain_id: str | None = None) -> JsonObject:
+        """Validate command input and serialize it with an optional chain identity.
+
+        Args:
+            value: Raw command envelope validated before IPC serialization.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+
+        Returns:
+            Detached wire command with optional chain identity, after command
+            validation.
+        """
+        return self._command_document(ServerCommand.model_validate(value), chain_id)
+
+    def _command_document(
+        self, command: ServerCommand, chain_id: str | None
+    ) -> JsonObject:
+        """Serialize a validated command, rejecting lifecycle commands inside chains.
+
+        Args:
+            command: Validated command model with defaults and normalized identity.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+
+        Returns:
+            Wire command excluding None fields and including the optional chain ID.
+        """
+        if chain_id is not None and command.command.startswith("server."):
+            raise ValueError("Runtime lifecycle commands do not accept chains or targets.")
+        document = command.model_dump(exclude_none=True)
+        if chain_id is not None:
+            document["chain_id"] = chain_id
+        return document
+
+    def submit(self, document: object, *, chain: bool = False) -> JsonObject:
+        """Validate and enqueue without awaiting: disconnect cannot split admission.
+
+        Args:
+            document: Single command or chain input to detach and validate before
+                admission.
+            chain: Whether the input is a command-chain envelope rather than a
+                single command.
+
+        Returns:
+            Immediate command or chain receipt. A matching retained submission
+            reuses the receipt; admission does not imply controller execution or DAG
+            completion.
+
+        Raises:
+            ValueError: Envelope, chain membership, or command identifiers are
+                invalid.
+            ServerError: Mode, retained-ID conflicts, capacity, lifecycle ownership,
+                or controller availability rejects admission.
+        """
+        self._prune()
+        chain_id, commands, submission = self._normalize_submission(document, chain)
+        message = self._submission_document(submission)
+        if (
+            len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
+            > self.settings.max_request_bytes
+        ):
+            raise ServerError(
+                "request_too_large",
+                "Command envelope exceeds its configured limit.",
+                413,
+            )
+        identifiers = [command.command_id for command in commands]
+        self._check_submission_identifiers(identifiers, chain_id)
+        records = [CommandRecord(command, chain_id) for command in commands]
+        if self._is_retained_submission(identifiers, records):
+            return self._receipt(identifiers, chain_id)
+        self._check_submission_mode(commands)
+        lifecycle = not chain and commands[0].command in (
+            "server.restart",
+            "server.mode",
+            "server.shutdown",
+        )
+        if lifecycle:
+            self._admit_lifecycle_command(commands)
+        else:
+            requests = self._require_ready()
+        priority_stop = not chain and commands[0].command == "stop"
+        self._check_submission_capacity(
+            len(commands), chain_id, priority_stop, lifecycle
+        )
+        if not lifecycle:
+            try:
+                requests.put_nowait(message)
+            except Full as error:
+                raise ServerError(
+                    "queue_full", "Controller request queue is full.", 429
+                ) from error
+        for identifier, record in zip(identifiers, records, strict=True):
+            self._records[identifier] = record
+        if chain_id is not None:
+            self._chains[chain_id] = identifiers
+        if lifecycle:
+            self._restart_command = commands[0]
+            self._restart_task = asyncio.create_task(
+                self.start(restart_command=commands[0])
+            )
+        return self._receipt(identifiers, chain_id)
+
+    def _check_submission_identifiers(
+        self, identifiers: list[str], chain_id: str | None
+    ) -> None:
+        """Reject duplicate command IDs and conflicts with active reads or retained chains.
+
+        Args:
+            identifiers: Normalized command UUIDs in submitted order.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+        """
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("Command IDs in a chain must be distinct.")
+        if any(identifier in self._reads for identifier in identifiers):
+            raise ServerError(
+                "command_id_conflict",
+                "A command ID is already used by an active read request.",
+                409,
+            )
+        if (
+            chain_id is not None
+            and chain_id in self._chains
+            and self._chains[chain_id] != identifiers
+        ):
+            raise ServerError(
+                "chain_id_conflict",
+                "The retained chain ID has a different command order or membership.",
+                409,
+            )
+
+    def _is_retained_submission(
+        self, identifiers: list[str], records: list[CommandRecord]
+    ) -> bool:
+        """Return whether every request matches retained fingerprints, rejecting conflicts.
+
+        Args:
+            identifiers: Normalized command UUIDs in submitted order.
+            records: Prepared command records with request fingerprints for replay
+                comparison.
+
+        Returns:
+            Whether every request matches retained fingerprints, rejecting
+            conflicts.
+        """
+        existing = [identifier in self._records for identifier in identifiers]
+        if any(existing):
+            if not all(existing) or any(
+                self._records[key].fingerprint != record.fingerprint
+                for key, record in zip(identifiers, records, strict=True)
+            ):
+                raise ServerError(
+                    "command_id_conflict",
+                    "A retained command ID has a different request.",
+                    409,
+                )
+            return True
+        return False
+
+    def _check_submission_mode(self, commands: list[ServerCommand]) -> None:
+        # Replaying a retained request retrieves its receipt across mode changes;
+        # only new work is subject to the current runtime's admission policy.
+        """Reject new module/service operations incompatible with the current server mode.
+
+        Args:
+            commands: Validated commands being considered for admission in their
+                submitted order.
+        """
+        for command in commands:
+            name = command.command
+            if (
+                name in ("service.start", "service.stop", "reload_template")
+                and self.settings.server_mode != "run"
+            ):
+                raise ServerError(
+                    "invalid_mode",
+                    "Service control and template reload require --mode run.",
+                    409,
+                )
+            if (
+                name.startswith("module.")
+                and self.settings.server_mode != "maintenance"
+            ):
+                raise ServerError(
+                    "invalid_mode", "Module commands require --mode maintenance.", 409
+                )
+
+    def _check_submission_capacity(
+        self, count: int, chain_id: str | None, priority_stop: bool, lifecycle: bool
+    ) -> None:
+        """Check pending/record capacity, reserving admission for stop or lifecycle work.
+
+        Args:
+            count: Number of new command records required by this submission.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+            priority_stop: Whether this is the standalone stop allowed to use
+                reserved admission capacity.
+            lifecycle: Whether admission is for an HTTP-owned runtime lifecycle
+                command.
+        """
+        if chain_id is not None and chain_id in self._chains:
+            raise ServerError(
+                "chain_id_conflict",
+                "The retained chain ID already identifies another chain.",
+                409,
+            )
+        pending = [
+            record for record in self._records.values() if record.response is None
+        ]
+        if priority_stop and any(record.is_stop for record in pending):
+            raise ServerError(
+                "stop_pending", "A standalone stop is already pending.", 409
+            )
+        if len(pending) + count > self.settings.max_pending + int(
+            priority_stop or lifecycle
+        ):
+            raise ServerError(
+                "queue_full",
+                "Too many pending commands; a standalone stop remains available.",
+                429,
+            )
+        self._prune(required=count)
+        if len(self._records) + count > self.settings.max_records:
+            raise ServerError(
+                "queue_full", "The command record limit has been reached.", 429
+            )
+
+    def _normalize_submission(
+        self, document: object, chain: bool
+    ) -> tuple[str | None, list[ServerCommand], ServerChain | ServerCommand]:
+        """Detach and validate one command or chain and return its ID, commands, and model.
+
+        Args:
+            document: Single command or chain input to detach and validate before
+                admission.
+            chain: Whether the input is a command-chain envelope rather than a
+                single command.
+
+        Returns:
+            Optional chain UUID, ordered detached validated commands, and the
+            corresponding single-command/chain model.
+        """
+        chain_id = None
+        if chain:
+            validated = (
+                document.model_copy(deep=True)
+                if isinstance(document, ServerChain)
+                else ServerChain.model_validate(document)
+            )
+            chain_id = validated.chain_id
+            commands = validated.commands
+        else:
+            validated = (
+                document.model_copy(deep=True)
+                if isinstance(document, ServerCommand)
+                else ServerCommand.model_validate(document)
+            )
+            commands = [validated]
+        return chain_id, commands, validated
+
+    def _submission_document(
+        self, submission: ServerChain | ServerCommand
+    ) -> JsonObject:
+        """Materialize the original wire shape for size checks and IPC.
+
+        Args:
+            submission: Detached validated single command or ordered chain to
+                serialize for IPC.
+
+        Returns:
+            IPC document for the single command or ordered chain, with child chain
+            IDs bound.
+        """
+        if isinstance(submission, ServerChain):
+            return {
+                "api_version": 1,
+                "chain_id": submission.chain_id,
+                "commands": [
+                    self._command_document(item, submission.chain_id)
+                    for item in submission.commands
+                ],
+            }
+        return self._command_document(submission, None)
+
+    def _admit_lifecycle_command(self, commands: list[ServerCommand]) -> None:
+        """Check lifecycle exclusivity, HTTP owner support, and restart readiness.
+
+        Args:
+            commands: Validated commands being considered for admission in their
+                submitted order.
+        """
+        if self._restart_command is not None:
+            raise ServerError(
+                "shutdown_pending"
+                if self._restart_command.command == "server.shutdown"
+                else "restart_pending",
+                "A server lifecycle operation is already pending.",
+                409,
+            )
+        if commands[0].command == "server.shutdown" and self._stop_http is None:
+            raise ServerError(
+                "unsupported_feature",
+                "This HTTP owner does not support remote shutdown.",
+                501,
+            )
+        if self._http_closing or self._state in ("new", "starting"):
+            raise ServerError(
+                "controller_unavailable", "Server is starting or shutting down."
+            )
+        if self._restart_blocked is not None:
+            raise ServerError("restart_blocked", self._restart_blocked, 409)
+
+    def _receipt(self, identifiers: list[str], chain_id: str | None) -> JsonObject:
+        """Return a command receipt or a validated aggregate receipt for a chain.
+
+        Args:
+            identifiers: Normalized command UUIDs in submitted order.
+            chain_id: Optional UUID of the enclosing ordered command chain.
+
+        Returns:
+            A command receipt or a validated aggregate receipt for a chain.
+        """
+        if chain_id is None:
+            return self.result(identifiers[0])
+        receipt = ChainReceipt.model_validate(
+            {
+                "server_instance_id": self.instance_id,
+                "chain_id": chain_id,
+                "commands": [self._result(key) for key in identifiers],
+            },
+        )
+        # Runtime chain output historically also checked the whole JSON depth.
+        return copy_json_object(receipt.model_dump(exclude_unset=True), "receipt")
+
+    def result(self, command_id: str) -> JsonObject:
+        """Read the retained receipt for a command without submitting new work.
+
+        Args:
+            command_id: UUID of the admitted command.
+
+        Returns:
+            Current receipt, including a pending state if no outcome is known.
+
+        Raises:
+            ServerError: The ID is unknown or expired; this does not prove nonexecution.
+            ValueError: The ID is not a UUID.
+        """
+        return self._result(command_id).model_dump(exclude_unset=True)
+
+    def _result(self, command_id: str) -> CommandReceipt:
+        """Prune expired records and construct the typed receipt for one command UUID.
+
+        Args:
+            command_id: UUID of the retained API command.
+
+        Returns:
+            Current retained CommandReceipt with server/submission metadata,
+            including pending when no outcome is known.
+        """
+        identifier = str(UUID(command_id))
+        self._prune()
+        record = self._records.get(identifier)
+        if record is None:
+            raise ServerError(
+                "unknown_command",
+                "Command is unknown or expired in this server instance; do not infer that it never executed.",
+                404,
+            )
+        response = record.response or RuntimeCommandOutcome.model_validate(
+            {
+                "command_id": identifier,
+                "chain_id": record.chain_id,
+                "state": "pending",
+                "result": None,
+                "experiment_id": None,
+                "data": None,
+                "error": None,
+            }
+        )
+        values: dict[str, object] = dict(response.model_extra or {})
+        for name in response.model_fields_set & type(response).model_fields.keys():
+            values[name] = getattr(response, name)
+        values.update(
+            server_instance_id=self.instance_id, submitted_at=record.submitted_at
+        )
+        return CommandReceipt.model_validate(values)
+
+    def list_commands(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+        state: str | None = None,
+        command: str | None = None,
+    ) -> JsonObject:
+        """List retained commands in submission order with optional filters.
+
+        Args:
+            after: Exclusive retained command UUID cursor, or None for the first page.
+            limit: Page size from 1 to 1000.
+            state: Optional command-state filter.
+            command: Optional exact command-name filter.
+
+        Returns:
+            Items, continuation metadata, and server-instance identity.
+
+        Raises:
+            ServerError: The continuation command is unknown or expired.
+            ValueError: Query arguments are invalid.
+        """
+        arguments = CommandListArguments.model_validate(
+            {"limit": limit, "state": state, "command": command, "after": after}
+        )
+        return self._list_commands(arguments)
+
+    def _list_commands(self, arguments: CommandListArguments) -> JsonObject:
+        """Page and filter retained records using validated command-history arguments.
+
+        Args:
+            arguments: Validated arguments for the selected read/control operation.
+
+        Returns:
+            Filtered retained command metadata, has_more, optional next_after
+            cursor, and server instance identity.
+        """
+        self._prune()
+        entries = list(self._records.items())
+        if arguments.after is not None:
+            identifiers = [identifier for identifier, _ in entries]
+            if arguments.after not in identifiers:
+                raise ServerError(
+                    "unknown_command",
+                    "List cursor is unknown or expired; restart pagination.",
+                    404,
+                )
+            entries = entries[identifiers.index(arguments.after) + 1 :]
+        items = []
+        for identifier, record in entries:
+            response = record.response
+            current_state = "pending" if response is None else response.state
+            if arguments.state is not None and current_state != arguments.state:
+                continue
+            if arguments.command is not None and record.command != arguments.command:
+                continue
+            items.append(
+                {
+                    "command_id": identifier,
+                    "command": record.command,
+                    "state": current_state,
+                    "chain_id": record.chain_id,
+                    "submitted_at": record.submitted_at,
+                    "experiment_id": None
+                    if response is None
+                    else (response.model_extra or {}).get("experiment_id"),
+                }
+            )
+            if len(items) > arguments.limit:
+                break
+        has_more = len(items) > arguments.limit
+        items = items[: arguments.limit]
+        return {
+            "items": items,
+            "has_more": has_more,
+            "next_after": items[-1]["command_id"] if has_more else None,
+            "server_instance_id": self.instance_id,
+        }
+
+    async def read(self, name: str, args: JsonObject | None = None) -> JsonObject:
+        """Request a fresh controller read with bounded concurrency and timeout.
+
+        Args:
+            name: Command name starting with stats. or logs.
+            args: Optional JSON read arguments.
+
+        Returns:
+            Controller outcome document; a completed read may itself report failure.
+
+        Raises:
+            ValueError: The command is not a read.
+            ServerError: The controller is unavailable, capacity is exhausted, or
+                the response does not arrive before the read timeout.
+        """
+        requests = self._require_ready()
+        if not name.startswith(("stats.", "logs.")):
+            raise ValueError("Only controller read commands use this channel.")
+        if len(self._reads) >= self.settings.max_reads:
+            raise ServerError(
+                "too_many_reads", "Too many concurrent controller reads.", 429
+            )
+        identifier = str(uuid4())
+        while identifier in self._records or identifier in self._reads:
+            identifier = str(uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self._reads[identifier] = future
+        try:
+            requests.put_nowait(
+                {
+                    "api_version": 1,
+                    "command_id": identifier,
+                    "command": name,
+                    "args": args or {},
+                }
+            )
+            response = await asyncio.wait_for(
+                asyncio.shield(future), self.settings.read_timeout
+            )
+            return response.model_dump(exclude_unset=True)
+        except Full as error:
+            raise ServerError(
+                "queue_full", "Controller request queue is full.", 429
+            ) from error
+        except TimeoutError as error:
+            raise ServerError(
+                "controller_timeout",
+                "Controller did not provide a fresh response before the deadline.",
+                504,
+            ) from error
+        finally:
+            self._reads.pop(identifier, None)
+            if not future.done():
+                future.cancel()
+
+    def _read_responses(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Forward IPC responses from a dedicated reader thread with runtime identity.
+
+        Args:
+            loop: Owning asyncio event loop receiving thread-safe IPC callbacks.
+        """
+        responses = self._responses
+        reader_stop = self._reader_stop
+        runtime_id = self._runtime_id
+        if responses is None:
+            return
+        try:
+            while not reader_stop.is_set():
+                try:
+                    message = responses.get(timeout=0.1)
+                except Empty:
+                    continue
+                loop.call_soon_threadsafe(self._accept_response, message, runtime_id)
+        except Exception as error:  # noqa: BLE001 - A broken IPC reader makes pending outcomes unknown.
+            if not reader_stop.is_set():
+                try:
+                    loop.call_soon_threadsafe(
+                        self._unavailable,
+                        f"Controller response channel failed: {error}",
+                        runtime_id,
+                    )
+                except RuntimeError:
+                    pass
+
+    async def _watch_process(self) -> None:
+        """Observe controller exit independently of IPC and mark its runtime unavailable.
+
+        Polls the owned process handle independently of the potentially blocked IPC
+        reader. Exit marks only the captured runtime unavailable; a stale watchdog
+        cannot invalidate a replacement runtime.
+        """
+        process = self._process
+        runtime_id = self._runtime_id
+        if process is None:
+            return
+        while process.is_alive():
+            await asyncio.sleep(0.1)
+        self._unavailable(
+            f"Controller exited with code {process.exitcode}.", runtime_id
+        )
+
+    def _accept_response(self, message: object, runtime_id: str | None = None) -> None:
+        """Validate a response from the current runtime and dispatch lifecycle/outcome data.
+
+        Args:
+            message: Raw controller IPC message or typed command outcome.
+            runtime_id: Identity of the runtime producing the callback; stale-
+                runtime callbacks are ignored.
+        """
+        if self._state == "closed" or (
+            runtime_id is not None and runtime_id != self._runtime_id
+        ):
+            return
+        try:
+            if isinstance(message, ControllerOutcome):
+                outcome = message
+                self._last_response_at = datetime.now(UTC).isoformat()
+            else:
+                response = copy_json_object(message, "controller response")
+                self._last_response_at = datetime.now(UTC).isoformat()
+                kind = response.get("_runtime")
+                if self._accept_runtime_response(response, kind):
+                    return
+                outcome = ControllerOutcome.model_validate(response)
+            self._accept_command_response(outcome)
+        except Exception as error:  # noqa: BLE001 - Do not leave a failed response consumer reporting readiness.
+            self._unavailable(f"Invalid controller response: {error}")
+
+    def _accept_command_response(self, outcome: ControllerOutcome) -> None:
+        """Resolve a read or retain a bounded result without replacing known outcomes.
+
+        Args:
+            outcome: Validated controller command outcome.
+        """
+        identifier = str(UUID(outcome.command_id))
+        response, encoded_size = self._bounded_response(outcome, identifier)
+        if self._accept_read_response(identifier, response):
+            return
+        record = self._records.get(identifier)
+        if record is not None and (
+            record.response is None or record.response.state == "unknown"
+        ):
+            # A complete queued reply is stronger evidence than an earlier
+            # process-exit observation. Never replace an already known outcome.
+            self._cache_bytes -= record.size
+            record.response = response
+            record.finished_at = time.monotonic()
+            record.size = encoded_size
+            self._cache_bytes += encoded_size
+            self._prune()
+
+    def _bounded_response(
+        self, outcome: ControllerOutcome, identifier: str
+    ) -> tuple[ControllerOutcome | RuntimeCommandOutcome, int]:
+        """Return the outcome and byte size, substituting metadata for oversized responses.
+
+        Args:
+            outcome: Validated controller command outcome.
+            identifier: Normalized command UUID used for receipt correlation.
+
+        Returns:
+            The outcome and byte size, substituting metadata for oversized
+            responses.
+        """
+        response = outcome.model_dump(exclude_unset=True)
+        encoded_size = len(
+            json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        )
+        if encoded_size <= self.settings.max_response_bytes:
+            return outcome, encoded_size
+        response = {
+            "command_id": identifier,
+            "chain_id": response.get("chain_id"),
+            "state": "unavailable",
+            "result": None,
+            "data": None,
+            "error": {
+                "code": "response_too_large",
+                "message": "Controller response exceeded its configured limit.",
+                "details": {
+                    "command_state": outcome.state,
+                    "command_result": outcome.result,
+                },
+            },
+        }
+        return RuntimeCommandOutcome.model_validate(response), len(
+            json.dumps(response).encode("utf-8")
+        )
+
+    def _accept_runtime_response(self, response: JsonObject, kind: object) -> bool:
+        """Apply ready/stopped/error notices and report whether the message was handled.
+
+        Args:
+            response: Private controller lifecycle notification before its
+                specialized validation.
+            kind: Private runtime notification discriminator extracted from the IPC
+                message.
+
+        Returns:
+            True for a handled ready/stopped/error lifecycle message; False when the
+            caller should treat the document as a command outcome.
+        """
+        if kind == "ready":
+            if self._closing or self._process is None or not self._process.is_alive():
+                return True
+            self._accept_runtime_ready(RuntimeReady.model_validate(response))
+            return True
+        if kind in ("stopped", "error"):
+            notice = RuntimeStopped.model_validate(response)
+            self._unavailable(str(notice.message))
+            if notice.kind == "stopped":
+                self._state = "stopped"
+            return True
+        return False
+
+    def _accept_runtime_ready(self, notice: RuntimeReady) -> None:
+        """Store controller/storage metadata and resolve the startup readiness future."""
+        self._identity = notice.process
+        self._storage = notice.storage
+        self._state = "ready"
+        if self._ready is not None and not self._ready.done():
+            self._ready.set_result(None)
+
+    def _accept_read_response(
+        self, identifier: str, response: ControllerOutcome | RuntimeCommandOutcome
+    ) -> bool:
+        """Resolve a matching unfinished read and return whether a waiter was found.
+
+        Args:
+            identifier: Normalized command UUID used for receipt correlation.
+            response: Participant/controller result envelope being processed.
+
+        Returns:
+            True when a live matching waiter was resolved, otherwise False so
+            command-result handling can continue.
+        """
+        waiter = self._reads.get(identifier)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(response)
+            return True
+        return False
+
+    def _unavailable(self, message: str, runtime_id: str | None = None) -> None:
+        """Fail live reads and mark unfinished command outcomes unknown for this runtime.
+
+        Args:
+            message: Transport/lifecycle failure explaining why fresh reads and
+                pending results are unavailable.
+            runtime_id: Identity of the runtime producing the callback; stale-
+                runtime callbacks are ignored.
+        """
+        if self._state == "closed" or (
+            runtime_id is not None and runtime_id != self._runtime_id
+        ):
+            return
+        self._state = "unavailable"
+        self._error = message
+        if self._ready is not None and not self._ready.done():
+            self._ready.set_exception(ServerError("controller_unavailable", message))
+        for future in self._reads.values():
+            if not future.done():
+                future.set_exception(ServerError("controller_unavailable", message))
+        for identifier, record in self._records.items():
+            if (
+                self._restart_command is not None
+                and identifier == self._restart_command.command_id
+            ):
+                continue
+            if record.response is None:
+                response = {
+                    "command_id": identifier,
+                    "chain_id": record.chain_id,
+                    "state": "unknown",
+                    "result": None,
+                    "data": None,
+                    "error": {
+                        "code": "command_outcome_unknown",
+                        "message": message,
+                        "details": {},
+                    },
+                }
+                record.response = RuntimeCommandOutcome.model_validate(response)
+                record.finished_at = time.monotonic()
+                record.size = len(json.dumps(response).encode("utf-8"))
+                self._cache_bytes += record.size
+        self._prune()
+
+    def _prune(self, *, required: int = 0) -> None:
+        """Evict finished receipts by age/capacity and remove chains with no retained members.
+
+        Args:
+            required: Additional command-record slots to reserve after pruning.
+        """
+        now = time.monotonic()
+        finished = sorted(
+            (
+                (record.finished_at, identifier, record)
+                for identifier, record in self._records.items()
+                if record.finished_at is not None
+            ),
+            key=lambda item: item[0],
+        )
+        for finished_at, identifier, record in finished:
+            if (
+                now >= finished_at + self.settings.result_ttl
+                or len(self._records) + required > self.settings.max_records
+                or self._cache_bytes > self.settings.max_cache_bytes
+            ):
+                self._cache_bytes -= record.size
+                del self._records[identifier]
+        for chain_id, identifiers in list(self._chains.items()):
+            if not any(identifier in self._records for identifier in identifiers):
+                del self._chains[chain_id]
+
+    async def close(self, *, restarting: bool = False) -> None:
+        """Stop the owned controller, release IPC, and retain unknown unfinished outcomes.
+
+        Args:
+            restarting: Whether shutdown prepares a replacement runtime while HTTP stays up.
+
+        Raises:
+            RuntimeError: Shutdown required forced termination, the controller exited
+                abnormally, or a previous failure blocks replacement startup.
+        """
+        if not restarting and asyncio.current_task() is not self._restart_task:
+            self._http_closing = True
+            if self._restart_task is not None and not self._restart_task.done():
+                # Let an admitted restart finish its safe shutdown, but suppress
+                # launching a replacement after the HTTP lifespan has ended.
+                await asyncio.shield(self._restart_task)
+        if self._closing:
+            return
+        self._closing = True
+        process = self._process
+        forced = False
+        exit_code = None
+        try:
+            if process is not None and process.pid is not None:
+                if process.is_alive() and self._requests is not None:
+                    try:
+                        self._requests.put_nowait(
+                            {
+                                "api_version": 1,
+                                "command_id": str(uuid4()),
+                                "command": "server.shutdown",
+                                "args": {},
+                            }
+                        )
+                    except Full:
+                        logging.getLogger(__name__).error(
+                            "Controller queue is full during server shutdown."
+                        )
+                    await asyncio.to_thread(
+                        process.join, self.settings.shutdown_timeout
+                    )
+                if process.is_alive():
+                    forced = True
+                    process.terminate()
+                    await asyncio.to_thread(process.join, 5)
+                    if process.is_alive():
+                        process.kill()
+                        await asyncio.to_thread(process.join, 5)
+                else:
+                    await asyncio.to_thread(process.join)
+                exit_code = process.exitcode
+            self._unavailable(
+                "Server runtime is closed; unfinished command outcomes are unknown."
+            )
+        except BaseException as error:
+            self._restart_blocked = f"Runtime shutdown was not confirmed: {error}"
+            raise
+        finally:
+            await self._close_runtime_channels(process, restarting)
+        if forced:
+            self._restart_blocked = "Controller shutdown timed out; inspect and recover unfinished experiments before continuing."
+            raise RuntimeError(self._restart_blocked)
+        if exit_code not in (None, 0):
+            self._restart_blocked = f"Controller exited with code {exit_code}; inspect its journal before continuing."
+            raise RuntimeError(self._restart_blocked)
+        if restarting and self._restart_blocked is not None:
+            raise RuntimeError(self._restart_blocked)
+
+    async def _close_runtime_channels(
+        self, process: BaseProcess | None, restarting: bool
+    ) -> None:
+        """Release watchdog/IPC resources and record a reader that blocks safe restart.
+
+        Args:
+            process: Owned process handle used to observe exit without trusting a
+                bare PID.
+            restarting: Whether channel closure prepares replacement while the HTTP
+                owner remains running.
+        """
+        if self._watcher is not None:
+            self._watcher.cancel()
+            await asyncio.gather(self._watcher, return_exceptions=True)
+        self._reader_stop.set()
+        if self._reader_thread is not None:
+            await asyncio.to_thread(self._reader_thread.join, 1)
+            if self._reader_thread.is_alive():
+                logging.getLogger(__name__).error(
+                    "A corrupted IPC reader will be released when the HTTP process exits."
+                )
+                if restarting:
+                    self._restart_blocked = "Controller IPC reader did not stop; restart the HTTP process before continuing."
+        for queue in (self._requests, self._responses):
+            if queue is not None:
+                queue.cancel_join_thread()
+                queue.close()
+        if process is not None and process.pid is not None and not process.is_alive():
+            process.close()
+        self._process = None
+        self._state = "closed"

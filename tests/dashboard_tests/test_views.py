@@ -1,3 +1,4 @@
+
 """Approved C/F and navigation additions: cache liveness and durable command outcomes."""
 
 import asyncio
@@ -10,6 +11,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
+from core.models.dashboard_commands import LocalCommandRecord
+from core.models.dashboard_resources import (
+    CollectorHistoryPage,
+    CollectorSample,
+    CollectorStatus,
+)
+from core.models.dashboard_upstream import LiveState
+from core.models.server_receipts import CommandReceipt
+from core.models.updates import _update_model
 from dashboard.api_client import SystemAPIError
 from dashboard.config import load_settings
 from dashboard.views import DashboardViews
@@ -23,17 +33,101 @@ from tests.helpers.dag import wait_until
 
 
 class ViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_records_and_receipts_survive_until_json_publication(self):
+        receipt = await self.views.command({"command": "pause"})
+        record = self.views._commands[0]
+        self.assertIsInstance(record, LocalCommandRecord)
+        self.assertIsInstance(record.result, CommandReceipt)
+        self.assertEqual(record.result.model_dump(exclude_unset=True), receipt)
+        original = record.model_dump(exclude_unset=True)
+        receipt["state"] = "external"
+        self.assertEqual(record.model_dump(exclude_unset=True), original)
+        emitted = await self.views.command_result(record.command_id)
+        current = self.views._commands[0]
+        self.assertIsInstance(current.result, CommandReceipt)
+        self.assertEqual(current.status, "succeeded")
+        self.assertEqual(record.status, "pending")
+        emitted["state"] = "external"
+        self.assertEqual(current.result.state, "succeeded")
+        saved = json.loads(
+            (self.config["state_directory"] / "commands.json").read_text()
+        )
+        self.assertEqual(saved["items"][0], current.model_dump(exclude_unset=True))
+
+    async def test_live_observation_models_survive_transport_failure_and_output_mutation(
+        self,
+    ):
+        await self.views.state(refresh=True)
+        retained = self.views._live
+        self.assertIsInstance(retained, LiveState)
+        before = retained.model_dump(exclude_unset=True)
+        emitted = await self.views.state()
+        emitted["experiment_id"] = "external"
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+        self.api.read.side_effect = SystemAPIError("timeout", "runtime timeout")
+        self.views._live_at = 0
+        failed = await self.views.state(refresh=True)
+        self.assertIs(self.views._live, retained)
+        self.assertFalse(failed["available"])
+        self.assertFalse(failed["fresh"])
+        self.assertEqual(failed["connection_error"], "runtime timeout")
+        self.assertEqual(failed["experiment_id"], before["experiment_id"])
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+        self.api.read.side_effect = self.read
+        self.views._live_at = 0
+        recovered = await self.views.state(refresh=True)
+        self.assertTrue(recovered["available"])
+        self.assertTrue(recovered["fresh"])
+        self.assertNotIn("connection_error", recovered)
+
+    async def test_resource_models_remain_retained_through_failures_and_json_output(
+        self,
+    ):
+        await self.views._refresh_resources()
+        retained = self.views._resource_status
+        self.assertIsInstance(retained, CollectorStatus)
+        self.assertTrue(
+            all(isinstance(sample, CollectorSample) for sample in retained.latest)
+        )
+        page = CollectorHistoryPage.model_validate(
+            {
+                "samples": self.status["latest"],
+                "cursor": 1,
+                "gap": False,
+                "history_id": retained.history_id,
+            }
+        )
+        self.views._accept_resource_history_page(page)
+        self.assertIs(self.views._history[-1], page.samples[0])
+        before = retained.model_dump(exclude_unset=True)
+        emitted = await self.views.compute({})
+        emitted["metrics"]["cpu"]["attributes"]["external"] = True
+        emitted["collector"]["latest"][0]["resources"]["host_cpu_percent"][
+            "attributes"
+        ]["external"] = True
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+        self.api.read.side_effect = SystemAPIError("timeout", "resource timeout")
+        self.views._resource_at = 0
+        await self.views._refresh_resources()
+        self.assertIs(self.views._resource_status, retained)
+        stale = await self.views.compute({})
+        self.assertEqual(stale["error"], "resource timeout")
+        self.assertFalse(stale["metrics"]["cpu"]["fresh"])
+        self.assertEqual(retained.model_dump(exclude_unset=True), before)
+
     def test_command_publication_handles_platform_reader_semantics(self):
         """T050/T074: command-state publication survives native reader semantics."""
         self.views._write_commands()
         path = self.config["state_directory"] / "commands.json"
         self.views._commands = [
-            {"command_id": str(uuid4()), "status": "pending", "polling": True}
+            LocalCommandRecord.model_validate(
+                {"command_id": str(uuid4()), "status": "pending", "polling": True}
+            )
         ]
         if os.name == "nt":
             failure = PermissionError("MoveFileEx denied replacement")
             failure.winerror = 32
-            with patch("core.runner_utils.runtimeio.os.replace", side_effect=failure):
+            with patch("core.primitives.json_files.os.replace", side_effect=failure):
                 self.views._write_commands()
         else:
             with path.open("r", encoding="utf-8") as previous:
@@ -41,13 +135,18 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.load(previous), {"items": []})
         self.assertEqual(
             json.loads(path.read_text(encoding="utf-8")),
-            {"items": self.views._commands},
+            {
+                "items": [
+                    record.model_dump(exclude_unset=True)
+                    for record in self.views._commands
+                ]
+            },
         )
         self.assertFalse(list(path.parent.glob(".publish-*")))
 
     async def test_concurrent_command_polling_shares_one_history_refresh(self):
         """T074/T075: successful command observers share the same history task."""
-        self.views.settings["project_root"] = self.root
+        self.views.settings = _update_model(self.views.settings, project_root=self.root)
         self.views._cache_pool = Mock()
         receipt = await self.views.command({"command": "pause"})
         entered, release = asyncio.Event(), asyncio.Event()
@@ -76,15 +175,13 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cache_failure_does_not_reverse_successful_command_outcome(self):
         """T076: runtime success remains success even when cache refresh fails."""
-        self.views.settings["project_root"] = self.root
+        self.views.settings = _update_model(self.views.settings, project_root=self.root)
         self.views._cache_pool = Mock()
         self.views._cache_pool.submit.side_effect = OSError("worker unavailable")
         receipt = await self.views.command({"command": "pause"})
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["result"], "success")
-        self.assertEqual(
-            self.views._cache_errors["exp"]["code"], "history_refresh_failed"
-        )
+        self.assertEqual(self.views._cache_errors["exp"].code, "history_refresh_failed")
         self.assertNotIn("exp", self.views._command_refreshing)
 
     async def test_failed_cancelled_and_expired_results_do_not_repeat_commands(self):
@@ -93,16 +190,16 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             self.result.update(state=state, result="fail")
             result = await self.views.command_result(receipt["command_id"])
             self.assertEqual(result["state"], state)
-            self.assertFalse(self.views._commands[-1]["polling"])
+            self.assertFalse(self.views._commands[-1].polling)
         await self.views.command({"command": "pause"})
         self.api.read.side_effect = SystemAPIError("unavailable", "expired", 404)
         task = asyncio.create_task(self.views._poll_commands())
         try:
-            await wait_until(lambda: not self.views._commands[-1]["polling"])
+            await wait_until(lambda: not self.views._commands[-1].polling)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(self.views._commands[-1]["status"], "unknown")
+        self.assertEqual(self.views._commands[-1].status, "unknown")
         self.assertEqual(self.api.submit.await_count, 3)
 
     async def test_receipt_persistence_failure_leaves_reconcilable_submission(self):
@@ -126,7 +223,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(saved["items"][0]["status"], "submitting")
         self.api.submit.assert_awaited_once()
-        self.assertEqual(self.views._commands[0]["status"], "pending")
+        self.assertEqual(self.views._commands[0].status, "pending")
 
     async def asyncSetUp(self):
         tmp = temporary_directory()
@@ -141,10 +238,11 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.views = DashboardViews(self.config, self.api)
         self.addAsyncCleanup(self.views.close)
         self.status = resource_status()
+        self.server_instance_id = str(uuid4())
         self.result = {
             "state": "succeeded",
             "result": "success",
-            "server_instance_id": "server",
+            "server_instance_id": self.server_instance_id,
             "experiment_id": "exp",
         }
 
@@ -153,7 +251,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "fresh": True,
                 "experiment_id": "exp",
-                "server_instance_id": "server",
+                "server_instance_id": self.server_instance_id,
                 "phase": "waiting",
                 "mode": "paused",
             }
@@ -161,7 +259,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             return self.status
         if path == "resources/history":
             return {"samples": [], "cursor": 0, "gap": False, "history_id": "history"}
-        return self.result
+        return {**self.result, "command_id": path.rsplit("/", 1)[-1]}
 
     async def submit(self, document):
         saved = json.loads(
@@ -172,7 +270,8 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         return {
             "command_id": document["command_id"],
             "state": "pending",
-            "server_instance_id": "server",
+            "result": None,
+            "server_instance_id": self.server_instance_id,
         }
 
     async def test_pages_never_wait_for_blocked_live_sources_and_age_becomes_stale(
@@ -252,10 +351,10 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
     async def test_commands_persist_before_submission_and_pending_is_not_success(self):
         receipt = await self.views.command({"command": "pause"})
         self.assertEqual(receipt["state"], "pending")
-        self.assertTrue(self.views._commands[0]["polling"])
+        self.assertTrue(self.views._commands[0].polling)
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["result"], "success")
-        self.assertFalse(self.views._commands[0]["polling"])
+        self.assertFalse(self.views._commands[0].polling)
         with self.assertRaises(SystemAPIError) as duplicate:
             await self.views.command(
                 {"command": "pause", "command_id": receipt["command_id"]}
@@ -279,17 +378,19 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.api.submit.side_effect = SystemAPIError("timeout", "lost response")
         with self.assertRaises(SystemAPIError):
             await self.views.command({"command": "pause"})
-        self.assertEqual(self.views._commands[0]["status"], "unknown")
+        self.assertEqual(self.views._commands[0].status, "unknown")
         task = asyncio.create_task(self.views._poll_commands())
         try:
-            await wait_until(lambda: self.views._commands[0]["status"] == "succeeded")
+            await wait_until(lambda: self.views._commands[0].status == "succeeded")
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.api.submit.assert_awaited_once()
 
     async def test_wrong_runtime_selection_uses_fresh_preflight_and_rejects_send(self):
-        self.views._live = {"experiment_id": "wrong", "fresh": True}
+        self.views._live = LiveState.model_validate(
+            {"experiment_id": "wrong", "fresh": True}
+        )
         self.views._live_at = time.monotonic()
         with self.assertRaises(SystemAPIError) as caught:
             await self.views.command(
@@ -301,11 +402,11 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_server_instance_change_cannot_confirm_old_command(self):
         receipt = await self.views.command({"command": "stop"})
-        self.result["server_instance_id"] = "replacement"
+        self.result["server_instance_id"] = str(uuid4())
         result = await self.views.command_result(receipt["command_id"])
         self.assertEqual(result["state"], "unknown")
         self.assertIsNone(result["result"])
-        self.assertFalse(self.views._commands[0]["polling"])
+        self.assertFalse(self.views._commands[0].polling)
 
     async def test_restart_reconciles_submitting_record_and_closes_background_tasks(
         self,
@@ -328,7 +429,7 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.views.open()
         tasks = list(self.views._source_tasks) + [self.views._command_task]
-        await wait_until(lambda: self.views._commands[0]["status"] == "succeeded")
+        await wait_until(lambda: self.views._commands[0].status == "succeeded")
         self.api.submit.assert_not_awaited()
         await self.views.close()
         self.assertTrue(all(task.done() for task in tasks))

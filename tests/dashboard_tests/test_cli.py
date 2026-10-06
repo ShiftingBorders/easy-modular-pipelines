@@ -36,7 +36,7 @@ class CommandLineTests(unittest.TestCase):
         ):
             main()
         self.assertEqual(caught.exception.code, 0)
-        self.assertEqual(build.call_args.args[0]["cache_workers"], 3)
+        self.assertEqual(build.call_args.args[0].cache_workers, 3)
 
     def test_precache_failure_and_interrupt_exit_codes(self):
         """T051: configuration/pool failures and interruption have distinct exits."""
@@ -82,7 +82,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(self.server.run.call_args.kwargs["port"], 9002)
         self.assertEqual(self.server.run.call_args.kwargs["workers"], 1)
         self.assertEqual(
-            self.server.run.call_args.args[0].state.settings["state_directory"],
+            self.server.run.call_args.args[0].state.settings.state_directory,
             self.directory / ".state",
         )
         self.assertFalse((self.directory / ".state").exists())

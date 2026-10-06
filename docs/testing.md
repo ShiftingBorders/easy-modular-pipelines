@@ -20,20 +20,44 @@ Temporary outputs belong under `.artifacts/`.
 The repository's VS Code configuration uses `unittest`, the `tests` directory,
 and the `test_*.py` discovery pattern.
 
+## Continuous integration
+
+GitHub Actions runs Ruff and Python compilation in a separate `Static checks`
+job. Test jobs run independently using a matrix of Ubuntu and Windows with
+nine groups: `storage`, `modules`, `experiments`, `journal`, `participants`,
+`resources`, `server`, `dashboard_tests`, and `root`.
+
+Each test job installs the locked environment and pinned SeaweedFS binary.
+Directory groups use discovery with the repository as the import root:
+
+```text
+uv run python -m unittest discover -s tests/experiments -t . -p "test_*.py" -v
+```
+
+The `root` group explicitly lists the test modules directly under `tests/`.
+When adding a root test module or a new test directory, update the workflow
+to keep all tests included. The matrix uses `fail-fast: false`, so a failed
+group does not cancel other groups. Failure diagnostics are uploaded from
+`.artifacts/ci-failures/` with the group and OS in the artifact name.
+
+Browser tests still require the prerequisites described below and skip when
+they are unavailable. Splitting the suite does not change platform-specific
+or opt-in test behavior.
+
 ## Selected suites
 
 | Area | Command |
 | --- | --- |
-| Module storage | `uv run python -m unittest tests.test_hashdb tests.test_modulemanager tests.test_seaweed -v` |
-| CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.test_experimentreader tests.test_cli_library_reads tests.test_cli_discovery -v` |
-| Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.test_runtime_restart tests.test_server_lifecycle tests.test_server_results -v` |
-| Graceful server shutdown and response delivery | `uv run python -m unittest tests.test_server_shutdown -v` |
-| Service control review regressions | `uv run python -m unittest tests.test_service_control_review -v` |
-| Template reload | `uv run python -m unittest tests.runner_utils.test_template_reload tests.runner_utils.test_template_reload_services tests.runner_utils.test_template_reload_failures tests.runner_utils.test_template_reload_recovery tests.test_template_reload_cli tests.test_cli -v` |
-| Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
-| Conditional stages | `uv run python -m unittest tests.runner_utils.test_conditional_stages tests.runner_utils.test_conditional_transitions tests.runner_utils.test_conditional_recovery -v` |
+| Module storage | `uv run python -m unittest tests.storage.test_hash_db tests.modules.test_manager tests.storage.test_seaweed -v` |
+| CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.experiments.test_reader tests.test_cli_library_reads tests.test_cli_discovery -v` |
+| Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.server.test_runtime_restart tests.server.test_lifecycle tests.server.test_results -v` |
+| Graceful server shutdown and response delivery | `uv run python -m unittest tests.server.test_shutdown -v` |
+| Service control review regressions | `uv run python -m unittest tests.server.test_service_control_review -v` |
+| Template reload | `uv run python -m unittest tests.experiments.test_template_reload tests.experiments.test_template_reload_services tests.experiments.test_template_reload_failures tests.experiments.test_template_reload_recovery tests.test_template_reload_cli tests.test_cli -v` |
+| Participant protocol and modules | `uv run python -m unittest tests.participants.test_participant_protocol tests.participants.test_stage_client tests.experiments.test_service_dag_requests tests.participants.test_command_proxy -v` |
+| Conditional stages | `uv run python -m unittest tests.experiments.test_conditional_stages tests.experiments.test_conditional_transitions tests.experiments.test_conditional_recovery -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
-| Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
+| Resource collector | `uv run python -m unittest discover -s tests/resources -t . -p "test_*.py" -v` |
 | Dashboard | `uv run python -m unittest discover -s tests/dashboard_tests -t . -p "test_*.py" -v` |
 
 The weather suite includes real timing intervals, processes, and journal
@@ -84,14 +108,15 @@ readiness after partial service startup, and replaying retained commands/chains
 across mode changes. They reuse the service/DAG, receipt and HTTP fixtures and
 run on Windows and Linux without additional dependencies.
 
-An additional integration entry point is outside normal `test_*.py` discovery:
+The HTTP/CLI and full-system DAG integration cases are part of normal discovery.
+To run those suites separately:
 
 ```text
-uv run python -m unittest tests.integration_cli -v
+uv run python -m unittest tests.test_cli tests.test_system_dag -v
 ```
 
-It requires an available SeaweedFS executable and permission to start a local
-service. Do not point integration checks at valuable runtime data.
+These checks start isolated local HTTP/CLI and participant processes with their
+own temporary data. Do not point integration checks at valuable runtime data.
 
 ## Dashboard
 
@@ -159,8 +184,15 @@ alongside any validation result rather than relying on an old test count.
 
 ## Changing tests
 
-Follow [AGENTS.md](../AGENTS.md). Before adding or modifying tests, finalize the
-feature and create its Markdown plan under `.artifacts/test-plans/`.
+Follow [AGENTS.md](../AGENTS.md). Before writing tests or implementation code,
+create the feature's Markdown test plan.
 Describe affected files, observable behavior, relevant boundaries and errors,
 and open questions. Write test code only after the maintainer explicitly
 confirms the plan. Existing approval does not authorize new cases automatically.
+
+Write and run the approved tests before implementing the feature or behavior
+change. Confirm that new behavior or regression tests fail for the expected
+reason, then implement the behavior and run the tests again together with
+relevant existing regression tests. For behavior-preserving refactoring,
+establish passing coverage before changing production code. Do not start
+implementation while test approval is pending.

@@ -5,6 +5,9 @@ implementation, and a README describing its contract. Start with a stage:
 it accepts one input, performs work, returns one result, and exits.
 Use a [service](python_bridges.md) for work that stays alive across stages.
 
+Before implementing a module, read the
+[module and service behavior contract](module_contract.md).
+
 ## 1. Create a module folder
 
 For example, create `modules/hello/1.0/` in your project:
@@ -58,8 +61,8 @@ Put this in `main.py`:
 import argparse
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.runner_utils.stage_client import StageClient
+from core.journal.logger import OperationLogger
+from core.participants.stage_client import StageClient
 
 
 def main() -> None:
@@ -97,6 +100,9 @@ if __name__ == "__main__":
 The executor appends `--emp-context <absolute-json-path>` and supplies the core
 SDK through `PYTHONPATH`. Python examples use the project's `uv` environment;
 `-B` prevents bytecode writes into the immutable module directory.
+The bare command `python` uses the runner's interpreter from that environment.
+An explicit executable path selects your own interpreter; provide the framework's
+dependencies in that environment.
 
 Do not run this entry point without a runner-created context. StageClient
 connects to its assigned executor; an arbitrary JSON file is not a standalone

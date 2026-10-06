@@ -7,16 +7,17 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from core.experimentassembler import ExperimentAssembler
-from core.hashdb import HashDB
-from core.logger import OperationLogger
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.journal import RunnerJournal
-from core.runner_utils.runtimeio import process_identity, read_json, write_json
-from core.runner_utils.services import ServiceManager
-from core.runner_utils.state import RunnerStateStore
-from core.seaweed import SeaweedDB
+from core.experiments.assembler import ExperimentAssembler
+from core.experiments.journal import RunnerJournal
+from core.experiments.runner import ExperimentRunner
+from core.experiments.services import ServiceManager
+from core.experiments.state import RunnerStateStore
+from core.journal.logger import OperationLogger
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.primitives.processes import process_identity
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 
 
 async def run_owner(options):
@@ -68,7 +69,7 @@ async def run_owner(options):
                 and instance.service_instance_id
                 == document.get("participant_instance_id")
                 and instance.process_identity is not None
-                and instance.process_identity != document.get("process")
+                and instance.process_identity.model_dump() != document.get("process")
                 for instance in runner._state.services.values()
             )
         ):
@@ -179,7 +180,7 @@ async def run_owner(options):
             and state.pending_rebuild is not None
             and any(
                 instance.stopped
-                and instance.definition["settings"].get("launcher_cleanup")
+                and instance.definition.settings.get("launcher_cleanup")
                 for instance in state.services.values()
             )
         ):
@@ -189,7 +190,7 @@ async def run_owner(options):
     try:
         if options.operation == "recover":
             with (
-                patch("core.runner_utils.experimentrunner.write_json", publish),
+                patch("core.experiments.runner.write_json", publish),
                 patch.object(RunnerStateStore, "save", save),
             ):
                 await runner.recover(options.experiment)
@@ -212,7 +213,7 @@ async def run_owner(options):
         )
         initial_revision = runner._state.template_revision_id
         with (
-            patch("core.runner_utils.snapshots.write_json", publish),
+            patch("core.experiments.snapshots.write_json", publish),
             patch.object(Path, "replace", move),
             patch.object(RunnerJournal, "complete_restore", complete),
             patch.object(ServiceManager, "load_states", load),
@@ -222,7 +223,7 @@ async def run_owner(options):
             patch.object(OperationLogger, "record_template_applied", applied),
             patch.object(ExperimentAssembler, "rebuild", rebuild),
             patch.object(ServiceManager, "prepare_rebuild", prepare),
-            patch("core.runner_utils.services.read_json", read_endpoint),
+            patch("core.experiments.services.read_json", read_endpoint),
         ):
             if options.operation == "rollback":
                 await runner.rollback(options.snapshot)

@@ -11,11 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from core.logger import OperationLogger
-from core.logger_utils.events import LoggingStorageError
-from core.resource_utils.sampling import ResourceSampler, collect_resources
-from core.resource_utils.state import CollectorSettings
-from core.runner_utils.runtimeio import process_identity
+from core.journal.events import LoggingStorageError
+from core.journal.logger import OperationLogger
+from core.primitives.processes import process_identity
+from core.resources.sampling import ResourceSampler, collect_resources
+from core.resources.state import CollectorSettings
 from tests.helpers.dag import REPOSITORY
 
 DEFAULT_CONFIG = REPOSITORY / "default_settings/resource_collector.json"
@@ -90,7 +90,7 @@ def target(identity: dict, context: dict | None = None) -> dict:
 def controlled_collector(connection, settings, *, controls: str) -> None:
     """Inject one local boundary inside the real spawned collector, without production hooks."""
     root = Path(controls)
-    sample = ResourceSampler.sample
+    sample = ResourceSampler._sample_observations
     record = OperationLogger.record_resources
     opened = OperationLogger.open
 
@@ -114,7 +114,7 @@ def controlled_collector(connection, settings, *, controls: str) -> None:
         return opened(self)
 
     with (
-        patch.object(ResourceSampler, "sample", sample_with_gate),
+        patch.object(ResourceSampler, "_sample_observations", sample_with_gate),
         patch.object(OperationLogger, "record_resources", fail_record),
         patch.object(OperationLogger, "open", fail_open),
     ):
@@ -144,7 +144,7 @@ def memory_and_cpu_process(connection) -> None:
 
 
 def run_owner(connection, config_path: str) -> None:
-    from core.resourcecollector import ResourceCollector
+    from core.resources.collector import ResourceCollector
 
     async def run():
         collector = ResourceCollector(Path(config_path))

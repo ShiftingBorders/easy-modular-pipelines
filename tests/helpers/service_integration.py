@@ -79,7 +79,7 @@ class ServiceDagWorkspace:
         }
 
     def template(self, stages=None, *, services=None, cycles=1):
-        template = copy.deepcopy(self.files.state.template)
+        template = copy.deepcopy(self.files.template)
         template["stages"] = [self.stage()] if stages is None else stages
         if services is not None:
             template["services"] = services

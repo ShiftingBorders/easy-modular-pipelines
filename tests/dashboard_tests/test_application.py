@@ -1,3 +1,4 @@
+
 """HTTP boundary, application lifecycle and independent resource/ICMP failures."""
 
 import asyncio
@@ -6,10 +7,12 @@ import socket
 import unittest
 from contextlib import AsyncExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from core.models.dashboard_queries import DashboardQuery, ViewQuery
+from core.models.updates import _update_model
 from dashboard.application import create_app
 from tests.dashboard_tests.helpers import (
     DASHBOARD,
@@ -25,12 +28,55 @@ WRITE_HEADERS = {"X-Dashboard-Request": "1", "Origin": "http://dashboard.test"}
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_local_page_success_does_not_change_global_runtime_connection(self):
-        self.app.state.views._live = {
-            "available": False,
-            "fresh": False,
-            "connection_error": "offline",
+    async def test_http_queries_reach_consumers_as_models_without_dump(self):
+        views = self.app.state.views
+        with (
+            patch.object(views, "compute", wraps=views.compute) as compute,
+            patch.object(views, "experiment", wraps=views.experiment) as experiment,
+            patch.object(
+                DashboardQuery,
+                "model_dump",
+                side_effect=AssertionError("Dumped HTTP query before consumption"),
+            ),
+        ):
+            response = await self.http.get("/api/system/compute", params={"limit": 1})
+            self.assertEqual(response.status_code, 200)
+            query = compute.call_args.args[0]
+            self.assertIsInstance(query, DashboardQuery)
+            self.assertEqual(query.limit, "1")
+            response = await self.http.get(
+                "/api/system/experiments/exp-test/events",
+                params={"limit": 1, "compact": "1"},
+            )
+            self.assertEqual(response.status_code, 200)
+            query = experiment.call_args.args[2]
+            self.assertIsInstance(query, DashboardQuery)
+            self.assertEqual(ViewQuery.from_query(query).compact, "1")
+
+    async def test_http_resource_thresholds_consume_retained_alert_rules(self):
+        rule = {
+            "id": "cpu-rule",
+            "name": "CPU threshold",
+            "kind": "resource",
+            "metric": "cpu",
+            "operator": "above",
+            "threshold": 20,
+            "enabled": True,
         }
+        await self.app.state.alerts.configure(rule)
+        retained = self.app.state.alerts.rules[0]
+        response = await self.http.get("/api/system/compute")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["metrics"]["cpu"]["exceeded"])
+        self.assertIs(self.app.state.alerts.rules[0], retained)
+        await self.app.state.alerts.configure({**rule, "enabled": False})
+        response = await self.http.get("/api/system/compute")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["metrics"]["cpu"].get("exceeded", False))
+
+    async def test_local_page_success_does_not_change_global_runtime_connection(self):
+        self.app.state.views._live_available = False
+        self.app.state.views._live_error = "offline"
         for page in ("overview", "experiments", "modules", "compute", "alerts"):
             self.assertEqual(
                 (await self.http.get("/api/system/" + page)).status_code, 200
@@ -154,8 +200,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             ).status_code,
             409,
         )
-        self.app.state.settings["max_response_bytes"] = 50
-        oversized = await self.http.get(path + "summary")
+        self.app.state.settings = _update_model(
+            self.app.state.settings, max_response_bytes=1024
+        )
+        with patch.object(
+            self.app.state.views,
+            "experiment",
+            new=AsyncMock(return_value={"large": "x" * 2048}),
+        ):
+            oversized = await self.http.get(path + "summary")
         self.assertEqual(oversized.status_code, 413)
 
     async def test_cache_publication_descriptors_are_bounded_and_filter_specific(self):
@@ -410,7 +463,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observation["source"], "dashboard_host")
         self.assertEqual(self.upstream_requests, [])
         stored = json.loads(
-            (self.app.state.settings["state_directory"] / "icmp.json").read_text()
+            (self.app.state.settings.state_directory / "icmp.json").read_text()
         )
         self.assertEqual(stored["settings"], icmp_settings())
         self.assertEqual(stored["history"][-1]["status"], "reply")
@@ -469,7 +522,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(response.status_code, expected)
         self.assertFalse(
-            (self.app.state.settings["state_directory"] / "icmp.json").exists()
+            (self.app.state.settings.state_directory / "icmp.json").exists()
         )
 
     async def test_config_write_failure_preserves_previous_settings(self) -> None:
@@ -494,7 +547,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.probes, [])
 
     async def test_lifespan_closes_http_client_monitor_and_state_lock(self) -> None:
-        state_path = self.app.state.settings["state_directory"]
+        state_path = self.app.state.settings.state_directory
         await self.stack.aclose()
         self.assertTrue(self.upstream.is_closed)
         self.assertTrue(self.app.state.icmp._task.done())

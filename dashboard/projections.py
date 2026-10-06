@@ -8,8 +8,11 @@ import math
 import sqlite3
 import statistics
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime
 from itertools import pairwise
+
+from core.models.dashboard_metadata import CompactTemplate
 
 
 def compact_event(event: dict) -> dict:
@@ -116,29 +119,39 @@ def compact_event(event: dict) -> dict:
             if metric["scope"] in {"operation", "process"}
         }
     if kind == "template.applied":
+        template = CompactTemplate.model_validate(data["template"])
         reduced = {
             "template_revision_id": data["template_revision_id"],
-            "template": compact_template(data["template"]),
+            "template": compact_template(template),
             "template_yaml": "",
         }
     return {**event, "data": reduced}
 
 
-def compact_template(template: dict) -> dict:
-    result = {key: template[key] for key in ("name", "cycles") if key in template}
+def compact_template(template: dict | CompactTemplate) -> dict:
+    if isinstance(template, CompactTemplate):
+        result = {
+            key: getattr(template, key)
+            for key in ("name", "cycles")
+            if key in template.model_fields_set
+        }
+        stages, services = template.stages, template.services
+    else:
+        result = {key: template[key] for key in ("name", "cycles") if key in template}
+        stages, services = template.get("stages", []), template.get("services", [])
     result["stages"] = [
         {
             key: stage[key]
             for key in ("stage_id", "name", "module", "service_id", "returns_data")
             if key in stage
         }
-        for stage in template.get("stages", [])
+        for stage in stages
     ]
     result["services"] = [
         {key: service[key] for key in ("service_id", "module") if key in service}
-        for service in template.get("services", [])
+        for service in services
     ]
-    return result
+    return deepcopy(result) if isinstance(template, CompactTemplate) else result
 
 
 def project_scope(dataset: dict, run_id: str | None, cycle: int | None) -> dict:

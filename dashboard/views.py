@@ -3,17 +3,45 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import multiprocessing
 import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import replace
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
-from core.logger_utils.events import LoggingError
-from core.runner_utils.runtimeio import write_json
+from core.journal.events import LoggingError
+from core.models.dashboard_cache import CacheWorkerError, CacheWorkerResult
+from core.models.dashboard_commands import (
+    DashboardCommand,
+    LocalCommandRecord,
+    SavedCommandHistory,
+)
+from core.models.dashboard_metadata import SchedulingState
+from core.models.dashboard_queries import (
+    DashboardQuery,
+    OffsetCursor,
+    PageLimit,
+    PublicationCursor,
+    ViewQuery,
+)
+from core.models.dashboard_resources import (
+    CollectorHistoryPage,
+    CollectorSample,
+    CollectorSamples,
+    CollectorStatus,
+)
+from core.models.dashboard_settings import DashboardRuntimeConfiguration
+from core.models.dashboard_upstream import LiveState
+from core.models.journal_cache import JournalBoundary
+from core.models.server_receipts import CommandReceipt
+from core.models.updates import _update_model
+from core.primitives.json_files import write_json
+from core.primitives.json_values import JsonObject
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.journals import (
     LocalJournals,
@@ -32,58 +60,53 @@ from dashboard.projections import (
 
 
 def validate_samples(samples: object) -> list[dict]:
-    if not isinstance(samples, list):
+    try:
+        return [
+            sample.model_dump(exclude_unset=True)
+            for sample in CollectorSamples.validate_python(samples, strict=True)
+        ]
+    except (ValueError, TypeError) as error:
+        raise SystemAPIError("invalid_response", "Invalid collector measurements.") from error
+
+
+def _command_receipt(document: object) -> CommandReceipt:
+    try:
+        return CommandReceipt.model_validate(document)
+    except (TypeError, ValueError) as error:
         raise SystemAPIError(
-            "invalid_response", "Collector measurements must be a list."
-        )
-    for sample in samples:
-        if (
-            not isinstance(sample, dict)
-            or not isinstance(sample.get("series_id"), str)
-            or instant(sample.get("observed_at")) is None
-            or not isinstance(sample.get("resources"), dict)
-        ):
-            raise SystemAPIError(
-                "invalid_response", "Invalid collector measurement envelope."
-            )
-        for metric in sample["resources"].values():
-            if (
-                not isinstance(metric, dict)
-                or not isinstance(metric.get("attributes", {}), dict)
-                or (
-                    metric.get("value") is not None
-                    and type(metric["value"]) not in (int, float)
-                )
-            ):
-                raise SystemAPIError("invalid_response", "Invalid collector metric.")
-        freshness = sample.get("freshness", {})
-        if not isinstance(freshness, dict) or any(
-            not isinstance(item, dict) or type(item.get("fresh")) is not bool
-            for item in freshness.values()
-        ):
-            raise SystemAPIError(
-                "invalid_response", "Invalid collector freshness metadata."
-            )
-    return samples
+            "invalid_response", "System API returned an invalid command receipt.", 502
+        ) from error
 
 
 class DashboardViews:
-    def __init__(self, settings: dict, system: SystemAPIClient) -> None:
-        self.settings = settings
+    def __init__(
+        self, settings: dict | DashboardRuntimeConfiguration, system: SystemAPIClient
+    ) -> None:
+        validated = (
+            settings if isinstance(settings, DashboardRuntimeConfiguration)
+            else DashboardRuntimeConfiguration.model_validate(settings)
+        )
+        self.settings = validated
         self.system = system
-        self.journals = LocalJournals(settings)
-        self._live: dict = {}
+        self.journals = LocalJournals(self.settings)
+        self._live: LiveState | None = None
+        self._live_available: bool | None = None
+        self._live_error: str | None = None
         self._live_at = 0.0
         self._live_lock = asyncio.Lock()
         self._resource_lock = asyncio.Lock()
-        self._resource_status: dict = {}
+        self._resource_status: CollectorStatus | None = None
+        self._resource_unavailable = False
+        self._resource_error: str | None = None
+        self._resource_history_error: str | None = None
+        self._resource_history_observed = False
         self._resource_at = 0.0
-        self._history: deque[dict] = deque(maxlen=50000)
+        self._history: deque[CollectorSample] = deque(maxlen=50000)
         self._history_id = None
         self._history_cursor = 0
         self._history_gap = False
         self._publications: dict[str, dict] = {}
-        self._commands: list[dict] = []
+        self._commands: list[LocalCommandRecord] = []
         self._command_lock = asyncio.Lock()
         self._command_task: asyncio.Task | None = None
         self._source_tasks: list[asyncio.Task] = []
@@ -92,8 +115,8 @@ class DashboardViews:
         self._resource_observed_at = 0.0
         self._cache_pool: ProcessPoolExecutor | None = None
         self._cache_jobs: dict = {}
-        self._cache_targets: dict[str, dict] = {}
-        self._cache_errors: dict[str, dict] = {}
+        self._cache_targets: dict[str, JournalBoundary | JsonObject] = {}
+        self._cache_errors: dict[str, CacheWorkerError] = {}
         self._cache_checked: dict[str, float] = {}
         self._module_error: str | None = None
         self._module_job = None
@@ -102,13 +125,13 @@ class DashboardViews:
         self._registry: dict = {}
         self._registry_error: str | None = None
         self._registry_checked = 0.0
-        self._registry_states: dict[str, dict] = {}
+        self._registry_states: dict[str, SchedulingState] = {}
         self._automatic_caches: set[str] = set()
         self._opened_caches: set[str] = set()
         self._cache_requests: set[str] = set()
         self._cache_final_requests: set[str] = set()
         self._cache_initial: set[str] = set()
-        self._cache_progress: dict[str, dict] = {}
+        self._cache_progress: dict[str, CacheWorkerResult] = {}
         self._ram_previews: dict[str, dict] = {}
         self._window_jobs: dict[str, asyncio.Task] = {}
         self._window_checked: dict[str, float] = {}
@@ -118,22 +141,10 @@ class DashboardViews:
         self._command_cache_locks: dict[str, asyncio.Lock] = {}
 
     async def open(self) -> None:
-        path = self.settings["state_directory"] / "commands.json"
+        path = self.settings.state_directory / "commands.json"
         if path.exists():
             document = await asyncio.to_thread(read_object, path, 8388608)
-            if not isinstance(document.get("items"), list):
-                raise ValueError("Invalid dashboard command history.")
-            for record in document["items"]:
-                if (
-                    not isinstance(record, dict)
-                    or not isinstance(record.get("status"), str)
-                    or type(record.get("polling")) is not bool
-                ):
-                    raise ValueError("Invalid saved command record.")
-                UUID(record["command_id"])
-                if record["status"] == "submitting":
-                    record.update(status="unknown", polling=True)
-            self._commands = document["items"][-1000:]
+            self._restore_commands(SavedCommandHistory.model_validate(document))
         self._replace_cache_pool()
         try:
             self._registry = await asyncio.to_thread(self.journals.registry)
@@ -149,6 +160,15 @@ class DashboardViews:
             asyncio.create_task(self._poll_windows()),
         ]
 
+    def _restore_commands(self, history: SavedCommandHistory) -> None:
+        records = []
+        for saved in history.items[-1000:]:
+            record = saved
+            if saved.status == "submitting":
+                record = _update_model(record, status="unknown", polling=True)
+            records.append(record)
+        self._commands = records
+
     async def _prime_caches(self) -> None:
         """Bootstrap at most one batch per worker before accepting HTTP reads."""
         initial = []
@@ -162,19 +182,19 @@ class DashboardViews:
             if "cache" in dataset:
                 continue
             future = self._cache_pool.submit(
-                cache_experiment, self.settings, identifier
+                cache_experiment, self.settings.model_dump(), identifier
             )
             self._cache_jobs[identifier] = future
             self._cache_initial.add(identifier)
             initial.append(asyncio.wrap_future(future))
-            if len(initial) >= self.settings.get("cache_workers", 2):
+            if len(initial) >= self.settings.cache_workers:
                 break
         await asyncio.gather(*initial, return_exceptions=True)
         self._collect_cache_jobs()
 
     async def _refresh_cache_selection(self) -> None:
         self._registry_states = await asyncio.to_thread(
-            self.journals.scheduling_states, self._registry
+            self.journals._scheduling_states, self._registry
         )
         active_phases = {
             "starting",
@@ -187,7 +207,7 @@ class DashboardViews:
         automatic = {
             identifier
             for identifier, state in self._registry_states.items()
-            if state.get("phase") in active_phases
+            if state.phase in active_phases
         }
         # A job already in flight may finish at a pre-terminal boundary.
         # Keep its successor separate so that completion cannot erase it.
@@ -200,7 +220,7 @@ class DashboardViews:
         self._collect_cache_jobs()
         if identifier in self._cache_jobs or identifier in self._command_refreshing:
             return
-        if len(self._cache_jobs) >= self.settings.get("cache_workers", 2):
+        if len(self._cache_jobs) >= self.settings.cache_workers:
             return
         try:
             dataset = await asyncio.to_thread(self.journals.cached, identifier)
@@ -213,20 +233,24 @@ class DashboardViews:
                 # Source polling requests a writer when either cursor changes.
                 self._cache_checked[identifier] = time.monotonic()
                 return
-            if identifier in self._cache_jobs or len(
-                self._cache_jobs
-            ) >= self.settings.get("cache_workers", 2):
+            if (
+                identifier in self._cache_jobs
+                or len(self._cache_jobs) >= self.settings.cache_workers
+            ):
                 return
             if not dataset.get("complete") and not (
                 dataset.get("cached_through") or {}
             ).get("cursor"):
                 self._cache_initial.add(identifier)
             final_refresh = identifier in self._cache_final_requests
+            target = None if final_refresh else self._cache_targets.get(identifier)
+            if isinstance(target, JournalBoundary):
+                target = target.model_dump(exclude_unset=True)
             self._cache_jobs[identifier] = self._cache_pool.submit(
                 cache_experiment,
-                self.settings,
+                self.settings.model_dump(),
                 identifier,
-                None if final_refresh else self._cache_targets.get(identifier),
+                target,
             )
             if final_refresh:
                 self._cache_final_requests.discard(identifier)
@@ -234,7 +258,9 @@ class DashboardViews:
         except BrokenProcessPool:
             self._replace_cache_pool()
         except SystemAPIError as error:
-            self._cache_errors[identifier] = {"code": error.code, "message": str(error)}
+            self._cache_errors[identifier] = CacheWorkerError(
+                code=error.code, message=str(error)
+            )
 
     def cache_activity(self) -> dict:
         """Small scheduling status; no source reads on the request path."""
@@ -242,14 +268,16 @@ class DashboardViews:
         for identifier, future in self._cache_jobs.items():
             if future.done():
                 continue
-            progress = self._cache_progress.get(identifier, {})
-            target = progress.get("target_boundary") or {}
+            progress = self._cache_progress.get(identifier)
+            target = None if progress is None else progress.target_boundary
             items.append(
                 {
                     "experiment_id": identifier,
                     "initial": identifier in self._cache_initial,
-                    "event_count": target.get("event_count"),
-                    "cached_through": progress.get("cached_through"),
+                    "event_count": None if target is None else target.event_count,
+                    "cached_through": None
+                    if progress is None or progress.cached_through is None
+                    else progress.cached_through.model_dump(exclude_unset=True),
                 }
             )
         return {
@@ -292,7 +320,7 @@ class DashboardViews:
                 for identifier in self._registry:
                     if identifier not in self._automatic_caches | self._opened_caches:
                         continue
-                    if len(self._window_jobs) >= self.settings.get("cache_workers", 2):
+                    if len(self._window_jobs) >= self.settings.cache_workers:
                         break
                     if (
                         identifier in self._window_jobs
@@ -335,13 +363,13 @@ class DashboardViews:
             )
             if (
                 self._module_job is None
-                and self.settings["project_root"] is not None
+                and self.settings.project_root is not None
                 and signature != self._module_registry
                 and now >= self._module_retry_at
             ):
                 try:
                     self._module_job = self._cache_pool.submit(
-                        publish_module_statistics, self.settings
+                        publish_module_statistics, self.settings.model_dump()
                     )
                     self._module_registry = signature
                 except BrokenProcessPool:
@@ -349,7 +377,7 @@ class DashboardViews:
                     await asyncio.sleep(0.25)
                     continue
             for identifier in registry:
-                if len(self._cache_jobs) >= self.settings.get("cache_workers", 2):
+                if len(self._cache_jobs) >= self.settings.cache_workers:
                     break
                 if (
                     identifier
@@ -370,7 +398,7 @@ class DashboardViews:
         if self._cache_pool is not None:
             self._cache_pool.shutdown(wait=False, cancel_futures=True)
         self._cache_pool = ProcessPoolExecutor(
-            max_workers=self.settings.get("cache_workers", 2),
+            max_workers=self.settings.cache_workers,
             mp_context=multiprocessing.get_context("spawn"),
         )
 
@@ -395,31 +423,37 @@ class DashboardViews:
                 continue
             del self._cache_jobs[identifier]
             try:
-                result = future.result()
+                outcome = CacheWorkerResult.model_validate(future.result())
+                if outcome.experiment_id != identifier:
+                    raise ValueError(
+                        "Cache worker result belongs to another experiment."
+                    )
             except Exception as error:  # noqa: BLE001 - Surface failed worker processes through history reads.
-                result = {
-                    "error": {"code": "cache_worker_failed", "message": str(error)}
-                }
-            error = result.get("error")
-            if result.get("modules_error"):
-                self._module_error = result["modules_error"]
+                outcome = None
+                failure = CacheWorkerError(
+                    code="cache_worker_failed", message=str(error)
+                )
+            else:
+                failure = outcome.error
+            if outcome is not None and outcome.modules_error:
+                self._module_error = outcome.modules_error
                 self._module_registry = None
-            elif result.get("modules_published"):
+            elif outcome is not None and outcome.modules_published:
                 self._module_error = None
-            elif result.get("modules_published") is False:
+            elif outcome is not None and outcome.modules_published is False:
                 # Retry publication even after a stopped experiment leaves the queue.
                 # An older module job completing must not clear this invalidation.
                 self._module_registry = None
-            if error:
+            if failure:
                 self._ram_previews.pop(identifier, None)
-                self._cache_errors[identifier] = error
+                self._cache_errors[identifier] = failure
                 self._cache_checked[identifier] = time.monotonic()
                 self._cache_targets.pop(identifier, None)
                 continue
             self._cache_errors.pop(identifier, None)
-            self._cache_progress[identifier] = result
-            self._cache_targets[identifier] = result["target_boundary"]
-            if result["complete"]:
+            self._cache_progress[identifier] = outcome
+            self._cache_targets[identifier] = outcome.target_boundary
+            if outcome.complete:
                 self._ram_previews.pop(identifier, None)
                 self._cache_requests.discard(identifier)
                 self._cache_initial.discard(identifier)
@@ -427,14 +461,13 @@ class DashboardViews:
                 self._cache_checked[identifier] = time.monotonic()
 
     def _write_commands(self) -> None:
-        path = self.settings["state_directory"] / "commands.json"
+        path = self.settings.state_directory / "commands.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(
-            {"items": self._commands}, ensure_ascii=False, allow_nan=False
-        )
+        document = {"items": [record.model_dump(exclude_unset=True) for record in self._commands]}
+        encoded = json.dumps(document, ensure_ascii=False, allow_nan=False)
         if len(encoded.encode("utf-8")) > 8388608:
             raise OSError("Dashboard command history exceeds its 8 MiB limit.")
-        write_json(path, {"items": self._commands})
+        write_json(path, document)
 
     async def _save_commands(self) -> None:
         writing = asyncio.create_task(asyncio.to_thread(self._write_commands))
@@ -446,25 +479,44 @@ class DashboardViews:
 
     async def state(self, *, refresh: bool = False) -> dict:
         if not refresh:
-            snapshot = dict(self._live)
-            if not self._live_at or time.monotonic() - self._live_at > 3:
-                snapshot["fresh"] = False
-            return snapshot
+            return self._live_document(
+                stale=not self._live_at or time.monotonic() - self._live_at > 3
+            )
         async with self._live_lock:
             if time.monotonic() - self._live_at < 0.5:
-                return dict(self._live)
+                return self._live_document()
             try:
-                self._live = await self.system.read("state")
-                self._live["available"] = True
+                observed = await self._read_live_state()
+                self._live = observed
+                self._live_available = True
+                self._live_error = None
             except SystemAPIError as error:
-                self._live = {
-                    **self._live,
-                    "fresh": False,
-                    "available": False,
-                    "connection_error": str(error),
-                }
+                self._live_available = False
+                self._live_error = str(error)
             self._live_at = time.monotonic()
-            return dict(self._live)
+            return self._live_document()
+
+    def _live_document(self, *, stale: bool = False) -> dict:
+        """Project the last checked observation with current owner availability."""
+        snapshot = (
+            {} if self._live is None else self._live.model_dump(exclude_unset=True)
+        )
+        if self._live_available is not None:
+            snapshot["available"] = self._live_available
+        if self._live_available is False:
+            snapshot["fresh"] = False
+            snapshot["connection_error"] = self._live_error
+        if stale:
+            snapshot["fresh"] = False
+        return snapshot
+
+    async def _read_live_state(self) -> LiveState:
+        try:
+            return LiveState.model_validate(await self.system.read("state"))
+        except (TypeError, ValueError) as error:
+            raise SystemAPIError(
+                "invalid_response", "System API returned an invalid live state.", 502
+            ) from error
 
     async def _poll_source(self, source: str) -> None:
         while True:
@@ -475,18 +527,11 @@ class DashboardViews:
                     await self._refresh_resources()
             except Exception as error:  # noqa: BLE001 - A broken source must not stop independent cached reads.
                 if source == "state":
-                    self._live = {
-                        **self._live,
-                        "available": False,
-                        "fresh": False,
-                        "connection_error": str(error),
-                    }
+                    self._live_available = False
+                    self._live_error = str(error)
                 else:
-                    self._resource_status = {
-                        **self._resource_status,
-                        "state": "unavailable",
-                        "error": str(error),
-                    }
+                    self._resource_unavailable = True
+                    self._resource_error = str(error)
             await asyncio.sleep(1)
 
     async def _model(
@@ -494,8 +539,8 @@ class DashboardViews:
     ) -> tuple[dict, dict]:
         async with self._model_locks.setdefault(identifier, asyncio.Lock()):
             error = self._cache_errors.get(identifier)
-            if error and error["code"] != "cache_busy":
-                raise SystemAPIError(error["code"], error["message"])
+            if error and error.code != "cache_busy":
+                raise SystemAPIError(error.code, error.message)
             if self._cache_pool is None:
                 dataset = await asyncio.to_thread(self.journals.load, identifier)
             else:
@@ -505,7 +550,8 @@ class DashboardViews:
                     raise SystemAPIError("not_found", "Unknown experiment.", 404)
                 dataset = await asyncio.to_thread(self.journals.cached, identifier)
                 if "cache" not in dataset:
-                    recorded = self._registry_states.get(identifier, {})
+                    scheduling = self._registry_states.get(identifier)
+                    recorded = scheduling.document() if scheduling is not None else {}
                     dataset = {
                         **dataset,
                         "state": {
@@ -593,14 +639,16 @@ class DashboardViews:
                     "operations": [],
                 }
             result.append((dataset, model))
-        if not result and self.settings["project_root"] is None:
+        if not result and self.settings.project_root is None:
             raise SystemAPIError(
                 "not_configured",
                 "Configure project_root to read the experiment journals.",
             )
         return result
 
-    async def read(self, resource: str, params: dict) -> dict:
+    async def read(
+        self, resource: str, params: dict | DashboardQuery | ViewQuery
+    ) -> dict:
         if resource == "compute":
             return await self.compute(params)
         if resource == "modules":
@@ -631,7 +679,7 @@ class DashboardViews:
         if resource == "overview":
             complete = (
                 source_error is None
-                and self.settings["project_root"] is not None
+                and self.settings.project_root is not None
                 and all(dataset["complete"] for dataset, _ in models)
             )
             metrics = {
@@ -724,8 +772,14 @@ class DashboardViews:
         )[0][0]
 
     async def experiment(
-        self, identifier: str, view: str, params: dict, *, defer_cache: bool = False
+        self,
+        identifier: str,
+        view: str,
+        params: dict | DashboardQuery | ViewQuery,
+        *,
+        defer_cache: bool = False,
     ) -> dict:
+        params = ViewQuery.from_query(params)
         first_open = identifier not in self._opened_caches
         if self._cache_pool is not None:
             self._collect_cache_jobs()
@@ -740,7 +794,7 @@ class DashboardViews:
             # The first request may hydrate a complete RAM preview itself.
             # Avoid starting a second source read during that short operation.
             self._window_checked[identifier] = time.monotonic()
-        dataset, model = await self._model(identifier, params.get("run_id"))
+        dataset, model = await self._model(identifier, params.run_id)
         preview = self._ram_previews.get(identifier)
         if first_open and self._cache_pool is not None and not dataset["complete"]:
             try:
@@ -768,7 +822,7 @@ class DashboardViews:
                     window_experiment_views,
                     preview,
                     await self.state(),
-                    params.get("run_id"),
+                    params.run_id,
                 )
         # Hydrate the first RAM response before a worker competes for this journal.
         if first_open and self._cache_pool is not None and not defer_cache:
@@ -831,7 +885,7 @@ class DashboardViews:
             )
         if view == "template":
             template = model["template"]
-            revision = params.get("revision")
+            revision = params.revision
             if revision:
                 selected = next(
                     (
@@ -866,11 +920,7 @@ class DashboardViews:
         if view == "snapshots":
             snapshots = await asyncio.to_thread(self.journals.snapshots, identifier)
             return self.page(snapshots, metadata, view, params)
-        key = (
-            "effective"
-            if view == "events" and params.get("view", "effective") == "effective"
-            else view
-        )
+        key = "effective" if view == "events" and params.view == "effective" else view
         if key not in model or not isinstance(model[key], list):
             raise SystemAPIError("not_found", "Unknown experiment view.", 404)
         items = model[key]
@@ -878,21 +928,19 @@ class DashboardViews:
             items = [
                 *items,
                 *(
-                    row
+                    row.model_dump(exclude_unset=True)
                     for row in self._commands
-                    if row.get("experiment_id") == identifier
+                    if row.experiment_id == identifier
                 ),
             ]
         return self.page(items, metadata, view, params)
 
     def _timeline_view(
-        self, dataset: dict, model: dict, metadata: dict, params: dict
+        self, dataset: dict, model: dict, metadata: dict, params: ViewQuery
     ) -> dict:
         """Keep timeline selection independent of ordinary operation pagination."""
-        since, until = instant(params.get("since")), instant(params.get("until"))
-        if ("since" in params or "until" in params) and (
-            since is None or until is None or since >= until
-        ):
+        since, until = instant(params.since), instant(params.until)
+        if params.has_range and (since is None or until is None or since >= until):
             raise SystemAPIError(
                 "invalid_range",
                 "Provide valid since and until times with since < until.",
@@ -1006,11 +1054,11 @@ class DashboardViews:
         }
 
     def _cached_view(
-        self, dataset: dict, model: dict, metadata: dict, view: str, params: dict
+        self, dataset: dict, model: dict, metadata: dict, view: str, params: ViewQuery
     ) -> dict:
         if view == "detail":
             try:
-                reference = json.loads(params.get("ref", "{}"))
+                reference = json.loads(params.ref)
             except (TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "invalid_reference", "Detail reference must be valid JSON.", 400
@@ -1049,11 +1097,11 @@ class DashboardViews:
         }:
             raise SystemAPIError("not_found", "Unknown experiment view.", 404)
         if view == "measurements":
-            params = {
-                **params,
-                "run_id": model["summary"]["run_id"],
-                "revision": model["summary"]["template_revision_id"],
-            }
+            params = replace(
+                params,
+                run_id=model["summary"]["run_id"],
+                revision=model["summary"]["template_revision_id"],
+            )
         page = self._cached_page(dataset, metadata, view, params)
         if view in {"parameters", "operations"}:
             for row in page["items"]:
@@ -1086,14 +1134,14 @@ class DashboardViews:
             page["total"] += len(parents)
         if view == "commands":
             page["items"] += [
-                row
+                row.model_dump(exclude_unset=True)
                 for row in self._commands
-                if row.get("experiment_id") == dataset["experiment_id"]
+                if row.experiment_id == dataset["experiment_id"]
             ]
         return {**metadata, **page}
 
     def _cached_page(
-        self, dataset: dict, metadata: dict, view: str, params: dict
+        self, dataset: dict, metadata: dict, view: str, params: ViewQuery
     ) -> dict:
         now = time.monotonic()
         self._publications = {
@@ -1103,16 +1151,16 @@ class DashboardViews:
         }
         scope = (
             dataset["experiment_id"],
-            params.get("run_id"),
+            params.run_id,
             view,
-            params.get("view", "effective"),
-            params.get("revision"),
+            params.view,
+            params.revision,
         )
-        cursor = params.get("cursor")
+        cursor = params.cursor
         if cursor:
             try:
-                cursor = json.loads(cursor)
-                token = cursor["publication"]
+                cursor = PublicationCursor.model_validate_json(cursor)
+                token = cursor.publication
                 publication = self._publications[token]
                 if (
                     publication["scope"] != scope
@@ -1120,8 +1168,8 @@ class DashboardViews:
                     or publication["metadata"]["journal"] != dataset["identity"]
                 ):
                     raise ValueError("History publication changed.")
-                internal = {**publication["cursor"], "position": cursor["position"]}
-                params = {**params, "cursor": json.dumps(internal)}
+                internal = {**publication["cursor"], "position": list(cursor.position)}
+                params = replace(params, cursor=json.dumps(internal))
             except (ValueError, TypeError, KeyError) as error:
                 raise SystemAPIError(
                     "history_changed", "Refresh this history publication.", 409
@@ -1183,9 +1231,9 @@ class DashboardViews:
             )
         return runs
 
-    def _cached_template(self, dataset: dict, model: dict, params: dict) -> dict:
-        selection = " AND run_id=?" if params.get("run_id") else ""
-        args = (params["run_id"],) if params.get("run_id") else ()
+    def _cached_template(self, dataset: dict, model: dict, params: ViewQuery) -> dict:
+        selection = " AND run_id=?" if params.run_id else ""
+        args = (params.run_id,) if params.run_id else ()
         rows = dataset["cache"].query(
             "SELECT event_id, compact FROM facts WHERE kind='template.applied' AND effective=1"
             + selection
@@ -1201,12 +1249,11 @@ class DashboardViews:
             (
                 row
                 for row in reversed(revisions)
-                if not params.get("revision")
-                or row["template_revision_id"] == params["revision"]
+                if not params.revision or row["template_revision_id"] == params.revision
             ),
             None,
         )
-        if params.get("revision") and selected is None:
+        if params.revision and selected is None:
             raise SystemAPIError(
                 "not_found", "The requested template revision is unavailable.", 404
             )
@@ -1243,8 +1290,15 @@ class DashboardViews:
         ]
         return template
 
-    def page(self, items: list[dict], metadata: dict, view: str, params: dict) -> dict:
-        limit = int(params.get("limit", 200))
+    def page(
+        self,
+        items: list[dict],
+        metadata: dict,
+        view: str,
+        params: dict | DashboardQuery | ViewQuery,
+    ) -> dict:
+        params = ViewQuery.from_query(params)
+        limit = PageLimit.model_validate(params.limit).root
         now = time.monotonic()
         self._publications = {
             key: publication
@@ -1253,20 +1307,18 @@ class DashboardViews:
         }
         scope = (
             metadata["experiment_id"],
-            params.get("run_id"),
+            params.run_id,
             view,
-            params.get("view", "effective"),
+            params.view,
         )
-        if params.get("cursor"):
+        if params.cursor:
             try:
-                cursor = json.loads(params["cursor"])
-                publication = self._publications[cursor["publication"]]
-                offset = cursor["offset"]
+                cursor = OffsetCursor.model_validate_json(params.cursor)
+                publication = self._publications[cursor.publication]
+                offset = cursor.offset
                 if (
                     publication["scope"] != scope
                     or publication["metadata"]["journal"] != metadata["journal"]
-                    or type(offset) is not int
-                    or offset < 0
                 ):
                     raise ValueError("Invalid publication cursor.")
             except (ValueError, KeyError, TypeError) as error:
@@ -1275,12 +1327,12 @@ class DashboardViews:
                     "The selected publication is unavailable; refresh the history.",
                     409,
                 ) from error
-            token = cursor["publication"]
+            token = cursor.publication
             items, metadata = publication["items"], publication["metadata"]
         else:
             offset, token = 0, uuid4().hex
             encoded_size = len(json.dumps(items, ensure_ascii=False).encode())
-            if encoded_size > self.settings["history_max_bytes"]:
+            if encoded_size > self.settings.history_max_bytes:
                 raise SystemAPIError(
                     "history_limit",
                     "This view exceeds the configured history memory limit.",
@@ -1290,7 +1342,7 @@ class DashboardViews:
                 len(self._publications) >= 16
                 or sum(item["bytes"] for item in self._publications.values())
                 + encoded_size
-                > self.settings["history_max_bytes"]
+                > self.settings.history_max_bytes
             ):
                 self._publications.pop(next(iter(self._publications)))
             self._publications[token] = {
@@ -1303,7 +1355,7 @@ class DashboardViews:
         selected, size = [], 1024
         for item in items[offset : offset + limit]:
             length = len(json.dumps(item, ensure_ascii=False).encode())
-            if size + length > self.settings["max_response_bytes"]:
+            if size + length > self.settings.max_response_bytes:
                 if not selected:
                     raise SystemAPIError(
                         "response_too_large",
@@ -1325,138 +1377,103 @@ class DashboardViews:
 
     async def _refresh_resources(self) -> None:
         async with self._resource_lock:
-            error = None
-            if time.monotonic() - self._resource_at >= 0.5:
-                try:
-                    status = await self.system.read("resources")
-                    if status.get("history_id") != self._history_id:
-                        self._history.clear()
-                        self._history_cursor = 0
-                        self._history_id = status.get("history_id")
-                        self._history_gap = False
-                    if not isinstance(status.get("latest"), list):
-                        raise SystemAPIError(
-                            "invalid_response",
-                            "Collector status has no measurements list.",
-                        )
-                    validate_samples(status["latest"])
-                    self._resource_status = status
-                    self._resource_observed_at = time.monotonic()
-                except SystemAPIError as failure:
-                    error = str(failure)
-                    self._resource_status = {
-                        **self._resource_status,
-                        "state": "unavailable",
-                        "error": error,
-                    }
-                if error is None:
-                    try:
-                        for _ in range(5):
-                            page = await self.system.read(
-                                "resources/history",
-                                {"after": self._history_cursor, "limit": 1000},
-                            )
-                            if (
-                                not isinstance(page.get("samples"), list)
-                                or type(page.get("cursor")) is not int
-                                or "history_id" not in page
-                                or "gap" not in page
-                            ):
-                                raise SystemAPIError(
-                                    "invalid_response", "Invalid resource history page."
-                                )
-                            if page["history_id"] != self._history_id:
-                                self._history.clear()
-                                self._history_id, self._history_cursor = (
-                                    page["history_id"],
-                                    0,
-                                )
-                                self._history_gap = False
-                                continue
-                            validate_samples(page["samples"])
-                            self._history_gap = (
-                                self._history_gap
-                                or page["gap"]
-                                or len(self._history) + len(page["samples"])
-                                > self._history.maxlen
-                            )
-                            self._history.extend(page["samples"])
-                            previous_cursor = self._history_cursor
-                            self._history_cursor = page["cursor"]
-                            if (
-                                not page["samples"]
-                                or self._history_cursor == previous_cursor
-                            ):
-                                break
-                        self._resource_status["history_error"] = None
-                    except SystemAPIError as failure:
-                        # History failure does not invalidate fresh instantaneous readings.
-                        self._resource_status["history_error"] = str(failure)
+            if time.monotonic() - self._resource_at < 0.5:
+                return
+            try:
+                status = CollectorStatus.model_validate(
+                    await self.system.read("resources")
+                )
+            except (ValueError, TypeError):
+                error = "Invalid collector status."
+            except SystemAPIError as failure:
+                error = str(failure)
+            else:
+                self._accept_resource_status(status)
+                await self._refresh_resource_history()
                 self._resource_at = time.monotonic()
+                return
+            self._resource_unavailable = True
+            self._resource_error = error
+            self._resource_at = time.monotonic()
 
-    async def compute(self, params: dict) -> dict:
-        status = dict(self._resource_status)
-        if (
+    def _accept_resource_status(self, status: CollectorStatus) -> None:
+        if status.history_id != self._history_id:
+            self._history.clear()
+            self._history_cursor = 0
+            self._history_id = status.history_id
+            self._history_gap = False
+        self._resource_status = status
+        self._resource_unavailable = False
+        self._resource_error = None
+        self._resource_history_error = None
+        self._resource_history_observed = False
+        self._resource_observed_at = time.monotonic()
+
+    async def _refresh_resource_history(self) -> None:
+        self._resource_history_observed = True
+        try:
+            for _ in range(5):
+                document = await self.system.read(
+                    "resources/history", {"after": self._history_cursor, "limit": 1000}
+                )
+                try:
+                    page = CollectorHistoryPage.model_validate(document)
+                except (ValueError, TypeError) as error:
+                    raise SystemAPIError(
+                        "invalid_response", "Invalid resource history page."
+                    ) from error
+                if self._accept_resource_history_page(page):
+                    break
+            self._resource_history_error = None
+        except SystemAPIError as failure:
+            # History failure does not invalidate fresh instantaneous readings.
+            self._resource_history_error = str(failure)
+
+    def _accept_resource_history_page(self, page: CollectorHistoryPage) -> bool:
+        """Apply a checked page and report whether this bounded read can stop."""
+        if page.history_id != self._history_id:
+            self._history.clear()
+            self._history_id, self._history_cursor = page.history_id, 0
+            self._history_gap = False
+            return False
+        self._history_gap = (
+            self._history_gap
+            or page.gap
+            or len(self._history) + len(page.samples) > self._history.maxlen
+        )
+        self._history.extend(page.samples)
+        previous_cursor = self._history_cursor
+        self._history_cursor = page.cursor
+        return not page.samples or self._history_cursor == previous_cursor
+
+    async def compute(self, params: dict | DashboardQuery | ViewQuery) -> dict:
+        params = ViewQuery.from_query(params)
+        observed = self._resource_status
+        state = None if observed is None else observed.state
+        error = None if observed is None else observed.error
+        stale = (
             not self._resource_observed_at
             or time.monotonic() - self._resource_observed_at > 3
-        ):
-            status["state"] = "unavailable"
-            status["error"] = (
-                status.get("error") or "Awaiting a current resource observation."
+        )
+        unavailable = self._resource_unavailable or stale
+        if self._resource_unavailable:
+            state, error = "unavailable", self._resource_error
+        if stale:
+            state, error = (
+                "unavailable",
+                error or "Awaiting a current resource observation.",
             )
+        latest = [] if observed is None else observed.latest
         host = next(
-            (
-                sample
-                for sample in status.get("latest", [])
-                if sample["series_id"].startswith("host:")
-            ),
-            {},
+            (sample for sample in latest if sample.series_id.startswith("host:")), None
         )
-        metrics = {}
-        names = {
-            "cpu": "host_cpu_percent",
-            "ram": "host_memory_percent",
-            "disk": "host_disk_percent",
-        }
-        for key, name in names.items():
-            measured = host.get("resources", {}).get(name, {})
-            fresh = status.get("state") == "running" and host.get("freshness", {}).get(
-                name, {}
-            ).get("fresh", False)
-            metrics[key] = {
-                "value": measured.get("value"),
-                "fresh": fresh,
-                "exceeded": False,
-                "reason": measured.get("attributes", {}).get("reason"),
-                "attributes": measured.get("attributes", {}),
-            }
-        metrics["disk"]["free_bytes"] = (
-            host.get("resources", {}).get("host_disk_free_bytes", {}).get("value")
-        )
-        metrics["internet"] = {
-            direction + "_mbps": host.get("resources", {})
-            .get("internet_" + direction + "_mbps", {})
-            .get("value")
-            for direction in ("receive", "transmit")
-        }
-        metrics["internet"]["interface"] = (
-            host.get("resources", {})
-            .get("internet_receive_mbps", {})
-            .get("attributes", {})
-            .get("interface")
-        )
-        metrics["internet"]["fresh"] = status.get("state") == "running" and all(
-            host.get("freshness", {})
-            .get("internet_" + direction + "_mbps", {})
-            .get("fresh", False)
-            for direction in ("receive", "transmit")
-        )
-        since = instant(params.get("since"))
-        until = instant(params.get("until"))
+        metrics = self._resource_metrics(host, state == "running")
+        since = instant(params.since)
+        until = instant(params.until)
         if (
-            params.get("since")
+            params.since
             and since is None
-            or params.get("until")
+            or params.until
             and until is None
             or since is not None
             and until is not None
@@ -1466,53 +1483,39 @@ class DashboardViews:
         samples = [
             sample
             for sample in self._history
-            if (since is None or (instant(sample["observed_at"]) or 0) >= since)
-            and (until is None or (instant(sample["observed_at"]) or 0) <= until)
+            if (since is None or (instant(sample.observed_at) or 0) >= since)
+            and (until is None or (instant(sample.observed_at) or 0) <= until)
         ]
+        names = {
+            "cpu": "host_cpu_percent",
+            "ram": "host_memory_percent",
+            "disk": "host_disk_percent",
+        }
         history = {
             key: [
                 {
-                    "observed_at": sample["observed_at"],
-                    "value": sample["resources"].get(name, {}).get("value"),
+                    "observed_at": sample.observed_at,
+                    "value": None
+                    if name not in sample.resources
+                    else sample.resources[name].value,
                 }
                 for sample in samples
-                if sample["series_id"].startswith("host:")
+                if sample.series_id.startswith("host:")
             ]
             for key, name in names.items()
         }
-        processes = {}
-        for sample in status.get("latest", []):
-            if sample["series_id"].startswith("host:"):
-                continue
-            values = sample["resources"]
-            processes[sample["series_id"]] = {
-                "rss_bytes": values.get("process_memory_rss_bytes", {}).get("value"),
-                "cpu_percent": values.get("process_cpu_percent", {}).get("value"),
-                "fresh": status.get("state") == "running"
-                and sample.get("fresh", False),
-                "observed_process": values.get("process_cpu_percent", {})
-                .get("attributes", {})
-                .get("observed_process"),
-                "history": [
-                    {
-                        "observed_at": point["observed_at"],
-                        "rss_bytes": point["resources"]
-                        .get("process_memory_rss_bytes", {})
-                        .get("value"),
-                        "cpu_percent": point["resources"]
-                        .get("process_cpu_percent", {})
-                        .get("value"),
-                    }
-                    for point in samples
-                    if point["series_id"] == sample["series_id"]
-                ],
-            }
+        processes = self._resource_processes(latest, samples, state == "running")
+        status = {} if observed is None else observed.model_dump(exclude_unset=True)
+        if unavailable:
+            status.update(state=state, error=error)
+        if self._resource_history_observed:
+            status["history_error"] = self._resource_history_error
         return {
             "metrics": metrics,
             "history": history,
             "processes": processes,
             "collector": status,
-            "observed_at": host.get("observed_at"),
+            "observed_at": None if host is None else host.observed_at,
             "history_id": self._history_id,
             "gap": self._history_gap,
             "error": status.get("error"),
@@ -1520,33 +1523,88 @@ class DashboardViews:
             "history_error": status.get("history_error"),
         }
 
-    async def command(self, command: dict) -> dict:
-        allowed = {
-            "run",
-            "pause",
-            "resume",
-            "step",
-            "stop",
-            "rerun",
-            "retry",
-            "move",
-            "reset_retries",
-            "replace",
-            "reload_template",
-            "snapshot",
-            "rollback",
-            "recover",
+    def _resource_metrics(self, host: CollectorSample | None, running: bool) -> dict:
+        resources = {} if host is None else host.resources
+        freshness = {} if host is None else host.freshness
+        names = {
+            "cpu": "host_cpu_percent",
+            "ram": "host_memory_percent",
+            "disk": "host_disk_percent",
         }
-        if command.get("command") not in allowed or command.keys() - {
-            "command",
-            "args",
-            "target",
-            "command_id",
-            "expected_experiment_id",
-        }:
-            raise ValueError("Unsupported dashboard command.")
-        command = dict(command)
-        expected = command.pop("expected_experiment_id", None)
+        metrics = {}
+        for key, name in names.items():
+            measured = resources.get(name)
+            attributes = {} if measured is None else copy.deepcopy(measured.attributes)
+            fresh = freshness.get(name)
+            metrics[key] = {
+                "value": None if measured is None else measured.value,
+                "fresh": running and fresh is not None and fresh.fresh,
+                "exceeded": False,
+                "reason": attributes.get("reason"),
+                "attributes": attributes,
+            }
+        free = resources.get("host_disk_free_bytes")
+        metrics["disk"]["free_bytes"] = None if free is None else free.value
+        metrics["internet"] = {}
+        for direction in ("receive", "transmit"):
+            measured = resources.get("internet_" + direction + "_mbps")
+            metrics["internet"][direction + "_mbps"] = (
+                None if measured is None else measured.value
+            )
+        incoming = resources.get("internet_receive_mbps")
+        metrics["internet"]["interface"] = (
+            None if incoming is None else incoming.attributes.get("interface")
+        )
+        metrics["internet"]["fresh"] = running and all(
+            name in freshness and freshness[name].fresh
+            for name in ("internet_receive_mbps", "internet_transmit_mbps")
+        )
+        return metrics
+
+    def _resource_processes(
+        self,
+        latest: list[CollectorSample],
+        samples: list[CollectorSample],
+        running: bool,
+    ) -> dict:
+        processes = {}
+        for sample in latest:
+            if sample.series_id.startswith("host:"):
+                continue
+            memory = sample.resources.get("process_memory_rss_bytes")
+            cpu = sample.resources.get("process_cpu_percent")
+            history = []
+            for point in samples:
+                if point.series_id == sample.series_id:
+                    point_memory = point.resources.get("process_memory_rss_bytes")
+                    point_cpu = point.resources.get("process_cpu_percent")
+                    history.append(
+                        {
+                            "observed_at": point.observed_at,
+                            "rss_bytes": None
+                            if point_memory is None
+                            else point_memory.value,
+                            "cpu_percent": None
+                            if point_cpu is None
+                            else point_cpu.value,
+                        }
+                    )
+            processes[sample.series_id] = {
+                "rss_bytes": None if memory is None else memory.value,
+                "cpu_percent": None if cpu is None else cpu.value,
+                "fresh": running and sample.fresh,
+                "observed_process": None
+                if cpu is None
+                else copy.deepcopy(cpu.attributes.get("observed_process")),
+                "history": history,
+            }
+        return processes
+
+    async def command(self, command: dict) -> dict:
+        return await self._command(DashboardCommand.model_validate(command))
+
+    async def _command(self, request: DashboardCommand) -> dict:
+        expected = request.expected_experiment_id
         if expected is not None:
             self._live_at = 0
             live = await self.state(refresh=True)
@@ -1560,35 +1618,35 @@ class DashboardViews:
                     "The runtime selection changed or is unavailable. Refresh before sending a command.",
                     409,
                 )
-        command["command_id"] = (
-            str(UUID(command["command_id"]))
-            if command.get("command_id")
-            else str(uuid4())
-        )
-        if not isinstance(command.get("args", {}), dict):
-            raise TypeError("Command args must be an object.")
+        record = await self._reserve_command(request)
+        return await self._submit_reserved_command(request, record)
+
+    async def _reserve_command(self, request: DashboardCommand) -> LocalCommandRecord:
+        """Persist a local submission record before the first network effect."""
         async with self._command_lock:
-            if any(
-                item["command_id"] == command["command_id"] for item in self._commands
-            ):
+            if any(item.command_id == request.command_id for item in self._commands):
                 raise SystemAPIError(
                     "command_exists",
                     "This command ID is already recorded; read its result instead.",
                     409,
                 )
-            record = {
-                "command_id": command["command_id"],
-                "command": command["command"],
-                "experiment_id": command.get("args", {}).get("experiment_id")
-                or self._live.get("experiment_id"),
-                "target": "Runner",
-                "kind": "control",
-                "status": "submitting",
-                "sent_at": datetime.now(UTC).isoformat(),
-                "server_instance_id": self._live.get("server_instance_id"),
-                "args": command.get("args", {}),
-                "polling": False,
-            }
+            record = LocalCommandRecord.model_validate(
+                {
+                    "command_id": request.command_id,
+                    "command": request.command,
+                    "experiment_id": request.args.get("experiment_id")
+                    or (None if self._live is None else self._live.experiment_id),
+                    "target": "Runner",
+                    "kind": "control",
+                    "status": "submitting",
+                    "sent_at": datetime.now(UTC).isoformat(),
+                    "server_instance_id": None
+                    if self._live is None
+                    else self._live.server_instance_id,
+                    "args": request.args,
+                    "polling": False,
+                }
+            )
             previous = list(self._commands)
             self._commands.append(record)
             self._commands = self._commands[-1000:]
@@ -1600,66 +1658,74 @@ class DashboardViews:
                     "command_storage_unavailable",
                     "Command was not sent because its receipt could not be saved.",
                 ) from error
+        return record
+
+    async def _submit_reserved_command(
+        self, request: DashboardCommand, record: LocalCommandRecord
+    ) -> dict:
+        command = request.wire_document()
         try:
-            receipt = await self.system.submit(command)
+            validated_receipt = _command_receipt(await self.system.submit(command))
+            if validated_receipt.command_id != command["command_id"]:
+                raise SystemAPIError(
+                    "invalid_response",
+                    "System returned a receipt for another command.",
+                    502,
+                )
         except SystemAPIError as error:
             async with self._command_lock:
-                record.update(
-                    status="unknown"
-                    if error.code in {"connection_error", "timeout"}
-                    else "failed",
-                    error=str(error),
+                status = (
+                    "unknown"
+                    if error.code in {"connection_error", "timeout", "invalid_response"}
+                    else "failed"
                 )
-                record["polling"] = record["status"] == "unknown"
+                self._replace_command_record(
+                    record,
+                    status=status,
+                    error=str(error),
+                    polling=status == "unknown",
+                )
                 await self._save_commands()
             raise
         async with self._command_lock:
-            record.update(
-                status=receipt.get("state", "pending"),
-                server_instance_id=receipt.get("server_instance_id"),
-                polling=receipt.get("state", "pending") == "pending",
-                result=receipt,
+            self._replace_command_record(
+                record,
+                status=validated_receipt.state,
+                server_instance_id=validated_receipt.server_instance_id,
+                polling=validated_receipt.state == "pending",
+                result=validated_receipt,
             )
             await self._save_commands()
-        return receipt
+        return validated_receipt.model_dump(exclude_unset=True)
 
     async def command_result(self, identifier: str) -> dict:
-        result = await self.system.read(f"commands/{identifier}")
+        validated_result = _command_receipt(
+            await self.system.read(f"commands/{identifier}")
+        )
+        if validated_result.command_id != identifier:
+            raise SystemAPIError(
+                "invalid_response", "System returned a result for another command.", 502
+            )
         refresh_history = None
         async with self._command_lock:
             record = next(
-                (item for item in self._commands if item["command_id"] == identifier),
+                (item for item in self._commands if item.command_id == identifier),
                 None,
             )
             if record:
-                if record.get("server_instance_id") not in (
-                    None,
-                    result.get("server_instance_id"),
-                ):
-                    record.update(
-                        status="unknown",
-                        polling=False,
-                        error="System server instance changed.",
-                    )
-                    await self._save_commands()
-                    return {**result, "state": "unknown", "result": None}
-                if (
-                    record.get("polling")
-                    and result.get("result") == "success"
-                    and result.get("state") != "pending"
-                ):
-                    refresh_history = result.get("experiment_id") or record.get(
-                        "experiment_id"
-                    )
-                record.update(status=result.get("state", "unknown"), result=result)
-                record["polling"] = result.get("state") == "pending"
-                if result.get("experiment_id"):
-                    record["experiment_id"] = result["experiment_id"]
-                await self._save_commands()
+                changed_instance, refresh_history = await self._apply_command_result(
+                    record, validated_result
+                )
+                if changed_instance:
+                    return {
+                        **validated_result.model_dump(exclude_unset=True),
+                        "state": "unknown",
+                        "result": None,
+                    }
             if (
                 refresh_history
                 and self._cache_pool is not None
-                and self.settings["project_root"] is not None
+                and self.settings.project_root is not None
             ):
                 self._command_history_tasks = {
                     key: task
@@ -1673,7 +1739,53 @@ class DashboardViews:
         self._live_at = 0
         if history_task is not None:
             await asyncio.shield(history_task)
-        return result
+        return validated_result.model_dump(exclude_unset=True)
+
+    async def _apply_command_result(
+        self, record: LocalCommandRecord, result: CommandReceipt
+    ) -> tuple[bool, object]:
+        """Apply a correlated receipt while the caller owns the command lock."""
+        if record.server_instance_id not in (None, result.server_instance_id):
+            self._replace_command_record(
+                record,
+                status="unknown",
+                polling=False,
+                error="System server instance changed.",
+            )
+            await self._save_commands()
+            return True, None
+        experiment_id = (result.model_extra or {}).get("experiment_id")
+        refresh_history = None
+        if record.polling and result.result == "success" and result.state != "pending":
+            refresh_history = experiment_id or record.experiment_id
+        changes: dict[str, object] = {
+            "status": result.state,
+            "result": result,
+            "polling": result.state == "pending",
+        }
+        if experiment_id:
+            changes["experiment_id"] = experiment_id
+        self._replace_command_record(record, **changes)
+        await self._save_commands()
+        return False, refresh_history
+
+    def _replace_command_record(
+        self, record: LocalCommandRecord, **changes: object
+    ) -> LocalCommandRecord:
+        """Replace the current owned version; an evicted in-flight record stays detached."""
+        index = next(
+            (
+                index
+                for index, item in enumerate(self._commands)
+                if item.command_id == record.command_id
+            ),
+            None,
+        )
+        current = record if index is None else self._commands[index]
+        replacement = _update_model(current, **changes)
+        if index is not None:
+            self._commands[index] = replacement
+        return replacement
 
     async def _refresh_command_history(self, identifier: str) -> None:
         """Make command effects visible without putting worker waits in page reads."""
@@ -1685,38 +1797,50 @@ class DashboardViews:
                     await asyncio.shield(asyncio.wrap_future(previous))
                     self._collect_cache_jobs()
                 current = self._cache_pool.submit(
-                    cache_experiment, self.settings, identifier
+                    cache_experiment, self.settings.model_dump(), identifier
                 )
                 self._cache_jobs[identifier] = current
                 await asyncio.shield(asyncio.wrap_future(current))
                 self._collect_cache_jobs()
                 self._registry = await asyncio.to_thread(self.journals.registry)
             except Exception as error:  # noqa: BLE001 - Keep successful command outcomes independent of cache failures.
-                self._cache_errors[identifier] = {
-                    "code": "history_refresh_failed",
-                    "message": str(error),
-                }
+                self._cache_errors[identifier] = CacheWorkerError(code="history_refresh_failed", message=str(error))
             finally:
                 self._command_refreshing.discard(identifier)
 
     async def _poll_commands(self) -> None:
         while True:
             for record in list(self._commands):
-                if not record.get("polling") or self.system.base_url is None:
+                if not record.polling or self.system.base_url is None:
                     continue
                 try:
-                    await self.command_result(record["command_id"])
+                    await self.command_result(record.command_id)
                 except SystemAPIError as error:
                     async with self._command_lock:
-                        record.update(status="unknown", error=str(error))
-                        if error.status_code == 404:
-                            record["polling"] = False
+                        current = next(
+                            (
+                                item
+                                for item in self._commands
+                                if item.command_id == record.command_id
+                            ),
+                            record,
+                        )
+                        self._replace_command_record(
+                            current,
+                            status="unknown",
+                            error=str(error),
+                            polling=False
+                            if error.status_code == 404
+                            else current.polling,
+                        )
                         try:
                             await self._save_commands()
                         except OSError as failure:
-                            record["storage_error"] = str(failure)
+                            self._replace_command_record(
+                                record, storage_error=str(failure)
+                            )
                 except OSError as error:
-                    record["storage_error"] = str(error)
+                    self._replace_command_record(record, storage_error=str(error))
             await asyncio.sleep(1)
 
     async def close(self) -> None:

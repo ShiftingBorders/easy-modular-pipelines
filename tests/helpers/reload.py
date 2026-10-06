@@ -65,4 +65,4 @@ def trace(runner):
 
 
 def candidate(work):
-    return copy.deepcopy(work.runner._state.template)
+    return copy.deepcopy(work.runner._state.template.model_dump(exclude_unset=True))

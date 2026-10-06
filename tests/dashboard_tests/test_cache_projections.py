@@ -1,17 +1,26 @@
 """Approved exactness regressions for partitioned journal projections."""
 
 import copy
+import json
+import sqlite3
+import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from dashboard.api_client import SystemAPIClient
+from core.journal.logger import OperationLogger
+from core.models.dashboard_metadata import CompactTemplate
+from core.models.dashboard_queries import DashboardQuery, PageLimit, ViewQuery
+from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
 from dashboard.projections import (
     cached_experiment_views,
     cached_metrics,
+    compact_event,
+    compact_template,
     experiment_views,
     window_experiment_views,
 )
@@ -29,6 +38,91 @@ from tests.dashboard_tests.integration_helpers import (
 
 
 class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timeline_queries_keep_range_presence_and_paging_scope(self):
+        _, reader, dataset = self.cache(history(((2, 5),)))
+        views = DashboardViews(reader.settings, SystemAPIClient(reader.settings))
+        self.addCleanup(views.journals.close)
+        model = cached_experiment_views(dataset, {})
+        with (
+            patch.object(views, "_model", AsyncMock(return_value=(dataset, model))),
+            patch.object(views, "state", AsyncMock(return_value={})),
+        ):
+            first = await views.experiment(
+                "exp-test", "timeline", DashboardQuery(limit="1")
+            )
+            self.assertGreater(first["total"], 1)
+            self.assertTrue(first["next_cursor"])
+            second = await views.experiment(
+                "exp-test",
+                "timeline",
+                DashboardQuery(limit="1", cursor=json.dumps(first["next_cursor"])),
+            )
+            self.assertEqual(first["total"], second["total"])
+            self.assertNotEqual(first["next_cursor"], second["next_cursor"])
+            for query in ({"since": None}, {"since": "bad"}, {"until": timestamp(1)}):
+                with (
+                    self.subTest(query=query),
+                    self.assertRaises(SystemAPIError) as error,
+                ):
+                    await views.experiment("exp-test", "timeline", query)
+                self.assertEqual(error.exception.code, "invalid_range")
+
+    def test_query_arguments_preserve_native_conversion_and_sparse_defaults(self):
+        for document in (
+            {},
+            {"limit": "1", "compact": "1", "view": "raw", "ref": "{}"},
+            {"view": None, "limit": None, "ref": None, "since": None},
+        ):
+            with self.subTest(document=document):
+                model = DashboardQuery.model_validate(document)
+                bound = ViewQuery.from_query(model)
+                self.assertEqual(bound, ViewQuery.from_query(document))
+                self.assertIs(ViewQuery.from_query(bound), bound)
+                self.assertEqual(
+                    bound.has_range, "since" in document or "until" in document
+                )
+                self.assertEqual(model.model_dump(exclude_unset=True), document)
+        for value, expected in ((1.9, 1), (True, 1), (b"2", 2), ("3", 3)):
+            with self.subTest(value=value):
+                bound = ViewQuery.from_query({"limit": value, "unused": object()})
+                self.assertIs(bound.limit, value)
+                self.assertEqual(PageLimit.model_validate(bound.limit).root, expected)
+
+    def test_compact_template_keeps_sparse_model_fields_until_projection(self):
+        for document in (
+            {},
+            {"name": None, "cycles": None},
+            {
+                "name": ["historical", "name"],
+                "cycles": "unknown",
+                "stages": [{"stage_id": "A", "module": {"name": "module"}, "extra": 1}],
+                "services": [{"service_id": "service", "module": {}, "extra": 2}],
+                "unknown": True,
+            },
+        ):
+            with self.subTest(document=document):
+                template = CompactTemplate.model_validate(document)
+                expected = compact_template(document)
+                self.assertEqual(compact_template(template), expected)
+                event = {
+                    "event_type": "template.applied",
+                    "data": {"template": document, "template_revision_id": "revision"},
+                }
+                with patch.object(
+                    CompactTemplate,
+                    "model_dump",
+                    side_effect=AssertionError("Dumped before projection"),
+                ):
+                    result = compact_event(event)
+                self.assertEqual(result["data"]["template"], expected)
+                self.assertEqual(result["data"]["template_yaml"], "")
+                projected = compact_template(template)
+                if isinstance(projected.get("name"), list):
+                    projected["name"].append("caller change")
+                    self.assertEqual(template.name, document["name"])
+                    projected["stages"][0]["module"]["name"] = "caller change"
+                    self.assertEqual(template.stages[0]["module"], {"name": "module"})
+
     async def test_ram_measurement_cards_do_not_use_only_the_requested_page(self):
         """T043: a complete RAM view preserves metrics beyond the selected page."""
         data = self.measurements()
@@ -107,6 +201,69 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
         reader.max_bytes = 1
         self.assertIsNone(reader.preview("exp-test"))
 
+    async def test_preview_at_500_events_preserves_order_and_source(self):
+        """The complete small-history shortcut stops at the 500-event boundary."""
+        data = history()
+        workspace, reader, _ = self.cache(data)
+        reader.window_events = 1000
+        identifiers = [event["event_id"] for event in data["entries"]]
+        for number in range(500 - len(identifiers)):
+            identifiers.append(
+                workspace.logger.record_event("preview.sample", {"number": number})
+            )
+        database_path = workspace.directory / "journals/events.sqlite"
+        with closing(
+            sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        ) as db:
+            before = tuple(db.iterdump())
+            preview = reader.preview("exp-test")
+            self.assertTrue(preview["complete"])
+            self.assertEqual(preview["window_count"], 500)
+            self.assertEqual(
+                [event["event_id"] for event in preview["entries"]], identifiers
+            )
+            self.assertEqual(
+                [event["cursor"] for event in preview["entries"]],
+                list(range(1, 501)),
+            )
+            self.assertEqual(tuple(db.iterdump()), before)
+            workspace.logger.record_event("preview.limit", {"number": 501})
+            before = tuple(db.iterdump())
+            self.assertIsNone(reader.preview("exp-test"))
+            self.assertEqual(tuple(db.iterdump()), before)
+
+    async def test_byte_limited_batch_cannot_become_a_complete_preview(self):
+        """An event-count fit is insufficient when the reader returns only a tail."""
+        _, reader, _ = self.cache(history())
+        reader.window_events = 500
+        with patch("core.journal.storage._PAGE_BYTES", 1):
+            self.assertIsNone(reader.preview("exp-test"))
+        preview = reader.preview("exp-test")
+        self.assertTrue(preview["complete"])
+        self.assertEqual(len(preview["entries"]), preview["boundary"]["event_count"])
+
+    async def test_append_during_preview_rejects_the_changed_boundary(self):
+        """A completed batch cannot hide an append before the boundary recheck."""
+        workspace, reader, _ = self.cache(history())
+        reader.window_events = 500
+        original = OperationLogger.read_events
+        appended = []
+
+        def read_page(source, *args, **kwargs):
+            result = original(source, *args, **kwargs)
+            if not appended:
+                appended.append(
+                    workspace.logger.record_event("preview.concurrent", {"new": True})
+                )
+            return result
+
+        with patch.object(OperationLogger, "read_events", read_page):
+            self.assertIsNone(reader.preview("exp-test"))
+        self.assertEqual(len(appended), 1)
+        preview = reader.preview("exp-test")
+        self.assertTrue(preview["complete"])
+        self.assertEqual(preview["entries"][-1]["event_id"], appended[0])
+
     async def test_historical_revision_is_not_replaced_by_latest_template(self):
         """T036/T059: each cycle retains the template revision recorded for it."""
         data = self.measurements()
@@ -133,7 +290,7 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
         views = DashboardViews(reader.settings, SystemAPIClient(reader.settings))
         self.addCleanup(views.journals.close)
         model = cached_experiment_views(dataset, {})
-        template = views._cached_template(dataset, model, {"revision": "rev-1"})
+        template = views._cached_template(dataset, model, ViewQuery(revision="rev-1"))
         self.assertEqual(len(template["template"]["stages"]), 2)
 
     async def test_command_observations_from_different_cycles_are_grouped_once(self):
@@ -175,6 +332,10 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
         reader = LocalJournals(settings)
         self.addCleanup(reader.close)
         dataset = reader.load("exp-test", force=True)
+        deadline = time.monotonic() + 30
+        target = dataset["target_boundary"]
+        while not dataset["complete"] and time.monotonic() < deadline:
+            dataset = reader.load("exp-test", force=True, target=target)
         self.assertTrue(dataset["complete"])
         return workspace, reader, dataset
 
@@ -392,7 +553,7 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
                     model,
                     {},
                     "parameters",
-                    {"compact": "1", **({"run_id": run} if run else {})},
+                    ViewQuery(compact="1", run_id=run if run else None),
                 )
                 self.assertEqual(
                     [(row["attempt_id"], row["status"]) for row in page["items"]],

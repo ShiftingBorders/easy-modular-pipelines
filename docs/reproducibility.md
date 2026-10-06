@@ -13,8 +13,9 @@ Module authors are responsible for the conditions their computation requires:
   The runner does not automatically recreate the module's dependency environment.
   Downloads and external services need their own versioning or captured inputs.
 - **Determinism.** Control randomness and other sources of variation, and
-  document remaining nondeterminism, such as GPU operations, timing, or changing
-  API responses. Identical code and settings alone do not ensure identical results.
+  document remaining nondeterminism, such as hardware-dependent operations,
+  timing, or changing API responses. Identical code and settings alone do not
+  ensure identical results.
 - **Portable state and artifacts.** Keep module code immutable, write to the
   supplied runtime directories, and return experiment-relative artifact paths.
   Validate inputs, including missing or changed data after a move or rerun.
@@ -30,4 +31,3 @@ makes the packaged experiment transferable; the recipient still needs the
 environment and external prerequisites documented by its module authors.
 See [module authoring](instructions/modules.md) and
 [service state and restoration](instructions/python_bridges.md#settings-and-state).
-

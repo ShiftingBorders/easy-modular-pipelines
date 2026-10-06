@@ -8,7 +8,9 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
-from dashboard.config import load_settings
+from core.models.dashboard_cache import CacheWorkerResult
+from core.models.dashboard_settings import DashboardRuntimeConfiguration
+from dashboard.config import _load_settings
 from dashboard.journals import (
     LocalJournals,
     cache_experiment,
@@ -16,9 +18,14 @@ from dashboard.journals import (
 )
 
 
-def precache(settings: dict) -> int:
+def precache(settings: dict | DashboardRuntimeConfiguration) -> int:
     """Build a fixed registry snapshot to finite source boundaries, then exit."""
-    if settings["project_root"] is None:
+    settings = (
+        settings
+        if isinstance(settings, DashboardRuntimeConfiguration)
+        else DashboardRuntimeConfiguration.model_validate(settings)
+    )
+    if settings.project_root is None:
         raise ValueError(
             "Precache requires project_root in the configuration or --project-root."
         )
@@ -30,39 +37,64 @@ def precache(settings: dict) -> int:
     pending = deque((identifier, None) for identifier in registry)
     running, progress = {}, {}
     completed, failed = 0, 0
-    workers = settings["cache_workers"]
+    workers = settings.cache_workers
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
         while pending or running:
             while pending and len(running) < workers:
                 identifier, target = pending.popleft()
-                future = pool.submit(cache_experiment, settings, identifier, target)
+                future = pool.submit(
+                    cache_experiment, settings.model_dump(), identifier, target
+                )
                 running[future] = (identifier, target)
             finished, _ = wait(running, return_when=FIRST_COMPLETED)
             for future in finished:
                 identifier, target = running.pop(future)
-                result = future.result()
-                error = result.get("error")
-                if error and error["code"] == "cache_busy":
+                outcome = CacheWorkerResult.model_validate(future.result())
+                if outcome.experiment_id != identifier:
+                    raise ValueError(
+                        "Cache worker result belongs to another experiment."
+                    )
+                error = outcome.error
+                if error and error.code == "cache_busy":
                     pending.append((identifier, target))
                     time.sleep(0.1)
                     continue
                 if error:
                     failed += 1
-                    print(json.dumps(result, ensure_ascii=False), flush=True)
+                    print(
+                        json.dumps(
+                            outcome.model_dump(exclude_unset=True), ensure_ascii=False
+                        ),
+                        flush=True,
+                    )
                     continue
-                marker = (result["cached_through"], result["complete"])
+                marker = (outcome.cached_through, outcome.complete)
                 if progress.get(identifier) != marker:
-                    print(json.dumps(result, ensure_ascii=False), flush=True)
+                    print(
+                        json.dumps(
+                            outcome.model_dump(exclude_unset=True), ensure_ascii=False
+                        ),
+                        flush=True,
+                    )
                     progress[identifier] = marker
-                if result["complete"]:
+                if outcome.complete:
                     completed += 1
                 else:
-                    pending.append((identifier, result["target_boundary"]))
+                    pending.append(
+                        (
+                            identifier,
+                            None
+                            if outcome.target_boundary is None
+                            else outcome.target_boundary.model_dump(exclude_unset=True),
+                        )
+                    )
         # Finish a project-wide publication even if concurrent per-experiment
         # workers found its writer lock busy on their last batch.
-        while not pool.submit(publish_module_statistics, settings).result():
+        while not pool.submit(
+            publish_module_statistics, settings.model_dump()
+        ).result():
             time.sleep(0.1)
     print(
         json.dumps({"mode": "precache", "completed": completed, "failed": failed}),
@@ -110,7 +142,7 @@ def main() -> None:
         overrides["cache_workers"] = arguments.cache_workers
     if arguments.mode == "precache":
         try:
-            settings = load_settings(arguments.config.resolve(), overrides)
+            settings = _load_settings(arguments.config.resolve(), overrides)
             result = precache(settings)
         except KeyboardInterrupt:
             parser.exit(
@@ -131,8 +163,8 @@ def main() -> None:
         parser.error("--port must be between 1 and 65535")
     uvicorn.run(
         app,
-        host=arguments.host or settings["host"],
-        port=arguments.port or settings["port"],
+        host=arguments.host or settings.host,
+        port=arguments.port or settings.port,
         workers=1,
         access_log=False,
     )

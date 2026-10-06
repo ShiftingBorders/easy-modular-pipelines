@@ -2,12 +2,16 @@
 
 import asyncio
 import json
+import os
 import unittest
 from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from core.models.dashboard_cache import CacheWorkerError, CacheWorkerResult
+from core.models.dashboard_metadata import SchedulingMetadata, SchedulingState
+from core.models.journal_cache import JournalBoundary
 from dashboard.api_client import SystemAPIClient
 from dashboard.config import load_settings
 from dashboard.journals import cache_experiment
@@ -21,6 +25,70 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace, history
 
 
 class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduling_retains_sparse_metadata_and_public_errors(self):
+        recorded = self.views._registry_states["running"]
+        self.assertIsInstance(recorded, SchedulingState)
+        self.assertIsInstance(recorded.metadata, SchedulingMetadata)
+        self.assertEqual(
+            recorded.document(),
+            self.views.journals.scheduling_states(self.views._registry)["running"],
+        )
+        path = self.workspaces[0].directory / "runner/state.json"
+        path.write_text(
+            json.dumps({"phase": "waiting", "template": {}}), encoding="utf-8"
+        )
+        await self.views._refresh_cache_selection()
+        self.assertIn("running", self.views._automatic_caches)
+        self.assertEqual(
+            self.views._registry_states["running"].document(),
+            {"phase": "waiting", "mode": None, "name": "running"},
+        )
+        path.write_text("{invalid", encoding="utf-8")
+        await self.views._refresh_cache_selection()
+        failed = self.views._registry_states["running"]
+        self.assertIsNone(failed.metadata)
+        self.assertEqual(failed.phase, "unknown")
+        self.assertNotIn("running", self.views._automatic_caches)
+        self.assertEqual(set(failed.document()), {"phase", "error"})
+        self.assertEqual(
+            failed.document(),
+            self.views.journals.scheduling_states(self.views._registry)["running"],
+        )
+
+    async def test_worker_progress_and_failures_remain_models_until_submission(self):
+        await self.views.experiment("stopped", "summary", {})
+        identity = self.workspaces[2].identity
+        target = {
+            **identity,
+            "schema_version": 2,
+            "event_count": 10,
+            "cursor": 10,
+            "change_cursor": 10,
+        }
+        self.views._cache_jobs["stopped"].set_result(
+            {
+                "experiment_id": "stopped",
+                "pid": os.getpid(),
+                "complete": False,
+                "cached_through": {**identity, "cursor": 1, "change_cursor": 1},
+                "target_boundary": target,
+            }
+        )
+        self.views._collect_cache_jobs()
+        progress = self.views._cache_progress["stopped"]
+        self.assertIsInstance(progress, CacheWorkerResult)
+        self.assertIsInstance(self.views._cache_targets["stopped"], JournalBoundary)
+        self.assertIs(self.views._cache_targets["stopped"], progress.target_boundary)
+        await self.views._submit_cache("stopped")
+        self.assertEqual(self.pool.submit.call_args.args[-1], target)
+        self.views._cache_jobs["stopped"].set_exception(OSError("worker failed"))
+        self.views._collect_cache_jobs()
+        self.assertIsInstance(self.views._cache_errors["stopped"], CacheWorkerError)
+        self.assertEqual(
+            self.views._cache_errors["stopped"].code, "cache_worker_failed"
+        )
+        self.assertNotIn("stopped", self.views._cache_targets)
+
     async def test_broken_pool_is_replaced_without_losing_captured_target(self):
         """T049/T050: pool recovery retries the saved target in a replacement pool."""
         target = {"cursor": 50, "change_cursor": 50}
@@ -36,7 +104,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.views._cache_targets["stopped"], target)
         await self.views._submit_cache("stopped")
         replacement.submit.assert_called_once_with(
-            cache_experiment, self.settings, "stopped", target
+            cache_experiment, self.views.settings.model_dump(), "stopped", target
         )
 
     async def asyncSetUp(self):
@@ -74,7 +142,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_running_and_paused_are_automatic(self):
         """T052/T053: metadata classification never opens a stopped journal."""
         with patch(
-            "core.logger.OperationLogger.open",
+            "core.journal.logger.OperationLogger.open",
             side_effect=AssertionError("Unexpected source read"),
         ):
             await self.views._refresh_cache_selection()
@@ -92,7 +160,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["cache_pending"])
         self.assertEqual(self.views._opened_caches, {"stopped"})
         self.pool.submit.assert_called_once_with(
-            cache_experiment, self.settings, "stopped", None
+            cache_experiment, self.views.settings.model_dump(), "stopped", None
         )
         await self.views.experiment("stopped", "artifacts", {"compact": "1"})
         self.assertEqual(self.pool.submit.call_count, 1)
@@ -113,11 +181,17 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         """T024/T052: completion ends an explicit stopped build."""
         await self.views.experiment("stopped", "summary", {})
         future = self.views._cache_jobs["stopped"]
+        identity = self.workspaces[2].identity
         future.set_result(
             {
+                "experiment_id": "stopped",
+                "pid": os.getpid(),
                 "complete": True,
-                "target_boundary": {"cursor": 1, "change_cursor": 1},
-                "cached_through": {"cursor": 1, "change_cursor": 1},
+                "target_boundary": {
+                    **identity, "schema_version": 2, "event_count": 1,
+                    "cursor": 1, "change_cursor": 1,
+                },
+                "cached_through": {**identity, "cursor": 1, "change_cursor": 1},
             }
         )
         self.views._collect_cache_jobs()
@@ -144,12 +218,18 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         """T056/T087: slow initial construction remains explicitly visible."""
         await self.views.experiment("stopped", "summary", {})
         future = self.views._cache_jobs["stopped"]
-        target = {"event_count": 10000, "cursor": 10000, "change_cursor": 10000}
+        identity = self.workspaces[2].identity
+        target = {
+            **identity, "schema_version": 2,
+            "event_count": 10000, "cursor": 10000, "change_cursor": 10000,
+        }
         future.set_result(
             {
+                "experiment_id": "stopped",
+                "pid": os.getpid(),
                 "complete": False,
                 "target_boundary": target,
-                "cached_through": {"cursor": 100, "change_cursor": 100},
+                "cached_through": {**identity, "cursor": 100, "change_cursor": 100},
             }
         )
         self.views._collect_cache_jobs()
@@ -159,7 +239,10 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(active["initial"])
         self.assertEqual(active["event_count"], 10000)
         self.views._cache_jobs["stopped"].set_result(
-            {"error": {"code": "journal_unavailable", "message": "Unavailable"}}
+            {
+                "experiment_id": "stopped", "pid": os.getpid(), "complete": False,
+                "error": {"code": "journal_unavailable", "message": "Unavailable"},
+            }
         )
         self.views._collect_cache_jobs()
         self.assertFalse(self.views.cache_activity()["building"])

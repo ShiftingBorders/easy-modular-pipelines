@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from core.runner_utils.runtimeio import write_json
+from core.primitives.json_files import write_json
 
 
 def main():
@@ -63,9 +63,9 @@ def main():
 
     with (
         patch.object(Path, "unlink", unlink),
-        patch("core.runner_utils.runtimeio.write_json", publish),
+        patch("core.primitives.json_files.write_json", publish),
     ):
-        runpy.run_module("core.runner_utils.executor", run_name="__main__")
+        runpy.run_module("core.participants.executor", run_name="__main__")
 
 
 if __name__ == "__main__":

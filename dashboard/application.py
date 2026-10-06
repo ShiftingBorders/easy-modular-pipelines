@@ -8,45 +8,29 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
+from core.models.dashboard_queries import DashboardQuery
 from dashboard.alerts import AlertMonitor
 from dashboard.api_client import SystemAPIClient, SystemAPIError
-from dashboard.config import load_settings
+from dashboard.config import _load_settings
 from dashboard.icmp import ICMPMonitor
 from dashboard.notifications import deliver
 from dashboard.views import DashboardViews
 
 
 def query_parameters(request: Request) -> dict:
-    allowed = {
-        "run_id",
-        "view",
-        "cursor",
-        "limit",
-        "q",
-        "module",
-        "metric",
-        "since",
-        "until",
-        "revision",
-        "ref",
-        "compact",
-    }
-    if request.query_params.keys() - allowed:
-        raise HTTPException(400, "Unknown query parameter.")
-    result = dict(request.query_params)
-    for value in result.values():
-        if len(value) > 4096:
-            raise HTTPException(400, "Query parameter is too long.")
-    if "limit" in result:
-        try:
-            limit = int(result["limit"])
-        except ValueError as error:
-            raise HTTPException(400, "limit must be an integer.") from error
-        if not 1 <= limit <= 1000:
-            raise HTTPException(400, "limit must be between 1 and 1000.")
-    return result
+    return _query_parameters(request).model_dump(exclude_unset=True)
+
+
+def _query_parameters(request: Request) -> DashboardQuery:
+    try:
+        return DashboardQuery.model_validate(dict(request.query_params))
+    except ValidationError as error:
+        context = error.errors()[0].get("ctx", {})
+        message = str(context.get("error", error))
+        raise HTTPException(400, message) from error
 
 
 def check_write_origin(request: Request) -> None:
@@ -62,14 +46,14 @@ def check_write_origin(request: Request) -> None:
 def create_app(
     config_path: str | Path | None = None, *, overrides: dict | None = None
 ) -> FastAPI:
-    settings = load_settings(
+    settings = _load_settings(
         Path(config_path) if config_path else Path(__file__).with_name("settings.json"),
         overrides,
     )
     system = SystemAPIClient(settings)
-    monitor = ICMPMonitor(settings["state_directory"])
+    monitor = ICMPMonitor(settings.state_directory)
     views = DashboardViews(settings, system)
-    alerts = AlertMonitor(settings["state_directory"], views, monitor)
+    alerts = AlertMonitor(settings.state_directory, views, monitor)
 
     async def lifespan(application: FastAPI):
         await system.open()
@@ -101,10 +85,10 @@ def create_app(
         return {
             "application": "EMP Dashboard",
             "system_api_configured": system.base_url is not None,
-            "refresh_seconds": settings["refresh_seconds"],
+            "refresh_seconds": settings.refresh_seconds,
             "icmp_source": "dashboard_host",
             "dashboard_host": monitor.host_name,
-            "journals_configured": settings["project_root"] is not None,
+            "journals_configured": settings.project_root is not None,
             "data_mode": "local_journals_and_system_api",
             "cache_activity": views.cache_activity(),
             "system_connection": {
@@ -129,7 +113,7 @@ def create_app(
         }
         if resource not in paths:
             raise HTTPException(404, "Unknown resource.")
-        params = query_parameters(request)
+        params = _query_parameters(request)
         if resource == "alerts":
             return alerts.status(system_only=True)
         result = await views.read(resource, params)
@@ -144,9 +128,9 @@ def create_app(
         )
         if metrics is not None:
             for rule in alerts.rules:
-                if not rule["enabled"] or rule["kind"] != "resource":
+                if not rule.enabled or rule.kind != "resource":
                     continue
-                key = rule["metric"]
+                key = rule.metric
                 metric = metrics.get(
                     "disk"
                     if key == "disk_free_gib"
@@ -163,9 +147,9 @@ def create_app(
                     value = metric.get(key.removeprefix("internet_") + "_mbps")
                 if value is not None and metric.get("fresh"):
                     metric["exceeded"] = metric.get("exceeded", False) or (
-                        value > rule["threshold"]
-                        if rule["operator"] == "above"
-                        else value < rule["threshold"]
+                        value > rule.threshold
+                        if rule.operator == "above"
+                        else value < rule.threshold
                     )
         return result
 
@@ -197,12 +181,12 @@ def create_app(
         ):
             raise HTTPException(400, "Invalid experiment identifier.")
         result = await views.experiment(
-            experiment_id, view, query_parameters(request), defer_cache=True
+            experiment_id, view, _query_parameters(request), defer_cache=True
         )
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
-        if len(encoded) > settings["max_response_bytes"]:
+        if len(encoded) > app.state.settings.max_response_bytes:
             raise SystemAPIError(
                 "response_too_large",
                 "This response exceeds max_response_bytes; request a smaller page.",

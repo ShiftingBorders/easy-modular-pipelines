@@ -6,9 +6,9 @@ import random
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.runner_utils.participant_server import ParticipantServer
-from core.runner_utils.runtimeio import read_json, write_json
+from core.journal.logger import OperationLogger
+from core.participants.server import ParticipantServer
+from core.primitives.json_files import read_json, write_json
 
 
 class WeatherService:
@@ -39,7 +39,10 @@ class WeatherService:
 
     async def tick(self):
         while True:
-            await asyncio.sleep(30)
+            deadline = time.monotonic() + 30
+            # Asyncio timers can wake up one clock-resolution step early.
+            while (remaining := deadline - time.monotonic()) > 0:
+                await asyncio.sleep(remaining)
             if not self.frozen:
                 self.generate()
 

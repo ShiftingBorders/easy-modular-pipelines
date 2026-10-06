@@ -11,15 +11,16 @@ from uuid import uuid4
 
 import yaml
 
-from core.experimentassembler import ExperimentAssembler
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.journal import RunnerJournal
-from core.runner_utils.launch import ModuleLauncher
-from core.runner_utils.runtimeio import read_json, write_json
-from core.runner_utils.services import ServiceManager
-from core.runner_utils.state import RunnerState, RunnerStateStore
-from core.seaweed import SeaweedDB
+from core.experiments.assembler import ExperimentAssembler
+from core.experiments.journal import RunnerJournal
+from core.experiments.launch import ModuleLauncher
+from core.experiments.services import ServiceManager
+from core.experiments.state import RunnerState, RunnerStateStore
+from core.models.updates import _update_model
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 
 TEMP_ROOT = REPOSITORY / ".artifacts/tmp/service-tests"
@@ -64,7 +65,23 @@ class ServiceWorkspace:
             "keep_attempts": 1,
             "start_timeout": 30,
             "runner_timeout_margin_seconds": 2,
-            "stages": [],
+            "stages": [
+                {
+                    "stage_id": str(uuid4()),
+                    "module": {
+                        "name": "fixture-stage",
+                        "version": "1",
+                        "hash": "0" * 64,
+                    },
+                    "settings": {},
+                    "timeout_seconds": None,
+                    "errors": {
+                        "retries": 0,
+                        "retry_delay_seconds": 0,
+                        "on_exhausted": "stop",
+                    },
+                }
+            ],
             "services": [],
             "resources": [],
             "unknown_state": {
@@ -153,8 +170,13 @@ class ServiceWorkspace:
                 "on_exhausted": "pause",
             },
         )
-        self.state.template["services"].append(definition)
-        self.state.template_yaml = yaml.safe_dump(self.state.template, sort_keys=False)
+        self.template["services"].append(definition)
+        self.state.template = _update_model(
+            self.state.template, services=self.template["services"]
+        )
+        self.state.template_yaml = yaml.safe_dump(
+            self.state.template.model_dump(exclude_unset=True), sort_keys=False
+        )
         self.state.template_path.write_text(self.state.template_yaml, encoding="utf-8")
         self.store.save(self.state)
         return definition
@@ -180,6 +202,12 @@ class ServiceWorkspace:
             for row in rows
             if kind is None or row["event"]["event_type"] == kind
         ]
+
+    def publish_service_definitions(self):
+        """Apply caller-edited fixture documents before starting their runtime owners."""
+        self.state.template = _update_model(
+            self.state.template, services=self.template["services"]
+        )
 
     def replacement_manager(self):
         manager = ServiceManager(self.launcher, self.journal, self.store)

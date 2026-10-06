@@ -81,20 +81,20 @@ def main() -> None:
                 sqlite3, "connect", side_effect=AssertionError("Unexpected DB I/O")
             ),
         ):
-            from core.logger import OperationLogger
-            from core.logger_utils.storage import SQLiteEventStore
+            from core.journal.logger import OperationLogger
+            from core.journal.storage import SQLiteEventStore
 
             OperationLogger(config)
             SQLiteEventStore(config.parent / "unopened.db", **STORE_OPTIONS)
-            from core.logger_utils.filtered import FilteredJournal
+            from core.journal.filtered import FilteredJournal
 
             FilteredJournal(config, config.parent / "view.db")
         announce({"imported": True})
         return
 
-    from core.logger import OperationLogger
-    from core.logger_utils.events import LoggingStateError
-    from core.logger_utils.storage import SQLiteEventStore
+    from core.journal.events import LoggingStateError
+    from core.journal.logger import OperationLogger
+    from core.journal.storage import SQLiteEventStore
 
     if mode in ("restore_before_commit", "restore_after_commit"):
         manifest = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
@@ -132,7 +132,7 @@ def main() -> None:
         return
 
     if mode in ("view_reader", "view_crash"):
-        from core.logger_utils.filtered import FilteredJournal
+        from core.journal.filtered import FilteredJournal
 
         view = FilteredJournal(config, Path(arguments[0]))
         view.open()
@@ -167,7 +167,7 @@ def main() -> None:
 
     with OperationLogger(config) as logger:
         if mode == "fork":
-            from core.logger_utils.filtered import FilteredJournal
+            from core.journal.filtered import FilteredJournal
 
             view = FilteredJournal(config, config.parent / "unopened-fork-view.db")
             child = os.fork()

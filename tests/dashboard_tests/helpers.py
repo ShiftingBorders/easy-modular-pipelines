@@ -1,17 +1,108 @@
 """Small fixtures for HTTP responses, probe output and isolated runtime files."""
 
 import asyncio
+import errno
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 import httpx
+import psutil
+
+from core.primitives.processes import process_identity, process_running
+from tests.helpers.dag import terminate_owned
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DASHBOARD = PROJECT_ROOT / "dashboard"
 FIXTURES = Path(__file__).with_name("fixtures")
+
+
+def close_browser(identity: dict, profile: Path) -> None:
+    """Close the isolated browser, then wait for its verified process tree."""
+    owned = [identity]
+    try:
+        if (
+            process_running(identity["pid"])
+            and process_identity(identity["pid"]) == identity
+        ):
+            parent = psutil.Process(identity["pid"])
+            children = parent.children(recursive=True)
+            # Enumeration must not adopt a replacement process with a reused PID.
+            if process_identity(parent.pid) != identity:
+                return
+            for child in children:
+                try:
+                    child_identity = process_identity(child.pid)
+                    if child.is_running() and parent in child.parents():
+                        owned.append(child_identity)
+                except psutil.NoSuchProcess:
+                    continue
+                except OSError as error:
+                    if error.errno not in (errno.ENOENT, errno.ESRCH) and getattr(
+                        error, "winerror", None
+                    ) not in (87, 1168):
+                        raise
+            try:
+                port, browser_path = (
+                    (profile / "DevToolsActivePort")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+                if (
+                    port.isdigit()
+                    and 0 < int(port) < 65536
+                    and browser_path.startswith("/devtools/browser/")
+                ):
+                    subprocess.run(
+                        [
+                            shutil.which("node"),
+                            str(FIXTURES / "browser_check.mjs"),
+                            port,
+                            "--close",
+                            browser_path,
+                        ],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass  # Incomplete startup still requires verified process cleanup.
+    except (psutil.NoSuchProcess, FileNotFoundError):
+        pass
+    except OSError as error:
+        if getattr(error, "winerror", None) not in (87, 1168):
+            raise
+
+    for force in (False, True):
+        deadline = time.monotonic() + 5
+        while owned:
+            remaining = []
+            for item in owned:
+                try:
+                    if (
+                        process_running(item["pid"])
+                        and process_identity(item["pid"]) == item
+                    ):
+                        if force:
+                            terminate_owned(item)
+                        remaining.append(item)
+                except OSError as error:
+                    if error.errno not in (errno.ENOENT, errno.ESRCH) and getattr(
+                        error, "winerror", None
+                    ) not in (87, 1168):
+                        raise
+            owned = remaining
+            if not owned or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if not owned:
+            return
+    raise RuntimeError(f"Test browser processes did not exit: {owned}")
 
 
 def temporary_directory() -> tempfile.TemporaryDirectory:

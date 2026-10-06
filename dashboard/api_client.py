@@ -6,6 +6,9 @@ import os
 
 import httpx
 
+from core.models.dashboard_settings import DashboardConnectionConfiguration
+from core.models.dashboard_upstream import UpstreamFailure
+
 
 class SystemAPIError(Exception):
     def __init__(self, code: str, message: str, status_code: int = 503) -> None:
@@ -15,12 +18,44 @@ class SystemAPIError(Exception):
         self.upstream_code: str | None = None
 
 
+def _response_error(status_code: int, payload: bytes | bytearray) -> SystemAPIError:
+    unavailable = status_code in {404, 501}
+    message = (
+        "This system API resource is unavailable."
+        if unavailable
+        else f"System API returned HTTP {status_code}."
+    )
+    upstream_code = None
+    try:
+        failure = UpstreamFailure.model_validate(json.loads(payload))
+        if failure.error is not None:
+            if failure.error.message is not None:
+                message = failure.error.message
+            upstream_code = failure.error.code
+    except (TypeError, ValueError, UnicodeError):
+        pass
+    status = status_code if unavailable or status_code in {401, 403, 409} else 502
+    error = SystemAPIError(
+        "unavailable" if unavailable else "upstream_error", message, status
+    )
+    error.upstream_code = upstream_code
+    return error
+
+
 class SystemAPIClient:
-    def __init__(self, settings: dict) -> None:
-        self.base_url = settings["system_api_url"]
-        self.timeout = settings["request_timeout_seconds"]
-        self.max_bytes = settings["max_response_bytes"]
-        self.token_env = settings.get("system_api_token_env")
+    def __init__(self, settings: dict | DashboardConnectionConfiguration) -> None:
+        validated = (
+            settings
+            if isinstance(settings, DashboardConnectionConfiguration)
+            else DashboardConnectionConfiguration.model_validate(settings)
+        )
+        self._configure(validated)
+
+    def _configure(self, settings: DashboardConnectionConfiguration) -> None:
+        self.base_url = settings.system_api_url
+        self.timeout = settings.request_timeout_seconds
+        self.max_bytes = settings.max_response_bytes
+        self.token_env = settings.system_api_token_env
         self._client: httpx.AsyncClient | None = None
 
     async def open(self) -> None:
@@ -77,39 +112,7 @@ class SystemAPIClient:
                             )
                         payload.extend(chunk)
                     if response.status_code not in {200, 202}:
-                        unavailable = response.status_code in {404, 501}
-                        message = (
-                            "This system API resource is unavailable."
-                            if unavailable
-                            else f"System API returned HTTP {response.status_code}."
-                        )
-                        upstream_code = None
-                        try:
-                            failure = json.loads(payload)
-                            detail = (
-                                failure.get("error")
-                                if isinstance(failure, dict)
-                                else None
-                            )
-                            if isinstance(detail, dict):
-                                if isinstance(detail.get("message"), str):
-                                    message = detail["message"]
-                                if isinstance(detail.get("code"), str):
-                                    upstream_code = detail["code"]
-                        except (ValueError, UnicodeError):
-                            pass
-                        status = (
-                            response.status_code
-                            if unavailable or response.status_code in {401, 403, 409}
-                            else 502
-                        )
-                        error = SystemAPIError(
-                            "unavailable" if unavailable else "upstream_error",
-                            message,
-                            status,
-                        )
-                        error.upstream_code = upstream_code
-                        raise error
+                        raise _response_error(response.status_code, payload)
             document = json.loads(payload)
             if not isinstance(document, dict):
                 raise TypeError("Expected an object.")

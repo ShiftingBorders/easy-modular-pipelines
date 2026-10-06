@@ -51,7 +51,7 @@ def verify_sha256(path: Path, expected: str) -> None:
 
 def install_binary(target_platform: str) -> None:
     build = BUILDS[target_platform]
-    destination = REPOSITORY_ROOT / "core" / "seaweedfs" / build["executable"]
+    destination = REPOSITORY_ROOT / "core" / "storage" / "seaweedfs" / build["executable"]
     if destination.exists():
         verify_sha256(destination, build["executable_sha256"])
         if target_platform == "linux":

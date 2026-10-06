@@ -11,7 +11,7 @@ Use that configuration instead of creating another journal.
 ```python
 from pathlib import Path
 
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 
 # context is the runner-provided module context.
 with OperationLogger(Path(context["logging_config_path"])) as logger:
@@ -81,7 +81,7 @@ Start with CLI `logs` / `logs --follow` or dashboard Events and Errors.
 For library readers, use an existing runner-provided logging configuration:
 
 ```python
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 
 with OperationLogger(existing_config_path, read_only=True) as logger:
     page = logger.read_events(limit=100, view="effective")

@@ -6,12 +6,13 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import process_identity, write_json
-from core.runner_utils.stages import StageRunner
-from core.seaweed import SeaweedDB
+from core.experiments.runner import ExperimentRunner
+from core.experiments.stages import StageRunner
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import write_json
+from core.primitives.processes import process_identity
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 
 
 async def run_owner(options) -> None:
@@ -40,7 +41,7 @@ async def run_owner(options) -> None:
         if (
             options.boundary == "accepted"
             and attempt.stage_id == options.condition
-            and result["result"] == "success"
+            and result.result == "success"
         ):
             crash()
         return result
@@ -51,7 +52,7 @@ async def run_owner(options) -> None:
         if (
             options.boundary == "transition"
             and transfer is not None
-            and transfer["source_stage_id"] == options.condition
+            and transfer.source_stage_id == options.condition
         ):
             crash()
 

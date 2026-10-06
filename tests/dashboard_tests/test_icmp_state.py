@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from core.models.dashboard_icmp import ICMPSettings
 from dashboard.icmp import ICMPMonitor
 from tests.dashboard_tests.helpers import (
     ProbeProcess,
@@ -30,7 +31,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(signal_patch.stop)
         self.addAsyncCleanup(self.monitor.close)
         self.initial = {
-            "settings": dict(self.monitor.settings),
+            "settings": self.monitor.settings.model_dump(),
             "history": [],
             "incidents": [],
         }
@@ -43,7 +44,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         replacement = ICMPMonitor(self.directory)
         await replacement.open()
         try:
-            self.assertEqual(replacement.settings, expected)
+            self.assertEqual(replacement.settings.model_dump(), expected)
             self.assertFalse(replacement.snapshot()["fresh"])
         finally:
             await replacement.close()
@@ -51,7 +52,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_previous_observations_and_active_incident_survive_restart_but_are_stale(
         self,
     ) -> None:
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         with patch(
             "dashboard.icmp.asyncio.create_subprocess_exec",
             new=AsyncMock(
@@ -69,7 +70,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await replacement.open()
             try:
-                self.assertEqual(replacement.incidents[0]["status"], "active")
+                self.assertEqual(replacement.incidents[0].status, "active")
                 self.assertFalse(replacement.snapshot()["fresh"])
                 self.assertEqual(replacement.snapshot()["status"], "waiting")
             finally:
@@ -166,7 +167,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.monitor.configure(icmp_settings(enabled=False))
         self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
-        self.assertEqual(self.monitor.settings, self.initial["settings"])
+        self.assertEqual(self.monitor.settings.model_dump(), self.initial["settings"])
 
     async def test_partial_write_failure_preserves_old_file_and_removes_temporary(
         self,
@@ -182,7 +183,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
             await self.monitor.configure(icmp_settings(enabled=False))
         self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
         self.assertEqual(list(self.directory.glob(".icmp-*.json")), [])
-        self.assertEqual(self.monitor.settings, self.initial["settings"])
+        self.assertEqual(self.monitor.settings.model_dump(), self.initial["settings"])
 
     async def test_flush_failure_preserves_old_configuration(self) -> None:
         with (
@@ -203,7 +204,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.monitor.configure(icmp_settings(enabled=False))
         self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
-        self.assertEqual(self.monitor.settings, self.initial["settings"])
+        self.assertEqual(self.monitor.settings.model_dump(), self.initial["settings"])
         self.assertEqual(list(self.directory.glob(".icmp-*.json")), [])
 
     async def test_shutdown_waits_for_pending_state_write_before_releasing_lock(
@@ -226,7 +227,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
                 finished.set()
 
         await self.monitor.open()
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         with (
             patch.object(self.monitor, "_write", side_effect=blocked_write),
             patch(

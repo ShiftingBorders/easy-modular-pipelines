@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from core.models.dashboard_icmp import ICMPIncident, ICMPObservation, ICMPSettings
+from core.models.updates import _update_model
 from dashboard.icmp import ICMPMonitor, validate_icmp_settings
 from tests.dashboard_tests.helpers import (
     ProbeProcess,
@@ -86,13 +88,31 @@ class ICMPSettingsTests(unittest.TestCase):
 
 
 class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observations_and_incidents_remain_models_until_json_output(self):
+        await self.measure("no_reply")
+        self.assertIsInstance(self.monitor.settings, ICMPSettings)
+        self.assertIsInstance(self.monitor.history[-1], ICMPObservation)
+        incident = self.monitor.incidents[0]
+        self.assertIsInstance(incident, ICMPIncident)
+        before = self.monitor.snapshot()
+        emitted = self.monitor.snapshot()
+        emitted["latest"]["host"] = "external"
+        emitted["incidents"][0]["status"] = "resolved"
+        self.assertEqual(self.monitor.snapshot(), before)
+        await self.monitor.configure(icmp_settings(timeout_seconds=2))
+        self.assertEqual(incident.status, "active")
+        self.assertEqual(self.monitor.incidents[0].status, "closed")
+        stored = json.loads((self.directory / "icmp.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["settings"], self.monitor.settings.model_dump())
+        self.assertEqual(stored["incidents"], self.monitor.snapshot()["incidents"])
+
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
         # Exercise explicit probe calls independently of the periodic scheduler.
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         if os.name != "nt":
             self.signal_patch = patch("dashboard.icmp.os.killpg")
             self.killpg = self.signal_patch.start()
@@ -170,29 +190,27 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incident_opens_once_and_only_reply_resolves_it(self) -> None:
         await self.measure("no_reply")
-        incident_id = self.monitor.incidents[0]["id"]
+        incident_id = self.monitor.incidents[0].id
         await self.measure("no_reply")
         await self.measure("error")
         self.assertEqual(len(self.monitor.incidents), 1)
-        self.assertEqual(self.monitor.incidents[0]["status"], "active")
-        self.assertIsNone(self.monitor.history[-1]["rtt_ms"])
+        self.assertEqual(self.monitor.incidents[0].status, "active")
+        self.assertIsNone(self.monitor.history[-1].rtt_ms)
         await self.measure("reply")
         incident = self.monitor.incidents[0]
-        self.assertEqual(incident["id"], incident_id)
-        self.assertEqual(incident["status"], "resolved")
-        self.assertEqual(incident["resolution"], "echo_reply")
-        self.assertIsNotNone(incident["ended_at"])
+        self.assertEqual(incident.id, incident_id)
+        self.assertEqual(incident.status, "resolved")
+        self.assertEqual(incident.resolution, "echo_reply")
+        self.assertIsNotNone(incident.ended_at)
 
     async def test_configuration_change_closes_incident_without_fake_reply(
         self,
     ) -> None:
         await self.measure("no_reply")
         await self.monitor.configure(icmp_settings(timeout_seconds=2))
-        self.assertEqual(self.monitor.incidents[0]["status"], "closed")
-        self.assertEqual(
-            self.monitor.incidents[0]["resolution"], "configuration_changed"
-        )
-        self.assertEqual(self.monitor.history[-1]["status"], "no_reply")
+        self.assertEqual(self.monitor.incidents[0].status, "closed")
+        self.assertEqual(self.monitor.incidents[0].resolution, "configuration_changed")
+        self.assertEqual(self.monitor.history[-1].status, "no_reply")
         self.assertFalse(self.monitor.snapshot()["fresh"])
 
     async def test_late_response_from_old_configuration_is_discarded(self) -> None:
@@ -221,15 +239,13 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"observed_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
             {"observed_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
         ]:
-            original = dict(latest)
-            latest.update(changes)
+            self.monitor.history[-1] = _update_model(latest, **changes)
             self.assertFalse(self.monitor.snapshot()["fresh"])
             self.assertEqual(self.monitor.snapshot()["status"], "waiting")
-            latest.clear()
-            latest.update(original)
+            self.monitor.history[-1] = latest
 
     async def test_disabled_monitor_does_not_spawn_process(self) -> None:
-        self.monitor.settings["enabled"] = False
+        self.monitor.settings = _update_model(self.monitor.settings, enabled=False)
         with (
             patch("dashboard.icmp.asyncio.create_subprocess_exec") as spawn,
             self.assertRaises(ValueError),
@@ -300,15 +316,25 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_and_incidents_are_bounded(self) -> None:
         await self.measure()
         original = self.monitor.history[0]
-        self.monitor.history = [{**original, "marker": index} for index in range(720)]
+        self.monitor.history = [
+            _update_model(original, marker=index) for index in range(720)
+        ]
         now = datetime.now(UTC).isoformat()
         self.monitor.incidents = [
-            {"id": str(index), "status": "closed", "started_at": now}
+            ICMPIncident.model_validate(
+                {
+                    "id": str(index),
+                    "host": "www.google.com",
+                    "probe_host": self.monitor.host_name,
+                    "status": "closed",
+                    "started_at": now,
+                }
+            )
             for index in range(200)
         ]
         result = await self.measure("no_reply")
         self.assertEqual(len(self.monitor.history), 720)
-        self.assertEqual(self.monitor.history[0]["marker"], 1)
+        self.assertEqual(self.monitor.history[0].model_extra["marker"], 1)
         self.assertEqual(len(result["history"]), 200)
         self.assertEqual(len(self.monitor.incidents), 200)
-        self.assertEqual(self.monitor.incidents[-1]["status"], "active")
+        self.assertEqual(self.monitor.incidents[-1].status, "active")

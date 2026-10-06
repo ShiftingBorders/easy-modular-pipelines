@@ -1,0 +1,673 @@
+"""Explicitly scheduled, rebuildable projection of one local operation journal."""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+import threading
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+from core.journal.diagnostics import _close_preserving_failure
+from core.journal.events import (
+    JournalGenerationChanged,
+    LoggingStateError,
+    LoggingStorageError,
+    encode_event,
+)
+from core.journal.logger import OperationLogger
+from core.journal.records import _read_boundary
+from core.journal.settings import _load_logging_settings
+from core.journal.view_schema import (
+    _APPLICATION_ID,
+    _CREATE_EVENTS,
+    _CREATE_INFO,
+    _validate_view_schema,
+)
+from core.primitives.json_values import JsonObject
+
+_PAGE_BYTES = 16777216
+
+if TYPE_CHECKING:
+    from core.models.journal_cache import FilteredCheckpoint, FilteredPublication
+    from core.models.journal_records import JournalChangeEntry, JournalEntry
+
+
+class FilteredJournal:
+    """One caller-owned publisher; no implicit threads, timers or filesystem I/O."""
+
+    def __init__(self, config_path: str | Path, view_path: str | Path) -> None:
+        """Initialize a derived-view publisher without opening source or view storage.
+
+        Args:
+            config_path: Absolute configuration path for an existing primary journal.
+            view_path: Absolute path for the disposable filtered SQLite database.
+
+        Raises:
+            ValueError: Either path is relative or contains a null character.
+        """
+        self._config_path = Path(config_path)
+        self.view_path = Path(view_path)
+        for path in (self._config_path, self.view_path):
+            if not path.is_absolute() or "\x00" in str(path):
+                raise ValueError("Filtered journal paths must be absolute.")
+        self._process_id = os.getpid()
+        self._lock = threading.RLock()
+        self._logger: OperationLogger | None = None
+        self._connection: sqlite3.Connection | None = None
+        self._file_identity: tuple[int, int] | None = None
+        self._interval: float | None = None
+        self._timeout: float | None = None
+        self._last_error: JsonObject | None = None
+
+    def _check_process(self) -> None:
+        """Reject using the publisher from a process other than its creator."""
+        if os.getpid() != self._process_id:
+            raise LoggingStateError("Create a filtered journal in this process.")
+
+    def _require_open(self) -> None:
+        """Require the owning process and an open primary logger."""
+        self._check_process()
+        if self._logger is None:
+            raise LoggingStateError("Filtered journal is closed.")
+
+    def open(self) -> None:
+        """Open the primary journal and attempt to open its separate derived database.
+
+        Derived-storage failures are journaled for fallback reads; primary-journal
+        failures propagate to the caller.
+
+        Raises:
+            LoggingStateError: The publisher is already open or belongs to another process.
+            ValueError: The source is not existing-mode or the view aliases primary files.
+        """
+        self._check_process()
+        with self._lock:
+            if self._logger is not None:
+                raise LoggingStateError("Filtered journal is already open.")
+            settings, _ = _load_logging_settings(self._config_path)
+            if settings.open_mode != "existing":
+                raise ValueError(
+                    "FilteredJournal connects to an existing primary journal."
+                )
+            source_path = settings.db_path
+            if self.view_path.resolve() in (
+                source_path.resolve(),
+                self._config_path.resolve(),
+            ):
+                raise ValueError("The derived database must have its own path.")
+            if self.view_path.exists() and (
+                os.path.samefile(self.view_path, source_path)
+                or os.path.samefile(self.view_path, self._config_path)
+            ):
+                raise ValueError(
+                    "The derived database cannot alias primary data or settings."
+                )
+            logger = OperationLogger(self._config_path)
+            logger.open()
+            self._logger = logger
+            self._interval = float(settings.filtered_refresh_interval_seconds)
+            self._timeout = float(settings.busy_timeout_seconds)
+            try:
+                try:
+                    self._open_view()
+                except (OSError, sqlite3.Error, LoggingStorageError) as error:
+                    self._report_refresh_failure(error)
+            except BaseException:
+                primary = sys.exc_info()[1]
+                self._close_preserving_primary(primary, "Filtered open cleanup failed")
+                raise
+
+    def _open_view(self) -> None:
+        """Create/open the derived database and check schema, integrity, and WAL support.
+
+        Creates missing parent directories and initializes only a newly reserved
+        derived database. Existing files must match the derived schema, pass
+        quick_check, and support WAL/FULL synchronization; the primary journal is
+        never replaced.
+        """
+        if self._connection is not None:
+            return
+        self.view_path.parent.mkdir(parents=True, exist_ok=True)
+        created = False
+        try:
+            with self.view_path.open("xb"):
+                pass
+            created = True
+        except FileExistsError:
+            pass
+        connection = sqlite3.connect(
+            self.view_path.as_uri() + "?mode=rw",
+            uri=True,
+            timeout=self._timeout,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        try:
+            if created:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(_CREATE_INFO)
+                connection.execute(_CREATE_EVENTS)
+                connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
+                connection.execute("PRAGMA user_version=1")
+                connection.execute("COMMIT")
+            _validate_view_schema(connection)
+            if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise LoggingStorageError("Derived database integrity check failed.")
+            if (
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
+                != "wal"
+            ):
+                raise LoggingStorageError("Derived database requires WAL mode.")
+            connection.execute("PRAGMA synchronous=FULL")
+            status = self.view_path.stat()
+            self._file_identity = (status.st_dev, status.st_ino)
+            self._connection = connection
+        except BaseException:
+            _close_preserving_failure(connection)
+            raise
+
+    def _check_view(self) -> None:
+        """Require an open derived database with unchanged file identity and valid schema."""
+        if self._connection is None:
+            raise LoggingStorageError("No derived database is available.")
+        status = self.view_path.stat()
+        if (status.st_dev, status.st_ino) != self._file_identity:
+            raise LoggingStorageError("The derived database file was replaced.")
+        _validate_view_schema(self._connection)
+
+    def _metadata(self) -> FilteredPublication | None:
+        """Read validated publication metadata, or return None before first publication.
+
+        Returns:
+            Validated publication metadata, or None when no publication row exists.
+        """
+        from core.models.journal_cache import FilteredPublication
+
+        row = self._connection.execute(
+            "SELECT metadata_json FROM filtered_info WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            return None
+        return FilteredPublication.model_validate(json.loads(row[0]))
+
+    def _write_entry(self, entry: JournalEntry) -> None:
+        """Upsert one effective entry into the derived database using original event JSON.
+
+        Args:
+            entry: Validated journal or working-request record consumed by this
+                operation.
+        """
+        event = entry.event
+        self._connection.execute(
+            "INSERT INTO filtered_events VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO UPDATE SET cursor=excluded.cursor, "
+            "event_json=excluded.event_json, effective_author=excluded.effective_author, "
+            "provisional=excluded.provisional",
+            (
+                entry.cursor,
+                event.event_id,
+                encode_event(json.loads(entry.encoded_event), None),
+                entry.effective_author,
+                int(entry.provisional),
+            ),
+        )
+
+    def _report_refresh_failure(self, error: Exception) -> None:
+        """Journal a changed derived-view failure and retain it for fallback metadata.
+
+        Args:
+            error: Primary failure retained while cleanup or error translation
+                proceeds.
+        """
+        try:
+            message = str(error)
+        except BaseException:  # noqa: BLE001 - Exception formatting cannot hide the failure.
+            message = "[exception message unavailable]"
+        record = {
+            "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+            "message": message,
+            "view_path": str(self.view_path),
+        }
+        if record != self._last_error:
+            # Failure here is a primary-journal failure and must reach the caller.
+            self._logger.record_event("logger.filtered_refresh_failed", record)
+        self._last_error = record
+
+    def refresh(self) -> JsonObject | None:
+        """Publish one consistent source view; derived failures preserve primary reads."""
+        publication = self._refresh()
+        return None if publication is None else publication.model_dump()
+
+    def _refresh(self) -> FilteredPublication | None:
+        """Publish a consistent effective view from a source snapshot or incremental changes.
+
+        Returns:
+            New/current publication metadata, or None after a reported derived failure.
+
+        Raises:
+            LoggingError: The primary journal is unavailable or its identity changes.
+        """
+        from core.models.journal_cache import FilteredPublication
+
+        self._check_process()
+        with self._lock:
+            self._require_open()
+            self._logger._require_open()
+            store = self._logger._store
+            phase = "view"
+            source = None
+            rows = None
+            try:
+                self._open_view()
+                self._check_view()
+                try:
+                    previous = self._metadata()
+                except (ValueError, TypeError, KeyError) as error:
+                    self._report_refresh_failure(error)
+                    previous = None
+                phase = "source"
+                store._check_health()
+                source = sqlite3.connect(
+                    store.db_path.as_uri() + "?mode=ro",
+                    uri=True,
+                    timeout=self._timeout,
+                    isolation_level=None,
+                )
+                source.execute("BEGIN")
+                boundary = _read_boundary(source)
+                expected = {
+                    "journal_id": store._journal_id,
+                    "generation": store._generation,
+                }
+                actual = {key: getattr(boundary, key) for key in expected}
+                if expected != actual:
+                    raise JournalGenerationChanged(expected, actual)
+                rebuild = (
+                    self._last_error is not None
+                    or previous is None
+                    or any(
+                        getattr(previous, key) != getattr(boundary, key)
+                        for key in ("journal_id", "generation")
+                    )
+                    or previous.change_cursor > boundary.change_cursor
+                )
+                phase = "view"
+                self._connection.execute("BEGIN IMMEDIATE")
+                if rebuild:
+                    self._connection.execute("DELETE FROM filtered_events")
+                    phase = "source"
+                    rows = source.execute("SELECT * FROM events ORDER BY cursor")
+                    while True:
+                        phase = "source"
+                        row = rows.fetchone()
+                        if row is None:
+                            break
+                        entry = store._effective_entry(store._decode_row(row), source)
+                        if entry is not None:
+                            phase = "view"
+                            self._write_entry(entry)
+                    rows.close()
+                    rows = None
+                else:
+                    phase = "source"
+                    rows = source.execute(
+                        "SELECT change_cursor, event_id, change_json FROM journal_changes "
+                        "WHERE change_cursor > ? ORDER BY change_cursor",
+                        (previous.change_cursor,),
+                    )
+                    while True:
+                        phase = "source"
+                        row = rows.fetchone()
+                        if row is None:
+                            break
+                        change = store._decode_change(row, source)
+                        phase = "view"
+                        self._apply_view_change(change)
+                    rows.close()
+                    rows = None
+                phase = "source"
+                source.execute("ROLLBACK")
+                source.close()
+                source = None
+                store._check_health()
+                changed = rebuild or previous.change_cursor != boundary.change_cursor
+                publication = FilteredPublication.model_validate(
+                    {
+                        **boundary.model_dump(),
+                        "publication_id": uuid4().hex
+                        if changed
+                        else previous.publication_id,
+                        "published_at": datetime.now(UTC).isoformat(
+                            timespec="microseconds"
+                        ),
+                    }
+                )
+                phase = "view"
+                self._connection.execute(
+                    "INSERT INTO filtered_info VALUES (1, ?) ON CONFLICT(singleton) "
+                    "DO UPDATE SET metadata_json=excluded.metadata_json",
+                    (json.dumps(publication.model_dump()),),
+                )
+                self._check_view()
+                self._connection.execute("COMMIT")
+                self._check_view()
+            except BaseException as error:
+                if self._connection is not None and self._connection.in_transaction:
+                    try:
+                        self._connection.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        self._connection.close()
+                        self._connection = None
+                if getattr(error, "journal_failed", False):
+                    raise
+                if phase == "source":
+                    raise store._storage_failure(error, "read filtered source")
+                if not isinstance(error, Exception):
+                    raise
+                self._report_refresh_failure(error)
+                return None
+            finally:
+                try:
+                    if rows is not None:
+                        _close_preserving_failure(rows)
+                finally:
+                    if source is not None:
+                        _close_preserving_failure(source)
+            if self._last_error is not None:
+                self._logger.record_event(
+                    "logger.filtered_refresh_recovered",
+                    {"view_path": str(self.view_path)},
+                )
+                self._last_error = None
+            return publication
+
+    def _apply_view_change(self, change: JournalChangeEntry) -> None:
+        """Remove superseded entries and upsert the change's effective event."""
+        for event_id in change.change.related_event_ids:
+            if event_id != change.change.effective_event_id:
+                self._connection.execute(
+                    "DELETE FROM filtered_events WHERE event_id=?",
+                    (event_id,),
+                )
+        self._write_entry(change.entry)
+
+    def _fallback(
+        self, checkpoint: FilteredCheckpoint | None, limit: int
+    ) -> JsonObject:
+        """Read primary effective events with a synthetic publication-bound checkpoint.
+
+        Args:
+            checkpoint: Identity-bound exclusive journal cursor, or None to start
+                reading.
+            limit: Maximum page item count, from 1 through 1000.
+
+        Returns:
+            Effective source-journal page with a synthetic publication ID and the
+            latest derived-refresh error, if any.
+        """
+        base = (
+            None
+            if checkpoint is None
+            else {
+                "journal_id": checkpoint.journal_id,
+                "generation": checkpoint.generation,
+                "cursor": checkpoint.cursor,
+            }
+        )
+        page = self._logger.read_events(base, limit=limit, view="effective")
+        boundary = page["boundary"]
+        publication = f"source:{boundary['generation']}:{boundary['change_cursor']}"
+        if checkpoint is not None and checkpoint.publication_id != publication:
+            raise LoggingStateError(
+                "Publication changed; restart reading from the first page."
+            )
+        page["checkpoint"]["publication_id"] = publication
+        return {
+            **page,
+            "source": "journal",
+            "published_at": None,
+            "publication_id": publication,
+            "refresh_error": None
+            if self._last_error is None
+            else dict(self._last_error),
+        }
+
+    def read_events(
+        self, checkpoint: JsonObject | None = None, *, limit: int = 100
+    ) -> JsonObject:
+        """Read a page from the current filtered publication or the primary fallback.
+
+        Args:
+            checkpoint: Previous publication checkpoint, or None to begin reading.
+            limit: Maximum event count from 1 to 1000.
+
+        Returns:
+            Events, boundary, continuation checkpoint, source, and refresh-error metadata.
+
+        Raises:
+            ValueError: Page limit or checkpoint is invalid.
+            JournalGenerationChanged: The checkpoint belongs to another journal generation.
+            LoggingStateError: The publisher is closed or the publication has changed.
+        """
+        self._check_process()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer from 1 to 1000.")
+        if checkpoint is not None:
+            from core.models.journal_cache import FilteredCheckpoint
+
+            parsed = FilteredCheckpoint.model_validate(checkpoint)
+        else:
+            parsed = None
+        with self._lock:
+            self._require_open()
+            current = self._logger.get_journal_info()
+            if parsed is not None:
+                expected = {
+                    "journal_id": parsed.journal_id,
+                    "generation": parsed.generation,
+                }
+                actual = {key: current[key] for key in expected}
+                if expected != actual:
+                    raise JournalGenerationChanged(expected, actual)
+            if self._connection is None:
+                return self._fallback(parsed, limit)
+            try:
+                self._check_view()
+                self._connection.execute("BEGIN")
+                metadata = self._metadata()
+                if (
+                    metadata is None
+                    or self._last_error is not None
+                    or any(
+                        getattr(metadata, key) != current[key]
+                        for key in ("journal_id", "generation")
+                    )
+                ):
+                    self._connection.execute("ROLLBACK")
+                    raise LookupError("No current publication is available.")
+                if (
+                    parsed is not None
+                    and parsed.publication_id != metadata.publication_id
+                ):
+                    raise LoggingStateError(
+                        "Publication changed; restart reading from the first page."
+                    )
+                after = 0 if parsed is None else parsed.cursor
+                if after > metadata.cursor:
+                    raise LoggingStateError("Checkpoint is beyond this publication.")
+                entries, after, more = self._read_derived_page(after, limit, metadata)
+                self._connection.execute("COMMIT")
+                self._check_view()
+            except LookupError:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                return self._fallback(parsed, limit)
+            except LoggingStateError:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+            except (
+                OSError,
+                sqlite3.Error,
+                ValueError,
+                TypeError,
+                LoggingStorageError,
+            ) as error:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                self._report_refresh_failure(error)
+                return self._fallback(parsed, limit)
+            self._logger.get_journal_info()
+            return {
+                "events": entries,
+                "checkpoint": {
+                    key: getattr(metadata, key)
+                    for key in ("journal_id", "generation", "publication_id")
+                }
+                | {"cursor": after},
+                "boundary": metadata.model_dump(),
+                "has_more": more,
+                "source": "filtered",
+                "published_at": metadata.published_at,
+                "publication_id": metadata.publication_id,
+                "refresh_error": None,
+            }
+
+    def _read_derived_page(
+        self, after: int, limit: int, metadata: FilteredPublication
+    ) -> tuple[list[JsonObject], int, bool]:
+        """Return validated entries, next cursor, and has-more under count/byte limits.
+
+        Args:
+            after: Exclusive cursor after which records are read.
+            limit: Maximum page item count, from 1 through 1000.
+            metadata: Validated filtered publication whose identity/boundary
+                constrains the read.
+
+        Returns:
+            Validated entries, next cursor, and has-more under count/byte limits.
+        """
+        entries, size = [], 0
+        more = False
+        for (
+            cursor,
+            event_id,
+            encoded,
+            author,
+            provisional,
+        ) in self._connection.execute(
+            "SELECT * FROM filtered_events WHERE cursor > ? ORDER BY cursor LIMIT ?",
+            (after, limit + 1),
+        ):
+            item_size = len(encoded.encode("utf-8"))
+            if len(entries) == limit or (entries and size + item_size > _PAGE_BYTES):
+                more = True
+                break
+            event = json.loads(encode_event(json.loads(encoded), None))
+            if event["event_id"] != event_id or provisional not in (0, 1):
+                raise ValueError("Invalid derived event identity.")
+            if author not in (None, "runner", "participant") or bool(provisional) != (
+                author == "participant"
+            ):
+                raise ValueError("Invalid derived result state.")
+            entries.append(
+                {
+                    "cursor": cursor,
+                    "event": event,
+                    "effective_author": author,
+                    "provisional": bool(provisional),
+                }
+            )
+            size += item_size
+            after = cursor
+        if not more:
+            after = metadata.cursor
+        return entries, after, more
+
+    def run(self, stop_event: threading.Event) -> None:
+        """Block in a caller-owned thread; primary failures propagate to that caller.
+
+        Args:
+            stop_event: Caller-owned event requesting termination of the refresh
+                loop.
+        """
+        self._check_process()
+        if not isinstance(stop_event, threading.Event):
+            raise TypeError("stop_event must be a threading.Event.")
+        if self._logger is not None:
+            raise LoggingStateError(
+                "run owns open/close; use refresh for an already open publisher."
+            )
+        try:
+            self.open()
+            while not stop_event.is_set():
+                deadline = time.monotonic() + self._interval
+                self.refresh()
+                while not stop_event.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    stop_event.wait(min(remaining, 60))
+        finally:
+            primary = sys.exc_info()[1]
+            self._close_preserving_primary(primary, "Filtered journal cleanup failed")
+
+    def _close_preserving_primary(
+        self, primary: BaseException | None, prefix: str
+    ) -> None:
+        """Close resources, attaching cleanup failure to the supplied primary exception.
+
+        Args:
+            primary: Existing exception to preserve while attempting resource
+                cleanup, or None.
+            prefix: Diagnostic prefix used when attaching a secondary cleanup
+                exception.
+        """
+        try:
+            self.close()
+        except BaseException as error:
+            if primary is None:
+                raise
+            try:
+                primary.add_note(f"{prefix}: {type(error).__name__}.")
+            except BaseException:  # noqa: BLE001, S110
+                pass
+
+    def close(self) -> None:
+        """Close derived storage and the primary client, preserving the first close failure.
+
+        Attempts to close both the derived connection and primary logger even if the
+        first close fails. Secondary cleanup failures are attached to the first
+        exception, which is then propagated.
+        """
+        self._check_process()
+        with self._lock:
+            failure = None
+            try:
+                if self._connection is not None:
+                    self._connection.close()
+                    self._connection = None
+            except BaseException as error:  # noqa: BLE001 - Still close the primary client.
+                failure = error
+            try:
+                if self._logger is not None:
+                    self._logger.close()
+                    self._logger = None
+            except BaseException as error:  # noqa: BLE001 - Preserve the first close failure.
+                if failure is None:
+                    failure = error
+                else:
+                    try:
+                        failure.add_note(
+                            f"Primary client close failed: {type(error).__name__}."
+                        )
+                    except BaseException:  # noqa: BLE001, S110
+                        pass
+            if failure is not None:
+                raise failure

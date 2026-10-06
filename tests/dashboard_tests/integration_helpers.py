@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 from tests.helpers.logging_process import existing_settings, write_settings
 
 

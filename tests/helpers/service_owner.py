@@ -7,15 +7,16 @@ import time
 import traceback
 from pathlib import Path
 
-from core.experimentassembler import ExperimentAssembler
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.journal import RunnerJournal
-from core.runner_utils.launch import ModuleLauncher
-from core.runner_utils.runtimeio import process_identity, read_json, write_json
-from core.runner_utils.services import ServiceManager
-from core.runner_utils.state import RunnerStateStore
-from core.seaweed import SeaweedDB
+from core.experiments.assembler import ExperimentAssembler
+from core.experiments.journal import RunnerJournal
+from core.experiments.launch import ModuleLauncher
+from core.experiments.services import ServiceManager
+from core.experiments.state import RunnerStateStore, _process_identity_document
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.primitives.processes import process_identity
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 from tests.helpers.services import wait_for
 
 
@@ -84,13 +85,14 @@ async def run(options):
             raise RuntimeError(f"Service startup required {action}.")
         write_json(
             controls / "ready.json",
-            {key: item.process_identity for key, item in state.services.items()},
+            {
+                key: _process_identity_document(item.process_identity)
+                for key, item in state.services.items()
+            },
         )
         operation = asyncio.create_task(manager.save_states(state, options.snapshot))
         if options.phase == "before_freeze":
-            service_controls = Path(
-                state.template["services"][0]["settings"]["controls"]
-            )
+            service_controls = Path(state.template.services[0].settings["controls"])
 
             def reached():
                 path = service_controls / "trace.jsonl"
