@@ -61,7 +61,7 @@ def process_running(pid: int) -> bool:
             kernel.CloseHandle(handle)
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
 
 
@@ -69,7 +69,11 @@ def terminate_owned(identity: ProcessIdentity | dict) -> None:
     if isinstance(identity, ProcessIdentity):
         identity = identity.model_dump()
     pid = identity["pid"]
-    if not process_running(pid) or process_identity(pid) != identity:
+    try:
+        if not process_running(pid) or process_identity(pid) != identity:
+            return
+    except (FileNotFoundError, ProcessLookupError):
+        # Linux may remove the process between the running and identity reads.
         return
     if os.name == "nt":
         from ctypes import wintypes
@@ -96,12 +100,16 @@ def terminate_owned(identity: ProcessIdentity | dict) -> None:
         finally:
             kernel.CloseHandle(handle)
     else:
-        descriptor = os.pidfd_open(pid)
         try:
-            if process_identity(pid) == identity:
-                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-        finally:
-            os.close(descriptor)
+            descriptor = os.pidfd_open(pid)
+            try:
+                if process_identity(pid) == identity:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            finally:
+                os.close(descriptor)
+        except (FileNotFoundError, ProcessLookupError):
+            # An already exited process needs no further cleanup.
+            return
 
 
 class DagWorkspace:
