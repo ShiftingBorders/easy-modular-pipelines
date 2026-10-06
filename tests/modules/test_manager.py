@@ -927,6 +927,84 @@ class FileAndPackageTests(ModuleManagerTestCase):
         )
         self.assertIn(Path("nested/data.bin"), manager._collect_module_files(other))
 
+    def test_hash_ignores_pycache_changes_at_every_depth(self):
+        """Cache creation, modification and removal do not change the digest."""
+        expected = self.manager.module_hash("demo", self.source)
+        for relative in ("__pycache__", "nested/__pycache__", "nested/deep/__pycache__"):
+            with self.subTest(directory=relative):
+                cache = self.source / relative
+                cache.mkdir(parents=True)
+                self.assertEqual(self.manager.module_hash("demo", self.source), expected)
+                cached_file = cache / "main.cpython-312.pyc"
+                for content in (b"bytecode", b"changed bytecode"):
+                    cached_file.write_bytes(content)
+                    before = self._snapshot(self.source)
+                    self.assertEqual(
+                        self.manager.module_hash("demo", self.source), expected
+                    )
+                    self.assertEqual(self._snapshot(self.source), before)
+                cached_file.unlink()
+                self.assertEqual(self.manager.module_hash("demo", self.source), expected)
+                cache.rmdir()
+                self.assertEqual(self.manager.module_hash("demo", self.source), expected)
+        (self.source / "main.py").write_bytes(b"changed source")
+        self.assertNotEqual(self.manager.module_hash("demo", self.source), expected)
+
+    def test_pycache_archive_exclusion_can_be_disabled(self):
+        """Archive filtering matches hashing and preserves source contents."""
+        source_files = ["empty.txt", "main.py", "module.yaml", "nested/data.bin"]
+        cache_files = [
+            "__pycache__/main.cpython-312.pyc",
+            "nested/deep/__pycache__/extra/data.bin",
+        ]
+        for relative in cache_files:
+            path = self.source / relative
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"cache contents")
+        before = self._snapshot(self.source)
+        for options, expected in (
+            ({}, source_files),
+            ({"apply_ignores": False}, sorted(source_files + cache_files)),
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.manager._collect_module_files(self.source, **options),
+                    [Path(relative) for relative in expected],
+                )
+                archive_path = self.manager._compress_folder(
+                    self.source, self.root / "out", **options
+                )
+                with tarfile.open(archive_path, "r:xz") as archive:
+                    self.assertEqual(archive.getnames(), expected)
+                    for relative in expected:
+                        with archive.extractfile(relative) as stream:
+                            self.assertEqual(stream.read(), before[relative])
+                self.assertEqual(self._snapshot(self.source), before)
+
+    def test_pycache_exclusion_matches_only_exact_directory_names(self):
+        """Similar directory names and a regular __pycache__ file remain hashed."""
+        included_files = [
+            "__pycache__backup/data.pyc",
+            "prefix__pycache__/data.pyc",
+            "nested/__pycache__",
+            "standalone.pyc",
+        ]
+        for relative in included_files:
+            with self.subTest(file=relative):
+                expected = self.manager.module_hash("demo", self.source)
+                path = self.source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"included")
+                self.assertNotEqual(
+                    self.manager.module_hash("demo", self.source), expected
+                )
+        self.assertEqual(
+            self.manager._collect_module_files(self.source),
+            [Path(relative) for relative in sorted(
+                included_files + ["empty.txt", "main.py", "module.yaml", "nested/data.bin"]
+            )],
+        )
+
     def test_service_package_is_not_filtered(self):
         """FILE-05."""
         # The absolute work root is an ancestor of package, but not of the code.

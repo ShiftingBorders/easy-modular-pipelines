@@ -323,6 +323,7 @@ class ModuleManager:
         """Return sorted relative file paths, skipping links and ignored folders.
 
         Relative ignored folder paths are interpreted from folder_path.
+        With ignores enabled, __pycache__ directories are skipped at every depth.
 
         Args:
             folder_path: Absolute module source directory.
@@ -353,7 +354,8 @@ class ModuleManager:
                 continue
             children[:] = [
                 name for name in children
-                if not (folder / name).is_symlink()
+                if not (apply_ignores and name == "__pycache__")
+                and not (folder / name).is_symlink()
                 and not (folder / name).is_junction()
                 and (folder / name).resolve() not in ignored_folders
             ]
