@@ -19,36 +19,24 @@ implementation and environment; it is not an unconditional guarantee.
 
 ## What it does
 
-- **Strict module identity and runtime integrity checks.** Templates pin each
-  module by name, version, and SHA-256 hash. The hash covers packaged file paths
-  and contents, including the module README. Different content cannot silently
-  replace a registered version. Checks compare the experiment's module files
-  with both the registered hash and the template at startup and during runtime
-  preparation of stage attempts, service launches, and service calls. A mismatch
-  fails validation. These are execution-boundary checks, not continuous file
-  monitoring. See [module storage](docs/storage.md#versions-hashes-and-failures).
-- **Execution controlled through commands.** Run sequential stages and
-  long-lived services with explicit inputs, settings, timeouts, and retry
-  policies. Pause, step, resume, stop, move the paused stage pointer, or rerun
-  a stage when the runtime state permits it.
-  See [execution commands](docs/cli.md#execute-and-control-experiments).
-- **Snapshots, rollbacks, and recovery.** Create a snapshot at an idle pause
-  and use `rollback` to restore saved experiment state and journal history.
-  Recover an interrupted experiment, or create a continuation from a valid
-  saved snapshot. Restoration of service state relies on the service's snapshot
-  implementation. See [snapshots and recovery](docs/basic_dag.md#snapshots-recovery-and-exchange).
-- **Experiment packaging, exchange, and installation.** Create a `tar.xz`
-  exchange archive from a stopped or completed experiment, share it, inspect
-  it, and install it into a new directory. Installation registers the required
-  module packages and installs the applied template and static resources for
-  another run. Exchange archives carry those inputs; snapshots serve runtime
-  restoration. See [archive commands](docs/cli.md#snapshots-and-archives).
-- **Execution history and observation.** Record operations and results in a
-  shared journal, with a separate dashboard for history, live state, artifacts,
-  resource monitoring, and alerts.
+- **[Module identity and integrity checks](docs/module_integrity.md).** Pin
+  packaged module contents by name, version, and hash, and verify them at
+  execution boundaries.
+- **[Controlled experiment execution](docs/execution.md).** Run sequential
+  stages and long-lived services with explicit policies. Pause, step, resume,
+  stop, or rerun work when the runtime state permits it.
+- **[Snapshots, rollbacks, and recovery](docs/restoration.md).** Save and
+  restore experiment state, recover interrupted work, or continue from a valid
+  snapshot. Service restoration depends on the service's implementation.
+- **[Experiment packaging, exchange, and installation](docs/packaging.md).**
+  Share module packages, the applied template, and static resources in a
+  `tar.xz` archive and install them for another run.
+- **[Execution history and observation](docs/observation.md).** Record
+  operations and results in a shared journal; inspect history, live state,
+  artifacts, resources, and alerts through the CLI and dashboard.
 
-Stages currently run sequentially; branching and parallel stage execution are
-not supported. See [current capabilities](docs/basic_dag.md#current-limits).
+Stages currently run sequentially, with conditional jumps and loops. Parallel
+stage execution is not supported. See [current capabilities](docs/basic_dag.md#current-limits).
 
 ## Reproducibility and responsibility
 
@@ -113,3 +101,6 @@ uv run python -m unittest discover -s tests -p "test_*.py" -v
 See [testing](docs/testing.md) for requirements and optional suites.
 [AGENTS.md](AGENTS.md) defines contribution boundaries and the approval process
 for adding or changing tests.
+
+## Acknowledgments
+Special thanks to Konstantin Mazin for creating additional logos for documentation.

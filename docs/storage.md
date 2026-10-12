@@ -97,6 +97,9 @@ edit templates automatically.
 
 ## Versions, hashes, and failures
 
+See [module identity and integrity checks](module_integrity.md) for the feature
+overview and the scope of runtime verification.
+
 Keep source files unchanged throughout registration. The hash includes relative
 file names and contents, including documentation packaged with the module.
 A changed README therefore changes the module hash too.

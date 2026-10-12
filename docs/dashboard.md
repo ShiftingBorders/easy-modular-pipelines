@@ -4,6 +4,9 @@ The dashboard is a separate FastAPI application. It reads local experiment
 history through the logger's read-only API and uses the system HTTP API for
 live state, resources, and commands. Starting it does not start the runtime.
 
+See [execution history and observation](observation.md) for the feature overview
+and how the dashboard, CLI, journal, and resource monitoring fit together.
+
 **The journal is the source of truth.** Dashboard history reads never change
 journal contents, event formats, tables, indexes, or schema versions. The
 dashboard writes its derived cache only in its own state directory. Removing
