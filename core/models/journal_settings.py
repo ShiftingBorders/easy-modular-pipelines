@@ -2,13 +2,14 @@
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.models.journal_options import (
     JournalOptions,
     validate_journal_limits,
     validate_journal_options,
 )
+from core.models.journal_writer import JournalWriterSettings
 from core.models.values import PositiveNumber
 from core.primitives.json_values import JsonObject
 
@@ -24,6 +25,7 @@ class JournalLimits(BaseModel):
         min_free_bytes: Nonnegative free-space reserve in bytes required before
             storage writes.
     """
+
     model_config = ConfigDict(
         extra="forbid",
         strict=True,
@@ -71,9 +73,14 @@ class JournalConfiguration(JournalLimits):
         expected_journal: Required identity in existing mode; must be None when
             creating a journal.
     """
+
     db_path: Path
     open_mode: str
     expected_journal: JsonObject | None
+    writer_endpoint_path: Path | None = None
+    writer_settings: JournalWriterSettings = Field(
+        default_factory=JournalWriterSettings
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -116,4 +123,5 @@ class LoggingConfiguration(JournalConfiguration):
         filtered_refresh_interval_seconds: Positive interval in seconds between
             filtered-view refreshes.
     """
+
     filtered_refresh_interval_seconds: PositiveNumber

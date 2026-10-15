@@ -72,6 +72,7 @@ def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
         raise ValueError(
             "Test cleanup must remain inside the logging scratch directory."
         )
+    stop_journal_writers(root)
     for attempt in range(3):
         try:
             directory.cleanup()
@@ -92,6 +93,60 @@ def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
                 has_entries = False
             if has_entries:
                 raise
+
+
+def stop_journal_writers(root: Path) -> None:
+    """Reap only standalone writers whose DB, runtime and command belong to a fixture."""
+    import psutil
+
+    from core.primitives.json_files import read_json
+    from tests.helpers.dag import terminate_owned
+
+    root = root.resolve()
+    if not root.is_relative_to((PROJECT_ROOT / ".artifacts").resolve()):
+        raise ValueError("Journal cleanup escaped the test artifacts directory.")
+    for pointer in root.rglob("*.writer.json"):
+        route = read_json(pointer)
+        if route["managed"]:
+            continue
+        runtime = Path(route["runtime_directory"]).resolve()
+        if not runtime.is_relative_to(root):
+            raise ValueError("Journal runtime escaped its owning test directory.")
+        endpoint_path = runtime / "endpoint.json"
+        if not endpoint_path.is_file():
+            continue
+        endpoint = read_json(endpoint_path)
+        if not Path(endpoint["db_path"]).resolve().is_relative_to(root):
+            raise ValueError("Journal database escaped its owning test directory.")
+        identity = endpoint["process"]
+        if identity["pid"] == os.getpid():
+            raise AssertionError("A writer cannot be the test runner.")
+        try:
+            process = psutil.Process(identity["pid"])
+            arguments = process.cmdline()
+            if "core.journal.writer" not in arguments or "--runtime" not in arguments:
+                continue
+            if Path(arguments[arguments.index("--runtime") + 1]).resolve() != runtime:
+                continue
+            parents = []
+            for parent in process.parents():
+                arguments = parent.cmdline()
+                if (
+                    "core.journal.writer" not in arguments
+                    or "--runtime" not in arguments
+                ):
+                    break
+                if (
+                    Path(arguments[arguments.index("--runtime") + 1]).resolve()
+                    != runtime
+                ):
+                    break
+                parents.append(parent)
+            terminate_owned(identity)
+            for owned in [process, *parents]:
+                owned.wait(timeout=5)
+        except psutil.NoSuchProcess:
+            continue
 
 
 def write_settings(directory: Path, *, context: dict | None = None, **settings) -> Path:
@@ -136,6 +191,12 @@ def read_database(path: Path) -> list[dict]:
             json.loads(row[0])
             for row in db.execute("SELECT event_json FROM events ORDER BY cursor")
         ]
+
+
+def database_dump(path: Path) -> list[str]:
+    """Independently compare schema and rows without a writer's private connection."""
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        return list(db.iterdump())
 
 
 class LoggingProcess:
@@ -313,9 +374,27 @@ def main() -> None:
                     *args, **kwargs, factory=SchemaConnection
                 ),
             ),
-            OperationLogger(config),
         ):
-            pass
+            from core.journal.settings import _load_logging_settings
+            from core.journal.supervisor import standalone_directory
+            from core.journal.writer import run_writer
+
+            configuration, _ = _load_logging_settings(config)
+            run_writer(
+                config,
+                standalone_directory(configuration.db_path),
+                configuration.writer_settings,
+                "schema-test",
+                managed=False,
+            )
+        return
+
+    if mode in ("before_insert", "during_insert", "after_commit"):
+        import asyncio
+
+        from tests.helpers.journal_owner import run_crash_writer
+
+        asyncio.run(run_crash_writer(mode, config, arguments))
         return
 
     if mode == "cwd":
@@ -362,33 +441,6 @@ def main() -> None:
                 checkpoint({"operation_id": operation.get_operation_id()})
                 logger.record_event("test.continued", operation=operation)
             announce({"completed": True})
-            return
-        if mode in ("before_insert", "during_insert", "after_commit"):
-            ids = [
-                logger.record_event("test.prefix", {"number": index})
-                for index in range(20)
-            ]
-            announce({"confirmed_ids": ids})
-            if mode == "before_insert":
-                checkpoint({"before_insert": True})
-            if mode == "during_insert":
-                connection = logger._store._connection
-                inserting_event = False
-
-                def trace_statement(sql: str) -> None:
-                    nonlocal inserting_event
-                    inserting_event = sql.startswith("INSERT INTO events")
-
-                def progress() -> int:
-                    if inserting_event:
-                        checkpoint({"during_insert": True})
-                    return 0
-
-                # Health checks also execute SQL; stop inside INSERT, not those reads.
-                connection.set_trace_callback(trace_statement)
-                connection.set_progress_handler(progress, 1)
-            event_id = logger.record_event("test.last", {"payload": "x" * 10000})
-            checkpoint({"confirmed_last": event_id})
             return
         if mode == "fork":
             from core.journal.events import LoggingStateError

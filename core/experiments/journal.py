@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
 from core.experiments.state import RunnerState, state_from_document
+from core.journal.events import LoggingStateError
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
+from core.journal.supervisor import JournalSupervisor
 from core.models.experiment_template import ExperimentTemplate
 from core.models.journal_diagnostics import JournalSnapshotManifest
 from core.primitives.json_files import read_json, write_json
@@ -17,8 +22,16 @@ from core.primitives.json_values import JsonObject, copy_json_object, require_te
 
 class RunnerJournal:
     """Own the runner's logger and publish identity-bound client configurations."""
+
     client: OperationLogger
     reader_config_path: Path | None = None
+
+    def __init__(self) -> None:
+        self._opened = False
+        self._opening = False
+        self._closing = False
+        self._opening_finished = threading.Event()
+        self._opening_finished.set()
 
     def open(self, state: RunnerState, *, create: bool) -> None:
         """Open a new/existing experiment journal and publish its identity and reader config.
@@ -30,7 +43,7 @@ class RunnerJournal:
         Raises:
             RuntimeError: The runner journal is already open.
         """
-        if getattr(self, "_opened", False):
+        if self._opened or self._opening:
             raise RuntimeError("Runner journal is already open.")
         if create:
             self._identity = None
@@ -44,9 +57,32 @@ class RunnerJournal:
             "run_id": state.run_id,
         }
         config_path = self.write_client_config(state, context, create=create)
-        self.client = OperationLogger(config_path)
-        self.client.open()
-        self._opened = True
+        parent = state.experiment_directory.parent
+        project = parent.parent if parent.name == "experiments" else parent
+        directory = (
+            project / "controller" / "journals" / state.experiment_directory.name
+        )
+        self._supervisor = JournalSupervisor(config_path, runtime_directory=directory)
+        self.client = OperationLogger(self._supervisor.client_config_path)
+        self.audit_complete = True
+        self._closing = False
+        self._opening = True
+        self._opening_finished.clear()
+        try:
+            self._supervisor.start()
+            if self._closing:
+                raise LoggingStateError("Journal startup was cancelled by shutdown.")
+            self.client.open()
+            if self._closing:
+                raise LoggingStateError("Journal startup was cancelled by shutdown.")
+            self._opened = True
+            self._publish_identity(state, context)
+        finally:
+            self._opening = False
+            self._opening_finished.set()
+
+    def _publish_identity(self, state: RunnerState, context: JsonObject) -> None:
+        """Publish usable identity and reader configuration only after opening."""
         info = self.client.get_journal_info()
         self._identity = {key: info[key] for key in ("journal_id", "generation")}
         write_json(
@@ -54,6 +90,35 @@ class RunnerJournal:
         )
         # Existing-mode config also provides a stable entry point for later readers.
         self.reader_config_path = self.write_client_config(state, context)
+
+    async def _run_transition(
+        self, operation: Callable[..., None], *args: object, **kwargs: object
+    ) -> None:
+        """Keep journal lifecycle I/O off the event loop and join it on cancellation.
+
+        A cancelled open/restore must finish before its caller replaces files or
+        stops participants. Repeated cancellation signals cover an open that has
+        not yet reached supervisor startup when the caller is cancelled.
+        """
+        pending = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError as cancellation:
+            while not pending.done():
+                self._closing = True
+                if hasattr(self, "client"):
+                    self.client._interrupt_waiting()
+                if hasattr(self, "_supervisor"):
+                    self._supervisor._request_stop()
+                await asyncio.wait({pending}, timeout=0.025)
+            try:
+                pending.result()
+            except BaseException as error:  # noqa: BLE001 - Preserve caller cancellation after reaping.
+                cancellation.add_note(
+                    f"Journal transition ended during cancellation: {error}"
+                )
+            await asyncio.to_thread(self.close)
+            raise
 
     def write_client_config(
         self, state: RunnerState, context: JsonObject, *, create: bool = False
@@ -78,6 +143,8 @@ class RunnerJournal:
                 "expected_journal": None if create else self._identity,
             }
         )
+        if not create and getattr(self, "_opened", False):
+            settings["writer_endpoint_path"] = str(self._supervisor.endpoint_path)
         path = state.experiment_directory / "runner" / "logging" / f"{uuid4()}.json"
         write_json(path, {"logging": settings, "operation_context": context})
         return path
@@ -194,11 +261,51 @@ class RunnerJournal:
 
     def close(self) -> None:
         """Close the owned client and clear the published reader-config reference."""
+        self._closing = True
+        if hasattr(self, "client"):
+            self.client._interrupt_waiting()
+        try:
+            if hasattr(self, "_supervisor"):
+                self._supervisor.close()
+            if not self._opening_finished.wait(5):
+                raise LoggingStateError(
+                    "Journal startup has not completed cancellation."
+                )
+            if hasattr(self, "client"):
+                self.client.close()
+        finally:
+            self._opened = False
+            self.reader_config_path = None
+
+    async def prepare_shutdown(self) -> bool:
+        """Allow a short drain, then unblock physical shutdown without a journal ACK."""
+        if self._opening:
+            self.audit_complete = False
+            await asyncio.to_thread(self.close)
+            return False
         if not getattr(self, "_opened", False):
-            return
-        self.client.close()
-        self._opened = False
-        self.reader_config_path = None
+            return True
+        if not self.audit_complete or self.client._failed:
+            self.audit_complete = False
+            self.client._interrupt_waiting()
+            return False
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            status = self._supervisor.get_status()
+            # A heartbeat can predate a newly admitted write. The local ordering
+            # lock must also be idle before that sample can permit shutdown audit.
+            if (
+                status["state"] == "ready"
+                and not status["busy"]
+                and status["queue_depth"] == 0
+                and self.client._lock.acquire(blocking=False)
+            ):
+                self.client._lock.release()
+                return True
+            await asyncio.sleep(0.025)
+        self.audit_complete = False
+        self.client._interrupt_waiting()
+        return False
 
 
 async def _read_recovery_checkpoint(
@@ -220,7 +327,7 @@ async def _read_recovery_checkpoint(
             != root / "journals/events.sqlite"
         ):
             continue
-        reader = OperationLogger(config_path)
+        reader = OperationLogger(config_path, read_only=True)
         try:
             reader.open()
             checkpoint = boundary = None
@@ -314,9 +421,7 @@ async def _read_recovery_evidence(
     launches = []
     boundary = None
     while True:
-        page = await asyncio.to_thread(
-            logger.read_events, checkpoint, limit=1000
-        )
+        page = await asyncio.to_thread(logger.read_events, checkpoint, limit=1000)
         if boundary is None:
             boundary = page["boundary"]["cursor"]
         for entry in page["events"]:
@@ -339,9 +444,7 @@ async def _read_recovery_evidence(
                 launches.append(
                     {
                         **event["context"],
-                        "queued_monotonic": event["data"][
-                            "queued_monotonic"
-                        ],
+                        "queued_monotonic": event["data"]["queued_monotonic"],
                         "queued_at": event["data"]["queued_at"],
                     }
                 )

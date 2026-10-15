@@ -458,7 +458,8 @@ async def controller_main(
                     await serving
                     raise RuntimeError("Controller stopped during startup.")
                 identity = process_identity(os.getpid())
-                logger.record_event(
+                await asyncio.to_thread(
+                    logger.record_event,
                     "server.controller_started",
                     {"runtime_id": instance_id, "process": identity},
                 )
@@ -485,7 +486,9 @@ async def controller_main(
                         await serving
                         raise RuntimeError("Controller stopped unexpectedly.")
                     if parent is not None and not parent.is_alive():
-                        logger.record_event("server.parent_lost", {})
+                        await asyncio.to_thread(
+                            logger.record_event, "server.parent_lost", {}
+                        )
                         break
                     await asyncio.sleep(0.1)
             finally:
@@ -499,11 +502,30 @@ async def controller_main(
                         if runner is not None:
                             await runner.close()
                         await asyncio.gather(serving, return_exceptions=True)
-            logger.record_event("server.controller_stopped", {})
-            responses.put_nowait({"_runtime": "stopped"})
+            audit = asyncio.create_task(
+                asyncio.to_thread(logger.record_event, "server.controller_stopped", {})
+            )
+            audit_complete = True
+            try:
+                await asyncio.wait_for(asyncio.shield(audit), 1)
+            except Exception:  # noqa: BLE001 - A journal outage must not prevent confirmed controller shutdown.
+                audit_complete = False
+                logger._interrupt_waiting()
+                await asyncio.gather(audit, return_exceptions=True)
+            responses.put_nowait(
+                {
+                    "_runtime": "stopped",
+                    "journal_audit_complete": audit_complete,
+                    "message": "Controller stopped."
+                    if audit_complete
+                    else "Controller stopped; journal audit incomplete.",
+                }
+            )
         except Exception as error:
             try:
-                logger.record_error(error, include_traceback=True)
+                await asyncio.to_thread(
+                    logger.record_error, error, include_traceback=True
+                )
             except Exception as logging_error:  # noqa: BLE001 - Preserve the startup/shutdown failure.
                 error.add_note(f"Server lifecycle logging also failed: {logging_error}")
             raise
@@ -515,6 +537,8 @@ def _open_control_journal(
     stack: ExitStack,
     logger_type: type[OperationLogger],
 ) -> OperationLogger:
+    from core.journal.supervisor import JournalSupervisor
+
     directory = settings.project_root / "controller/server" / instance_id
     logging_settings = read_json(DEFAULT_CONFIG.with_name("logging.json"))
     logging_settings.update(
@@ -532,11 +556,17 @@ def _open_control_journal(
             "operation_context": {"source": "server_controller"},
         },
     )
-    logger = stack.enter_context(logger_type(logging_config))
+    supervisor = JournalSupervisor(
+        logging_config, runtime_directory=directory / "writer"
+    )
+    stack.callback(supervisor.close)
+    supervisor.start()
+    logger = stack.enter_context(logger_type(supervisor.client_config_path))
     identity = logger.get_journal_info()
     logging_settings.update(
         {
             "open_mode": "existing",
+            "writer_endpoint_path": str(supervisor.endpoint_path),
             "expected_journal": {
                 key: identity[key] for key in ("journal_id", "generation")
             },
@@ -582,6 +612,7 @@ def controller_process(
 
 class CommandRecord:
     """Retained request fingerprint, submission time, and optional cached outcome."""
+
     def __init__(self, command: ServerCommand, chain_id: str | None = None) -> None:
         """Fingerprint a validated request and initialize pending-result accounting.
 
@@ -846,6 +877,16 @@ class ServerRuntime:
             errors.
         """
         alive = self._process is not None and self._process.is_alive()
+        journal_path = (
+            self.settings.project_root
+            / "controller/server"
+            / self._runtime_id
+            / "writer/status.json"
+        )
+        try:
+            journal_status = read_json(journal_path)
+        except (OSError, ValueError):
+            journal_status = None
         return {
             "server_instance_id": self.instance_id,
             "runtime_id": self._runtime_id,
@@ -859,6 +900,7 @@ class ServerRuntime:
             if self._restart_command is not None
             else self._state,
             "controller_alive": alive,
+            "journal_writer": journal_status,
             "controller": self._identity,
             "last_response_at": self._last_response_at,
             "pending_commands": sum(
@@ -913,7 +955,9 @@ class ServerRuntime:
             Wire command excluding None fields and including the optional chain ID.
         """
         if chain_id is not None and command.command.startswith("server."):
-            raise ValueError("Runtime lifecycle commands do not accept chains or targets.")
+            raise ValueError(
+                "Runtime lifecycle commands do not accept chains or targets."
+            )
         document = command.model_dump(exclude_none=True)
         if chain_id is not None:
             document["chain_id"] = chain_id

@@ -9,6 +9,7 @@ import asyncio
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -26,6 +27,7 @@ from core.experiments.state import (
     RunnerStateStore,
     ServiceInstance,
     _process_identity_document,
+    state_from_document,
     state_to_document,
 )
 from core.journal.events import LoggingError
@@ -56,6 +58,15 @@ from core.primitives.json_values import JsonObject, copy_json_object, require_te
 from core.primitives.processes import module_process_arguments, process_identity
 
 type ServiceAction = Literal["ready", "pause", "stop"]
+
+
+@dataclass
+class _HeartbeatAudit:
+    event_type: str
+    data: JsonObject
+    context: JsonObject
+    coalesced: int = 0
+    error: Exception | None = None
 
 
 class ServiceManager:
@@ -93,6 +104,9 @@ class ServiceManager:
         self._state_store = state_store
         self._notify_resources = notify_resources
         self._connections = {}
+        self._heartbeat_tasks: dict[str, asyncio.Task] = {}
+        self._heartbeat_pending: dict[tuple[str, str], _HeartbeatAudit] = {}
+        self._heartbeat_audit_task: asyncio.Task | None = None
         self._processes: dict[str, subprocess.Popen] = {}
         self._launch_processes: list[subprocess.Popen] = []
         self._restarts: dict[str, asyncio.Task] = {}
@@ -100,6 +114,8 @@ class ServiceManager:
         self._probes: dict[str, JsonObject] = {}
         self._next_probe: dict[str, float] = {}
         self._bad_replies: dict[str, int] = {}
+        self._startup_recovery: dict[str, float] = {}
+        self._request_recovery: dict[str, float] = {}
         self._waiters: dict[str, asyncio.Future] = {}
         self._sends: dict[str, tuple[str, asyncio.Task]] = {}
         self._pending_action: Literal["pause", "stop"] | None = None
@@ -286,16 +302,19 @@ class ServiceManager:
         manifest = await self._launcher._assembler._check_module_async(
             state, definition.module, False
         )
-        instance, directory, launch, context = self._prepare_service_start(
+        instance, directory, launch, context = await self._prepare_service_start(
             state, definition, manifest
         )
         service_id = instance.service_id
         instance_id = instance.service_instance_id
         self._starting.add(service_id)
         instance.start_deadline = time.monotonic() + state.template.start_timeout
+        self._startup_recovery[instance.service_instance_id] = (
+            self._journal.client._recovery_seconds()
+        )
         spawn = None
         try:
-            self._publish_service_start_intent(state, definition, launch, context)
+            await self._publish_service_start_intent(state, definition, launch, context)
             with (
                 (directory / "stdout.log").open("ab") as stdout,
                 (directory / "stderr.log").open("ab") as stderr,
@@ -335,11 +354,11 @@ class ServiceManager:
             )
             launcher_identity = instance.process_identity
             self._write_service_process(directory, instance, context, launcher_identity)
-            self._save(state)
+            await self._save_async(state)
             await self._confirm_service_readiness(
                 state, service_id, instance_id, instance, process, context
             )
-            self._publish_service_start(
+            await self._publish_service_start(
                 state, directory, instance, context, launcher_identity
             )
             return instance
@@ -358,8 +377,10 @@ class ServiceManager:
                 self._notify_resources()
             self._changed.set()
 
-    def _prepare_service_start(
-        self, state: RunnerState, definition: ServiceDefinition,
+    async def _prepare_service_start(
+        self,
+        state: RunnerState,
+        definition: ServiceDefinition,
         manifest: ModuleManifest | None = None,
     ) -> tuple[ServiceInstance, Path, PreparedLaunch, JsonObject]:
         """Prepare a fresh instance/launch and inherit eligible requests from a stopped predecessor.
@@ -392,30 +413,37 @@ class ServiceManager:
         )
         if (
             manifest is None
-            or getattr(self._launcher.prepare, "__func__", None) is not ModuleLauncher.prepare
+            or getattr(self._launcher.prepare, "__func__", None)
+            is not ModuleLauncher.prepare
         ):
             launch = PreparedLaunch.model_validate(
                 self._launcher.prepare(
-                    state, definition.model_dump(exclude_unset=True), context,
-                    directory, None,
+                    state,
+                    definition.model_dump(exclude_unset=True),
+                    context,
+                    directory,
+                    None,
                 )
             )
         else:
             inputs = ModulePreparation(
                 context=ParticipantIdentity.model_validate(context),
-                artifacts_directory=directory, input_data=None,
+                artifacts_directory=directory,
+                input_data=None,
             )
-            launch = self._launcher._prepare_checked(state, definition, inputs, manifest)
+            launch = self._launcher._prepare_checked(
+                state, definition, inputs, manifest
+            )
         instance = ServiceInstance(service_id, instance_id, definition)
         instance.implementation = launch.module.implementation
         instance.artifacts_directory = directory
         instance.endpoint_path = launch.endpoint_path
         if old is not None:
-            self._inherit_service_requests(state, old, instance)
+            await self._inherit_service_requests(state, old, instance)
         state.services[service_id] = instance
         return instance, directory, launch, context
 
-    def _inherit_service_requests(
+    async def _inherit_service_requests(
         self, state: RunnerState, old: ServiceInstance, instance: ServiceInstance
     ) -> None:
         """Transfer retries and unsent requests, invalidating work pinned to the old instance.
@@ -431,7 +459,7 @@ class ServiceManager:
         instance.restart_count = old.restart_count
         for entry in old.pending_requests:
             if (entry.model_extra or {}).get("expected_instance") is not None:
-                self._finish_request(
+                await self._finish_request(
                     state,
                     old,
                     entry,
@@ -444,7 +472,7 @@ class ServiceManager:
             else:
                 instance.pending_requests.append(entry)
 
-    def _publish_service_start_intent(
+    async def _publish_service_start_intent(
         self,
         state: RunnerState,
         definition: ServiceDefinition,
@@ -461,7 +489,8 @@ class ServiceManager:
             launch: Validated fixed participant launch inputs and runtime paths.
             context: Journal/participant coordinates associated with this operation.
         """
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "service.parameters",
             {
                 "definition": definition.model_dump(exclude_unset=True),
@@ -470,14 +499,15 @@ class ServiceManager:
             },
             context=context,
         )
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.intent",
             {"action": "start_service", "argv": launch.argv},
             context=context,
         )
         if state.pending_rebuild is not None:
             # Retain the prospective instance even if the owner dies during spawn.
-            self._save(state)
+            await self._save_async(state)
 
     def _write_service_process(
         self,
@@ -507,7 +537,7 @@ class ServiceManager:
             },
         )
 
-    def _publish_service_start(
+    async def _publish_service_start(
         self,
         state: RunnerState,
         directory: Path,
@@ -529,7 +559,8 @@ class ServiceManager:
                 service, or None before it is known.
         """
         self._write_service_process(directory, instance, context, launcher_identity)
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "service.started",
             {
                 "process": _process_identity_document(instance.process_identity),
@@ -538,7 +569,7 @@ class ServiceManager:
             },
             context=context,
         )
-        self._save(state)
+        await self._save_async(state)
 
     async def _confirm_service_readiness(
         self,
@@ -568,7 +599,7 @@ class ServiceManager:
             TimeoutError: Startup exceeds its original deadline.
             ValueError: The endpoint process is not owned by the launched process.
         """
-        while time.monotonic() < instance.start_deadline:
+        while time.monotonic() < self._startup_deadline(instance):
             if process.poll() is not None:
                 raise ConnectionError("Service process exited before readiness.")
             try:
@@ -592,9 +623,9 @@ class ServiceManager:
                     )
             connection = ParticipantConnection(instance.endpoint_path, context)
             self._connections[service_id] = connection
-            remaining = max(0.001, instance.start_deadline - time.monotonic())
+            remaining = max(0.001, self._startup_deadline(instance) - time.monotonic())
             await connection.connect(timeout_seconds=remaining)
-            remaining = max(0.001, instance.start_deadline - time.monotonic())
+            remaining = max(0.001, self._startup_deadline(instance) - time.monotonic())
             instance.process_identity = ProcessIdentity.model_validate(declared)
             request_id = str(uuid4())
             state.used_request_ids.add(request_id)
@@ -602,7 +633,8 @@ class ServiceManager:
                 "request_id": request_id,
                 "sent_monotonic": time.monotonic(),
             }
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "control.intent",
                 {"action": "heartbeat", "request_id": request_id},
                 context=context,
@@ -763,7 +795,7 @@ class ServiceManager:
                 if (
                     not instance.ever_ready
                     and instance.start_deadline is not None
-                    and time.monotonic() >= instance.start_deadline
+                    and time.monotonic() >= self._startup_deadline(instance)
                 ):
                     instance.failure = ServiceFailureDetails(
                         code="startup_timeout",
@@ -831,27 +863,36 @@ class ServiceManager:
         try:
             await self._handle_message(state, service_id, task.result())
         except (OSError, EOFError, ValueError, TypeError, KeyError) as error:
-            if service_id in self._connecting or instance.stopping or instance.stopped:
+            if not self._note_communication_failure(service_id, instance, error):
                 return
-            instance.ready = False
-            self._probes.pop(service_id, None)
-            self._bad_replies[service_id] = self._bad_replies.get(service_id, 0) + 1
-            self._journal.client.record_error(
+            await asyncio.to_thread(
+                self._journal.client.record_error,
                 error,
                 context=_context(state, service_id, instance.service_instance_id),
             )
-            if self._bad_replies[service_id] >= 2:
-                instance.failure = ServiceFailureDetails(
-                    code="connection_failed",
-                    message=f"Participant communication failed: {error}",
+
+    def _note_communication_failure(
+        self, service_id: str, instance: ServiceInstance, error: Exception
+    ) -> bool:
+        """Reconnect once, then apply the existing service replacement policy."""
+        if service_id in self._connecting or instance.stopping or instance.stopped:
+            return False
+        instance.ready = False
+        self._probes.pop(service_id, None)
+        self._bad_replies[service_id] = self._bad_replies.get(service_id, 0) + 1
+        if self._bad_replies[service_id] >= 2:
+            instance.failure = ServiceFailureDetails(
+                code="connection_failed",
+                message=f"Participant communication failed: {error}",
+            )
+        else:
+            self._connecting[service_id] = asyncio.create_task(
+                self._connections[service_id].connect(
+                    timeout_seconds=instance.definition.heartbeat.grace_seconds,
                 )
-            else:
-                self._connecting[service_id] = asyncio.create_task(
-                    self._connections[service_id].connect(
-                        timeout_seconds=instance.definition.heartbeat.grace_seconds
-                    )
-                )
-                self._next_probe[service_id] = 0
+            )
+            self._next_probe[service_id] = 0
+        return True
 
     def _check_heartbeat_deadline(
         self, service_id: str, instance: ServiceInstance
@@ -878,51 +919,140 @@ class ServiceManager:
     def _schedule_heartbeat(
         self, state: RunnerState, service_id: str, instance: ServiceInstance
     ) -> None:
-        """Journal and send a due heartbeat using startup or steady-state timing limits.
+        """Keep health probes independent of request and journal completion."""
+        task = self._heartbeat_tasks.get(service_id)
+        if task is None or task.done():
+            if task is not None and not task.cancelled():
+                task.exception()
+            self._heartbeat_tasks[service_id] = asyncio.create_task(
+                self._heartbeat_loop(state, service_id, instance)
+            )
 
-        Args:
-            state: Runner state providing the selected template, cursor, and
-                participant ownership.
-            service_id: Stable service definition UUID.
-            instance: Current service instance whose ownership/queue/lifecycle is
-                being handled.
-        """
-        if (
-            service_id not in self._connecting
-            and service_id not in self._probes
-            and time.monotonic() >= self._next_probe.get(service_id, 0)
-        ):
-            request_id = str(uuid4())
-            state.used_request_ids.add(request_id)
-            self._journal.client.record_event(
-                "control.intent",
-                {"action": "heartbeat", "request_id": request_id},
-                context=_context(state, service_id, instance.service_instance_id),
+    async def _heartbeat_loop(
+        self, state: RunnerState, service_id: str, instance: ServiceInstance
+    ) -> None:
+        while not self._closed and not instance.stopped and not instance.stopping:
+            if state.services.get(service_id) is not instance:
+                return
+            if (
+                service_id not in self._connecting
+                and service_id in self._connections
+                and time.monotonic() >= self._next_probe.get(service_id, 0)
+            ):
+                await self._probe_service(state, service_id, instance)
+            await asyncio.sleep(0.05)
+
+    async def _probe_service(
+        self, state: RunnerState, service_id: str, instance: ServiceInstance
+    ) -> None:
+        request_id = str(uuid4())
+        state.used_request_ids.add(request_id)
+        context = _context(state, service_id, instance.service_instance_id)
+        self._audit_heartbeat(
+            service_id,
+            "control.intent",
+            {"action": "heartbeat", "request_id": request_id},
+            context,
+        )
+        self._probes[service_id] = {
+            "request_id": request_id,
+            "sent_monotonic": time.monotonic(),
+        }
+        timeout = instance.definition.heartbeat.grace_seconds
+        if not instance.ever_ready and instance.start_deadline is not None:
+            timeout = max(0.001, self._startup_deadline(instance) - time.monotonic())
+        try:
+            reply = await self._exchange(
+                service_id, request_id, "heartbeat", {}, timeout=timeout
             )
-            self._probes[service_id] = {
-                "request_id": request_id,
-                "sent_monotonic": time.monotonic(),
-            }
-            self._sends[request_id] = (
+            observation = ServiceObservation.model_validate(reply)
+            if state.services.get(service_id) is not instance or instance.stopping:
+                return
+            self._handle_heartbeat(
+                service_id, instance, observation, request_id, context
+            )
+            self._audit_heartbeat(
                 service_id,
-                asyncio.create_task(
-                    self._exchange(
-                        service_id,
-                        request_id,
-                        "heartbeat",
-                        {},
-                        timeout=(
-                            max(
-                                0.001,
-                                instance.start_deadline - time.monotonic(),
-                            )
-                            if not instance.ever_ready
-                            and instance.start_deadline is not None
-                            else instance.definition.heartbeat.grace_seconds
-                        ),
-                    )
-                ),
+                "service.message",
+                observation.model_dump(exclude_unset=True),
+                context,
             )
+        except TimeoutError:
+            instance.failure = ServiceFailureDetails(
+                code="heartbeat_timeout",
+                message="Service heartbeat grace period expired.",
+            )
+            instance.ready = False
+            self._probes.pop(service_id, None)
+        except (OSError, EOFError, ValueError, TypeError, KeyError) as error:
+            if state.services.get(
+                service_id
+            ) is instance and self._note_communication_failure(
+                service_id, instance, error
+            ):
+                self._audit_heartbeat(
+                    service_id, "error.recorded", {}, context, error=error
+                )
+        finally:
+            self._next_probe[service_id] = (
+                time.monotonic() + instance.definition.heartbeat.interval_seconds
+            )
+            self._changed.set()
+
+    def _audit_heartbeat(
+        self,
+        service_id: str,
+        event_type: str,
+        data: JsonObject,
+        context: JsonObject,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        # One audit worker prevents many services from occupying every executor
+        # thread during a writer outage. Pending observations keep the latest
+        # data per service/kind and explicitly count the replaced observations.
+        key = (service_id, event_type)
+        previous = self._heartbeat_pending.get(key)
+        self._heartbeat_pending[key] = _HeartbeatAudit(
+            event_type,
+            data,
+            context,
+            0 if previous is None else previous.coalesced + 1,
+            error=error,
+        )
+        if self._heartbeat_audit_task is None or self._heartbeat_audit_task.done():
+            self._heartbeat_audit_task = asyncio.create_task(
+                self._write_heartbeat_audits()
+            )
+
+    async def _write_heartbeat_audits(self) -> None:
+        while self._heartbeat_pending and not self._closed:
+            key = next(iter(self._heartbeat_pending))
+            audit = self._heartbeat_pending.pop(key)
+            data = audit.data
+            if audit.coalesced:
+                data = {**data, "coalesced_observations": audit.coalesced}
+            try:
+                if audit.error is None:
+                    await asyncio.to_thread(
+                        self._journal.client.record_event,
+                        audit.event_type,
+                        data,
+                        context=audit.context,
+                    )
+                else:
+                    if audit.coalesced:
+                        audit.error.add_note(
+                            f"Coalesced heartbeat errors: {audit.coalesced}."
+                        )
+                    await asyncio.to_thread(
+                        self._journal.client.record_error,
+                        audit.error,
+                        context=audit.context,
+                        include_traceback=True,
+                    )
+            except Exception:  # noqa: BLE001 - Health probes must survive a rejected audit observation.
+                self._journal.audit_complete = False
 
     async def restart(
         self, state: RunnerState, service_id: str, *, automatic: bool
@@ -977,7 +1107,7 @@ class ServiceManager:
                     )
                 return "stop"
             if exhausted:
-                return self._finish_exhausted_restart(
+                return await self._finish_exhausted_restart(
                     state, service_id, instance, policy, retry, waiter
                 )
             if automatic:
@@ -1009,14 +1139,14 @@ class ServiceManager:
                     raise
                 continue
             if retry is not None:
-                self._requeue_timed_out_request(
+                await self._requeue_timed_out_request(
                     state, service_id, instance, retry, waiter
                 )
             self._changed.set()
             return "ready"
         raise RuntimeError("Service manager is closed.")
 
-    def _finish_exhausted_restart(
+    async def _finish_exhausted_restart(
         self,
         state: RunnerState,
         service_id: str,
@@ -1054,7 +1184,8 @@ class ServiceManager:
         try:
             self._state_store.save(state)
         except OSError as error:
-            self._journal.client.record_error(
+            await asyncio.to_thread(
+                self._journal.client.record_error,
                 error,
                 context={
                     "experiment_id": state.experiment_id,
@@ -1064,7 +1195,7 @@ class ServiceManager:
         self._changed.set()
         return instance.blocked_action
 
-    def _requeue_timed_out_request(
+    async def _requeue_timed_out_request(
         self,
         state: RunnerState,
         service_id: str,
@@ -1100,7 +1231,8 @@ class ServiceManager:
         instance.pending_requests.insert(0, replacement)
         if waiter is not None:
             self._waiters[replacement.request_id] = waiter
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "service.request_queued",
             replacement.model_dump(exclude_unset=True),
             context={
@@ -1112,7 +1244,8 @@ class ServiceManager:
         try:
             self._state_store.save(state)
         except OSError as error:
-            self._journal.client.record_error(
+            await asyncio.to_thread(
+                self._journal.client.record_error,
                 error,
                 context={
                     "experiment_id": state.experiment_id,
@@ -1135,7 +1268,7 @@ class ServiceManager:
             Correlated result of the admitted command.
         """
         request_id = str(uuid4())
-        future = self.enqueue(
+        future = await self._enqueue(
             state, service_id, request_id, command, args, owner="service"
         )
         monitor = self._monitor_task
@@ -1143,6 +1276,22 @@ class ServiceManager:
         if not future.done():
             monitor.result()
         return await asyncio.shield(future)
+
+    def _startup_deadline(self, instance: ServiceInstance) -> float | None:
+        if instance.start_deadline is None:
+            return None
+        recovered = self._journal.client._recovery_seconds()
+        baseline = self._startup_recovery.setdefault(
+            instance.service_instance_id, recovered
+        )
+        return instance.start_deadline + max(0, recovered - baseline)
+
+    def _request_deadline(self, entry: WorkingServiceRequest) -> float | None:
+        if entry.deadline_monotonic is None:
+            return None
+        recovered = self._journal.client._recovery_seconds()
+        baseline = self._request_recovery.setdefault(entry.request_id, recovered)
+        return entry.deadline_monotonic + max(0, recovered - baseline)
 
     async def _send_next(self, state: RunnerState, service_id: str) -> None:
         """Expire queued requests, persist send ownership, and transmit the next ready request.
@@ -1163,23 +1312,24 @@ class ServiceManager:
             entry = instance.pending_requests[0]
             if (
                 entry.deadline_monotonic is None
-                or time.monotonic() < entry.deadline_monotonic
+                or time.monotonic() < self._request_deadline(entry)
             ):
                 break
             instance.pending_requests.pop(0)
-            self._finish_request(
+            await self._finish_request(
                 state,
                 instance,
                 entry,
                 {"result": "fail", "data": {"reason": "queue_timeout"}},
                 "timed_out",
             )
-            self._save(state)
+            await self._save_async(state)
         if not instance.pending_requests:
             return
         entry = instance.pending_requests[0]
         context = _context(state, service_id, instance.service_instance_id)
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.intent",
             {"action": "service_request", **entry.model_dump(exclude_unset=True)},
             context=context,
@@ -1192,8 +1342,9 @@ class ServiceManager:
         )
         instance.pending_requests.pop(0)
         instance.active_request = entry
-        self._save(state)
-        self._journal.client.record_event(
+        await self._save_async(state)
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "service.send_started",
             entry.model_dump(exclude_unset=True),
             context=context,
@@ -1206,7 +1357,7 @@ class ServiceManager:
                     entry.request_id,
                     entry.command,
                     entry.args,
-                    deadline=entry.deadline_monotonic,
+                    deadline=self._request_deadline(entry),
                 )
             ),
         )
@@ -1248,7 +1399,8 @@ class ServiceManager:
         }
         for key in ("experiment_id", "service_id", "service_instance_id"):
             if (observation.model_extra or {}).get(key, context[key]) != context[key]:
-                self._journal.client.record_event(
+                await asyncio.to_thread(
+                    self._journal.client.record_event,
                     "service.message_ignored",
                     {
                         "ignored": "different_instance",
@@ -1257,7 +1409,8 @@ class ServiceManager:
                     context=context,
                 )
                 return
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "service.message",
             observation.model_dump(exclude_unset=True),
             context=context,
@@ -1274,7 +1427,9 @@ class ServiceManager:
         try:
             self._state_store.save(state)
         except OSError as error:
-            self._journal.client.record_error(error, context=context)
+            await asyncio.to_thread(
+                self._journal.client.record_error, error, context=context
+            )
         self._changed.set()
 
     async def _handle_work_observation(
@@ -1303,7 +1458,8 @@ class ServiceManager:
         request_id = observation.request_id
         active = instance.active_request
         if active is None or active.request_id != request_id:
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "service.message_ignored",
                 {
                     "ignored": "retired_or_unknown_request",
@@ -1323,7 +1479,8 @@ class ServiceManager:
             if active is None:
                 return False
         if active.timed_out:
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "service.message_ignored",
                 {
                     "ignored": "command_timeout",
@@ -1347,7 +1504,7 @@ class ServiceManager:
             if instance.blocked_action == "pause":
                 instance.blocked_action = None
         else:
-            self._finish_request(
+            await self._finish_request(
                 state,
                 instance,
                 active,
@@ -1382,7 +1539,8 @@ class ServiceManager:
         """
         probe = self._probes.get(service_id)
         if probe is None or probe["request_id"] != request_id:
-            self._journal.client.record_event(
+            self._audit_heartbeat(
+                service_id,
                 "service.message_ignored",
                 {
                     "ignored": "old_probe",
@@ -1394,7 +1552,7 @@ class ServiceManager:
         if (
             not instance.ever_ready
             and instance.start_deadline is not None
-            and time.monotonic() >= instance.start_deadline
+            and time.monotonic() >= self._startup_deadline(instance)
         ):
             instance.failure = ServiceFailureDetails(
                 code="startup_timeout",
@@ -1457,7 +1615,8 @@ class ServiceManager:
         action = instance.definition.on_command_timeout
         if not active.timed_out:
             response = {"result": "fail", "data": {"reason": "command_timeout"}}
-            self._journal.client.record_command_result(
+            await asyncio.to_thread(
+                self._journal.client.record_command_result,
                 request_id,
                 response,
                 author="runner",
@@ -1481,7 +1640,8 @@ class ServiceManager:
             try:
                 self._state_store.save(state)
             except OSError as error:
-                self._journal.client.record_error(
+                await asyncio.to_thread(
+                    self._journal.client.record_error,
                     error,
                     context={
                         "experiment_id": state.experiment_id,
@@ -1772,7 +1932,8 @@ class ServiceManager:
             for entry in list(instance.pending_requests):
                 if entry.request_id not in sent_ids:
                     continue
-                recorded = read_result(
+                recorded = await asyncio.to_thread(
+                    read_result,
                     self._journal.client,
                     entry.request_id,
                     expected={
@@ -1903,7 +2064,7 @@ class ServiceManager:
                 raise ValueError(
                     "An unfinished service startup requires its original deadline."
                 )
-            timeout = max(0, instance.start_deadline - time.monotonic())
+            timeout = max(0, self._startup_deadline(instance) - time.monotonic())
             if timeout == 0:
                 instance.failure = ServiceFailureDetails(
                     code="startup_timeout",
@@ -1928,7 +2089,8 @@ class ServiceManager:
         if request_id in state.used_request_ids:
             raise RuntimeError("Request ID collision.")
         state.used_request_ids.add(request_id)
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.intent",
             {"action": "command_state", "request_id": request_id},
             context=context,
@@ -1967,7 +2129,8 @@ class ServiceManager:
             True and stop for work that has no matching saved owner; otherwise False
             and None after journal polling.
         """
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "service.commands_reconciled",
             observed.model_dump(exclude_unset=True),
             context=context,
@@ -2224,8 +2387,10 @@ class ServiceManager:
         try:
             self._state_store.save(state)
         except OSError as error:
-            self._journal.client.record_error(
-                error, context={"experiment_id": state.experiment_id}
+            await asyncio.to_thread(
+                self._journal.client.record_error,
+                error,
+                context={"experiment_id": state.experiment_id},
             )
 
     async def stop_all(
@@ -2294,9 +2459,10 @@ class ServiceManager:
         if request_id in state.used_request_ids:
             raise RuntimeError("Request ID collision.")
         state.used_request_ids.add(request_id)
-        error_message = self._record_service_stop_intent(
+        error_message = await self._record_service_stop_intent(
             state, service_id, request_id, context
         )
+        audit_error = error_message
         shutdown_response, shutdown_error = await self._request_service_shutdown(
             state, service_id, instance, request_id, deadline
         )
@@ -2317,7 +2483,7 @@ class ServiceManager:
             )
             instance.blocked_action = "stop"
             self._pending_action = "stop"
-        error_message = self._cancel_service_stop_requests(
+        error_message = await self._cancel_service_stop_requests(
             state, instance, preserve_pending, error_message
         )
         instance.stopping = False
@@ -2326,7 +2492,9 @@ class ServiceManager:
         if process is not None:
             process.poll()
         results[service_id] = {"stopped": instance.stopped, "error": error_message}
-        self._record_service_stop_outcome(
+        if audit_error is not None:
+            results[service_id]["audit_error"] = audit_error
+        await self._record_service_stop_outcome(
             state, service_id, request_id, shutdown_response, context, results
         )
 
@@ -2356,7 +2524,7 @@ class ServiceManager:
             await connection.close()
         self._probes.pop(service_id, None)
 
-    def _record_service_stop_intent(
+    async def _record_service_stop_intent(
         self, state: RunnerState, service_id: str, request_id: str, context: JsonObject
     ) -> str | None:
         """Journal shutdown intent or write emergency metadata, returning any journal error.
@@ -2375,7 +2543,8 @@ class ServiceManager:
         """
         error_message = None
         try:
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "control.intent",
                 {"action": "stop_service", "request_id": request_id},
                 context=context,
@@ -2555,7 +2724,7 @@ class ServiceManager:
             instance.stopped = process.poll() is not None
         return error_message
 
-    def _cancel_service_stop_requests(
+    async def _cancel_service_stop_requests(
         self,
         state: RunnerState,
         instance: ServiceInstance,
@@ -2585,7 +2754,7 @@ class ServiceManager:
             instance.active_request = None
         for entry in cancelled:
             try:
-                self._finish_request(
+                await self._finish_request(
                     state,
                     instance,
                     entry,
@@ -2596,7 +2765,7 @@ class ServiceManager:
                 error_message = str(error)
         return error_message
 
-    def _record_service_stop_outcome(
+    async def _record_service_stop_outcome(
         self,
         state: RunnerState,
         service_id: str,
@@ -2619,7 +2788,8 @@ class ServiceManager:
             results: Mutable per-service shutdown result mapping.
         """
         try:
-            self._journal.client.record_command_result(
+            await asyncio.to_thread(
+                self._journal.client.record_command_result,
                 request_id,
                 shutdown_response.model_dump(exclude_unset=True)
                 if shutdown_response is not None
@@ -2635,12 +2805,17 @@ class ServiceManager:
                 context=context,
             )
         except LoggingError as error:
-            results[service_id]["error"] = str(error)
+            previous_audit = results[service_id].get("audit_error")
+            if results[service_id]["error"] in (None, previous_audit):
+                results[service_id]["error"] = str(error)
+            results[service_id]["audit_error"] = str(error)
         try:
             self._state_store.save(state)
         except OSError as error:
             try:
-                self._journal.client.record_error(error, context=context)
+                await asyncio.to_thread(
+                    self._journal.client.record_error, error, context=context
+                )
             except LoggingError as logging_error:
                 results[service_id]["error"] = str(logging_error)
         self._changed.set()
@@ -2733,6 +2908,8 @@ class ServiceManager:
         self._closed = True
         tasks = [
             self._monitor_task,
+            *self._heartbeat_tasks.values(),
+            self._heartbeat_audit_task,
             *self._restarts.values(),
             *self._connecting.values(),
             *(task for _, task in self._sends.values()),
@@ -2751,6 +2928,9 @@ class ServiceManager:
         self._restarts.clear()
         self._connecting.clear()
         self._sends.clear()
+        self._heartbeat_tasks.clear()
+        self._heartbeat_pending.clear()
+        self._heartbeat_audit_task = None
         for future in self._waiters.values():
             future.cancel()
         self._waiters.clear()
@@ -2779,6 +2959,13 @@ class ServiceManager:
             self._journal.client.record_error(
                 error, context={"experiment_id": state.experiment_id}
             )
+
+    async def _save_async(self, state: RunnerState) -> None:
+        """Persist a detached checkpoint without holding the service event loop."""
+        checkpoint = state_from_document(
+            state.experiment_directory, state_to_document(state)
+        )
+        await asyncio.to_thread(self._save, checkpoint)
 
     async def _exchange(
         self,
@@ -2812,7 +2999,7 @@ class ServiceManager:
         )
         return {**reply, "command": command}
 
-    def _finish_request(
+    async def _finish_request(
         self,
         state: RunnerState,
         instance: ServiceInstance,
@@ -2839,7 +3026,8 @@ class ServiceManager:
             )
         context = _context(state, instance.service_id, instance.service_instance_id)
         if entry.owner != "caller" and not entry.timed_out:
-            self._journal.client.record_command_result(
+            await asyncio.to_thread(
+                self._journal.client.record_command_result,
                 entry.request_id,
                 response,
                 author="runner",
@@ -2847,7 +3035,8 @@ class ServiceManager:
                 context=context,
             )
         elif entry.owner == "caller":
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "service.request_retired",
                 {"request_id": entry.request_id, "response": response},
                 context=context,
@@ -2857,7 +3046,7 @@ class ServiceManager:
             future.set_result({"request_id": entry.request_id, **response})
         self._changed.set()
 
-    def enqueue(
+    def _prepare_queue_entry(
         self,
         state: RunnerState,
         service_id: str,
@@ -2867,7 +3056,7 @@ class ServiceManager:
         *,
         owner: str = "caller",
         deadline: float | None = None,
-    ) -> asyncio.Future:
+    ) -> WorkingServiceRequest:
         """Persist fresh working-request admission and return a result future.
 
         Args:
@@ -2916,17 +3105,71 @@ class ServiceManager:
         ):
             values["expected_instance"] = instance.service_instance_id
         entry = WorkingServiceRequest.model_validate(values)
+        self._request_recovery[request_id] = self._journal.client._recovery_seconds()
+        return entry
+
+    def _publish_queue_entry(
+        self, state: RunnerState, service_id: str, entry: WorkingServiceRequest
+    ) -> asyncio.Future:
+        """Publish already committed admission to the in-memory send queue."""
+        state.services[service_id].pending_requests.append(entry)
+        future = asyncio.get_running_loop().create_future()
+        self._waiters[entry.request_id] = future
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self.monitor(state))
+        return future
+
+    def enqueue(
+        self,
+        state: RunnerState,
+        service_id: str,
+        request_id: str,
+        command: str,
+        args: JsonObject,
+        *,
+        owner: str = "caller",
+        deadline: float | None = None,
+    ) -> asyncio.Future:
+        """Commit admission synchronously and return the eventual command result."""
+        entry = self._prepare_queue_entry(
+            state, service_id, request_id, command, args, owner=owner, deadline=deadline
+        )
         self._journal.client.record_event(
             "service.request_queued",
             entry.model_dump(exclude_unset=True),
-            context=_context(state, service_id, instance.service_instance_id),
+            context=_context(
+                state, service_id, state.services[service_id].service_instance_id
+            ),
         )
-        instance.pending_requests.append(entry)
-        future = asyncio.get_running_loop().create_future()
-        self._waiters[request_id] = future
+        future = self._publish_queue_entry(state, service_id, entry)
         self._save(state)
-        if self._monitor_task is None or self._monitor_task.done():
-            self._monitor_task = asyncio.create_task(self.monitor(state))
+        return future
+
+    async def _enqueue(
+        self,
+        state: RunnerState,
+        service_id: str,
+        request_id: str,
+        command: str,
+        args: JsonObject,
+        *,
+        owner: str = "caller",
+        deadline: float | None = None,
+    ) -> asyncio.Future:
+        """Wait for the same admission COMMIT while keeping control tasks alive."""
+        entry = self._prepare_queue_entry(
+            state, service_id, request_id, command, args, owner=owner, deadline=deadline
+        )
+        await asyncio.to_thread(
+            self._journal.client.record_event,
+            "service.request_queued",
+            entry.model_dump(exclude_unset=True),
+            context=_context(
+                state, service_id, state.services[service_id].service_instance_id
+            ),
+        )
+        future = self._publish_queue_entry(state, service_id, entry)
+        await self._save_async(state)
         return future
 
     def _validate_enqueue(
@@ -2997,14 +3240,14 @@ class ServiceManager:
         for entry in list(instance.pending_requests):
             if entry.request_id == request_id:
                 instance.pending_requests.remove(entry)
-                self._finish_request(
+                await self._finish_request(
                     state,
                     instance,
                     entry,
                     {"result": "fail", "data": {"reason": "cancelled_before_send"}},
                     "cancelled",
                 )
-                self._save(state)
+                await self._save_async(state)
                 return True
         active = instance.active_request
         if active is None or active.request_id != request_id:
@@ -3013,7 +3256,7 @@ class ServiceManager:
         future = self._waiters.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
-        self._save(state)
+        await self._save_async(state)
         if instance.stopped:
             return True
         if not interrupt:
@@ -3046,7 +3289,8 @@ class ServiceManager:
         """
         control_id = str(uuid4())
         state.used_request_ids.add(control_id)
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.intent",
             {
                 "action": "interrupt_request",
@@ -3065,7 +3309,7 @@ class ServiceManager:
             )
             if reply["result"] == "success":
                 instance.active_request = None
-                self._save(state)
+                await self._save_async(state)
                 return True
         except (OSError, TimeoutError):
             pass
@@ -3083,7 +3327,8 @@ class ServiceManager:
         active = instance.active_request
         if active is None:
             return
-        record = read_result(
+        record = await asyncio.to_thread(
+            read_result,
             self._journal.client,
             active.request_id,
             expected={
@@ -3099,11 +3344,11 @@ class ServiceManager:
             and not active.timed_out
             and active.owner != "caller"
         ):
-            self._finish_request(
+            await self._finish_request(
                 state, instance, active, record["response"], record["outcome"]
             )
             instance.active_request = None
-            self._save(state)
+            await self._save_async(state)
             return
         participant = next(
             (

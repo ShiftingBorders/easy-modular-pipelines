@@ -14,6 +14,8 @@ from core.journal.events import LoggingStorageError
 from core.journal.logger import OperationLogger
 from core.models.resource_messages import ResourceSample
 from core.resources.sampling import ResourceWriter
+from tests.helpers.journal_owner import WriterOwner
+from tests.helpers.logging_process import stop_journal_writers
 from tests.helpers.resources import TEMP_ROOT, events, journal, settings
 
 
@@ -63,6 +65,7 @@ class ResourceWriterTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(stop_journal_writers, self.root)
         self.config, self.reader, self.context = journal(self.root)
         self.addCleanup(self.reader.close)
         self.settings = settings(self.root)
@@ -203,11 +206,13 @@ class ResourceWriterTests(unittest.TestCase):
 
     def test_low_disk_and_corrupt_journal_make_monitoring_unavailable(self):
         """D: storage failure is exposed without endless synchronous retries."""
+        self.reader.close()
+        stop_journal_writers(self.root)
+        owner = WriterOwner(self.config).open()
+        self.addCleanup(owner.close)
+        self.reader.open()
         self.writer.select(str(self.config))
-        with patch("core.journal.storage.shutil.disk_usage") as usage:
-            from collections import namedtuple
-
-            usage.return_value = namedtuple("Usage", "total used free")(100, 100, 0)
+        with owner.disk_space(0):
             config = json.loads(self.config.read_text())
             config["logging"]["min_free_bytes"] = 1
             self.config.write_text(json.dumps(config), encoding="utf-8")
@@ -215,6 +220,7 @@ class ResourceWriterTests(unittest.TestCase):
         self.assertIsNotNone(self.writer.error)
         self.writer.close()
         self.reader.close()
+        owner.close()
         (self.root / "events.sqlite").write_bytes(b"not a sqlite database")
         with patch(
             "core.resources.sampling.time.monotonic",

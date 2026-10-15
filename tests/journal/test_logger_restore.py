@@ -27,6 +27,7 @@ from core.models.journal_diagnostics import (
     JournalSnapshotManifest,
 )
 from core.models.journal_records import CommandObservation
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_fixtures import write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -46,6 +47,8 @@ class JournalRestorationTests(unittest.TestCase):
         self.folder = Path(temporary.name)
         self.config = write_context_settings(self.folder)
         self.path = self.folder / "events.db"
+        self.owner = WriterOwner(self.config).open()
+        self.addCleanup(self.owner.close)
         self.logger = OperationLogger(self.config)
         self.addCleanup(self.logger.close)
         self.logger.open()
@@ -54,9 +57,8 @@ class JournalRestorationTests(unittest.TestCase):
 
     def test_sql_and_diagnostic_observations_remain_models_until_public_output(self):
         self.prepare_diagnostics()
-        store = self.logger._store
-        with store._lock:
-            state = store._load_command_result("request")
+        store = self.owner
+        state = store.call("method", name="_load_command_result", arguments=["request"])
         self.assertIsInstance(state["runner"]["observation"], AuthorObservation)
         self.assertIsInstance(state["participant"]["observation"], AuthorObservation)
         self.assertIsInstance(state["runner"]["result"], CommandObservation)
@@ -64,7 +66,9 @@ class JournalRestorationTests(unittest.TestCase):
         public = self.logger.read_command_result("request")
         self.assertIsInstance(public["observations"][0]["observation"], dict)
         self.assertEqual(public["response"], state["runner"]["result"].response)
-        bundle, _, commands = store._read_diagnostics(self.diagnostics)
+        bundle, _, commands = store.call(
+            "method", name="_read_diagnostics", arguments=[self.diagnostics]
+        )
         self.assertIsInstance(bundle, DiagnosticManifest)
         self.assertEqual(bundle.model_dump(), self.bundle)
         self.assertTrue(commands)
@@ -97,7 +101,10 @@ class JournalRestorationTests(unittest.TestCase):
         )
         # Service observation is outside the operation tree; result references must include it.
         self.service_id = self.logger.record_command_result(
-            "request", {"value": "participant"}, author="participant", outcome="succeeded"
+            "request",
+            {"value": "participant"},
+            author="participant",
+            outcome="succeeded",
         )
         self.runner_id = self.logger.record_command_result(
             "request",
@@ -203,7 +210,8 @@ class JournalRestorationTests(unittest.TestCase):
         self.assertEqual(command["event_id"], self.runner_id)
         self.assertEqual(command["author"], "runner")
         self.assertEqual(
-            {item["author"] for item in command["observations"]}, {"runner", "participant"}
+            {item["author"] for item in command["observations"]},
+            {"runner", "participant"},
         )
         self.assertTrue(store.read_changes()["changes"])
         self.assertEqual(read_database(self.path), self.before)
@@ -526,7 +534,9 @@ class JournalRestorationTests(unittest.TestCase):
             .splitlines()
         ]
         command = next(record for record in records if record["kind"] == "command")
-        command["participant"]["observation"]["occurred_at"] = "2026-01-01T00:00:00+00:00"
+        command["participant"]["observation"]["occurred_at"] = (
+            "2026-01-01T00:00:00+00:00"
+        )
         (self.diagnostics / "records.jsonl").write_text(
             "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
         )

@@ -194,7 +194,8 @@ class ExperimentSnapshots:
             state.phase = terminal_phase
             if self._notify_resources is not None:
                 self._notify_resources()
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "experiment.finalized",
                 {"phase": state.phase, "stops": stops},
                 context={"experiment_id": state.experiment_id, "run_id": state.run_id},
@@ -564,14 +565,16 @@ class ExperimentSnapshots:
                 ) from error
         if failure is not None:
             raise failure
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "snapshot.prepared",
             {"snapshot_id": snapshot_id, "kind": kind, "label": label},
             context={"experiment_id": state.experiment_id, "run_id": state.run_id},
         )
         write_json(directory / "manifest.json", manifest.document())
         try:
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "snapshot.created",
                 {"snapshot_id": snapshot_id, "kind": kind, "label": label},
                 context={"experiment_id": state.experiment_id, "run_id": state.run_id},
@@ -583,8 +586,10 @@ class ExperimentSnapshots:
         try:
             self._state_store.save(state)
         except OSError as error:
-            self._journal.client.record_error(
-                error, context={"experiment_id": state.experiment_id}
+            await asyncio.to_thread(
+                self._journal.client.record_error,
+                error,
+                context={"experiment_id": state.experiment_id},
             )
         await self._retain_snapshots(directory, state, manifest)
         return {
@@ -609,10 +614,16 @@ class ExperimentSnapshots:
             published: Just-published snapshot payload that anchors retention
                 selection.
         """
-        candidates, owned = await _await_read_task(asyncio.create_task(asyncio.to_thread(
-            _retention_candidates, directory.parent, published.experiment_id,
-            published.experiment_folder,
-        )))
+        candidates, owned = await _await_read_task(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _retention_candidates,
+                    directory.parent,
+                    published.experiment_id,
+                    published.experiment_folder,
+                )
+            )
+        )
         retained = {directory}
         for _, path in candidates:
             if len(retained) >= state.template.snapshots.keep:
@@ -715,7 +726,9 @@ class ExperimentSnapshots:
             exclude_unset=True
         ):
             raise ValueError("Snapshot template differs from its applied revision.")
-        self._validate_snapshot_modules(directory, ExperimentTemplate.model_validate(template))
+        self._validate_snapshot_modules(
+            directory, ExperimentTemplate.model_validate(template)
+        )
         for relative in state.retained_artifacts:
             if not (directory / "files" / relative).exists():
                 raise ValueError("Snapshot is missing a retained conditional artifact.")
@@ -1043,13 +1056,15 @@ class ExperimentSnapshots:
             # Bootstrap a clone's private journal to record its own restore intent.
             # The source experiment and archived journal are never opened for writing.
             if source_directory is not None:
-                self._bootstrap_clone_journal(state, archive, manifest, target)
-            operation = self._journal.client.start_operation(
+                await self._bootstrap_clone_journal(state, archive, manifest, target)
+            operation = await asyncio.to_thread(
+                self._journal.client.start_operation,
                 "restore_prepare",
                 "experiment.restore_intent",
                 context={"experiment_id": state.experiment_id, "run_id": state.run_id},
             )
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "control.intent",
                 {
                     "action": "restore_experiment",
@@ -1059,14 +1074,20 @@ class ExperimentSnapshots:
                 },
                 operation=operation,
             )
-            self._journal.client.finish_operation(
-                operation, attributes={"phase": "prepared"}
+            await asyncio.to_thread(
+                self._journal.client.finish_operation,
+                operation,
+                attributes={"phase": "prepared"},
             )
             operations = [operation.get_operation_id()]
             if preserve_rebuild_diagnostics and state.pending_rebuild is not None:
                 operations.append(state.pending_rebuild.operation_id)
-            self._journal.client.export_diagnostics(operations, work / "diagnostics")
-            self._journal.close()
+            await asyncio.to_thread(
+                self._journal.client.export_diagnostics,
+                operations,
+                work / "diagnostics",
+            )
+            await self._journal._run_transition(self._journal.close)
             transaction = RestoreTransaction.model_validate(
                 {
                     "schema_version": 2,
@@ -1088,7 +1109,7 @@ class ExperimentSnapshots:
             write_json(marker, transaction.model_dump(exclude_unset=True))
             return await self._finish_restore(state, transaction, marker)
 
-    def _bootstrap_clone_journal(
+    async def _bootstrap_clone_journal(
         self, state: RunnerState, archive: Path, manifest: SnapshotPayload, target: Path
     ) -> None:
         """Copy the snapshot journal into a continuation and open its private runner client.
@@ -1116,7 +1137,7 @@ class ExperimentSnapshots:
                 "generation": manifest.journal.generation,
             },
         )
-        self._journal.open(state, create=False)
+        await self._journal._run_transition(self._journal.open, state, create=False)
 
     async def _finish_restore(
         self,
@@ -1173,7 +1194,7 @@ class ExperimentSnapshots:
         )
         if transaction.phase == "prepared":
             transaction = await self._install_restore_files(transaction, marker, paths)
-        transaction = self._bind_restored_journal(
+        transaction = await self._bind_restored_journal(
             state, transaction, marker, paths, manifest, restoration_id
         )
         if transaction.phase == "complete":
@@ -1290,8 +1311,8 @@ class ExperimentSnapshots:
                 "Restored participant state belongs to another experiment."
             )
         vars(state).update(vars(recovered))
-        self._journal.close()
-        self._journal.open(state, create=False)
+        await self._journal._run_transition(self._journal.close)
+        await self._journal._run_transition(self._journal.open, state, create=False)
         self._restore_announced_services(state, target)
         stops = await self._services.stop_all(state)
         transaction = _update_model(transaction, stopped_state=state_to_document(state))
@@ -1523,7 +1544,7 @@ class ExperimentSnapshots:
         write_json(marker, transaction.model_dump(exclude_unset=True))
         return transaction
 
-    def _bind_restored_journal(
+    async def _bind_restored_journal(
         self,
         state: RunnerState,
         transaction: RestoreTransaction,
@@ -1556,7 +1577,8 @@ class ExperimentSnapshots:
             raise ValueError("Installed state has another experiment identity.")
         vars(state).update(vars(restored))
         if transaction.phase == "files_installed":
-            self._journal.complete_restore(
+            await self._journal._run_transition(
+                self._journal.complete_restore,
                 state,
                 manifest.journal,
                 restoration_id,
@@ -1565,7 +1587,7 @@ class ExperimentSnapshots:
             transaction = _update_model(transaction, phase="journal_restored")
             write_json(marker, transaction.model_dump(exclude_unset=True))
         elif transaction.phase == "journal_restored":
-            self._journal.open(state, create=False)
+            await self._journal._run_transition(self._journal.open, state, create=False)
         return transaction
 
     async def _start_restore_services(
@@ -1609,7 +1631,8 @@ class ExperimentSnapshots:
                 exports[key] = Path(value)
             await self._services.load_states(state, exports)
             state.phase, state.mode = "waiting", "paused"
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "experiment.restored",
                 {
                     "snapshot_id": snapshot_id,
@@ -1646,12 +1669,9 @@ class ExperimentSnapshots:
                 or not path.resolve().is_relative_to(work.resolve())
             ):
                 raise ValueError("Unsafe completed restoration cleanup.")
-            if any(
-                item.is_symlink() or item.is_junction() for item in path.rglob("*")
-            ):
+            if any(item.is_symlink() or item.is_junction() for item in path.rglob("*")):
                 continue
             await asyncio.to_thread(shutil.rmtree, path)
-
 
     async def _replace_restore_directory(self, source: Path, target: Path) -> None:
         """Rename a restoration directory with a bounded retry for Windows sharing errors.

@@ -64,6 +64,12 @@ The weather suite includes real timing intervals, processes, and journal
 behavior; do not assume that all scenarios finish immediately.
 
 Conditional tests use real stage/service processes and the SQLite journal.
+The single-writer tests also terminate or stall real writer processes at COMMIT
+boundaries, check replay without duplicate events, exercise bounded queues and
+heartbeat during recovery, and verify rollback, replacement storage, and
+standalone idle shutdown. Fault instrumentation lives in test fixtures inside
+the writer process. Temporary-directory cleanup stops only fixture-owned
+standalone writers before removing their files on Windows.
 They cover result errors and retries, exact move inputs, backwards/self visits,
 pause/stop/step boundaries, service-call targets, template reload, protected
 artifact reads, and snapshot/rollback/continuation. Owner-crash fixtures exercise

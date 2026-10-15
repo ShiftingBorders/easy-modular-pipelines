@@ -19,9 +19,28 @@ from core.models.updates import _update_model
 from core.primitives.json_values import JsonObject
 
 
+def _record_reload_reconciliation(
+    logger: OperationLogger, context: JsonObject, failure_id: str | None
+) -> None:
+    """Keep the complete rollback audit scope in the journal worker thread."""
+    with logger.operation(
+        "rebuild", "reload_template_rollback", context=context
+    ) as recovery:
+        logger.record_event(
+            "control.reconciled",
+            {
+                "action": "reload_template",
+                "state": "rolled_back",
+                "error_id": failure_id,
+            },
+            operation=recovery,
+        )
+
+
 @dataclass(frozen=True)
 class ReloadLayout:
     """Compared service/stage definitions, preserved prefix, and next DAG position."""
+
     old_services: dict[str, ServiceDefinition]
     new_services: dict[str, ServiceDefinition]
     changed_services: set[str]
@@ -34,6 +53,7 @@ class ReloadLayout:
 @dataclass(frozen=True)
 class ReloadCursor:
     """Reload cursor decision and stage IDs whose current results remain valid."""
+
     next_position: int
     stage_position: int
     pending_advance: bool
@@ -44,6 +64,7 @@ class ReloadCursor:
 @dataclass
 class ReloadApplication:
     """Working reload state, audit operation, workspace, and commit/cleanup progress."""
+
     template: ExperimentTemplate
     template_yaml: str
     previous: ExperimentTemplate
@@ -106,9 +127,9 @@ def _reload_layout(
     old_stages, new_stages = previous.stages, candidate.stages
     prefix = 0
     for before, after in zip(old_stages, new_stages):
-        if _definition_fingerprint(before, ignore_snapshot_policy=True) != _definition_fingerprint(
-            after, ignore_snapshot_policy=True
-        ) or (
+        if _definition_fingerprint(
+            before, ignore_snapshot_policy=True
+        ) != _definition_fingerprint(after, ignore_snapshot_policy=True) or (
             isinstance(before, ServiceCallDefinition)
             and before.service_id in changed_services
         ):

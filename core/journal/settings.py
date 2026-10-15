@@ -45,6 +45,12 @@ def _load_logging_settings(
         from core.models.journal_records import JournalContext
         from core.models.journal_settings import LoggingConfiguration
 
+        endpoint = values.get("writer_endpoint_path")
+        if endpoint is not None:
+            endpoint_path = Path(require_text(endpoint, "writer_endpoint_path"))
+            if not endpoint_path.is_absolute():
+                endpoint_path = config_path.parent / endpoint_path
+            values = {**values, "writer_endpoint_path": endpoint_path}
         settings = LoggingConfiguration.model_validate({**values, "db_path": path})
         context = JournalContext.model_validate(document.get("operation_context", {}))
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as error:

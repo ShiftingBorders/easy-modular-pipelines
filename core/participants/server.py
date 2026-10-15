@@ -6,11 +6,11 @@ import asyncio
 import hmac
 import os
 import secrets
-import time
 from collections.abc import Awaitable, Callable
 from functools import partial
 from pathlib import Path
 
+from core.journal.deadlines import wait_journal_deadline
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.models.participant_observations import CommandWork
@@ -37,6 +37,7 @@ class ParticipantServer:
     The caller owns the logger and application lifecycle. Start and close are
     explicit; close must be invoked by the owner after a request handler returns.
     """
+
     def __init__(
         self,
         endpoint_path: Path,
@@ -79,6 +80,7 @@ class ParticipantServer:
         self._client_tasks: set[asyncio.Task] = set()
         self._reply_commands: dict[asyncio.Task, str] = {}
         self._work: dict[str, asyncio.Task[ParticipantResult]] = {}
+        self._cancellation_audits: set[asyncio.Task] = set()
         self._requests: dict[str, CommandWork] = {}
         self._seen: set[str] = set()
         self._current: str | None = None
@@ -236,7 +238,10 @@ class ParticipantServer:
                     role == "runner"
                     and request.command
                     not in ("heartbeat", "command_state", "interrupt", "shutdown")
-                    and self._logger.read_command_result(request_id) is not None
+                    and await asyncio.to_thread(
+                        self._logger.read_command_result, request_id
+                    )
+                    is not None
                 ):
                     raise ValueError(
                         "The request already has a durable journal result."
@@ -395,7 +400,8 @@ class ParticipantServer:
             await asyncio.gather(*tasks, return_exceptions=True)
         result = ParticipantResult.model_validate(response)
         if command in ("interrupt", "shutdown"):
-            self._logger.record_command_result(
+            await asyncio.to_thread(
+                self._logger.record_command_result,
                 request["request_id"],
                 result.model_dump(exclude_unset=True),
                 author="participant",
@@ -416,21 +422,35 @@ class ParticipantServer:
         request_id = request["request_id"]
         if task.cancelled():
             # A task cancelled before its first instruction never reaches finally.
-            try:
-                self._logger.record_command_result(
-                    request_id,
-                    {"result": "fail", "data": {"reason": "cancelled_before_start"}},
-                    author="participant",
-                    outcome="cancelled",
-                    context=self._call_context(request),
+            if request_id in self._requests:
+                audit = asyncio.create_task(
+                    self._record_unstarted_cancellation(request)
                 )
-            except Exception as error:  # noqa: BLE001 - Surface a failed durable cancellation.
-                self._failure = error
-            self._work.pop(request_id, None)
-            self._requests.pop(request_id, None)
+                self._cancellation_audits.add(audit)
+                audit.add_done_callback(self._cancellation_audits.discard)
+                return
         elif task.exception() is not None:
             self._failure = task.exception()
         self._completed.setdefault(request_id, asyncio.Event()).set()
+
+    async def _record_unstarted_cancellation(self, request: JsonObject) -> None:
+        """Confirm cancellation without blocking heartbeat in a task callback."""
+        request_id = request["request_id"]
+        try:
+            await asyncio.to_thread(
+                self._logger.record_command_result,
+                request_id,
+                {"result": "fail", "data": {"reason": "cancelled_before_start"}},
+                author="participant",
+                outcome="cancelled",
+                context=self._call_context(request),
+            )
+        except BaseException as error:  # noqa: BLE001 - Retain an interrupted or failed cancellation audit.
+            self._failure = error
+        finally:
+            self._work.pop(request_id, None)
+            self._requests.pop(request_id, None)
+            self._completed.setdefault(request_id, asyncio.Event()).set()
 
     def has_call(self, request_id: str) -> bool:
         """Return whether a call is tracked as running, queued, or completed.
@@ -490,29 +510,33 @@ class ParticipantServer:
         try:
             context = self._call_context(handler_request)
             deadline = request.deadline_monotonic
-            remaining = (
-                None if deadline is None else max(0, deadline - time.monotonic())
-            )
+            recovery_baseline = self._logger._recovery_seconds()
             try:
                 if self._stopping:
                     raise RuntimeError(
                         "Participant is stopping; no new work is accepted."
                     )
-                async with asyncio.timeout(remaining):
-                    await self._work_lock.acquire()
+                await wait_journal_deadline(
+                    self._work_lock.acquire(), deadline, self._logger
+                )
                 acquired = True
                 self._current = request_id
                 if self._stopping:
                     raise RuntimeError(
                         "Participant stopped accepting work while the request was queued."
                     )
-                self._logger.record_event(
+                await asyncio.to_thread(
+                    self._logger.record_event,
                     "call.started",
                     {"request_id": request_id, "command": request.command},
                     context=context,
                 )
                 # External work belongs to its handler; an expired waiter alone
                 # must not release this lock while that work is still running.
+                if deadline is not None:
+                    handler_request["deadline_monotonic"] = deadline + max(
+                        0, self._logger._recovery_seconds() - recovery_baseline
+                    )
                 response = ParticipantResult.model_validate(
                     await self._handler(handler_request)
                 )
@@ -531,7 +555,8 @@ class ParticipantServer:
                     result="fail",
                     data={"code": "command_failed", "message": str(error)},
                 )
-            self._logger.record_command_result(
+            await asyncio.to_thread(
+                self._logger.record_command_result,
                 request_id,
                 response.model_dump(exclude_unset=True),
                 author="participant",
@@ -589,7 +614,7 @@ class ParticipantServer:
         ]
         if replies:
             await asyncio.wait(replies, timeout=self._timeout)
-        tasks = [*self._work.values(), *self._client_tasks]
+        tasks = [*self._work.values(), *self._client_tasks, *self._cancellation_audits]
         tasks = [task for task in tasks if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()

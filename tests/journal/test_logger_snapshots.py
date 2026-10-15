@@ -7,12 +7,11 @@ import time
 import unittest
 from contextlib import closing
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
 from uuid import UUID
 
 from core.journal.events import LoggingStateError, LoggingStorageError
 from core.journal.logger import OperationLogger
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_fixtures import BASE_CONTEXT, write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -32,6 +31,8 @@ class LoggerSnapshotTests(unittest.TestCase):
             self.folder, context={**BASE_CONTEXT, "source": "participant"}
         )
         self.path = self.folder / "events.db"
+        self.owner = WriterOwner(self.config).open()
+        self.addCleanup(self.owner.close)
         self.logger = OperationLogger(self.config)
         self.addCleanup(self.logger.close)
         self.logger.open()
@@ -99,7 +100,6 @@ class LoggerSnapshotTests(unittest.TestCase):
         )
         before = read_database(self.path)
         worker = self.start_worker()
-        validate = self.logger._store._validate_snapshot_source
         appended_ids = []
 
         def write_after_boundary(reader):
@@ -119,14 +119,9 @@ class LoggerSnapshotTests(unittest.TestCase):
             worker.send(json.dumps({"action": "write", "count": 20}))
             self.assertEqual(worker.receive(), {"attempting": "write"})
             appended_ids.extend(worker.receive()["ids"])
-            validate(reader)
 
         target = self.folder / "snapshot"
-        with patch.object(
-            self.logger._store,
-            "_validate_snapshot_source",
-            side_effect=write_after_boundary,
-        ):
+        with self.owner.observe("snapshot_boundary", write_after_boundary):
             manifest = self.logger.export_snapshot(target, min_free_bytes=0)
         worker.send(json.dumps({"action": "stop"}))
         self.assertEqual(worker.wait(), 0)
@@ -155,33 +150,19 @@ class LoggerSnapshotTests(unittest.TestCase):
             )
         before = read_database(self.path)
         worker = self.start_worker()
-        connect = sqlite3.connect
         write_completed = []
         page_counts = []
 
-        def progress(status, remaining, total):
+        def progress(data):
+            _status, remaining, total = data
             page_counts.append((remaining, total))
             if remaining > 0 and not write_completed:
                 worker.send(json.dumps({"action": "write", "count": 5}))
                 self.assertEqual(worker.receive(), {"attempting": "write"})
                 write_completed.extend(worker.receive()["ids"])
 
-        def observe_source(*args, **kwargs):
-            connection = connect(*args, **kwargs)
-            if args[0] != self.path.as_uri() + "?mode=ro":
-                return connection
-            observed = Mock(wraps=connection)
-
-            def backup(destination, **options):
-                return connection.backup(destination, progress=progress, **options)
-
-            observed.backup.side_effect = backup
-            return observed
-
         target = self.folder / "snapshot"
-        with patch(
-            "core.journal.storage.sqlite3.connect", side_effect=observe_source
-        ):
+        with self.owner.observe("backup_progress", progress):
             manifest = self.logger.export_snapshot(target, min_free_bytes=0)
         worker.send(json.dumps({"action": "stop"}))
         self.assertEqual(worker.wait(), 0)
@@ -232,42 +213,29 @@ class LoggerSnapshotTests(unittest.TestCase):
         archives.mkdir()
         self.logger.close()
         self.config = write_context_settings(self.folder, min_free_bytes=100)
-        visited = []
-
-        def free_space(directory):
-            visited.append(Path(directory))
-            return SimpleNamespace(free=50 if Path(directory) == archives else 500)
-
-        with patch(
-            "core.journal.storage.shutil.disk_usage", side_effect=free_space
-        ):
+        with self.owner.disk_space({str(archives): 50, "default": 500}) as visited:
             self.logger.open()
             with self.assertRaises(LoggingStorageError):
                 self.logger.export_snapshot(archives / "snapshot", min_free_bytes=200)
             self.logger.record_event("snapshot.failed")
-        self.assertIn(archives, visited)
-        self.assertIn(self.path.parent, visited)
+        self.assertIn((archives,), visited)
+        self.assertIn((self.path.parent,), visited)
         self.assertFalse((archives / "snapshot").exists())
         self.assertEqual(len(read_database(self.path)), 2)
         self.assertEqual(len(list(self.folder.glob("*.emergency-*.jsonl"))), 1)
 
     def test_publication_failure_keeps_partial_copy_and_source_can_record_error(self):
-        rename = Path.rename
         target = self.folder / "snapshot"
         failure = OSError("injected manifest publication failure")
 
-        def fail_manifest(path, destination):
-            if path.name == "manifest.json.part":
-                raise failure
-            return rename(path, destination)
-
         before = read_database(self.path)
         with (
-            patch.object(Path, "rename", fail_manifest),
+            self.owner.fault("publication_failure", error=failure),
             self.assertRaises(LoggingStorageError) as caught,
         ):
             self.logger.export_snapshot(target, min_free_bytes=0)
-        self.assertIs(caught.exception.__cause__, failure)
+        self.assertIsInstance(caught.exception.__cause__, type(failure))
+        self.assertEqual(str(caught.exception.__cause__), str(failure))
         self.assertFalse((target / "manifest.json").exists())
         self.assertTrue((target / "journal.sqlite").exists())
         self.assertEqual(read_database(target / "journal.sqlite"), before)
@@ -302,7 +270,7 @@ class LoggerSnapshotTests(unittest.TestCase):
                         logger.record_event("must-not-write")
 
     def test_export_of_confirmed_prefix_is_allowed_after_failed_write(self):
-        self.logger._store._connection.execute(
+        self.owner.execute(
             "CREATE TEMP TRIGGER deny_write BEFORE INSERT ON events "
             "BEGIN SELECT RAISE(ABORT, 'blocked write'); END"
         )

@@ -29,6 +29,7 @@ from core.experiments.archive_inputs import (
 from core.experiments.assembler import ExperimentAssembler, find_experiment
 from core.experiments.state import RunnerState
 from core.journal.logger import OperationLogger
+from core.journal.supervisor import JournalSupervisor
 from core.models.archive_documents import ArchiveFile, ArchiveManifest, ArchiveModule
 from core.models.archive_settings import ArchiveConfiguration
 from core.models.experiment_template import ExperimentTemplate, ResourceDefinition
@@ -167,6 +168,7 @@ class ExperimentArchiver:
             The operation's result with operation_id and logging_config_path added.
         """
         logger = None
+        supervisor = None
         failure = None
         config = None
         try:
@@ -189,9 +191,11 @@ class ExperimentArchiver:
                     "operation_context": {"source": "experiment_archiver"},
                 },
             )
-            logger = OperationLogger(config)
+            supervisor = JournalSupervisor(config, runtime_directory=folder / "writer")
+            await asyncio.to_thread(supervisor.start)
+            logger = OperationLogger(supervisor.client_config_path)
             await asyncio.to_thread(logger.open)
-            info = logger.get_journal_info()
+            info = await asyncio.to_thread(logger.get_journal_info)
             identity = JournalIdentity.model_validate(
                 {"journal_id": info["journal_id"], "generation": info["generation"]}
             )
@@ -233,21 +237,30 @@ class ExperimentArchiver:
             raise
         finally:
             operation.close()
-            if logger is not None:
+            operation_failed = failure is not None
+            for resource, resource_name in (
+                (logger, "logger"),
+                (supervisor, "writer supervisor"),
+            ):
+                if resource is None:
+                    continue
                 try:
-                    await asyncio.to_thread(logger.close)
-                except Exception as close_error:
+                    await asyncio.to_thread(resource.close)
+                except Exception as close_error:  # noqa: BLE001 - Close both owned resources while retaining the first failure.
                     if failure is None:
-                        close_error.add_note(
-                            "Archive operation completed before logger close failed."
+                        failure = close_error
+                        failure.add_note(
+                            f"Archive operation completed before {resource_name} close failed."
                         )
-                        close_error.add_note(
+                        failure.add_note(
                             f"Archive operation logging configuration: {config}"
                         )
-                        raise
-                    failure.add_note(
-                        f"Closing the archive logger also failed: {close_error}"
-                    )
+                    else:
+                        failure.add_note(
+                            f"Closing the archive journal also failed: {close_error}"
+                        )
+            if failure is not None and not operation_failed:
+                raise failure
 
     def _space(self, folder: Path, required: int = 0) -> None:
         """Require free bytes for the operation plus the configured storage reserve.

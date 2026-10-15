@@ -78,6 +78,11 @@ disappears.
 
 Resource-log failures can produce a later `resources.gap` observation.
 They do not override the policy for obligatory runner journal writes.
+The collector shares the experiment's writer process. Optional delivery waits
+for `logging_busy_timeout_seconds` plus a 0.1-second IPC allowance, then counts
+an unconfirmed sample and follows `logging_retry_seconds`. It does not replay
+that sample. This bounded wait keeps collector control and status available
+while mandatory experiment writes wait for writer recovery.
 
 CPU/RAM/disk/network observations describe the runtime machine.
 [Dashboard ICMP](dashboard.md#icmp-and-notifications) runs on the dashboard

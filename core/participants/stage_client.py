@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Self
 from uuid import uuid4
@@ -33,6 +34,7 @@ class StageClient:
         settings: Effective module settings loaded when opened.
         context: Runner-provided context document containing absolute runtime paths.
     """
+
     def __init__(self, context_path: Path) -> None:
         """Initialize an unopened client for an absolute runner-created context path.
 
@@ -93,11 +95,20 @@ class StageClient:
             target=self._run, name="stage-client", daemon=True
         )
         self._thread.start()
-        if not self._ready.wait(self._timeout):
-            self.close()
-            raise TimeoutError(
-                "StageClient did not connect before its control deadline."
+        deadline = time.monotonic() + self._timeout
+        recovery_baseline = None
+        while not self._ready.wait(0.1):
+            recovery = 0.0 if self._logger is None else self._logger._recovery_seconds()
+            if recovery_baseline is None and self._logger is not None:
+                recovery_baseline = recovery
+            extension = (
+                0 if recovery_baseline is None else max(0, recovery - recovery_baseline)
             )
+            if time.monotonic() >= deadline + extension:
+                self.close()
+                raise TimeoutError(
+                    "StageClient did not connect before its control deadline."
+                )
         if self._error is not None:
             error = self._error
             self.close()
@@ -127,7 +138,7 @@ class StageClient:
             context.endpoint_path, context.context, role="module"
         )
         try:
-            self._logger.open()
+            await asyncio.to_thread(self._logger.open)
             await self._connection.connect(timeout_seconds=self._timeout)
             reply = await self._connection.request(
                 str(uuid4()), "module_status", {}, timeout_seconds=self._timeout
@@ -147,7 +158,7 @@ class StageClient:
                 raise
         finally:
             await self._connection.close()
-            self._logger.close()
+            await asyncio.to_thread(self._logger.close)
 
     def _check_open(self) -> None:
         """Raise the background connection error or reject a closed client."""
@@ -171,9 +182,17 @@ class StageClient:
                 value, message = data.value, data.message
             else:
                 value, message = data["value"], data["message"]
-            self._logger.record_progress(value, total=1, stage=message, unit="fraction")
+            await asyncio.to_thread(
+                self._logger.record_progress,
+                value,
+                total=1,
+                stage=message,
+                unit="fraction",
+            )
         else:
-            self._logger.record_event(f"module.{command}", data)
+            await asyncio.to_thread(
+                self._logger.record_event, f"module.{command}", data
+            )
         reply = await self._connection.request(
             str(uuid4()),
             command,
@@ -193,8 +212,25 @@ class StageClient:
         """
         self._check_open()
         future = asyncio.run_coroutine_threadsafe(self._send(command, data), self._loop)
+        deadline = time.monotonic() + self._timeout
+        baseline = self._logger._recovery_seconds()
         try:
-            future.result(timeout=self._timeout)
+            while True:
+                remaining = (
+                    deadline
+                    + max(0, self._logger._recovery_seconds() - baseline)
+                    - time.monotonic()
+                )
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "StageClient report exceeded its control deadline."
+                    )
+                try:
+                    future.result(timeout=min(0.1, remaining))
+                    return
+                except TimeoutError:
+                    if future.done():
+                        raise
         except BaseException:
             future.cancel()
             raise

@@ -41,14 +41,23 @@ from tests.helpers.services import ServiceWorkspace
 
 class ModelRetentionTests(unittest.TestCase):
     def setUp(self):
-        path = Path(__file__).resolve().parents[2] / "default_settings/experiment_template.yaml"
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "default_settings/experiment_template.yaml"
+        )
         self.document = yaml.safe_load(path.read_text(encoding="utf-8"))
-        self.document["stages"] = [{
-            "module": {"name": "worker", "version": "1", "hash": "a" * 64},
-            "settings": {"nested": [1]},
-            "timeout_seconds": None,
-            "errors": {"retries": 0, "retry_delay_seconds": 0, "on_exhausted": "stop"},
-        }]
+        self.document["stages"] = [
+            {
+                "module": {"name": "worker", "version": "1", "hash": "a" * 64},
+                "settings": {"nested": [1]},
+                "timeout_seconds": None,
+                "errors": {
+                    "retries": 0,
+                    "retry_delay_seconds": 0,
+                    "on_exhausted": "stop",
+                },
+            }
+        ]
         self.template = ExperimentTemplate.model_validate(self.document)
 
     def test_conditional_model_updates_preserve_public_json_and_original_result(self):
@@ -134,7 +143,10 @@ class ModelRetentionTests(unittest.TestCase):
             errors=stage.errors,
         )
         call = ServiceCallDefinition(
-            service_id=service_id, settings={}, timeout_seconds=None, errors=stage.errors
+            service_id=service_id,
+            settings={},
+            timeout_seconds=None,
+            errors=stage.errors,
         )
         original = self.template.model_dump(exclude_unset=True)
         with self.assertRaisesRegex(ValueError, "explicit service_id"):
@@ -158,7 +170,11 @@ class ModelRetentionTests(unittest.TestCase):
     def test_typed_input_keeps_json_constraints_and_empty_dag_check(self):
         for bad in (float("inf"), "\ud800", {1: "value"}, self.template.logging):
             with self.subTest(bad=type(bad).__name__):
-                document = {**self.document, "name": bad, "stages": self.template.stages}
+                document = {
+                    **self.document,
+                    "name": bad,
+                    "stages": self.template.stages,
+                }
                 with self.assertRaises((TypeError, ValueError)):
                     ExperimentTemplate.model_validate(document)
         with self.assertRaises(ValueError):
@@ -180,7 +196,9 @@ class ModelRetentionTests(unittest.TestCase):
             _update_model(stage, errors={"retries": 1})
 
     def test_cursor_update_uses_explicit_json_representation(self):
-        cursor = PublicationCursor.model_validate({"position": [1, "a", "b"], "publication": "p"})
+        cursor = PublicationCursor.model_validate(
+            {"position": [1, "a", "b"], "publication": "p"}
+        )
         replacement = _update_model(cursor, _dump_mode="json", publication="next")
         self.assertEqual(replacement.position, (1, "a", "b"))
         self.assertEqual(replacement.publication, "next")
@@ -192,8 +210,13 @@ class ModelRetentionTests(unittest.TestCase):
             nested = [nested]
         stage = _update_model(self.template.stages[0], settings={"deep": nested})
         for definition in (stage, stage.model_dump(exclude_unset=True)):
-            with self.subTest(kind=type(definition).__name__), self.assertRaises(ValueError):
-                ExperimentTemplate.model_validate({**self.document, "stages": [definition]})
+            with (
+                self.subTest(kind=type(definition).__name__),
+                self.assertRaises(ValueError),
+            ):
+                ExperimentTemplate.model_validate(
+                    {**self.document, "stages": [definition]}
+                )
         module = _update_model(self.template.stages[0].module, name="worker\ud800")
         stage = _update_model(self.template.stages[0], module=module)
         with self.assertRaises(ValueError):
@@ -373,7 +396,7 @@ class ModelRetentionTests(unittest.TestCase):
             return document
 
         with patch.object(workspace.launcher, "prepare", prepare):
-            instance, directory, launch, context = (
+            instance, directory, launch, context = asyncio.run(
                 workspace.manager._prepare_service_start(workspace.state, definition)
             )
         self.assertEqual(len(captured), 1)

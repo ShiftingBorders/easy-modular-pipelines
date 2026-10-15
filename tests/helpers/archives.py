@@ -404,6 +404,9 @@ class ArchiveWorkspace:
             or not self.root.is_relative_to(TEMP_ROOT.resolve())
         ):
             raise ValueError("Unsafe archive fixture cleanup target.")
+        from tests.helpers.logging_process import stop_journal_writers
+
+        await asyncio.to_thread(stop_journal_writers, self.root)
         for attempt in range(10):
             try:
                 self.temporary.cleanup()

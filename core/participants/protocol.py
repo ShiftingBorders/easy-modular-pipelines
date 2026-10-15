@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-
 from core.models.participant_identity import ParticipantIdentity
 from core.models.participant_protocol import (
     ParticipantRequest,
     ParticipantResult,
     ResultEnvelope,
 )
-from core.primitives.json_values import JsonObject, copy_json_object, require_text
+from core.primitives.framing import encode_frame, read_frame  # noqa: F401 - Public framing imports remain available.
+from core.primitives.json_values import JsonObject, require_text
 
 PROTOCOL_VERSION = 2
 IDENTITY_FIELDS = ("experiment_id", "participant_id", "participant_instance_id")
@@ -44,25 +42,6 @@ def _participant_identity(
 def validate_response(response: JsonObject, *, envelope: bool = False) -> JsonObject:
     model = ResultEnvelope if envelope else ParticipantResult
     return model.model_validate(response).model_dump(exclude_unset=True)
-
-
-def encode_frame(message: JsonObject) -> bytes:
-    payload = json.dumps(
-        copy_json_object(message, "protocol message"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return len(payload).to_bytes(8, "big") + payload
-
-
-async def read_frame(reader: asyncio.StreamReader) -> JsonObject:
-    size = int.from_bytes(await reader.readexactly(8), "big")
-    if size == 0:
-        raise ValueError("Empty protocol frame.")
-    return copy_json_object(
-        json.loads((await reader.readexactly(size)).decode("utf-8")),
-        "protocol message",
-    )
 
 
 def validate_request(message: JsonObject, identity: JsonObject) -> None:

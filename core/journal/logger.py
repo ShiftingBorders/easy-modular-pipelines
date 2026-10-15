@@ -64,6 +64,8 @@ class OperationLogger:
             raise ValueError("config_path must be an absolute filesystem path.")
         self._config_path = path
         self._store: SQLiteEventStore | None = None
+        self._opening_store = None
+        self._request_timeout_seconds: float | None = None
         self._context: JournalContext
         self._producer_instance_id: str | None = None
         self._sequence_number = 0
@@ -117,15 +119,10 @@ class OperationLogger:
             context = JournalContext.model_validate(values)
             reopening = db_path == self._journal_path
             if reopening and self._journal_info is not None:
-                from core.models.journal_settings import JournalConfiguration
-
                 # Reopening intentionally replaces the file's original create identity.
-                settings = JournalConfiguration.model_validate(
+                settings = type(settings).model_validate(
                     {
-                        "db_path": settings.db_path,
-                        "busy_timeout_seconds": settings.busy_timeout_seconds,
-                        "max_event_bytes": settings.max_event_bytes,
-                        "min_free_bytes": settings.min_free_bytes,
+                        **settings.model_dump(),
                         "open_mode": "existing",
                         "expected_journal": {
                             name: self._journal_info[name]
@@ -133,7 +130,8 @@ class OperationLogger:
                         },
                     }
                 )
-            store = SQLiteEventStore._from_settings(settings, context, self._read_only)
+            store = self._make_store(settings, context)
+            self._opening_store = store
             producer_instance_id = uuid4().hex
             expected_identity = (
                 self._journal_identity if db_path == self._journal_path else None
@@ -176,11 +174,14 @@ class OperationLogger:
                         error, failure, "closing a failed journal open"
                     )
                 if isinstance(error, OSError):
+                    self._opening_store = None
                     raise LoggingStorageError(
                         f"Cannot reopen the known journal at {db_path}."
                     ) from error
+                self._opening_store = None
                 raise
             self._store = store
+            self._opening_store = None
             self._journal_path = db_path
             self._journal_identity = identity
             self._journal_info = journal_info
@@ -197,6 +198,13 @@ class OperationLogger:
         detaches the store so later use requires an explicit reopen.
         """
         self._check_process()
+        # Cancellation must reach an in-flight transport before waiting for
+        # the logger's ordering lock, which that request currently owns.
+        from core.journal.client import JournalClient
+
+        store = self._store or self._opening_store
+        if isinstance(store, JournalClient):
+            store.request_close()
         with self._lock:
             if self._store is None:
                 return
@@ -207,6 +215,34 @@ class OperationLogger:
                 raise
             self._store = None
             self._producer_instance_id = None
+
+    def _make_store(self, settings, context):
+        from core.journal.client import _make_journal_store
+
+        return _make_journal_store(
+            self._config_path,
+            settings,
+            context,
+            self._read_only,
+            request_timeout_seconds=self._request_timeout_seconds,
+        )
+
+    def _recovery_seconds(self) -> float:
+        """Owner-observed outage duration, independent of the blocked write lock."""
+        from core.journal.client import JournalClient
+
+        store = self._store or self._opening_store
+        if isinstance(store, JournalClient):
+            return store.recovery_seconds()
+        return 0.0
+
+    def _interrupt_waiting(self) -> None:
+        """Abort local waits for emergency shutdown, without claiming rollback."""
+        from core.journal.client import JournalClient
+
+        store = self._store or self._opening_store
+        if isinstance(store, JournalClient):
+            store.request_close()
 
     def __enter__(self) -> Self:
         """Open the logger and return it for a with block."""
@@ -338,7 +374,7 @@ class OperationLogger:
             # Input rejection happens before INSERT; the journal remains usable.
             raise
         except BaseException as error:
-            self._failed = True
+            self._failed = not getattr(error, "retryable", False)
             try:
                 self._store._report_failure(error, "record event", event)
             except BaseException:  # noqa: BLE001, S110 - Preserve original failure.
@@ -986,13 +1022,15 @@ class OperationLogger:
         """
         from core.models.artifacts import ArtifactRegistration
 
-        parameters = ArtifactRegistration.model_validate({
-            "artifact_id": artifact_id,
-            "path": path,
-            "purpose": purpose,
-            "size_bytes": size_bytes,
-            "content_hash": content_hash,
-        })
+        parameters = ArtifactRegistration.model_validate(
+            {
+                "artifact_id": artifact_id,
+                "path": path,
+                "purpose": purpose,
+                "size_bytes": size_bytes,
+                "content_hash": content_hash,
+            }
+        )
         artifact = parameters.model_dump()
         if artifact_id is None:
             artifact_id = uuid4().hex

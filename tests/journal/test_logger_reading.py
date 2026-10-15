@@ -15,7 +15,6 @@ from core.journal.events import (
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
-from core.journal.records import _read_boundary
 from core.models.journal_records import (
     JournalChangeData,
     JournalChangeEntry,
@@ -26,6 +25,7 @@ from core.models.journal_records import (
     JournalEventPage,
     JournalReadBoundary,
 )
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_fixtures import context_event, write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -44,6 +44,8 @@ class JournalReadingTests(unittest.TestCase):
         self.folder = Path(temporary.name)
         self.config = write_context_settings(self.folder)
         self.path = self.folder / "events.db"
+        self.owner = WriterOwner(self.config).open()
+        self.addCleanup(self.owner.close)
         self.logger = OperationLogger(self.config)
         self.addCleanup(self.logger.close)
         self.logger.open()
@@ -52,20 +54,21 @@ class JournalReadingTests(unittest.TestCase):
         identifier = self.logger.record_event(
             "ordered", {"b": [True, 1, 1.0], "a": None}
         )
-        store = self.logger._store
-        with store._lock:
-            row = store._connection.execute(
-                "SELECT cursor, event_id, producer_instance_id, sequence_number, event_json "
-                "FROM events WHERE event_id=?",
-                (identifier,),
-            ).fetchone()
-            original = json.loads(row[4])
-            reordered = {key: original[key] for key in reversed(original)}
-            encoded = json.dumps(reordered, ensure_ascii=False, separators=(",", ":"))
-            store._connection.execute(
-                "UPDATE events SET event_json=? WHERE event_id=?", (encoded, identifier)
-            )
-            entry = store._event_entry(identifier, store._connection)
+        store = self.owner
+        row = store.execute(
+            "SELECT cursor, event_id, producer_instance_id, sequence_number, event_json "
+            "FROM events WHERE event_id=?",
+            (identifier,),
+        )[0]
+        original = json.loads(row[4])
+        reordered = {key: original[key] for key in reversed(original)}
+        encoded = json.dumps(reordered, ensure_ascii=False, separators=(",", ":"))
+        store.execute(
+            "UPDATE events SET event_json=? WHERE event_id=?", (encoded, identifier)
+        )
+        entry = store.call(
+            "method", name="_event_entry", arguments=[identifier], connection=True
+        )
         self.assertIsInstance(entry, JournalEntry)
         self.assertIsInstance(entry.event, JournalEvent)
         self.assertIsInstance(entry.event.context, JournalContext)
@@ -81,16 +84,16 @@ class JournalReadingTests(unittest.TestCase):
         self.assertEqual(entry.document()["event"], reordered)
 
     def test_typed_boundary_and_page_preserve_empty_and_populated_public_shapes(self):
-        store = self.logger._store
-        with store._lock:
-            boundary = _read_boundary(store._connection)
+        store = self.owner
+        boundary = store.call("boundary")
         self.assertIsInstance(boundary, JournalReadBoundary)
         empty = JournalEventPage(events=[], boundary=boundary, after=0)
         self.assertEqual(empty.document(), self.logger.read_events())
         identifier = self.logger.record_event("page", {"values": [True, 1.0]})
-        with store._lock:
-            boundary = _read_boundary(store._connection)
-            entry = store._event_entry(identifier, store._connection)
+        boundary = store.call("boundary")
+        entry = store.call(
+            "method", name="_event_entry", arguments=[identifier], connection=True
+        )
         page = JournalEventPage(events=[entry], boundary=boundary, after=entry.cursor)
         self.assertEqual(page.document(), self.logger.read_events())
         batch = JournalEventPage(events=[entry], boundary=boundary)
@@ -104,22 +107,26 @@ class JournalReadingTests(unittest.TestCase):
 
     def test_sql_changes_keep_models_until_public_page_and_original_key_order(self):
         identifier = self.logger.record_event("change", {"values": [True, 1, 1.0]})
-        store = self.logger._store
-        with store._lock:
-            row = store._connection.execute(
-                "SELECT change_cursor, event_id, change_json FROM journal_changes "
-                "WHERE event_id=?",
-                (identifier,),
-            ).fetchone()
-            original = json.loads(row[2])
-            reordered = {name: original[name] for name in reversed(original)}
-            encoded = json.dumps(reordered)
-            store._connection.execute(
-                "UPDATE journal_changes SET change_json=? WHERE change_cursor=?",
-                (encoded, row[0]),
-            )
-            change = store._decode_change((row[0], row[1], encoded), store._connection)
-            boundary = _read_boundary(store._connection)
+        store = self.owner
+        row = store.execute(
+            "SELECT change_cursor, event_id, change_json FROM journal_changes "
+            "WHERE event_id=?",
+            (identifier,),
+        )[0]
+        original = json.loads(row[2])
+        reordered = {name: original[name] for name in reversed(original)}
+        encoded = json.dumps(reordered)
+        store.execute(
+            "UPDATE journal_changes SET change_json=? WHERE change_cursor=?",
+            (encoded, row[0]),
+        )
+        change = store.call(
+            "method",
+            name="_decode_change",
+            arguments=[(row[0], row[1], encoded)],
+            connection=True,
+        )
+        boundary = store.call("boundary")
         self.assertIsInstance(change, JournalChangeEntry)
         self.assertIsInstance(change.change, JournalChangeData)
         self.assertIsInstance(change.entry, JournalEntry)

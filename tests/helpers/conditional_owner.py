@@ -23,7 +23,7 @@ async def run_owner(options) -> None:
     )
     runner = ExperimentRunner(options.root, manager)
     original_accept = StageRunner._accept
-    original_save = ExperimentRunner._save_state
+    original_save = ExperimentRunner._save_state_async
     original_attempt_save = StageRunner._save_state
 
     def crash():
@@ -36,8 +36,8 @@ async def run_owner(options) -> None:
         )
         os._exit(23)
 
-    def accept(stages, state, attempt, response, outcome):
-        result = original_accept(stages, state, attempt, response, outcome)
+    async def accept(stages, state, attempt, response, outcome):
+        result = await original_accept(stages, state, attempt, response, outcome)
         if (
             options.boundary == "accepted"
             and attempt.stage_id == options.condition
@@ -46,8 +46,8 @@ async def run_owner(options) -> None:
             crash()
         return result
 
-    def save(owner):
-        original_save(owner)
+    async def save(owner):
+        await original_save(owner)
         transfer = owner._state.pending_input
         if (
             options.boundary == "transition"
@@ -56,8 +56,8 @@ async def run_owner(options) -> None:
         ):
             crash()
 
-    def save_attempt(stages, state, **kwargs):
-        original_attempt_save(stages, state, **kwargs)
+    async def save_attempt(stages, state, **kwargs):
+        await original_attempt_save(stages, state, **kwargs)
         attempt = state.active_attempt
         if (
             options.boundary == "target_started"
@@ -75,7 +75,7 @@ async def run_owner(options) -> None:
         )
         with (
             patch.object(StageRunner, "_accept", accept),
-            patch.object(ExperimentRunner, "_save_state", save),
+            patch.object(ExperimentRunner, "_save_state_async", save),
             patch.object(StageRunner, "_save_state", save_attempt),
         ):
             await runner.resume()

@@ -31,6 +31,7 @@ from core.experiments.state import (
     _process_identity_document,
     _process_identity_pid,
     _retain_process_identity,
+    state_from_document,
     state_to_document,
 )
 from core.journal.events import LoggingError
@@ -95,6 +96,7 @@ def _finish_executor_status(status: ExecutorStatus | JsonValue) -> ExecutorStatu
 
 class StageRunner:
     """Execute/recover stage attempts and accept outcomes while the runner owns DAG movement."""
+
     def __init__(
         self,
         launcher: ModuleLauncher,
@@ -125,6 +127,7 @@ class StageRunner:
         self._executor_processes = []
         self._executor_identities: dict[str, ProcessIdentity | JsonObject | None] = {}
         self._notify_resources = notify_resources
+        self._journal_deadlines: dict[str, float] = {}
 
     def bind_services(self, services) -> None:
         """Set the service manager used for queued DAG calls and interruption.
@@ -159,7 +162,9 @@ class StageRunner:
         definition = state.template.stages[state.stage_position - 1]
         stage_id = definition.stage_id
         input_data = (
-            self.select_input(state) if recovered is None else recovered.input_data
+            await asyncio.to_thread(self.select_input, state)
+            if recovered is None
+            else recovered.input_data
         )
         execution_id = recovered.stage_execution_id if recovered else str(uuid4())
         if manual:
@@ -177,7 +182,8 @@ class StageRunner:
             )
             recovered = None
             response = await self._collect_result(state, attempt)
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "stage.finished",
                 {
                     "result": response.model_dump(exclude_unset=True),
@@ -186,7 +192,7 @@ class StageRunner:
                 },
                 context=self._context(state, attempt),
             )
-            self._save_state(state)
+            await self._save_state(state)
             if attempt.outcome == "unknown":
                 return StageOutcome(attempt, response, "stop")
             if response is not None and response.result == "success":
@@ -208,7 +214,7 @@ class StageRunner:
                 if state.pause_requested:
                     return StageOutcome(attempt, response, "pause")
             state.stage_retry_counts[stage_id] = used + 1
-            self._save_state(state)
+            await self._save_state(state)
 
     def _exhausted_action(
         self,
@@ -473,6 +479,9 @@ class StageRunner:
         )
         attempt.queued_at = datetime.now(UTC).isoformat()
         attempt.queued_monotonic = time.monotonic()
+        self._journal_deadlines[attempt.attempt_id] = (
+            self._journal.client._recovery_seconds()
+        )
         return attempt, instance
 
     def _write_attempt_context(
@@ -510,13 +519,17 @@ class StageRunner:
         }
         if (
             manifest is None
-            or getattr(self._launcher.prepare, "__func__", None) is not ModuleLauncher.prepare
+            or getattr(self._launcher.prepare, "__func__", None)
+            is not ModuleLauncher.prepare
         ):
             # Preserve the public synchronous preparation hook for library callers.
             launch = PreparedLaunch.model_validate(
                 self._launcher.prepare(
-                    state, definition.model_dump(exclude_unset=True), context,
-                    attempt.artifacts_directory, attempt.input_data,
+                    state,
+                    definition.model_dump(exclude_unset=True),
+                    context,
+                    attempt.artifacts_directory,
+                    attempt.input_data,
                 )
             )
         else:
@@ -525,7 +538,9 @@ class StageRunner:
                 artifacts_directory=attempt.artifacts_directory,
                 input_data=attempt.input_data,
             )
-            launch = self._launcher._prepare_checked(state, definition, inputs, manifest)
+            launch = self._launcher._prepare_checked(
+                state, definition, inputs, manifest
+            )
         attempt.endpoint_path = launch.endpoint_path
         attempt.effective_settings = launch.effective_settings
         runtime_context = _update_model(
@@ -574,13 +589,15 @@ class StageRunner:
         if self._connection is not None:
             await self._connection.close()
         self._connection = None
-        self._journal.client.record_attempt_parameters(
+        await asyncio.to_thread(
+            self._journal.client.record_attempt_parameters,
             state.template.model_dump(exclude_unset=True),
             attempt.effective_settings,
             template_yaml=state.template_yaml,
             context=context,
         )
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.intent",
             {
                 "action": "start_stage",
@@ -591,7 +608,7 @@ class StageRunner:
             },
             context=context,
         )
-        self._save_state(state)
+        await self._save_state(state)
 
     async def _start_service_call(
         self,
@@ -622,13 +639,13 @@ class StageRunner:
             raise RuntimeError("Service attempts require a bound ServiceManager.")
         if state.services[instance.service_id] is not instance:
             return attempt
-        self._call_future = self._services.enqueue(
+        self._call_future = await self._services._enqueue(
             state,
             instance.service_id,
             attempt.request_id,
             "execute",
             launch.call.model_dump(mode="json", exclude_unset=True),
-            deadline=deadline,
+            deadline=self._deadline(attempt),
         )
         self._unstarted_attempt_id = None
         return attempt
@@ -730,10 +747,22 @@ class StageRunner:
             is already available.
         """
         startup_deadline = time.monotonic() + launch.control_timeout_seconds
+        deadline = self._deadline(attempt)
         if deadline is not None:
             startup_deadline = min(startup_deadline, deadline)
-        while time.monotonic() < startup_deadline:
-            if self._journal.client.read_command_result(attempt.request_id) is not None:
+        recovery_baseline = self._journal.client._recovery_seconds()
+        while True:
+            extension = max(
+                0, self._journal.client._recovery_seconds() - recovery_baseline
+            )
+            if time.monotonic() >= startup_deadline + extension:
+                break
+            if (
+                await asyncio.to_thread(
+                    self._journal.client.read_command_result, attempt.request_id
+                )
+                is not None
+            ):
                 return attempt
             if attempt.endpoint_path.is_file():
                 try:
@@ -741,21 +770,27 @@ class StageRunner:
                     if endpoint.get("participant_instance_id") != attempt_id:
                         await asyncio.sleep(0.02)
                         continue
+                    extension = max(
+                        0, self._journal.client._recovery_seconds() - recovery_baseline
+                    )
                     await self._connect(
-                        attempt, max(0.001, startup_deadline - time.monotonic())
+                        attempt,
+                        max(0.001, startup_deadline + extension - time.monotonic()),
                     )
                     self._call_future = asyncio.create_task(
                         self._connection.request(
                             attempt.request_id,
                             "execute",
                             launch.call.model_dump(mode="json", exclude_unset=True),
-                            deadline_monotonic=deadline,
+                            deadline_monotonic=self._deadline(attempt),
                         )
                     )
                     return attempt
                 except (OSError, EOFError):
                     if (
-                        self._journal.client.read_command_result(attempt.request_id)
+                        await asyncio.to_thread(
+                            self._journal.client.read_command_result, attempt.request_id
+                        )
                         is not None
                     ):
                         return attempt
@@ -766,16 +801,20 @@ class StageRunner:
                     "Executor exited before publishing its endpoint or journal result."
                 )
             await asyncio.sleep(0.02)
-        if deadline is not None and time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline + extension:
             return attempt
         raise TimeoutError("Executor startup deadline expired.")
 
     def _deadline(self, attempt: StageAttempt) -> float | None:
         """Return the attempt's monotonic deadline from queue time, or None when unbounded."""
+        if attempt.timeout_seconds is None:
+            return None
+        recovered = self._journal.client._recovery_seconds()
+        baseline = self._journal_deadlines.setdefault(attempt.attempt_id, recovered)
         return (
-            None
-            if attempt.timeout_seconds is None
-            else attempt.queued_monotonic + attempt.timeout_seconds
+            attempt.queued_monotonic
+            + attempt.timeout_seconds
+            + max(0, recovered - baseline)
         )
 
     async def _connect(self, attempt: StageAttempt, timeout: float) -> None:
@@ -793,7 +832,7 @@ class StageRunner:
         )
         await self._connection.connect(timeout_seconds=timeout)
 
-    def _accept(
+    async def _accept(
         self,
         state: RunnerState,
         attempt: StageAttempt,
@@ -811,11 +850,12 @@ class StageRunner:
         Returns:
             Accepted typed response; invalid conditional output becomes failure.
         """
-        result, outcome = self._normalize_accepted_response(
+        result, outcome = await self._normalize_accepted_response(
             state, attempt, StageOutcomeResult.model_validate(response), outcome
         )
         state.used_request_ids.add(attempt.request_id)
-        self._journal.client.record_command_result(
+        await asyncio.to_thread(
+            self._journal.client.record_command_result,
             attempt.request_id,
             result.model_dump(exclude_unset=True),
             author="runner",
@@ -832,12 +872,12 @@ class StageRunner:
             )
             attempt.started_at = attempt.executor_status.started_at
         attempt.executor_status = _finish_executor_status(attempt.executor_status)
-        self._save_state(state)
+        await self._save_state(state)
         if self._notify_resources is not None:
             self._notify_resources()
         return result
 
-    def _normalize_accepted_response(
+    async def _normalize_accepted_response(
         self,
         state: RunnerState,
         attempt: StageAttempt,
@@ -892,7 +932,8 @@ class StageRunner:
                     and isinstance(decision, dict)
                     and "data" in decision
                 ):
-                    self._journal.client.record_error(
+                    await asyncio.to_thread(
+                        self._journal.client.record_error,
                         ValueError(
                             "Conditional stage returned data with returns_data=false; "
                             "the payload was ignored."
@@ -920,7 +961,9 @@ class StageRunner:
         deadline = self._deadline(attempt)
         try:
             while True:
-                record = read_result(
+                deadline = self._deadline(attempt)
+                record = await asyncio.to_thread(
+                    read_result,
                     self._journal.client,
                     attempt.request_id,
                     expected=_attempt_result_identity(attempt),
@@ -947,7 +990,7 @@ class StageRunner:
                         attempt.outcome = "unknown"
                     return StageOutcomeResult.model_validate(record["response"])
                 if deadline is not None and time.monotonic() >= deadline:
-                    response = self._accept(
+                    response = await self._accept(
                         state,
                         attempt,
                         {"result": "fail", "data": {"reason": "timeout"}},
@@ -961,7 +1004,7 @@ class StageRunner:
                         attempt.outcome = "unknown"
                     return response
                 if record is not None:
-                    return self._accept(
+                    return await self._accept(
                         state,
                         attempt,
                         record["response"],
@@ -977,7 +1020,7 @@ class StageRunner:
                         or instance.service_instance_id
                         != attempt.participant.participant_instance_id
                     ):
-                        return self._accept(
+                        return await self._accept(
                             state,
                             attempt,
                             {
@@ -1001,7 +1044,7 @@ class StageRunner:
                     ):
                         response = self._call_future.result()
                         if response["result"] == "fail":
-                            return self._accept(
+                            return await self._accept(
                                 state,
                                 attempt,
                                 {"result": "fail", "data": response["data"]},
@@ -1061,11 +1104,16 @@ class StageRunner:
             attempt.executor_status = reply.data
             attempt.process_identity = reply.data.process
             attempt.started_at = reply.data.started_at
-            self._save_state(state, checkpoint=first_observation)
+            await self._save_state(state, checkpoint=first_observation)
             if first_observation and self._notify_resources is not None:
                 self._notify_resources()
         except (OSError, EOFError):
-            if self._journal.client.read_command_result(attempt.request_id) is not None:
+            if (
+                await asyncio.to_thread(
+                    self._journal.client.read_command_result, attempt.request_id
+                )
+                is not None
+            ):
                 return True
             if deadline is not None and time.monotonic() >= deadline:
                 return True
@@ -1076,7 +1124,9 @@ class StageRunner:
                 # reconnecting. Reenter normal result validation and
                 # deadline handling before declaring the attempt unknown.
                 if (
-                    self._journal.client.read_command_result(attempt.request_id)
+                    await asyncio.to_thread(
+                        self._journal.client.read_command_result, attempt.request_id
+                    )
                     is not None
                 ):
                     return True
@@ -1100,9 +1150,11 @@ class StageRunner:
         if attempt is None or self._unstarted_attempt_id == attempt.attempt_id:
             return True
         try:
-            existing = self._journal.client.read_command_result(attempt.request_id)
+            existing = await asyncio.to_thread(
+                self._journal.client.read_command_result, attempt.request_id
+            )
             if existing is None or existing["author"] != "runner":
-                self._accept(
+                await self._accept(
                     state,
                     attempt,
                     {"result": "fail", "data": {"reason": reason}},
@@ -1147,7 +1199,8 @@ class StageRunner:
                     "reason": reason,
                 }
                 try:
-                    self._journal.client.record_event(
+                    await asyncio.to_thread(
+                        self._journal.client.record_event,
                         "control.intent",
                         intent,
                         context={
@@ -1241,8 +1294,11 @@ class StageRunner:
         self._process_attempt_id = attempt.attempt_id
         self._unstarted_attempt_id = None
         try:
-            record = read_result(
-                self._journal.client, attempt.request_id, expected=attempt.participant
+            record = await asyncio.to_thread(
+                read_result,
+                self._journal.client,
+                attempt.request_id,
+                expected=attempt.participant,
             )
             if record is None and attempt.service_id is None:
                 try:
@@ -1253,7 +1309,8 @@ class StageRunner:
                     # The executor may finish between the journal read and connect.
                     # A matching committed result no longer needs a live endpoint.
                     if (
-                        read_result(
+                        await asyncio.to_thread(
+                            read_result,
                             self._journal.client,
                             attempt.request_id,
                             expected=attempt.participant,
@@ -1261,8 +1318,11 @@ class StageRunner:
                         is None
                     ):
                         raise
-            self._journal.client.record_event(
-                "stage.reconnected", {}, context=self._context(state, attempt)
+            await asyncio.to_thread(
+                self._journal.client.record_event,
+                "stage.reconnected",
+                {},
+                context=self._context(state, attempt),
             )
             return await self.execute(
                 state, wait_services=wait_services, recovered=attempt
@@ -1305,7 +1365,8 @@ class StageRunner:
             if state.unknown_state_recovery_count >= policy.recovery_limit
             else policy.on_timeout
         )
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "stage.recovery_failed",
             {
                 "action": action,
@@ -1316,11 +1377,11 @@ class StageRunner:
         )
         if action == "pause":
             attempt.outcome = "unknown"
-            self._save_state(state)
+            await self._save_state(state)
             return StageOutcome(attempt, None, "pause")
         if not await self.interrupt(state, "unknown_state"):
             attempt.outcome = "unknown"
-            self._save_state(state)
+            await self._save_state(state)
             return StageOutcome(attempt, None, "stop")
         attempt.outcome = "unknown_stopped"
         if action == "rerun":
@@ -1417,7 +1478,7 @@ class StageRunner:
                 return True
             raise
 
-    def _save_state(self, state: RunnerState, *, checkpoint: bool = True) -> None:
+    async def _save_state(self, state: RunnerState, *, checkpoint: bool = True) -> None:
         # Retry/input ownership must survive loss of the optional state.json
         # copy, including a crash between acceptance and the DAG transition.
         """Journal an optional authoritative checkpoint and publish state.json with I/O diagnostics.
@@ -1430,12 +1491,20 @@ class StageRunner:
         """
         if checkpoint:
             state.checkpoint_id = str(uuid4())
-            _record_runner_checkpoint(self._journal.client, state)
+        saved = state_from_document(
+            state.experiment_directory, state_to_document(state)
+        )
+        if checkpoint:
+            await asyncio.to_thread(
+                _record_runner_checkpoint, self._journal.client, saved
+            )
         try:
-            self._state_store.save(state)
+            self._state_store.save(saved)
         except OSError as error:
-            self._journal.client.record_error(
-                error, context={"experiment_id": state.experiment_id}
+            await asyncio.to_thread(
+                self._journal.client.record_error,
+                error,
+                context={"experiment_id": state.experiment_id},
             )
 
     async def close(self, state: RunnerState | None = None) -> None:
@@ -1484,7 +1553,9 @@ class StageRunner:
             if transfer is not None:
                 request_ids.add(transfer.request_id)
         for request_id in request_ids:
-            record = self._journal.client.read_command_result(request_id)
+            record = await asyncio.to_thread(
+                self._journal.client.read_command_result, request_id
+            )
             if record is None:
                 raise ValueError("An accepted result is missing from the journal.")
             context = record["event"]["context"]

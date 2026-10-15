@@ -261,8 +261,6 @@ class FilteredJournal:
             self._logger._require_open()
             store = self._logger._store
             phase = "view"
-            source = None
-            rows = None
             try:
                 self._open_view()
                 self._check_view()
@@ -272,70 +270,32 @@ class FilteredJournal:
                     self._report_refresh_failure(error)
                     previous = None
                 phase = "source"
-                store._check_health()
-                source = sqlite3.connect(
-                    store.db_path.as_uri() + "?mode=ro",
-                    uri=True,
-                    timeout=self._timeout,
-                    isolation_level=None,
+                from core.models.journal_cache import FilteredSourceHeader
+                from core.models.journal_records import (
+                    JournalChangeEntry,
+                    JournalEntry,
                 )
-                source.execute("BEGIN")
-                boundary = _read_boundary(source)
-                expected = {
-                    "journal_id": store._journal_id,
-                    "generation": store._generation,
-                }
-                actual = {key: getattr(boundary, key) for key in expected}
-                if expected != actual:
-                    raise JournalGenerationChanged(expected, actual)
-                rebuild = (
-                    self._last_error is not None
-                    or previous is None
-                    or any(
-                        getattr(previous, key) != getattr(boundary, key)
-                        for key in ("journal_id", "generation")
-                    )
-                    or previous.change_cursor > boundary.change_cursor
-                )
-                phase = "view"
-                self._connection.execute("BEGIN IMMEDIATE")
-                if rebuild:
-                    self._connection.execute("DELETE FROM filtered_events")
-                    phase = "source"
-                    rows = source.execute("SELECT * FROM events ORDER BY cursor")
-                    while True:
+
+                previous_source = None if self._last_error is not None else previous
+                with store._filtered_source(previous_source) as source:
+                    header = FilteredSourceHeader.model_validate_json(next(source))
+                    boundary = header.boundary
+                    rebuild = header.rebuild
+                    phase = "view"
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    if rebuild:
+                        self._connection.execute("DELETE FROM filtered_events")
+                    for line in source:
                         phase = "source"
-                        row = rows.fetchone()
-                        if row is None:
-                            break
-                        entry = store._effective_entry(store._decode_row(row), source)
-                        if entry is not None:
+                        if rebuild:
+                            entry = JournalEntry.model_validate_json(line)
                             phase = "view"
                             self._write_entry(entry)
-                    rows.close()
-                    rows = None
-                else:
+                        else:
+                            change = JournalChangeEntry.model_validate_json(line)
+                            phase = "view"
+                            self._apply_view_change(change)
                     phase = "source"
-                    rows = source.execute(
-                        "SELECT change_cursor, event_id, change_json FROM journal_changes "
-                        "WHERE change_cursor > ? ORDER BY change_cursor",
-                        (previous.change_cursor,),
-                    )
-                    while True:
-                        phase = "source"
-                        row = rows.fetchone()
-                        if row is None:
-                            break
-                        change = store._decode_change(row, source)
-                        phase = "view"
-                        self._apply_view_change(change)
-                    rows.close()
-                    rows = None
-                phase = "source"
-                source.execute("ROLLBACK")
-                source.close()
-                source = None
-                store._check_health()
                 changed = rebuild or previous.change_cursor != boundary.change_cursor
                 publication = FilteredPublication.model_validate(
                     {
@@ -372,13 +332,6 @@ class FilteredJournal:
                     raise
                 self._report_refresh_failure(error)
                 return None
-            finally:
-                try:
-                    if rows is not None:
-                        _close_preserving_failure(rows)
-                finally:
-                    if source is not None:
-                        _close_preserving_failure(source)
             if self._last_error is not None:
                 self._logger.record_event(
                     "logger.filtered_refresh_recovered",
@@ -671,3 +624,82 @@ class FilteredJournal:
                         pass
             if failure is not None:
                 raise failure
+
+
+def _export_source_view(store, previous, destination: Path) -> None:
+    """Stream one consistent effective snapshot or delta inside the writer process.
+
+    The immutable file holds only the selected changes. Readers of a derived view
+    never retain handles to the live SQLite database during directory restoration.
+    """
+    if destination.exists():
+        return
+    store._check_health()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".part")
+    source = sqlite3.connect(
+        store.db_path.as_uri() + "?mode=ro",
+        uri=True,
+        timeout=store._timeout,
+        isolation_level=None,
+    )
+    try:
+        source.execute("BEGIN")
+        boundary = _read_boundary(source)
+        actual = {key: getattr(boundary, key) for key in ("journal_id", "generation")}
+        expected = {"journal_id": store._journal_id, "generation": store._generation}
+        if expected != actual:
+            raise JournalGenerationChanged(expected, actual)
+        rebuild = (
+            previous is None
+            or any(getattr(previous, key) != value for key, value in actual.items())
+            or previous.change_cursor > boundary.change_cursor
+        )
+        with temporary.open("w", encoding="utf-8") as output:
+            output.write(
+                json.dumps({"boundary": boundary.model_dump(), "rebuild": rebuild})
+                + "\n"
+            )
+            if rebuild:
+                rows = source.execute("SELECT * FROM events ORDER BY cursor")
+            else:
+                rows = source.execute(
+                    "SELECT change_cursor, event_id, change_json FROM journal_changes "
+                    "WHERE change_cursor > ? ORDER BY change_cursor",
+                    (previous.change_cursor,),
+                )
+            try:
+                for row in rows:
+                    if rebuild:
+                        entry = store._effective_entry(store._decode_row(row), source)
+                        if entry is None:
+                            continue
+                        record = {
+                            **entry.model_dump(),
+                            "encoded_event": entry.encoded_event,
+                        }
+                    else:
+                        change = store._decode_change(row, source)
+                        record = {
+                            **change.model_dump(),
+                            "encoded_change": change.encoded_change,
+                            "entry": {
+                                **change.entry.model_dump(),
+                                "encoded_event": change.entry.encoded_event,
+                            },
+                            "observed": {
+                                **change.observed.model_dump(),
+                                "encoded_event": change.observed.encoded_event,
+                            },
+                        }
+                    output.write(json.dumps(record, ensure_ascii=True) + "\n")
+                output.flush()
+            finally:
+                rows.close()
+        source.execute("ROLLBACK")
+        store._check_health()
+        temporary.replace(destination)
+    except BaseException as error:  # noqa: BLE001 - Preserve source failures through snapshot cleanup.
+        raise store._storage_failure(error, "export filtered source")
+    finally:
+        _close_preserving_failure(source)

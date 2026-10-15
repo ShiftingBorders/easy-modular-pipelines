@@ -5,9 +5,11 @@ from contextlib import closing
 from pathlib import Path
 from uuid import UUID
 
-from core.journal.storage import SQLiteEventStore
+from core.journal.client import _make_journal_store
 from core.models.artifacts import ArtifactLocation
 from core.models.experiment_registry import RegistryEntry
+from core.models.journal_records import JournalContext
+from core.models.journal_settings import JournalConfiguration
 from core.models.runner_state import SavedStateMetadata
 from core.models.server_arguments import (
     ArtifactReference,
@@ -22,6 +24,7 @@ from core.primitives.json_values import JsonObject, copy_json_object, require_te
 
 class ExperimentReader:
     """Read saved project metadata and resolve journaled artifacts within project roots."""
+
     def __init__(self, project_root: Path) -> None:
         """Bind a resolved absolute project root without reading project metadata."""
         if not project_root.is_absolute():
@@ -223,14 +226,19 @@ class ExperimentReader:
         """
         directory = self._directory(experiment_id, self._registry())
         identity = read_json(self._path(directory, "runner/journal.json"))
-        store = SQLiteEventStore(
-            self._path(directory, "journals/events.sqlite"),
+        configuration = JournalConfiguration(
+            db_path=self._path(directory, "journals/events.sqlite"),
             busy_timeout_seconds=5,
             max_event_bytes=None,
             open_mode="existing",
             min_free_bytes=0,
             expected_journal=identity,
-            read_only=True,
+        )
+        store = _make_journal_store(
+            directory / "runner/journal.json",
+            configuration,
+            JournalContext.model_validate({"source": "experiment_reader"}),
+            True,
         )
         try:
             store.open()

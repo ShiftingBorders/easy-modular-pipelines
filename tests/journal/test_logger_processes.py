@@ -15,6 +15,7 @@ from tests.helpers.logging_process import (
     cleanup_directory,
     existing_settings,
     read_database,
+    stop_journal_writers,
 )
 
 
@@ -31,6 +32,8 @@ class LoggerProcessTests(unittest.TestCase):
         existing_settings(self.config)
 
     def process(self, mode, name, *arguments, context=None, config=None):
+        if mode in ("result_before_commit", "result_after_commit", "snapshot_crash"):
+            stop_journal_writers(self.folder)
         if config is None:
             config = write_context_settings(
                 self.folder / name,
@@ -87,7 +90,8 @@ class LoggerProcessTests(unittest.TestCase):
 
     def test_concurrent_matching_and_conflicting_responses_are_atomic(self):
         workers = {
-            author: self.process("worker", author) for author in ("runner", "participant")
+            author: self.process("worker", author)
+            for author in ("runner", "participant")
         }
         for worker in workers.values():
             self.assertTrue(worker.receive()["ready"])

@@ -376,8 +376,10 @@ class HistoryCacheTests(unittest.TestCase):
 
     def test_cache_rebuild_preserves_source_and_all_screen_records(self):
         """T001/T002/T003/T033: disposable cache, authoritative unchanged source."""
-        connection = self.workspace.logger._store._connection
-        original = list(connection.iterdump())
+        from tests.helpers.logging_process import database_dump
+
+        source = self.workspace.directory / "journals/events.sqlite"
+        original = database_dump(source)
         first = self.build()
         records = first["cache"].query(
             "SELECT kind,record_key,payload FROM records ORDER BY kind,record_key"
@@ -391,7 +393,7 @@ class HistoryCacheTests(unittest.TestCase):
             ),
             records,
         )
-        self.assertEqual(list(connection.iterdump()), original)
+        self.assertEqual(database_dump(source), original)
         self.assertTrue(
             rebuilt["cache"].path.is_relative_to(self.settings["state_directory"])
         )
@@ -545,8 +547,15 @@ class HistoryCacheTests(unittest.TestCase):
         self.assertFalse(observed["complete"])
         filled = self.build()
         self.assertIsNone(filled["cache"].observe()["gap"])
-        connection = self.workspace.logger._store._connection
-        connection.execute("UPDATE sqlite_sequence SET seq=seq+100 WHERE name='events'")
+        from tests.helpers.journal_owner import WriterOwner
+        from tests.helpers.logging_process import stop_journal_writers
+
+        self.workspace.logger.close()
+        stop_journal_writers(self.workspace.directory)
+        owner = WriterOwner(self.workspace.config).open()
+        self.addCleanup(owner.close)
+        self.workspace.logger.open()
+        owner.execute("UPDATE sqlite_sequence SET seq=seq+100 WHERE name='events'")
         self.workspace.logger.record_event("sparse")
         self.build()
         self.assertIsNone(first["cache"].observe()["gap"])

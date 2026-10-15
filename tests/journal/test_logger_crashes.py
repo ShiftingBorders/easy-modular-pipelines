@@ -10,13 +10,14 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from core.journal.client import JournalClient
 from core.journal.events import (
     LoggingConfigurationError,
     LoggingStateError,
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
-from core.journal.storage import SQLiteEventStore
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
     LoggingProcess,
@@ -255,7 +256,7 @@ class LoggingCrashTests(unittest.TestCase):
         stderr = io.StringIO()
         with (
             patch.object(
-                SQLiteEventStore,
+                JournalClient,
                 "close",
                 side_effect=LoggingStorageError("Controlled close failure"),
             ),
@@ -349,11 +350,12 @@ class LoggingCrashTests(unittest.TestCase):
 
     def test_sqlite_full_preserves_confirmed_prefix(self):
         """CRASH-07: force real SQLITE_FULL by limiting pages, without filling the disk."""
+        owner = WriterOwner(self.config).open()
+        self.addCleanup(owner.close)
         with OperationLogger(self.config) as logger:
             confirmed_id = logger.record_event("test.confirmed")
-            connection = logger._store._connection
-            page_count = connection.execute("PRAGMA page_count").fetchone()[0]
-            connection.execute(f"PRAGMA max_page_count={page_count}")
+            page_count = owner.execute("PRAGMA page_count")[0][0]
+            owner.execute(f"PRAGMA max_page_count={page_count}")
             with self.assertRaises(LoggingStorageError) as caught:
                 logger.record_event("test.exceeds-capacity", {"text": "x" * 100000})
             self.assertEqual(

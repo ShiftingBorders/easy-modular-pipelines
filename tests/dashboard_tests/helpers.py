@@ -117,6 +117,9 @@ def cleanup_directory(directory: tempfile.TemporaryDirectory) -> None:
     parent = (PROJECT_ROOT / ".artifacts/tmp/dashboard/test-runs").resolve()
     if root.parent != parent:
         raise ValueError("Dashboard test cleanup escaped its scratch directory.")
+    from tests.helpers.logging_process import stop_journal_writers
+
+    stop_journal_writers(root)
     for attempt in range(5):
         try:
             directory.cleanup()

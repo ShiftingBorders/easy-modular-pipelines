@@ -64,6 +64,9 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        from tests.helpers.logging_process import stop_journal_writers
+
+        self.addCleanup(stop_journal_writers, self.root)
         self.collector = None
         self.task = None
         self.addAsyncCleanup(self.close_collector)
@@ -421,6 +424,9 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(events(reader, "resources.recorded")), count)
             first_id = reader.get_journal_info()["generation"]
             reader.close()
+            from tests.helpers.logging_process import stop_journal_writers
+
+            stop_journal_writers(self.root)
             for name in ("events.sqlite", "events.sqlite-wal", "events.sqlite-shm"):
                 (self.root / name).unlink(missing_ok=True)
             replacement_path, replacement, new_context = journal(self.root)

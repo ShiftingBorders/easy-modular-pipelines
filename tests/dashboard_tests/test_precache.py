@@ -47,8 +47,10 @@ class PrecacheTests(unittest.TestCase):
 
     def test_cli_precaches_stopped_experiments_in_independent_processes(self):
         """T015/T045/T046/T047/T051/T066: finite targets, process PIDs, final Modules."""
+        from tests.helpers.logging_process import database_dump
+
         snapshots = [
-            list(workspace.logger._store._connection.iterdump())
+            database_dump(workspace.directory / "journals/events.sqlite")
             for workspace in self.workspaces
         ]
         result = subprocess.run(
@@ -86,7 +88,8 @@ class PrecacheTests(unittest.TestCase):
         self.assertTrue(self.reader.modules()["complete"])
         for index, workspace in enumerate(self.workspaces):
             self.assertEqual(
-                list(workspace.logger._store._connection.iterdump()), snapshots[index]
+                database_dump(workspace.directory / "journals/events.sqlite"),
+                snapshots[index],
             )
         self.assertFalse((self.settings["state_directory"] / "monitor.lock").exists())
         self.assertFalse((self.settings["state_directory"] / "commands.json").exists())

@@ -28,6 +28,7 @@ from core.experiments.reload import (
     _definition_change,
     _definition_fingerprint,
     _prepare_reload_candidate,
+    _record_reload_reconciliation,
     _reload_cursor,
     _reload_layout,
     _service_state,
@@ -49,6 +50,7 @@ from core.experiments.state import (
     _process_identity_document,
     _retain_process_identity,
     state_from_document,
+    state_to_document,
 )
 from core.journal.events import LoggingError, encode_event
 from core.journal.logger import Operation, OperationLogger
@@ -90,6 +92,7 @@ class ExperimentRunner:
     Run admission starts background work. Callers observe get_state for experiment
     completion and explicitly close the runner to release owned runtime resources.
     """
+
     def __init__(
         self,
         project_root: Path,
@@ -121,6 +124,7 @@ class ExperimentRunner:
         )
         self._hash_module = module_manager.module_hash
         self._journal = RunnerJournal()
+        self._journal_pause_reason: str | None = None
         self._control_logger = control_logger
         self._state_store = RunnerStateStore()
         self._resource_observer: Callable[[JsonObject], None] | None = None
@@ -247,7 +251,9 @@ class ExperimentRunner:
         ):
             raise ValueError("A new experiment requires an absolute template_path.")
         await self._reset_run_components()
-        self._bind_new_run(experiment_id, template_path, source, delayed_start or continue_run)
+        self._bind_new_run(
+            experiment_id, template_path, source, delayed_start or continue_run
+        )
         return {"experiment_id": experiment_id, "signaled": True}
 
     async def _reset_run_components(self) -> None:
@@ -276,10 +282,16 @@ class ExperimentRunner:
             hash_module=self._hash_module,
             notify_resources=self._publish_resources,
         )
-        self._journal.close()
+        await asyncio.to_thread(
+            self._journal.close,
+        )
 
     def _bind_new_run(
-        self, experiment_id: str, template_path: Path | None, source: Path | None, paused: bool
+        self,
+        experiment_id: str,
+        template_path: Path | None,
+        source: Path | None,
+        paused: bool,
     ) -> None:
         """Reset selected-run observations and start the background DAG task.
 
@@ -348,6 +360,7 @@ class ExperimentRunner:
         """
         wake_task = None
         readiness_task = None
+        journal_watch = asyncio.create_task(self._watch_journal())
         try:
             state = await self._prepare_dag_state()
             if state is None:
@@ -357,6 +370,9 @@ class ExperimentRunner:
                 self._service_task = asyncio.create_task(self._services.monitor(state))
 
             while not self._stop_requested:
+                if self._journal_pause_reason is not None:
+                    await asyncio.sleep(0.1)
+                    continue
                 waiting = [
                     wake_task,
                     self._service_task,
@@ -369,7 +385,7 @@ class ExperimentRunner:
                 )
                 # Apply service decisions even while a stage runs or the DAG is paused.
                 if self._service_task is not None and self._service_task.done():
-                    self._apply_supervision_result(state)
+                    await self._apply_supervision_result(state)
 
                 if self._stage_task is not None and self._stage_task.done():
                     stage_action = await self._complete_stage_task(state)
@@ -399,7 +415,7 @@ class ExperimentRunner:
                     continue
                 action = readiness_task.result()
                 readiness_task = None
-                if not self._apply_readiness_result(state, action):
+                if not await self._apply_readiness_result(state, action):
                     continue
                 # Manual recovery must finish before a new stage or final shutdown.
                 if self._service_retrying or self._maintenance:
@@ -410,13 +426,19 @@ class ExperimentRunner:
                     break
                 if state.mode == "paused" and self._step_future is None:
                     continue
-                self._launch_next_stage(state)
+                await self._launch_next_stage(state)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - Background failures become explicit experiment state.
             await self._fail(error, {})
         finally:
-            tasks = [wake_task, readiness_task, self._stage_task, self._service_task]
+            tasks = [
+                wake_task,
+                readiness_task,
+                self._stage_task,
+                self._service_task,
+                journal_watch,
+            ]
             tasks = [task for task in tasks if task is not None]
             for task in tasks:
                 task.cancel()
@@ -425,6 +447,47 @@ class ExperimentRunner:
             self._publish_resources()
             self._ready.set()
             self._idle.set()
+
+    async def _watch_journal(self) -> None:
+        """Pause scheduling without journaling into unavailable storage.
+
+        Keep the requested mode separate so automatic recovery cannot undo a
+        user's pause or restart an experiment that has been stopped.
+        """
+        while not self._stop_requested:
+            supervisor = getattr(self._journal, "_supervisor", None)
+            state = self._state
+            if (
+                supervisor is not None
+                and state is not None
+                and (self._journal._opened or self._journal._opening)
+            ):
+                status = supervisor.get_status()
+                reason = None
+                if not status.get("history_available", True):
+                    reason = "journal_history_unavailable"
+                elif status["state"] in (
+                    "starting",
+                    "restarting",
+                    "storage_unavailable",
+                ):
+                    reason = "journal_" + status["state"]
+                if reason is not None:
+                    self._journal_pause_reason = reason
+                    state.mode = "paused"
+                    if state.active_attempt is None and state.phase in (
+                        "starting",
+                        "waiting",
+                    ):
+                        state.phase = "waiting"
+                elif (
+                    self._journal_pause_reason is not None
+                    and status["state"] == "ready"
+                ):
+                    self._journal_pause_reason = None
+                    state.mode = self._desired_mode
+                    self._wake.set()
+            await asyncio.sleep(0.1)
 
     async def _prepare_dag_state(self) -> RunnerState | None:
         """Prepare/recover selected state and apply pending decisions before scheduling work.
@@ -450,7 +513,7 @@ class ExperimentRunner:
             raise RuntimeError("Service startup or recovery requires experiment stop.")
         if state.pending_dag_decision is not None:
             self._apply_pending_dag_decision(state)
-            self._save_state()
+            await self._save_state_async()
             if state.last_dag_decision.decision.command == "stop":
                 await self._stop_from_stage()
                 return
@@ -468,7 +531,7 @@ class ExperimentRunner:
             if state.active_attempt is not None
             else ("waiting" if state.mode == "paused" else "starting")
         )
-        self._save_state()
+        await self._save_state_async()
         self._ready.set()
         if state.active_attempt is not None:
             self._idle.clear()
@@ -479,7 +542,7 @@ class ExperimentRunner:
             self._idle.set()
         return state
 
-    def _apply_supervision_result(self, state: RunnerState) -> None:
+    async def _apply_supervision_result(self, state: RunnerState) -> None:
         """Apply a service pause/stop decision and keep observation active during pauses.
 
         Args:
@@ -488,23 +551,17 @@ class ExperimentRunner:
         """
         action = self._service_task.result()
         if action == "stop":
-            raise RuntimeError(
-                "Service supervision requires experiment stop."
-            )
+            raise RuntimeError("Service supervision requires experiment stop.")
         state.mode = self._desired_mode = "paused"
         state.pause_requested = True
         if self._stage_task is None:
             state.phase = "waiting"
-        self._save_state()
+        await self._save_state_async()
         if self._step_future is not None:
             future, self._step_future = self._step_future, None
             if not future.done():
-                future.set_exception(
-                    RuntimeError("A service requires a pause.")
-                )
-        self._service_task = asyncio.create_task(
-            self._services.monitor(state)
-        )
+                future.set_exception(RuntimeError("A service requires a pause."))
+        self._service_task = asyncio.create_task(self._services.monitor(state))
 
     async def _complete_stage_task(
         self, state: RunnerState
@@ -524,7 +581,7 @@ class ExperimentRunner:
         self._last_attempt = outcome.attempt
         self._last_response = outcome.result
         if outcome.attempt.outcome == "unknown":
-            self._pause_unknown_stage(state, outcome)
+            await self._pause_unknown_stage(state, outcome)
             return "unknown"
         if outcome.action == "stop":
             state.last_result = None
@@ -534,7 +591,8 @@ class ExperimentRunner:
             raise RuntimeError("Stage execution requires experiment stop.")
         response = outcome.result
         definition = next(
-            item for item in state.template.stages
+            item
+            for item in state.template.stages
             if item.stage_id == outcome.attempt.stage_id
         )
         requested_snapshot = (
@@ -546,11 +604,11 @@ class ExperimentRunner:
         )
         self._apply_stage_outcome(outcome, defer_dag=requested_snapshot)
         state.phase = "waiting"
-        self._save_state()
+        await self._save_state_async()
         if requested_snapshot:
             await self._snapshot_stage_boundary(state, outcome, False, requested=True)
             self._apply_pending_dag_decision(state)
-            self._save_state()
+            await self._save_state_async()
         final = self._at_dag_end()
         if (
             state.last_dag_decision is not None
@@ -566,7 +624,9 @@ class ExperimentRunner:
             self._wake.set()
         return "ready"
 
-    def _pause_unknown_stage(self, state: RunnerState, outcome: StageOutcome) -> None:
+    async def _pause_unknown_stage(
+        self, state: RunnerState, outcome: StageOutcome
+    ) -> None:
         """Retain unresolved attempt ownership and pause or fail according to its action.
 
         Args:
@@ -580,7 +640,7 @@ class ExperimentRunner:
         state.phase = "waiting"
         self._idle.clear()
         self._pending_advance = False
-        self._save_state()
+        await self._save_state_async()
         if outcome.action == "stop":
             raise RuntimeError(
                 "Previous stage ownership or termination is unconfirmed."
@@ -589,14 +649,16 @@ class ExperimentRunner:
             future, self._step_future = self._step_future, None
             if not future.done():
                 future.set_exception(
-                    RuntimeError(
-                        "Stage state is unknown; recover or stop it first."
-                    )
+                    RuntimeError("Stage state is unknown; recover or stop it first.")
                 )
 
     async def _snapshot_stage_boundary(
-        self, state: RunnerState, outcome: StageOutcome, final: bool,
-        *, requested: bool = False,
+        self,
+        state: RunnerState,
+        outcome: StageOutcome,
+        final: bool,
+        *,
+        requested: bool = False,
     ) -> None:
         """Create a requested or policy-triggered snapshot while holding runner maintenance.
 
@@ -629,7 +691,7 @@ class ExperimentRunner:
                 self._maintenance = False
                 if state.phase == "snapshotting":
                     state.phase = "waiting"
-            self._save_state()
+            await self._save_state_async()
 
     def _finish_stage_step(
         self,
@@ -667,7 +729,7 @@ class ExperimentRunner:
                         RuntimeError("Stage did not complete or skip under its policy.")
                     )
 
-    def _apply_readiness_result(self, state: RunnerState, action: str) -> bool:
+    async def _apply_readiness_result(self, state: RunnerState, action: str) -> bool:
         """Apply a readiness pause/stop and return whether stage scheduling may proceed.
 
         Args:
@@ -686,7 +748,7 @@ class ExperimentRunner:
             state.mode = self._desired_mode = "paused"
             state.pause_requested = True
             state.phase = "waiting"
-            self._save_state()
+            await self._save_state_async()
             if self._step_future is not None:
                 future, self._step_future = self._step_future, None
                 if not future.done():
@@ -720,7 +782,7 @@ class ExperimentRunner:
         )
         await self._services.close()
         state.phase = "completed"
-        self._save_state()
+        await self._save_state_async()
         if self._step_future is not None:
             future, self._step_future = self._step_future, None
             if not future.done():
@@ -736,7 +798,7 @@ class ExperimentRunner:
                     }
                 )
 
-    def _launch_next_stage(self, state: RunnerState) -> None:
+    async def _launch_next_stage(self, state: RunnerState) -> None:
         """Apply pending cursor/cycle advancement, checkpoint, and schedule the next stage.
 
         Args:
@@ -761,7 +823,7 @@ class ExperimentRunner:
         state.last_dag_decision = None
         state.pause_requested = False
         state.phase = "stage_running"
-        self._save_state()
+        await self._save_state_async()
         self._stage_task = asyncio.create_task(
             self._stages.execute(
                 state,
@@ -783,9 +845,11 @@ class ExperimentRunner:
             Newly restored runner state and ready action; the continuation remains
             paused.
         """
-        manifest = await _await_read_task(asyncio.create_task(asyncio.to_thread(
-            self._snapshots._latest_valid, self._continue_source
-        )))
+        manifest = await _await_read_task(
+            asyncio.create_task(
+                asyncio.to_thread(self._snapshots._latest_valid, self._continue_source)
+            )
+        )
         saved = manifest.state
         if manifest.experiment_id != self._requested_id.split(":", 1)[1]:
             raise ValueError("Continuation snapshot belongs to another experiment.")
@@ -860,13 +924,17 @@ class ExperimentRunner:
         # must remain starting instead of exposing the constructor's idle phase.
         state.mode = self._desired_mode
         state.phase = "starting"
-        self._journal.open(state, create=True)
-        self._journal.record_template(
-            state, state.template_yaml, state.template, "initial"
+        await self._journal._run_transition(self._journal.open, state, create=True)
+        await asyncio.to_thread(
+            self._journal.record_template,
+            state,
+            state.template_yaml,
+            state.template,
+            "initial",
         )
         await self._assembler._check_modules_async(state)
         await self._assembler._check_resources_async(state)
-        self._save_state()
+        await self._save_state_async()
         action = await self._services.start_all(state)
         return state, action
 
@@ -1060,8 +1128,8 @@ class ExperimentRunner:
         future, self._step_future = self._step_future, None
         try:
             if recovering:
-                self._retire_accepted_service_requests(self._state)
-                self._save_state()
+                await self._retire_accepted_service_requests(self._state)
+                await self._save_state_async()
             await self._stop(finalize_snapshot=not recovering)
         except BaseException as error:
             if future is not None and not future.done():
@@ -1080,7 +1148,7 @@ class ExperimentRunner:
                 }
             )
 
-    def _retire_accepted_service_requests(self, state: RunnerState) -> None:
+    async def _retire_accepted_service_requests(self, state: RunnerState) -> None:
         # A crash may leave completed snapshot calls in saved queues.
         # Preserve their accepted outcomes before stopping unresolved work.
         """Remove saved queue entries already accepted by the runner before recovered shutdown.
@@ -1094,7 +1162,9 @@ class ExperimentRunner:
             if instance.active_request is not None:
                 requests.append(instance.active_request)
             for request in requests:
-                record = self._journal.client.read_command_result(request.request_id)
+                record = await asyncio.to_thread(
+                    self._journal.client.read_command_result, request.request_id
+                )
                 if record is None or record["author"] != "runner":
                     continue
                 if request is instance.active_request:
@@ -1116,14 +1186,14 @@ class ExperimentRunner:
         if self._state is not None:
             self._state.mode = "paused"
             self._state.pause_requested = True
-            self._save_state()
+            await self._save_state_async()
         await self._ready.wait()
         await self._idle.wait()
         self._require_active()
         self._state.mode = "paused"
         if self._state.phase == "starting":
             self._state.phase = "waiting"
-        self._save_state()
+        await self._save_state_async()
 
     async def resume(self) -> None:
         """Resume normal DAG scheduling after checking maintenance, attempts, and services.
@@ -1136,6 +1206,8 @@ class ExperimentRunner:
             raise RuntimeError("There is no experiment to resume.")
         await self._ready.wait()
         state = self._require_active()
+        if self._journal_pause_reason is not None:
+            raise RuntimeError(f"Experiment is paused: {self._journal_pause_reason}.")
         if any(
             definition.service_id not in state.services
             for definition in state.template.services
@@ -1169,7 +1241,7 @@ class ExperimentRunner:
             and state.last_dag_decision.decision.command == "pause"
         ):
             state.last_dag_decision = None
-        self._save_state()
+        await self._save_state_async()
         self._wake.set()
 
     async def step(self) -> JsonObject:
@@ -1210,7 +1282,7 @@ class ExperimentRunner:
             and state.last_dag_decision.decision.command == "pause"
         ):
             state.last_dag_decision = None
-            self._save_state()
+            await self._save_state_async()
         self._step_future = asyncio.get_running_loop().create_future()
         future = self._step_future
         self._wake.set()
@@ -1255,6 +1327,7 @@ class ExperimentRunner:
         """
         self._stop_requested = True
         await self._cancel_control_tasks()
+        audit_available = await self._journal.prepare_shutdown()
         if self._state is not None:
             failure = None
             try:
@@ -1262,7 +1335,11 @@ class ExperimentRunner:
                 if not stopped:
                     failure = RuntimeError("Could not confirm stage termination.")
                 else:
-                    await self._stages.close(self._state)
+                    try:
+                        await self._stages.close(self._state)
+                    except LoggingError:
+                        if audit_available:
+                            raise
             except Exception as error:  # noqa: BLE001 - Services must still receive stop after a stage error.
                 stopped = False
                 failure = error
@@ -1274,6 +1351,7 @@ class ExperimentRunner:
                 if (
                     stopped
                     and finalize_snapshot
+                    and audit_available
                     and self._state.pending_rebuild is None
                     and self._state.phase
                     not in (
@@ -1294,7 +1372,14 @@ class ExperimentRunner:
                         result["stopped"] for result in results.values()
                     )
                     if any(
-                        not result["stopped"] or result["error"]
+                        not result["stopped"]
+                        or (
+                            result["error"]
+                            and (
+                                audit_available
+                                or result["error"] != result.get("audit_error")
+                            )
+                        )
                         for result in results.values()
                     ):
                         failure = failure or RuntimeError(
@@ -1333,7 +1418,10 @@ class ExperimentRunner:
             if self._state.active_attempt is not None:
                 self._last_attempt = self._state.active_attempt
             self._state.active_attempt = None
-            self._save_state()
+            if audit_available:
+                await self._save_state_async()
+            else:
+                self._state_store.save(self._state)
         if self._step_future is not None:
             if not self._step_future.done():
                 self._step_future.set_exception(
@@ -1463,7 +1551,7 @@ class ExperimentRunner:
         self._service_control_task = asyncio.current_task()
         try:
             instance = await self._services.start(state, service_id)
-            self._save_state()
+            await self._save_state_async()
             return {
                 "service_id": service_id,
                 "service_instance_id": instance.service_instance_id,
@@ -1505,17 +1593,17 @@ class ExperimentRunner:
             # Persist intent before touching the process so recovery can finish
             # an interrupted stop without restarting the selected service.
             instance.manually_stopped = True
-            self._save_state()
+            await self._save_state_async()
             self._state_store.save(state)
             # A stopped process can still have a delayed automatic restart.
             # The manager must cancel that work before acknowledging manual stop.
             results = await self._services.stop_all(state, service_ids={service_id})
             if not results[service_id]["stopped"] or results[service_id]["error"]:
-                self._save_state()
+                await self._save_state_async()
                 raise RuntimeError(f"Service shutdown failed: {results[service_id]}")
             instance.ready = False
             instance.blocked_action = None
-            self._save_state()
+            await self._save_state_async()
             return {
                 "service_id": service_id,
                 "service_instance_id": instance.service_instance_id,
@@ -1566,7 +1654,7 @@ class ExperimentRunner:
                 action = await self._services.reconcile(state, state.template)
             if action == "stop":
                 raise RuntimeError("Service retry requires experiment stop.")
-            self._save_state()
+            await self._save_state_async()
             return {
                 "service_id": service_id,
                 "action": action,
@@ -1581,7 +1669,7 @@ class ExperimentRunner:
             self._service_retrying = False
             self._wake.set()
 
-    def move(self, position: int) -> None:
+    def _move_cursor(self, position: int) -> None:
         """Move the paused DAG pointer and clear any conditional input assignment.
 
         Args:
@@ -1607,9 +1695,8 @@ class ExperimentRunner:
         if state.last_result_id not in state.stage_result_ids.values():
             state.last_result = state.last_result_id = None
         self._pending_advance = False
-        self._save_state()
 
-    def reset_retries(self, kind: ModuleRole, position: int) -> JsonObject:
+    def _reset_retry_count(self, kind: ModuleRole, position: int) -> JsonObject:
         """Reset a stage or service retry counter while paused.
 
         Args:
@@ -1657,8 +1744,27 @@ class ExperimentRunner:
             old = state.stage_retry_counts.get(stage_id, 0)
             state.stage_retry_counts[stage_id] = 0
             result_key, identifier = "stage_id", stage_id
-        self._save_state()
         return {result_key: identifier, "previous": old, "current": 0}
+
+    def move(self, position: int) -> None:
+        """Move the idle paused DAG pointer and durably publish its checkpoint."""
+        self._move_cursor(position)
+        self._save_state()
+
+    async def _move(self, position: int) -> None:
+        self._move_cursor(position)
+        await self._save_state_async()
+
+    def reset_retries(self, kind: ModuleRole, position: int) -> JsonObject:
+        """Reset the selected paused module's retry counter and commit the change."""
+        result = self._reset_retry_count(kind, position)
+        self._save_state()
+        return result
+
+    async def _reset_retries(self, kind: ModuleRole, position: int) -> JsonObject:
+        result = self._reset_retry_count(kind, position)
+        await self._save_state_async()
+        return result
 
     async def replace(
         self, kind: ModuleRole, position: int, module: JsonObject, settings: JsonObject
@@ -1727,7 +1833,8 @@ class ExperimentRunner:
                 )
         except RuntimeError as error:
             if logger is not None:
-                logger.record_event(
+                await asyncio.to_thread(
+                    logger.record_event,
                     "reload.rejected",
                     {
                         "template_path": None
@@ -1738,7 +1845,8 @@ class ExperimentRunner:
                     context=self._command_context,
                 )
             raise
-        operation = self._journal.client.start_operation(
+        operation = await asyncio.to_thread(
+            self._journal.client.start_operation,
             "rebuild",
             "reload_template",
             context={
@@ -1770,18 +1878,22 @@ class ExperimentRunner:
             )
             result = await self._apply_template(text, template)
             if self._reload_operation is not None:
-                self._journal.client.finish_operation(operation, attributes=result)
+                await asyncio.to_thread(
+                    self._journal.client.finish_operation, operation, attributes=result
+                )
                 self._reload_operation = None
             return result
         except BaseException as error:
             if self._reload_operation is not None:
                 try:
-                    self._journal.client.record_error(
+                    await asyncio.to_thread(
+                        self._journal.client.record_error,
                         error,
                         operation=operation,
                         include_traceback=True,
                     )
-                    self._journal.client.finish_operation(
+                    await asyncio.to_thread(
+                        self._journal.client.finish_operation,
                         operation,
                         status="cancelled"
                         if isinstance(error, asyncio.CancelledError)
@@ -1829,20 +1941,22 @@ class ExperimentRunner:
             "changes": [],
         }
         if not result["changed"]:
-            logger.record_event("reload.unchanged", result, operation=operation)
+            await asyncio.to_thread(
+                logger.record_event, "reload.unchanged", result, operation=operation
+            )
             return result
         application = await self._plan_reload_application(
             state, template_yaml, template, operation, result
         )
-        self._audit_reload_definitions(application)
-        self._audit_reload_candidate(state, application)
-        self._audit_reload_progress(state, application)
+        await self._audit_reload_definitions(application)
+        await self._audit_reload_candidate(state, application)
+        await self._audit_reload_progress(state, application)
         try:
             await self._prepare_reload_snapshot(state, application)
-            self._isolate_reload_service_data(state, application)
+            await self._isolate_reload_service_data(state, application)
             await self._publish_reload_dag(state, application)
             await self._transfer_reload_services(state, application)
-            self._commit_reload(state, application)
+            await self._commit_reload(state, application)
             return result
         except BaseException as error:
             await self._handle_reload_failure(state, application, error)
@@ -1911,7 +2025,7 @@ class ExperimentRunner:
             },
         )
 
-    def _audit_reload_definitions(self, application: ReloadApplication) -> None:
+    async def _audit_reload_definitions(self, application: ReloadApplication) -> None:
         """Journal per-definition changes and append compact changes to the reload result.
 
         Args:
@@ -1948,8 +2062,11 @@ class ExperimentRunner:
                 ):
                     continue
                 change = _definition_change(role, identity, before, after)
-                application.logger.record_event(
-                    "reload.definition_changed", change, operation=application.operation
+                await asyncio.to_thread(
+                    application.logger.record_event,
+                    "reload.definition_changed",
+                    change,
+                    operation=application.operation,
                 )
                 application.result["changes"].append(
                     {
@@ -1959,7 +2076,7 @@ class ExperimentRunner:
                     }
                 )
 
-    def _audit_reload_candidate(
+    async def _audit_reload_candidate(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
         # Validate the dedicated full-template event before any filesystem/process effects.
@@ -1995,7 +2112,8 @@ class ExperimentRunner:
             },
             state.template.logging.max_event_bytes,
         )
-        application.logger.record_event(
+        await asyncio.to_thread(
+            application.logger.record_event,
             "reload.previous_template",
             {
                 "template": application.previous.model_dump(exclude_unset=True),
@@ -2003,7 +2121,8 @@ class ExperimentRunner:
             },
             operation=application.operation,
         )
-        application.parameters = application.logger.record_event(
+        application.parameters = await asyncio.to_thread(
+            application.logger.record_event,
             "reload.candidate",
             {
                 "template": application.template.model_dump(exclude_unset=True),
@@ -2014,7 +2133,9 @@ class ExperimentRunner:
             operation=application.operation,
         )
 
-    def _audit_reload_progress(self, state: RunnerState, application: ReloadApplication) -> None:
+    async def _audit_reload_progress(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         """Journal preserved/invalidated results, retry counters, and planned cursor movement.
 
         Args:
@@ -2023,11 +2144,14 @@ class ExperimentRunner:
             application: Reload plan and mutable progress/audit state shared by
                 reload stages.
         """
-        application.logger.record_event(
+        await asyncio.to_thread(
+            application.logger.record_event,
             "reload.progress",
             {
                 "template_revision_id": application.candidate_revision,
-                "preserved_completed_stage_ids": sorted(application.completed & application.cursor.preserved),
+                "preserved_completed_stage_ids": sorted(
+                    application.completed & application.cursor.preserved
+                ),
                 "cycle_number": state.cycle_number,
                 "old_position": state.stage_position,
                 "old_pending_advance": self._pending_advance,
@@ -2041,7 +2165,9 @@ class ExperimentRunner:
                     if k not in application.cursor.preserved
                 },
                 "preserved_results": {
-                    k: v for k, v in state.stage_result_ids.items() if k in application.cursor.preserved
+                    k: v
+                    for k, v in state.stage_result_ids.items()
+                    if k in application.cursor.preserved
                 },
                 "result_origins": state.stage_result_origins,
                 "cleared_retries": {
@@ -2101,8 +2227,9 @@ class ExperimentRunner:
             }
         )
         state.phase = "rebuilding"
-        self._save_state()
-        application.logger.record_event(
+        await self._save_state_async()
+        await asyncio.to_thread(
+            application.logger.record_event,
             "control.intent",
             {
                 "action": "reload_template",
@@ -2112,9 +2239,9 @@ class ExperimentRunner:
             operation=application.operation,
         )
         await self._services.prepare_rebuild(state, application.template)
-        self._save_state()
+        await self._save_state_async()
 
-    def _isolate_reload_service_data(
+    async def _isolate_reload_service_data(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
         """Move stale data aside for new IDs or changed module names and audit transfer plans.
@@ -2127,7 +2254,8 @@ class ExperimentRunner:
         """
         for sid, definition in application.layout.new_services.items():
             previous = application.layout.old_services.get(sid)
-            application.logger.record_event(
+            await asyncio.to_thread(
+                application.logger.record_event,
                 "reload.service_plan",
                 {
                     "service_id": sid,
@@ -2158,7 +2286,8 @@ class ExperimentRunner:
                     displaced = application.workspace / "previous_data" / sid
                     displaced.parent.mkdir(parents=True, exist_ok=True)
                     data.replace(displaced)
-                    application.logger.record_event(
+                    await asyncio.to_thread(
+                        application.logger.record_event,
                         "reload.service_data",
                         {
                             "service_id": sid,
@@ -2198,7 +2327,8 @@ class ExperimentRunner:
             application.template.model_dump(exclude_unset=True),
             workspace=application.workspace,
         )
-        application.logger.record_event(
+        await asyncio.to_thread(
+            application.logger.record_event,
             "control.observed",
             {"action": "reload_template", "state": "files_published"},
             operation=application.operation,
@@ -2249,14 +2379,16 @@ class ExperimentRunner:
                 application.layout.new_stages[predecessor].stage_id
             )
             if request_id is not None:
-                record = application.logger.read_command_result(request_id)
+                record = await asyncio.to_thread(
+                    application.logger.read_command_result, request_id
+                )
                 if record is None or record["author"] != "runner":
                     raise ValueError(
                         "Retained predecessor has no accepted journal result."
                     )
                 state.last_result_id = request_id
                 state.last_result = record["response"]["data"]
-        self._save_state()
+        await self._save_state_async()
 
     async def _transfer_reload_services(
         self, state: RunnerState, application: ReloadApplication
@@ -2307,7 +2439,8 @@ class ExperimentRunner:
             [*application.layout.old_services, *application.layout.new_services]
         ):
             instance = state.services.get(sid)
-            application.logger.record_event(
+            await asyncio.to_thread(
+                application.logger.record_event,
                 "reload.service",
                 {
                     "service_id": sid,
@@ -2335,7 +2468,7 @@ class ExperimentRunner:
                 operation=application.operation,
             )
 
-    def _commit_reload(
+    async def _commit_reload(
         self, state: RunnerState, application: ReloadApplication
     ) -> None:
         """Journal the applied revision and checkpoint an idle pause with no pending rebuild.
@@ -2346,7 +2479,8 @@ class ExperimentRunner:
             application: Reload plan and mutable progress/audit state shared by
                 reload stages.
         """
-        application.logger.record_template_applied(
+        await asyncio.to_thread(
+            application.logger.record_template_applied,
             application.template.model_dump(exclude_unset=True),
             template_yaml=application.template_yaml,
             template_revision_id=application.candidate_revision,
@@ -2363,7 +2497,7 @@ class ExperimentRunner:
         pending = state.pending_rebuild
         state.pending_rebuild = None
         try:
-            self._save_state()
+            await self._save_state_async()
         except BaseException:
             state.pending_rebuild = pending
             raise
@@ -2397,10 +2531,14 @@ class ExperimentRunner:
             return
         failure_id = None
         try:
-            failure_id = application.logger.record_error(
-                error, operation=application.operation, include_traceback=True
+            failure_id = await asyncio.to_thread(
+                application.logger.record_error,
+                error,
+                operation=application.operation,
+                include_traceback=True,
             )
-            application.logger.finish_operation(
+            await asyncio.to_thread(
+                application.logger.finish_operation,
                 application.operation,
                 status="cancelled"
                 if isinstance(error, asyncio.CancelledError)
@@ -2419,30 +2557,23 @@ class ExperimentRunner:
             )
             self._last_attempt = self._last_response = None
             self._pending_advance = state.pending_advance
-            with self._journal.client.operation(
-                "rebuild",
-                "reload_template_rollback",
-                context={
+            await asyncio.to_thread(
+                _record_reload_reconciliation,
+                self._journal.client,
+                {
                     "experiment_id": state.experiment_id,
                     "run_id": state.run_id,
                     "parent_operation_id": application.operation.get_operation_id(),
                 },
-            ) as recovery:
-                self._journal.client.record_event(
-                    "control.reconciled",
-                    {
-                        "action": "reload_template",
-                        "state": "rolled_back",
-                        "error_id": failure_id,
-                    },
-                    operation=recovery,
-                )
-            self._save_state()
+                failure_id,
+            )
+            await self._save_state_async()
         except BaseException as rollback_error:  # noqa: BLE001 - Cancellation must preserve unfinished ownership.
             if rollback_error is not error:
                 error.add_note(f"Reload rollback failed: {rollback_error}")
                 try:
-                    self._journal.client.record_error(
+                    await asyncio.to_thread(
+                        self._journal.client.record_error,
                         rollback_error,
                         caused_by_error_id=failure_id,
                         context={
@@ -2456,7 +2587,9 @@ class ExperimentRunner:
             if not isinstance(rollback_error, asyncio.CancelledError):
                 await self._fail(error, {})
 
-    async def _handle_detached_reload_failure(self, state: RunnerState, application: ReloadApplication, error: BaseException) -> None:
+    async def _handle_detached_reload_failure(
+        self, state: RunnerState, application: ReloadApplication, error: BaseException
+    ) -> None:
         """Fail a detached uncommitted reload unless original services and snapshot barriers remain healthy.
 
         Args:
@@ -2495,7 +2628,9 @@ class ExperimentRunner:
         ):
             await self._fail(error, {})
 
-    async def _cleanup_reload_application(self, state: RunnerState, application: ReloadApplication) -> None:
+    async def _cleanup_reload_application(
+        self, state: RunnerState, application: ReloadApplication
+    ) -> None:
         """Resume paused scheduling/resource observation and remove only completed owned workspaces.
 
         Args:
@@ -2528,14 +2663,14 @@ class ExperimentRunner:
             try:
                 await asyncio.to_thread(shutil.rmtree, application.workspace)
             except OSError as cleanup_error:
-                self._journal.client.record_error(
+                await asyncio.to_thread(
+                    self._journal.client.record_error,
                     cleanup_error,
                     context={
                         "experiment_id": state.experiment_id,
                         "parent_operation_id": application.operation.get_operation_id(),
                     },
                 )
-
 
     async def snapshot(self, label: str | None = None) -> JsonObject:
         """Publish a manual snapshot from an idle pause with no concurrent maintenance.
@@ -2573,11 +2708,11 @@ class ExperimentRunner:
         self._maintenance = True
         self._maintenance_task = asyncio.current_task()
         state.phase = "snapshotting"
-        self._save_state()
+        await self._save_state_async()
         try:
             self._last_snapshot = await self._snapshots.create(state, label)
             state.phase = "waiting"
-            self._save_state()
+            await self._save_state_async()
             return self._last_snapshot
         except asyncio.CancelledError:
             raise
@@ -2740,8 +2875,10 @@ class ExperimentRunner:
         self._publish_resources()
         try:
             # Reopening also permits rollback after an earlier journal writer failure.
-            self._journal.close()
-            self._journal.open(state, create=False)
+            await asyncio.to_thread(
+                self._journal.close,
+            )
+            await self._journal._run_transition(self._journal.open, state, create=False)
             await self._snapshots.restore(
                 state, snapshot_id, suspend_resources=self._suspend_resources
             )
@@ -2798,7 +2935,7 @@ class ExperimentRunner:
         self._recover_live = False
         self._wake.clear()
         self._ready.clear()
-        self._save_state()
+        await self._save_state_async()
         self._task = asyncio.create_task(
             self._advance_dag(), name=f"dag:{state.experiment_id}"
         )
@@ -2835,7 +2972,9 @@ class ExperimentRunner:
         state = await self._load_recovery_state(root, experiment_id, transaction)
         await self._services.close()
         await self._stages.close()
-        self._journal.close()
+        await asyncio.to_thread(
+            self._journal.close,
+        )
         self._state = state
         self._requested_id = experiment_id
         self._desired_mode = "paused"
@@ -2867,7 +3006,9 @@ class ExperimentRunner:
                 )
                 self._recover_live = False
             else:
-                self._journal.open(state, create=False)
+                await self._journal._run_transition(
+                    self._journal.open, state, create=False
+                )
                 latest, launches = await _read_recovery_evidence(
                     self._journal.client, experiment_id
                 )
@@ -2878,8 +3019,12 @@ class ExperimentRunner:
                     launches = []
                 if launches:
                     self._recover_launched_attempt(state, root, launches[-1])
-                self._journal.close()
-                self._journal.open(state, create=False)
+                await asyncio.to_thread(
+                    self._journal.close,
+                )
+                await self._journal._run_transition(
+                    self._journal.open, state, create=False
+                )
                 self._recover_live = not rebuilding
             await self._start_recovered_dag(state, experiment_id)
         except asyncio.CancelledError:
@@ -3033,12 +3178,13 @@ class ExperimentRunner:
         # Startup may have published ownership after the last checkpoint.
         # Never assume that a missing PID proves no process was launched.
         for sid, instance in state.services.items():
-            self._retire_rebuild_requests(state, sid, instance)
+            await self._retire_rebuild_requests(state, sid, instance)
             if instance.stopped:
                 continue
             await self._recover_service_process(state, sid, instance)
         operation_id = state.pending_rebuild.operation_id
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.reconciled",
             {
                 "action": "reload_template",
@@ -3056,7 +3202,8 @@ class ExperimentRunner:
             preserve_rebuild_diagnostics=True,
             suspend_resources=self._suspend_resources,
         )
-        self._journal.client.record_event(
+        await asyncio.to_thread(
+            self._journal.client.record_event,
             "control.reconciled",
             {
                 "action": "reload_template",
@@ -3069,9 +3216,9 @@ class ExperimentRunner:
             },
         )
         self._pending_advance = state.pending_advance
-        self._save_state()
+        await self._save_state_async()
 
-    def _retire_rebuild_requests(
+    async def _retire_rebuild_requests(
         self, state: RunnerState, sid: str, instance: ServiceInstance
     ) -> None:
         # The accepted result can be newer than the queue checkpoint.
@@ -3089,7 +3236,9 @@ class ExperimentRunner:
         if instance.active_request is not None:
             requests.append(instance.active_request)
         for request in requests:
-            accepted = self._journal.client.read_command_result(request.request_id)
+            accepted = await asyncio.to_thread(
+                self._journal.client.read_command_result, request.request_id
+            )
             if accepted is None or accepted["author"] != "runner":
                 continue
             context = accepted["event"]["context"]
@@ -3110,7 +3259,8 @@ class ExperimentRunner:
                 instance.active_request = None
             else:
                 instance.pending_requests.remove(request)
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "control.reconciled",
                 {
                     "action": "retire_rebuild_request",
@@ -3174,7 +3324,9 @@ class ExperimentRunner:
         state.active_attempt = attempt
         state.stage_attempt_numbers[attempt.stage_id] = attempt.attempt_number
 
-    async def _start_recovered_dag(self, state: RunnerState, experiment_id: str) -> None:
+    async def _start_recovered_dag(
+        self, state: RunnerState, experiment_id: str
+    ) -> None:
         """Keep terminal stopped state or launch paused recovery scheduling and await readiness.
 
         Args:
@@ -3379,7 +3531,8 @@ class ExperimentRunner:
                 },
             )
             instance.process_identity = ProcessIdentity.model_validate(declared)
-            self._journal.client.record_event(
+            await asyncio.to_thread(
+                self._journal.client.record_event,
                 "control.reconciled",
                 {
                     "action": "rebuild_service_process",
@@ -3453,10 +3606,12 @@ class ExperimentRunner:
             self._state.phase = "failed"
             self._publish_resources()
             try:
-                self._journal.client.record_error(
-                    error, context={"experiment_id": self._state.experiment_id}
+                await asyncio.to_thread(
+                    self._journal.client.record_error,
+                    error,
+                    context={"experiment_id": self._state.experiment_id},
                 )
-                self._save_state()
+                await self._save_state_async()
             except Exception as logging_error:  # noqa: BLE001 - Emergency storage must not recurse into the logger.
                 write_json(
                     self._project_root / "controller" / f"failure-{uuid4()}.json",
@@ -3493,37 +3648,51 @@ class ExperimentRunner:
             raise RuntimeError("The experiment is not active.")
         return self._state
 
-    def _save_state(self) -> None:
-        """Journal the authoritative checkpoint and publish state, resources, and notifications.
-
-        Assigns a fresh checkpoint and current OS owner identity, writes the
-        authoritative journal checkpoint, then attempts the optional state.json
-        copy. State-file I/O errors are journaled; required journal failures
-        propagate.
-        """
+    def _prepare_state_save(self) -> tuple[RunnerState, JsonObject]:
+        """Freeze a checkpoint before passing persistence to a worker thread."""
         self._state.pending_advance = self._pending_advance
         self._state.checkpoint_id = str(uuid4())
         self._state.owner_identity = ProcessIdentity.model_validate(
             process_identity(os.getpid())
         )
-        _record_runner_checkpoint(self._journal.client, self._state)
-        self._publish_resources()
+        checkpoint = state_from_document(
+            self._state.experiment_directory, state_to_document(self._state)
+        )
+        return checkpoint, self.get_state()
+
+    def _persist_state(self, checkpoint: RunnerState, public_state: JsonObject) -> None:
+        """Commit the frozen checkpoint before publishing its optional disk copy."""
+        _record_runner_checkpoint(self._journal.client, checkpoint)
         try:
-            self._state_store.save(self._state)
+            self._state_store.save(checkpoint)
         except OSError as error:
             self._journal.client.record_error(
-                error, context={"experiment_id": self._state.experiment_id}
+                error, context={"experiment_id": checkpoint.experiment_id}
             )
         self._journal.client.record_event(
             "experiment.state",
-            self.get_state(),
+            public_state,
             context={
-                "experiment_id": self._state.experiment_id,
-                "run_id": self._state.run_id,
+                "experiment_id": checkpoint.experiment_id,
+                "run_id": checkpoint.run_id,
             },
         )
+
+    def _publish_state(self) -> None:
+        self._publish_resources()
         if self._notify is not None:
             self._notify(self.get_state())
+
+    def _save_state(self) -> None:
+        """Synchronous persistence for the existing synchronous control methods."""
+        self._persist_state(*self._prepare_state_save())
+        self._publish_state()
+
+    async def _save_state_async(self) -> None:
+        """Wait for COMMIT without blocking control or service heartbeat tasks."""
+        checkpoint, public_state = self._prepare_state_save()
+        await asyncio.to_thread(self._persist_state, checkpoint, public_state)
+        self._publish_state()
 
     def set_resource_observer(
         self,
@@ -3708,6 +3877,11 @@ class ExperimentRunner:
             "observed_at": datetime.now(UTC).isoformat(),
             "services": copy_json_object({"items": services}, "service state")["items"],
             "termination_confirmed": self._termination_confirmed,
+            "journal_audit_complete": getattr(self._journal, "audit_complete", True),
+            "journal_pause_reason": self._journal_pause_reason,
+            "journal_writer": None
+            if not hasattr(self._journal, "_supervisor")
+            else self._journal._supervisor.get_status(),
             "resource_observer_error": self._resource_error,
             "stable_snapshot_id": None if state is None else state.stable_snapshot_id,
             "pending_rebuild": None
@@ -3781,7 +3955,9 @@ class ExperimentRunner:
                 self._state.owner_identity = None
                 self._state.checkpoint_id = str(uuid4())
                 try:
-                    _record_runner_checkpoint(self._journal.client, self._state)
+                    await asyncio.to_thread(
+                        _record_runner_checkpoint, self._journal.client, self._state
+                    )
                     self._state_store.save(self._state)
                 except (LoggingError, OSError) as error:
                     write_json(

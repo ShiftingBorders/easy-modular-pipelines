@@ -10,6 +10,7 @@ from uuid import uuid4
 from core.journal.events import LoggingError, LoggingStateError
 from core.journal.logger import OperationLogger
 from tests.dashboard_tests.helpers import cleanup_directory, temporary_directory
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_process import (
     event_fixture,
     existing_settings,
@@ -21,21 +22,22 @@ from tests.helpers.logging_process import (
 class ReadOnlyLoggerTests(unittest.TestCase):
     def test_reader_opens_while_writer_holds_uncommitted_write_transaction(self):
         self.writer.record_event("committed")
-        connection = self.writer._store._connection
-        connection.execute("BEGIN IMMEDIATE")
+        self.owner.execute("BEGIN IMMEDIATE")
         try:
             reader = self.reader()
             self.assertEqual(
                 reader.read_events()["events"][0]["event"]["event_type"], "committed"
             )
         finally:
-            connection.execute("ROLLBACK")
+            self.owner.execute("ROLLBACK")
 
     def setUp(self):
         tmp = temporary_directory()
         self.addCleanup(cleanup_directory, tmp)
         self.root = Path(tmp.name)
         self.config = write_settings(self.root)
+        self.owner = WriterOwner(self.config).open()
+        self.addCleanup(self.owner.close)
         self.writer = OperationLogger(self.config)
         self.writer.open()
         self.addCleanup(self.writer.close)
@@ -59,10 +61,10 @@ class ReadOnlyLoggerTests(unittest.TestCase):
         )
         self.assertTrue(reader.read_changes()["changes"])
         self.assertEqual(
-            reader._store._connection.execute("PRAGMA query_only").fetchone()[0], 1
+            self.owner.execute("PRAGMA query_only", read_only=True)[0][0], 1
         )
         with self.assertRaises(sqlite3.OperationalError):
-            reader._store._connection.execute("CREATE TABLE forbidden (value TEXT)")
+            self.owner.execute("CREATE TABLE forbidden (value TEXT)", read_only=True)
         self.assertEqual(len(reader.read_events()["events"]), 1)
         self.assertFalse(list(self.root.glob("*.emergency*")))
 
@@ -82,6 +84,7 @@ class ReadOnlyLoggerTests(unittest.TestCase):
         self,
     ):
         self.writer.close()
+        self.owner.close()
         original = (self.root / "events.db").read_bytes()
         for content in (b"", b"not SQLite", None):
             with self.subTest(content=content):
@@ -122,7 +125,7 @@ class ReadOnlyLoggerTests(unittest.TestCase):
         with (
             patch.object(
                 reader._store,
-                "_check_health",
+                "_call",
                 side_effect=AssertionError("write path reached"),
             ),
             self.assertRaises(LoggingStateError),

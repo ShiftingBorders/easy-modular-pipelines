@@ -11,6 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from core.journal.deadlines import wait_journal_deadline
 from core.journal.logger import OperationLogger
 from core.journal.streams import capture_stream
 from core.models.participant_launch import StageLaunch
@@ -24,6 +25,7 @@ from core.primitives.processes import module_process_arguments, process_identity
 
 class StageExecutor:
     """Own one stage child process and report its observed outcome to the journal."""
+
     def __init__(self, launch_path: Path) -> None:
         """Initialize an executor for an absolute launch-file path without starting work.
 
@@ -69,7 +71,7 @@ class StageExecutor:
             describe=self._describe,
             control_timeout_seconds=launch.control_timeout_seconds,
         )
-        self._logger.open()
+        await asyncio.to_thread(self._logger.open)
         try:
             await self._server.start()
             write_json(
@@ -89,7 +91,7 @@ class StageExecutor:
                 try:
                     await self._server.close()
                 finally:
-                    self._logger.close()
+                    await asyncio.to_thread(self._logger.close)
 
     async def _wait_for_call(self, launch: StageLaunch) -> None:
         """Await the assigned execute call and record failure if admission never arrives.
@@ -108,7 +110,8 @@ class StageExecutor:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done or stopped in done and not self._server.has_call(request_id):
-                self._logger.record_command_result(
+                await asyncio.to_thread(
+                    self._logger.record_command_result,
                     request_id,
                     {
                         "result": "fail",
@@ -228,6 +231,7 @@ class StageExecutor:
         output = bytearray()
         error = None
         response = None
+        recovery_baseline = self._logger._recovery_seconds()
         try:
             await self._start_process()
             streams = asyncio.gather(
@@ -247,11 +251,14 @@ class StageExecutor:
                 ),
             )
             deadline = request.get("deadline_monotonic")
-            remaining = (
-                None if deadline is None else max(0, deadline - time.monotonic())
-            )
             try:
-                await asyncio.wait_for(asyncio.shield(streams), remaining)
+                await wait_journal_deadline(
+                    streams,
+                    deadline,
+                    self._logger,
+                    cancel_on_timeout=False,
+                    recovery_baseline=recovery_baseline,
+                )
             except TimeoutError:
                 await self._interrupt("timeout")
                 await streams
@@ -330,7 +337,8 @@ class StageExecutor:
                 "started_monotonic": self._started_monotonic,
             },
         )
-        self._logger.record_event(
+        await asyncio.to_thread(
+            self._logger.record_event,
             "stage.process_started",
             self._describe(),
             context=self._context.model_dump(),

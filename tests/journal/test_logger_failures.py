@@ -7,8 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 from core.journal.events import (
     LoggingConfigurationError,
@@ -16,6 +15,7 @@ from core.journal.events import (
     LoggingStorageError,
 )
 from core.journal.logger import OperationLogger
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_fixtures import write_context_settings
 from tests.helpers.logging_process import SCRATCH_ROOT, cleanup_directory, read_database
 
@@ -28,6 +28,8 @@ class LoggerFailureTests(unittest.TestCase):
         self.folder = Path(temporary.name)
         self.config = write_context_settings(self.folder)
         self.path = self.folder / "events.db"
+        self.owners = {}
+        self.owner = self.start_owner(self.config)
         self.logger = OperationLogger(self.config)
         self.addCleanup(self.logger.close)
         self.logger.open()
@@ -35,10 +37,16 @@ class LoggerFailureTests(unittest.TestCase):
 
     def deny_insert(self, logger=None):
         client = self.logger if logger is None else logger
-        client._store._connection.execute(
+        self.owners[client._config_path].execute(
             "CREATE TEMP TRIGGER deny_insert BEFORE INSERT ON events "
             "BEGIN SELECT RAISE(ABORT, 'injected write denial'); END"
         )
+
+    def start_owner(self, config):
+        owner = WriterOwner(config).open()
+        self.addCleanup(owner.close)
+        self.owners[config] = owner
+        return owner
 
     def test_failed_write_creates_one_diagnostic_with_context_and_unconfirmed_id(self):
         operation = self.logger.start_operation("attempt", "stage-A")
@@ -74,23 +82,15 @@ class LoggerFailureTests(unittest.TestCase):
     ):
         self.logger.close()
         write_context_settings(self.folder, min_free_bytes=100)
-        with patch(
-            "core.journal.storage.shutil.disk_usage",
-            return_value=SimpleNamespace(free=200),
-        ):
+        with self.owner.disk_space(200):
             self.logger.open()
         with (
-            patch(
-                "core.journal.storage.shutil.disk_usage",
-                return_value=SimpleNamespace(free=50),
-            ) as usage,
+            self.owner.disk_space(50) as usage,
             self.assertRaises(LoggingStorageError),
         ):
             self.logger.record_event("space.rejected")
-        self.assertTrue(usage.called)
-        self.assertTrue(
-            all(call.args == (self.path.parent,) for call in usage.call_args_list)
-        )
+        self.assertTrue(usage)
+        self.assertTrue(all(args == (self.path.parent,) for args in usage))
         self.assertEqual(
             [e["event_id"] for e in read_database(self.path)], [self.prefix]
         )
@@ -104,6 +104,7 @@ class LoggerFailureTests(unittest.TestCase):
             with self.subTest(phase=phase):
                 folder = self.folder / phase
                 config = write_context_settings(folder)
+                self.start_owner(config)
                 with OperationLogger(config) as logger:
                     logger.record_event("confirmed")
                     self.deny_insert(logger)
@@ -246,28 +247,24 @@ class LoggerFailureTests(unittest.TestCase):
             self.assertEqual(len(list(path.parent.glob("*.emergency-*.jsonl"))), 1)
         with self.subTest(action="read"):
             failure = sqlite3.OperationalError("read failed")
-            real = self.logger._store._connection
-            mocked = Mock(wraps=real)
-            mocked.execute.side_effect = failure
             with (
-                patch.object(self.logger._store, "_connection", mocked),
+                self.owner.connection_failure("execute", failure, read_only=True),
                 self.assertRaises(LoggingStorageError) as caught,
             ):
                 self.logger.read_events()["events"]
-            self.assertIs(caught.exception.__cause__, failure)
+            self.assertIsInstance(caught.exception.__cause__, type(failure))
+            self.assertEqual(str(caught.exception.__cause__), str(failure))
         self.logger.close()
         self.logger.open()
         with self.subTest(action="close"):
             failure = sqlite3.OperationalError("close failed")
-            real = self.logger._store._connection
-            mocked = Mock(wraps=real)
-            mocked.close.side_effect = failure
             with (
-                patch.object(self.logger._store, "_connection", mocked),
+                self.owner.connection_failure("close", failure),
                 self.assertRaises(LoggingStorageError) as caught,
             ):
-                self.logger.close()
-            self.assertIs(caught.exception.__cause__, failure)
+                self.owner.call("close_store")
+            self.assertIsInstance(caught.exception.__cause__, type(failure))
+            self.assertEqual(str(caught.exception.__cause__), str(failure))
         self.assertEqual(len(list(self.folder.glob("events.db.emergency-*.jsonl"))), 2)
 
     def test_changed_disk_header_is_detected_even_with_open_sqlite_connection(self):

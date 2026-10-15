@@ -234,9 +234,17 @@ class CacheProjectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_byte_limited_batch_cannot_become_a_complete_preview(self):
         """An event-count fit is insufficient when the reader returns only a tail."""
-        _, reader, _ = self.cache(history())
+        workspace, reader, _ = self.cache(history())
+        from tests.helpers.journal_owner import WriterOwner
+        from tests.helpers.logging_process import stop_journal_writers
+
+        workspace.logger.close()
+        stop_journal_writers(workspace.directory)
+        owner = WriterOwner(workspace.config).open()
+        self.addCleanup(owner.close)
+        workspace.logger.open()
         reader.window_events = 500
-        with patch("core.journal.storage._PAGE_BYTES", 1):
+        with owner.fault("patch_storage", name="_PAGE_BYTES", value=1):
             self.assertIsNone(reader.preview("exp-test"))
         preview = reader.preview("exp-test")
         self.assertTrue(preview["complete"])

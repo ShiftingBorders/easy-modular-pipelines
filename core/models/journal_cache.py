@@ -41,6 +41,7 @@ class CacheIdentity(_Document):
         generation: Journal generation used to reject checkpoints from
             superseded history.
     """
+
     journal_id: UUIDText
     generation: UUIDText
 
@@ -64,7 +65,10 @@ class HistoryCacheParameters(BaseModel):
         max_events: Maximum effective events loaded for one projection working
             set. Defaults to 100000.
     """
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True, hide_input_in_errors=True)
+
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
+    )
 
     path: AbsolutePath
     config_path: AbsolutePath
@@ -87,6 +91,7 @@ class CacheSource(_Document):
         experiment_id: Experiment identifier associating this document with its
             execution history.
     """
+
     version: SchemaVersionOne
     identity: CacheIdentity
     file_key: Annotated[list[NonnegativeInteger], Field(min_length=2, max_length=2)]
@@ -131,6 +136,7 @@ class CacheChangeCheckpoint(CacheIdentity):
         change_cursor: Nonnegative SQLite change-feed position, independent of
             the event cursor.
     """
+
     change_cursor: SQLitePosition
 
 
@@ -147,6 +153,7 @@ class CacheCheckpoint(CacheChangeCheckpoint):
         cursor: Nonnegative event cursor identifying a position in the source
             journal.
     """
+
     cursor: SQLitePosition
 
 
@@ -167,6 +174,7 @@ class JournalBoundary(CacheCheckpoint):
         event_count: Number of source events represented by the recorded
             boundary or export.
     """
+
     schema_version: Annotated[int, Field(strict=True, ge=2, le=2)]
     event_count: SQLitePosition
 
@@ -178,6 +186,7 @@ class CacheGap(_Document):
         after: Last cached source cursor before the gap, excluded from the gap.
         before: First source cursor after the gap, excluded from the gap.
     """
+
     after: SQLitePosition
     before: SQLitePosition
 
@@ -209,6 +218,7 @@ class CachePublication(_Document):
         target_boundary: Source boundary that the current cache task aims to
             make fully available. Defaults to None.
     """
+
     complete: Boolean
     version: NonnegativeInteger
     observed_at: Text | None
@@ -274,8 +284,16 @@ class FilteredPublication(JournalBoundary):
             publication.
         published_at: Wall-clock timestamp of publication.
     """
+
     publication_id: UUIDText
     published_at: UTCText
+
+
+class FilteredSourceHeader(_Document):
+    """Boundary and replay mode for an immutable writer-owned source export."""
+
+    boundary: JournalBoundary
+    rebuild: Boolean
 
 
 class FilteredCheckpoint(_Document):
@@ -346,7 +364,10 @@ class CacheReaderContext(BaseModel):
         state: Reader projection state copied separately with its own JSON depth
             allowance.
     """
-    model_config = ConfigDict(extra="allow", strict=True, frozen=True, hide_input_in_errors=True)
+
+    model_config = ConfigDict(
+        extra="allow", strict=True, frozen=True, hide_input_in_errors=True
+    )
 
     directory: Text
     project_root: Text
@@ -434,6 +455,7 @@ class HistoryCacheRefresh(BaseModel):
         reader_context: Optional paths/state to publish alongside the refreshed
             projections. Defaults to None.
     """
+
     model_config = ConfigDict(
         extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
     )

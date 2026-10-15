@@ -70,7 +70,7 @@ prove that a process is currently alive.
 | Stage exits but fails | Check exit code and stdout. It must contain exactly one JSON object with `result` and `data`; banners and extra JSON invalidate it. |
 | Service never becomes ready | Check its real startup work and first heartbeat, then `start_timeout`. A socket handshake is not readiness. |
 | Timeout despite a later success | The DAG deadline includes queueing. Late success does not replace a timed-out accepted result. |
-| Journal write fails | Check free space, permissions, expected journal identity, and the original error. Do not replace it with an empty database. |
+| Journal write waits or the DAG pauses for storage | Inspect `journal_writer` and `journal_pause_reason` in state, then free space, permissions, identity, and the original error. EMP restarts its writer and may create a replacement journal; required history must be restored before DAG execution resumes. See [writer recovery](logging.md#writer-lifetime-and-recovery). |
 | Missing artifact | Check experiment-relative vs attempt-relative paths and attempt retention. A journal entry can outlive its file. |
 | Dashboard shows history but no live connection | Verify both `project_root` and `system_api_url` refer to the same runtime. |
 | Windows access denied while publishing `state.json` | Shared JSON readers permit delete sharing; publication falls back to an atomic native rename when `os.replace` rejects an open reader. Transient read/write conflicts are retried for at most one second. Persistent errors still require checking permissions, external file locks and filesystem support. |

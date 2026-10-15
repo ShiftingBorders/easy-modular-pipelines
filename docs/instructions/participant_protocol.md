@@ -136,6 +136,11 @@ each call. See the [template reference](../experiment_template.md).
 The attempt deadline starts at queue admission. Queueing, transmission, and
 response all consume it. Retrying creates a new request ID; restarting a service
 does not silently resend a DAG request.
+EMP excludes journal-writer recovery intervals from this deadline. Framework
+journal waits leave heartbeat and control handling available; write methods
+still acknowledge only committed records. Async application handlers should
+offload synchronous logger calls with `asyncio.to_thread` as described in
+[logging](../logging.md#writer-lifetime-and-recovery).
 
 ## Wire protocol
 

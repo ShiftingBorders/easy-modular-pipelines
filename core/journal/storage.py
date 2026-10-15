@@ -119,9 +119,12 @@ class SQLiteEventStore:
         if read_only and open_mode != "existing":
             raise ValueError("Read-only access requires an existing journal.")
         settings = validate_journal_options(
-            db_path=db_path, busy_timeout_seconds=busy_timeout_seconds,
-            max_event_bytes=max_event_bytes, open_mode=open_mode,
-            min_free_bytes=min_free_bytes, expected_journal=expected_journal,
+            db_path=db_path,
+            busy_timeout_seconds=busy_timeout_seconds,
+            max_event_bytes=max_event_bytes,
+            open_mode=open_mode,
+            min_free_bytes=min_free_bytes,
+            expected_journal=expected_journal,
         )
         context = validate_context(
             {} if diagnostic_context is None else diagnostic_context,
@@ -165,6 +168,8 @@ class SQLiteEventStore:
             read_only: Whether the operation uses the read-only execution path.
         """
         self._read_only = read_only
+        self._report_local_failures = True
+        self._export_request_id: str | None = None
         self._immutable_read = False
         self.db_path = settings.db_path
         self._timeout = float(settings.busy_timeout_seconds)
@@ -313,7 +318,7 @@ class SQLiteEventStore:
                 policy decision.
             event: Complete journal event envelope.
         """
-        if self._read_only:
+        if self._read_only or not self._report_local_failures:
             return
         try:
             if getattr(error, "_logging_diagnostic_attempted", False):
@@ -483,8 +488,11 @@ class SQLiteEventStore:
                 connection = sqlite3.connect(
                     self.db_path.as_uri()
                     + (
-                        "?mode=ro&immutable=1" if self._immutable_read
-                        else "?mode=ro" if self._read_only else "?mode=rw"
+                        "?mode=ro&immutable=1"
+                        if self._immutable_read
+                        else "?mode=ro"
+                        if self._read_only
+                        else "?mode=rw"
                     ),
                     timeout=self._timeout,
                     isolation_level=None,
@@ -624,12 +632,43 @@ class SQLiteEventStore:
             raise ValueError(
                 "Use append_command_result for managed command observations."
             )
+        self._append_validated(snapshot, encoded, replay=False)
+
+    def _append_replayed(self, event: JsonObject) -> None:
+        """Apply an authenticated writer retry without duplicating its change feed."""
+        encoded = encode_event(event, self._max_event_bytes)
+        snapshot = json.loads(encoded)
+        if snapshot["event_type"] == "command.result":
+            raise ValueError("Managed results require append_command_result.")
+        self._append_validated(snapshot, encoded, replay=True)
+
+    def _append_validated(
+        self, snapshot: JsonObject, encoded: str, *, replay: bool
+    ) -> None:
         with self._lock:
             self._require_open(writing=True)
             try:
                 self._check_health(writing=True)
                 self._connection.execute("BEGIN IMMEDIATE")
                 self._check_health(writing=True)
+                if replay:
+                    existing = self._connection.execute(
+                        "SELECT event_json FROM events WHERE event_id=?",
+                        (snapshot["event_id"],),
+                    ).fetchone()
+                    if existing is not None:
+                        canonical = json.dumps(
+                            snapshot, sort_keys=True, ensure_ascii=True
+                        )
+                        previous = json.dumps(
+                            json.loads(existing[0]), sort_keys=True, ensure_ascii=True
+                        )
+                        if canonical != previous:
+                            raise ValueError(
+                                "Replayed event ID has different contents."
+                            )
+                        self._connection.execute("ROLLBACK")
+                        return
                 self._insert_event(snapshot, encoded)
                 self._record_change(snapshot["event_id"])
                 self._connection.execute("COMMIT")
@@ -1133,6 +1172,26 @@ class SQLiteEventStore:
             except BaseException as error:  # noqa: BLE001 - Fail closed on interrupted I/O.
                 raise self._storage_failure(error, "read journal identity")
 
+    def _read_command(self, call):
+        """Apply the finite validated read protocol in an opened storage owner."""
+        if call.command in ("open", "get_journal_info"):
+            return self.get_journal_info()
+        if call.command == "read_events":
+            return self.read_events(call.checkpoint, limit=call.limit, view=call.view)
+        if call.command == "read_changes":
+            return self.read_changes(call.checkpoint, limit=call.limit)
+        if call.command == "read_event_batch":
+            return self.read_event_batch(
+                call.event_ids, limit=call.limit, before=call.before
+            )
+        if call.command == "read_command_result":
+            return self.read_command_result(call.request_id)
+        if call.command == "export_snapshot":
+            return self.export_snapshot(call.path, min_free_bytes=call.min_free_bytes)
+        if call.command == "export_diagnostics":
+            return self.export_diagnostics(call.operation_ids, call.path)
+        raise LoggingStateError("Unsupported read-only journal operation.")
+
     def _load_command_result(
         self, request_id: str, *, connection: sqlite3.Connection | None = None
     ) -> dict | None:
@@ -1493,7 +1552,7 @@ class SQLiteEventStore:
                 temporary_database.rename(target / "journal.sqlite")
                 manifest = {
                     "schema_version": SCHEMA_VERSION,
-                    "snapshot_id": uuid4().hex,
+                    "snapshot_id": self._export_request_id or uuid4().hex,
                     "journal_id": info["journal_id"],
                     "generation": info["generation"],
                     "storage_schema_version": SCHEMA_VERSION,
@@ -1614,6 +1673,8 @@ class SQLiteEventStore:
                 manifest = _diagnostic_manifest(
                     roots, boundary, records_sha256, len(selected), len(requests)
                 )
+                if self._export_request_id is not None:
+                    manifest["diagnostics_id"] = self._export_request_id
                 source_phase = False
                 (target / "records.jsonl.part").rename(target / "records.jsonl")
                 _publish_manifest(target, manifest)
@@ -1776,8 +1837,14 @@ class SQLiteEventStore:
                 connection.execute("BEGIN IMMEDIATE")
                 self._check_free_space(self.db_path.parent, self._min_free_bytes)
                 result, changed = self._restore_journal_records(
-                    connection, manifest, identity, restoration_id, new_generation,
-                    parameters, prepared_events, commands,
+                    connection,
+                    manifest,
+                    identity,
+                    restoration_id,
+                    new_generation,
+                    parameters,
+                    prepared_events,
+                    commands,
                 )
                 if not changed:
                     connection.execute("ROLLBACK")
@@ -1906,8 +1973,12 @@ class SQLiteEventStore:
         return result, True
 
     def _recorded_restoration_result(
-        self, previous: tuple, parameters: str, restoration_id: str,
-        new_generation: str, actual: JsonObject,
+        self,
+        previous: tuple,
+        parameters: str,
+        restoration_id: str,
+        new_generation: str,
+        actual: JsonObject,
     ) -> JsonObject:
         """Validate replay parameters and require the recorded restoration to remain current.
 
@@ -1931,12 +2002,8 @@ class SQLiteEventStore:
             LoggingStateError: A later restoration has superseded this generation.
         """
         if previous[0] != parameters:
-            raise ValueError(
-                "restoration_id already belongs to another restoration."
-            )
-        result = copy_json_object(
-            json.loads(previous[1]), "restoration result"
-        )
+            raise ValueError("restoration_id already belongs to another restoration.")
+        result = copy_json_object(json.loads(previous[1]), "restoration result")
         if (
             result.keys()
             != {
@@ -1953,15 +2020,9 @@ class SQLiteEventStore:
             or result["restoration_id"] != restoration_id
             or result["generation"] != new_generation
         ):
-            raise LoggingStorageError(
-                "Invalid recorded restoration result."
-            )
-        if actual != {
-            name: result[name] for name in ("journal_id", "generation")
-        }:
-            raise LoggingStateError(
-                "This restoration has already been superseded."
-            )
+            raise LoggingStorageError("Invalid recorded restoration result.")
+        if actual != {name: result[name] for name in ("journal_id", "generation")}:
+            raise LoggingStateError("This restoration has already been superseded.")
         return result
 
     def _check_restored_snapshot(
@@ -2010,14 +2071,19 @@ class SQLiteEventStore:
         with self._lock:
             self._require_open()
             if not self._read_only:
-                raise LoggingStateError("Snapshot inspection requires a read-only journal.")
+                raise LoggingStateError(
+                    "Snapshot inspection requires a read-only journal."
+                )
             try:
                 self._check_health()
                 connection = self._connection
                 connection.execute("BEGIN")
                 info = _read_journal_info(connection)
                 actual = {name: info[name] for name in ("journal_id", "generation")}
-                expected = {"journal_id": manifest.journal_id, "generation": manifest.generation}
+                expected = {
+                    "journal_id": manifest.journal_id,
+                    "generation": manifest.generation,
+                }
                 if actual != expected:
                     raise JournalGenerationChanged(expected, actual)
                 self._check_restored_snapshot(connection, manifest)
@@ -2052,9 +2118,9 @@ class SQLiteEventStore:
                 (event["event_id"],),
             ).fetchone()
             if previous is not None:
-                if json.dumps(
-                    json.loads(previous[0]), sort_keys=True
-                ) != json.dumps(event, sort_keys=True):
+                if json.dumps(json.loads(previous[0]), sort_keys=True) != json.dumps(
+                    event, sort_keys=True
+                ):
                     raise ValueError(
                         "Diagnostic event ID conflicts with restored history."
                     )
@@ -2104,7 +2170,9 @@ class SQLiteEventStore:
         return changed_requests
 
     def _record_restored_changes(
-        self, connection: sqlite3.Connection, inserted: list[JsonObject],
+        self,
+        connection: sqlite3.Connection,
+        inserted: list[JsonObject],
         changed_requests: dict[str, tuple[str, bool]],
     ) -> None:
         """Record change-feed entries for imported events and updated command results.
@@ -2132,7 +2200,9 @@ class SQLiteEventStore:
                 connection=connection,
             )
 
-    def _remember_restored_journal(self, result: JsonObject, file_identity: tuple[int, int]) -> None:
+    def _remember_restored_journal(
+        self, result: JsonObject, file_identity: tuple[int, int]
+    ) -> None:
         """Bind the restored file/generation identity and clear the client's failure state.
 
         Args:

@@ -524,6 +524,11 @@ class ResourceWriter:
             },
         )
         self._client = OperationLogger(path)
+        # Allow the SQLite wait plus a small IPC allowance, so a confirmed BUSY
+        # failure can arrive before optional delivery becomes uncertain.
+        self._client._request_timeout_seconds = (
+            self._settings.logging_busy_timeout_seconds + 0.1
+        )
         self._client.open()
 
     def close(self) -> None:

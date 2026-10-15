@@ -53,6 +53,7 @@ from core.storage.errors import (
 
 class ExperimentController:
     """Coordinate run-mode commands, independent reads, and resource monitoring."""
+
     def __init__(
         self,
         project_root: Path,
@@ -190,7 +191,10 @@ class ExperimentController:
                     batch = self._read_chain(request)
                 else:
                     command = ControllerCommand.model_validate(request)
-                    if command.command == "server.shutdown" and self._shutdown_requested is not None:
+                    if (
+                        command.command == "server.shutdown"
+                        and self._shutdown_requested is not None
+                    ):
                         # Only the server owner sends this private queue message.
                         self._shutdown_requested.set()
                         return
@@ -446,8 +450,8 @@ class ExperimentController:
             "retry": (self._runner.retry, PositionArguments),
             "service.start": (self._runner.start_service, PositionArguments),
             "service.stop": (self._runner.stop_service, PositionArguments),
-            "move": (self._runner.move, PositionArguments),
-            "reset_retries": (self._runner.reset_retries, ResetRetriesArguments),
+            "move": (self._runner._move, PositionArguments),
+            "reset_retries": (self._runner._reset_retries, ResetRetriesArguments),
             "replace": (self._runner.replace, None),
             "reload_template": (self._runner.reload_template, TemplateArguments),
             "snapshot": (self._runner.snapshot, SnapshotArguments),

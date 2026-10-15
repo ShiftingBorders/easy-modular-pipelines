@@ -1,4 +1,4 @@
-"""Approved discovery scenarios Q2-01–09, Q2-19–25 and Q2-33."""
+"""Approved discovery scenarios Q2-01â€“09, Q2-19â€“25 and Q2-33."""
 
 import copy
 import json
@@ -12,6 +12,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from core.experiments.reader import ExperimentReader
+from core.journal.client import JournalClient
 from core.journal.events import LoggingError
 from core.journal.logger import OperationLogger
 from core.journal.storage import SQLiteEventStore
@@ -19,7 +20,7 @@ from core.models.runner_state import SavedStateMetadata
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import DagWorkspace
 from tests.helpers.logging_fixtures import BASE_CONTEXT, write_context_settings
-from tests.helpers.logging_process import journal_identity
+from tests.helpers.logging_process import journal_identity, stop_journal_writers
 from tests.modules import test_manager as test_modulemanager
 
 
@@ -289,6 +290,7 @@ class ExperimentReaderTests(unittest.TestCase):
     ):
         logger, source = self.make_journal()
         logger.close()
+        stop_journal_writers(self.directory)
         continuation = self.root / "experiments/continued"
         shutil.copytree(self.directory, continuation)
         write_json(
@@ -361,6 +363,7 @@ class ExperimentReaderTests(unittest.TestCase):
     def test_inherited_artifacts_reject_escaping_paths(self):
         logger, source = self.make_journal()
         logger.close()
+        stop_journal_writers(self.directory)
         continuation = self.root / "experiments/continued"
         shutil.copytree(self.directory, continuation)
         write_json(
@@ -395,6 +398,7 @@ class ExperimentReaderTests(unittest.TestCase):
             self.reader.list_artifacts("unknown")
         logger, _ = self.make_journal()
         logger.close()
+        stop_journal_writers(self.directory)
         identity_path = self.directory / "runner/journal.json"
         identity = read_json(identity_path)
         for field in ("journal_id", "generation"):
@@ -439,7 +443,7 @@ class ExperimentReaderTests(unittest.TestCase):
 
     def test_artifact_scan_stops_at_initial_boundary_q2_23(self):
         logger, _ = self.make_journal()
-        real_read = SQLiteEventStore.read_events
+        real_read = JournalClient.read_events
         appended = False
 
         def read(store, checkpoint=None, **kwargs):
@@ -450,7 +454,7 @@ class ExperimentReaderTests(unittest.TestCase):
                 logger.record_artifact("output.bin", "late", artifact_id="late")
             return page
 
-        with patch.object(SQLiteEventStore, "read_events", read):
+        with patch.object(JournalClient, "read_events", read):
             self.assertEqual(
                 [
                     row["artifact_id"]
@@ -463,6 +467,7 @@ class ExperimentReaderTests(unittest.TestCase):
     def test_generation_change_during_scan_q2_24(self):
         logger, _ = self.make_journal()
         logger.close()
+        stop_journal_writers(self.directory)
         real_read = SQLiteEventStore.read_events
         changed = False
 

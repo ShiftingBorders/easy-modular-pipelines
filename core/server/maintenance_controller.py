@@ -32,6 +32,7 @@ from core.storage.errors import StorageConflict, StorageError, StoredObjectNotFo
 
 class MaintenanceController:
     """Serialize module mutations while serving bounded concurrent maintenance reads."""
+
     def __init__(
         self,
         manager: ModuleManager,
@@ -251,8 +252,10 @@ class MaintenanceController:
                 code = "invalid_request"
             if not isinstance(error, LoggingError):
                 try:
-                    self._logger.record_error(
-                        error, context={"command_id": command.command_id}
+                    await asyncio.to_thread(
+                        self._logger.record_error,
+                        error,
+                        context={"command_id": command.command_id},
                     )
                 except Exception as logging_error:  # noqa: BLE001 - Preserve both failures.
                     error.add_note(f"Logging the failure also failed: {logging_error}")
@@ -351,7 +354,8 @@ class MaintenanceController:
             Module reference/installation status, validation metadata, or removal
             status, depending on the admitted action.
         """
-        self._logger.record_event(
+        await asyncio.to_thread(
+            self._logger.record_event,
             "module.command_started",
             {"command": command.model_dump(exclude_unset=True)},
         )
@@ -380,7 +384,8 @@ class MaintenanceController:
                     arguments.name, arguments.version
                 )
                 data = {"status": "removed" if removed else "already_absent"}
-        self._logger.record_event(
+        await asyncio.to_thread(
+            self._logger.record_event,
             "module.command_completed",
             {
                 "command_id": command.command_id,
