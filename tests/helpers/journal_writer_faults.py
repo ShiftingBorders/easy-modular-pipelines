@@ -122,6 +122,15 @@ class WriterFaults:
         write_json(self.directory / "startup.json", {"directory": str(directory)})
         return gate
 
+    def hold_quick_check(self) -> CommitGate:
+        """Hold one real quick_check after an already running writer is ready."""
+        directory = self.directory / uuid4().hex
+        directory.mkdir()
+        gate = CommitGate(directory)
+        self.gates.append(gate)
+        write_json(self.directory / "quick-check.json", {"directory": str(directory)})
+        return gate
+
     def refuse_storage(self, database: Path, *, replacement_too: bool = False) -> None:
         write_json(
             self.directory / "open-failure.json",
@@ -247,6 +256,23 @@ def instrument_sqlite(control: Path):
 
         def execute(self, sql, parameters=()):
             statement = " ".join(sql.upper().split())
+            if statement == "PRAGMA QUICK_CHECK":
+                instruction = control / "quick-check.json"
+                if instruction.is_file():
+                    directory = Path(read_json(instruction)["directory"])
+                    try:
+                        with (directory / "claim").open("x", encoding="utf-8"):
+                            pass
+                    except FileExistsError:
+                        pass
+                    else:
+                        write_json(
+                            directory / "entered-0.json",
+                            {
+                                "process": process_identity(os.getpid()),
+                            },
+                        )
+                        _wait_release(directory)
             if statement.startswith("INSERT INTO EVENTS "):
                 self._observed_event = json.loads(parameters[-1])
             event = self._observed_event or getattr(pending, "event", None)

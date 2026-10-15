@@ -13,6 +13,7 @@ from pathlib import Path
 
 from core.journal.deadlines import wait_journal_deadline
 from core.journal.logger import OperationLogger
+from core.journal.startup_diagnostics import StartupDiagnostics, describe_startup_error
 from core.journal.streams import capture_stream
 from core.models.participant_launch import StageLaunch
 from core.models.participant_protocol import ModuleProgress, StageResult
@@ -49,8 +50,19 @@ class StageExecutor:
 
     async def run(self) -> None:
         """Read and validate the fixed launch document, then serve its assigned attempt."""
-        launch = StageLaunch.model_validate(read_json(self._launch_path))
-        await self._run(launch)
+        document = read_json(self._launch_path)
+        self._startup = StartupDiagnostics(
+            self._launch_path.parent / "startup-executor.jsonl",
+            document.get("context", {}),
+        )
+        self._startup.record("process.entered")
+        try:
+            launch = StageLaunch.model_validate(document)
+            self._startup.record("launch.validated")
+            await self._run(launch)
+        except Exception as error:
+            self._startup.record("executor.failed", error=describe_startup_error(error))
+            raise
 
     async def _run(self, launch: StageLaunch) -> None:
         """Open the journal and participant server, serve one call, and clean up ownership.
@@ -62,6 +74,7 @@ class StageExecutor:
         self._context = launch.context
         self._directory = self._launch_path.parent
         self._logger = OperationLogger(launch.executor_logging_config)
+        self._logger._startup_diagnostics = self._startup
         self._server = ParticipantServer(
             launch.endpoint_path,
             self._context.model_dump(),
@@ -104,11 +117,17 @@ class StageExecutor:
         started = asyncio.create_task(self._started.wait())
         stopped = asyncio.create_task(self._stop_requested.wait())
         try:
-            done, _ = await asyncio.wait(
-                (completed, started, stopped),
-                timeout=launch.control_timeout_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            try:
+                done, _ = await wait_journal_deadline(
+                    asyncio.wait(
+                        (completed, started, stopped),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    ),
+                    time.monotonic() + launch.control_timeout_seconds,
+                    self._logger,
+                )
+            except TimeoutError:
+                done = set()
             if not done or stopped in done and not self._server.has_call(request_id):
                 await asyncio.to_thread(
                     self._logger.record_command_result,
@@ -213,6 +232,7 @@ class StageExecutor:
         ):
             raise ValueError("Execute arguments differ from the fixed attempt context.")
         self._started.set()
+        self._startup.record("execute.received")
         if self._reason is not None:
             return {"result": "fail", "data": {"reason": self._reason}}
         return await self._execute(request)
@@ -318,6 +338,7 @@ class StageExecutor:
             raise
         self._started_at = datetime.now(UTC).isoformat()
         self._started_monotonic = time.monotonic()
+        self._startup.record("module.spawned", process_id=self._process.pid)
         try:
             self._process_identity = ProcessIdentity.model_validate(
                 process_identity(self._process.pid)

@@ -47,6 +47,8 @@ Stopping a watch/follow client with Ctrl+C does not stop the experiment.
 | Stage input and supplied paths | The attempt's `context.json`; treat it as runtime evidence, not an editable configuration. |
 | Artifacts | `shared_artifacts/epoch_<n>/<module>/<stage-id>/attempt_<n>/`; result links are experiment-relative. |
 | Application exceptions | Journal error events, traceback, captured stderr. |
+| Executor startup delay or early exit | Attempt `startup-runner.jsonl`, `startup-executor.jsonl`, and `executor.stdout.log` / `executor.stderr.log`; see [startup diagnostics](logging.md#startup-diagnostics). |
+| Writer admits writes but reads wait | `journal_writer.active_read`, `read_queue_depth`, and the writer's independent `startup.jsonl`. Write queue depth alone does not describe read backlog. |
 | Service status and restarts | Status, journal events, dashboard Modules / Services. |
 | Controller startup failures | The server terminal and its controller journal, when available. |
 

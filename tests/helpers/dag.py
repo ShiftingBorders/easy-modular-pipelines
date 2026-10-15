@@ -364,7 +364,7 @@ class DagSession:
         )
         if result["result"] != "success":
             raise AssertionError(result)
-        await wait_until(lambda: self.runner.get_state()["phase"] != "starting")
+        await asyncio.wait_for(self.runner._ready.wait(), 30)
         return result
 
     async def ready_attempt(self) -> tuple[Path, dict]:

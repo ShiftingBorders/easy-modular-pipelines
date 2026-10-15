@@ -9,6 +9,7 @@ import shutil
 import socket
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -68,6 +69,7 @@ from core.primitives.json_values import (
 _PAGE_BYTES = 16777216
 
 if TYPE_CHECKING:
+    from core.journal.startup_diagnostics import StartupDiagnostics
     from core.models.journal_diagnostics import (
         DiagnosticCommand,
         DiagnosticManifest,
@@ -189,6 +191,8 @@ class SQLiteEventStore:
             if isinstance(diagnostic_context, dict)
             else diagnostic_context
         )
+        self._startup_diagnostics: StartupDiagnostics | None = None
+        self._startup_diagnostic_id: str | None = None
 
     def _check_process(self) -> None:
         """Reject a journal client inherited from another process."""
@@ -485,6 +489,8 @@ class SQLiteEventStore:
                         pass
                     status = self.db_path.stat()
                     previous_identity = (status.st_dev, status.st_ino)
+                started = time.monotonic()
+                self._record_open_phase("sqlite.connect.begin")
                 connection = sqlite3.connect(
                     self.db_path.as_uri()
                     + (
@@ -499,67 +505,12 @@ class SQLiteEventStore:
                     check_same_thread=False,
                     uri=True,
                 )
-                empty = self._check_schema(connection)
-                if empty and (
-                    self._file_identity is not None or self._open_mode == "existing"
-                ):
-                    raise LoggingConfigurationError(
-                        "An initialized journal is required."
-                    )
-                if not empty and self._expected_journal is not None:
-                    existing = _read_journal_info(connection)
-                    actual = {
-                        name: existing[name] for name in ("journal_id", "generation")
-                    }
-                    if actual != self._expected_journal:
-                        raise JournalGenerationChanged(self._expected_journal, actual)
-                connection.execute("PRAGMA foreign_keys=ON")
-                if self._read_only:
-                    connection.execute("PRAGMA query_only=ON")
-                else:
-                    connection.execute("PRAGMA synchronous=EXTRA")
-                    connection.execute("BEGIN IMMEDIATE")
-                    if self._check_schema(connection):
-                        if (
-                            self._file_identity is not None
-                            or self._open_mode == "existing"
-                        ):
-                            raise LoggingStorageError(
-                                "The known journal lost its schema."
-                            )
-                        self._initialize_empty_journal(connection)
-                    connection.execute("COMMIT")
-                    if (
-                        connection.execute("PRAGMA journal_mode=WAL")
-                        .fetchone()[0]
-                        .lower()
-                        != "wal"
-                    ):
-                        raise LoggingConfigurationError(
-                            "The journal requires SQLite WAL mode."
-                        )
-                    connection.execute("PRAGMA synchronous=FULL")
-                    if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
-                        raise LoggingConfigurationError(
-                            "SQLite FULL synchronization is required."
-                        )
-                if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                    raise LoggingStorageError("Journal integrity check failed.")
-                info = _read_journal_info(connection)
-                actual = {name: info[name] for name in ("journal_id", "generation")}
-                if (
-                    self._expected_journal is not None
-                    and actual != self._expected_journal
-                ):
-                    raise JournalGenerationChanged(self._expected_journal, actual)
-                if self._journal_id is not None and (
-                    info["journal_id"],
-                    info["generation"],
-                ) != (self._journal_id, self._generation):
-                    raise LoggingStorageError("The known journal identity changed.")
-                identity = self._check_file()
-                if previous_identity is not None and identity != previous_identity:
-                    raise LoggingStorageError("The journal changed while opening.")
+                self._record_open_phase("sqlite.connect.end", started)
+                self._validate_open_schema(connection)
+                self._configure_open_connection(connection)
+                info, identity = self._verify_open_identity(
+                    connection, previous_identity
+                )
                 self._connection = connection
                 self._file_identity = identity
                 self._journal_id = info["journal_id"]
@@ -576,6 +527,86 @@ class SQLiteEventStore:
                     self._report_failure(error, "open")
                     raise
                 raise self._storage_failure(error, "open")
+
+    def _record_open_phase(self, phase: str, started: float | None = None) -> None:
+        """Correlate probe timings without logging SQL arguments or using SQLite."""
+        if self._startup_diagnostics is not None:
+            self._startup_diagnostics.record(
+                phase,
+                diagnostic_id=self._startup_diagnostic_id,
+                duration_seconds=None
+                if started is None
+                else time.monotonic() - started,
+            )
+
+    def _validate_open_schema(self, connection: sqlite3.Connection) -> None:
+        """Reject an incompatible or unexpected journal before configuring writes."""
+        started = time.monotonic()
+        self._record_open_phase("sqlite.schema_identity.begin")
+        empty = self._check_schema(connection)
+        if empty and (self._file_identity is not None or self._open_mode == "existing"):
+            raise LoggingConfigurationError("An initialized journal is required.")
+        if not empty and self._expected_journal is not None:
+            existing = _read_journal_info(connection)
+            actual = {name: existing[name] for name in ("journal_id", "generation")}
+            if actual != self._expected_journal:
+                raise JournalGenerationChanged(self._expected_journal, actual)
+        self._record_open_phase("sqlite.schema_identity.end", started)
+
+    def _configure_open_connection(self, connection: sqlite3.Connection) -> None:
+        """Preserve reader restrictions and the writer's creation/WAL/FULL sequence."""
+        connection.execute("PRAGMA foreign_keys=ON")
+        if self._read_only:
+            connection.execute("PRAGMA query_only=ON")
+            return
+        connection.execute("PRAGMA synchronous=EXTRA")
+        started = time.monotonic()
+        self._record_open_phase("sqlite.begin_immediate.begin")
+        connection.execute("BEGIN IMMEDIATE")
+        self._record_open_phase("sqlite.begin_immediate.end", started)
+        if self._check_schema(connection):
+            if self._file_identity is not None or self._open_mode == "existing":
+                raise LoggingStorageError("The known journal lost its schema.")
+            self._initialize_empty_journal(connection)
+        started = time.monotonic()
+        self._record_open_phase("sqlite.commit.begin")
+        connection.execute("COMMIT")
+        self._record_open_phase("sqlite.commit.end", started)
+        if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
+            raise LoggingConfigurationError("The journal requires SQLite WAL mode.")
+        connection.execute("PRAGMA synchronous=FULL")
+        if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
+            raise LoggingConfigurationError("SQLite FULL synchronization is required.")
+
+    def _verify_open_identity(
+        self, connection: sqlite3.Connection, previous_identity: tuple[int, int]
+    ) -> tuple[JsonObject, tuple[int, int]]:
+        """Check integrity and retained ownership before publishing the connection."""
+        started = time.monotonic()
+        self._record_open_phase("sqlite.quick_check.begin")
+        check = connection.execute("PRAGMA quick_check").fetchall()
+        self._record_open_phase("sqlite.quick_check.end", started)
+        if check != [("ok",)]:
+            raise LoggingStorageError("Journal integrity check failed.")
+        started = time.monotonic()
+        self._record_open_phase("sqlite.identity.begin")
+        info = _read_journal_info(connection)
+        actual = {name: info[name] for name in ("journal_id", "generation")}
+        if self._expected_journal is not None and actual != self._expected_journal:
+            raise JournalGenerationChanged(self._expected_journal, actual)
+        if self._journal_id is not None and (
+            info["journal_id"],
+            info["generation"],
+        ) != (
+            self._journal_id,
+            self._generation,
+        ):
+            raise LoggingStorageError("The known journal identity changed.")
+        identity = self._check_file()
+        if previous_identity is not None and identity != previous_identity:
+            raise LoggingStorageError("The journal changed while opening.")
+        self._record_open_phase("sqlite.identity.end", started)
+        return info, identity
 
     def _initialize_empty_journal(self, connection: sqlite3.Connection) -> None:
         """Create journal tables and set application/schema identifiers in the transaction."""

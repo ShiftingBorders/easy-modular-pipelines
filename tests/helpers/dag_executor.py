@@ -24,13 +24,40 @@ def main() -> None:
             "write_failure",
             "no_execute",
             "timeout",
+            "startup_hold",
+            "startup_exit",
+            "startup_flood",
         ),
         required=True,
     )
+    parser.add_argument("--gate", type=Path)
     args = parser.parse_args()
     original = OperationLogger.record_command_result
     original_execute = executor.StageExecutor._execute
     directory = args.launch.parent
+    if args.fault.startswith("startup_"):
+        if args.fault == "startup_hold":
+            if args.gate is None:
+                parser.error("startup_hold requires --gate")
+            args.gate.with_suffix(".entered").write_text(
+                str(os.getpid()), encoding="utf-8"
+            )
+            while not args.gate.exists():
+                time.sleep(0.01)
+            asyncio.run(executor.StageExecutor(args.launch).run())
+            return
+        else:
+            import sys
+
+            print("executor bootstrap stdout", flush=True)
+            print("executor bootstrap stderr", file=sys.stderr, flush=True)
+            if args.fault == "startup_flood":
+                for _ in range(64):
+                    sys.stdout.write("o" * 65536)
+                    sys.stderr.write("e" * 65536)
+                sys.stdout.flush()
+                sys.stderr.flush()
+            raise RuntimeError("injected executor bootstrap failure")
 
     async def execute(worker, request):
         if args.fault != "timeout":

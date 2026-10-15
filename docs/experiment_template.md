@@ -211,7 +211,7 @@ automatically restart the service.
 | `errors.retries` | Nonnegative automatic retry count. |
 | `errors.retry_delay_seconds` | Nonnegative delay between retries. |
 | `errors.on_exhausted` | `skip`, `pause`, or `stop` for stage failures; service policies are described below. |
-| `start_timeout` | Positive startup deadline; also used as the separate shutdown deadline. |
+| `start_timeout` | Participant startup budget. Executor time starts at the launch request and includes process creation, journal admission and handshake. Also used as the separate shutdown allowance. |
 | `runner_timeout_margin_seconds` | Cancellation and termination confirmation margin. |
 | `unknown_state.timeout_seconds` | Positive wait before handling unresolved work. |
 | `unknown_state.on_timeout` | `stop`, `pause`, `rerun`, or `skip`. |
@@ -227,6 +227,19 @@ See [service authoring](instructions/python_bridges.md#readiness-and-timeouts).
 
 A timed-out response cannot later become success. Retry/skip of unresolved
 stage work requires confirmation that the previous attempt has stopped.
+
+Executor startup uses the earlier applicable `start_timeout` or stage
+`timeout_seconds` deadline. Observed journal-writer recovery intervals are
+excluded exactly once; a slow query while the writer reports ready still uses
+the budget. `unknown_state.timeout_seconds` remains the control/reconciliation
+allowance and does not select the executor startup budget.
+
+An executor that exits before execute, cannot be spawned, or exceeds startup
+time produces a failed attempt. After termination is confirmed, ordinary stage
+retries and `errors.on_exhausted` apply. Unconfirmed termination prevents retry
+or skip. Temporary writer recovery does not spend a stage retry; unavailable
+required history keeps the separate journal pause in effect. With `step`, a
+skipped stage leaves a pending advance for the next `step` or `resume`.
 
 ## Static resources
 

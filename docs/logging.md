@@ -203,6 +203,52 @@ Logging calls are synchronous. In an asynchronous application handler, use
 the event loop responsive while waiting for COMMIT. Framework-owned async paths
 perform this wait outside their event loop.
 
+## Startup diagnostics
+
+Startup also records small independent diagnostic files, including when the
+journal cannot yet accept calls. These are evidence, never command results or
+recovery checkpoints. An attempt directory can contain:
+
+| File | Evidence |
+| --- | --- |
+| `startup-runner.jsonl` | Launch request/return, effective timeout and source, connection, execute dispatch, failure and cleanup. |
+| `startup-executor.jsonl` | Executor entry after imports, validated launch, logger open, listener/endpoint readiness, execute receipt and module spawn. |
+| `executor.stdout.log`, `executor.stderr.log` | Early uv/Python output, including failures before logger availability. |
+| `failure.jsonl` | Runner failure with original exception/traceback and separate cleanup observation. |
+
+Writer evidence is `controller/journals/<experiment-directory>/startup.jsonl`.
+Other logger clients can create `startup/client-<pid>-<id>.jsonl` under the
+selected database's parent directory; configuration/code directories are not
+used for this output. Failures outside an active attempt use the experiment's
+`runner/failure.jsonl`, or the project's `controller/failure.jsonl` before an
+experiment is available. Paths follow their runtime owners, not the caller's cwd.
+
+Records contain UTC time, monotonic time, process identity and allowlisted
+experiment/attempt coordinates. Startup failures include the effective budget,
+excluded recovery time, last phase, traceback/cause and error ID. That error ID
+links to the later journal error; its journal timestamp can follow cleanup.
+The interval before the executor entry record includes interpreter/import work.
+Client and writer request records share a `diagnostic_id`, including the
+per-client SQLite probe. It is separate from the stage's execution request ID.
+
+Each structured file is limited to 256 KiB and retains one bounded `.previous`
+file. Rotation or oversized records produce `diagnostics.truncated`. Each raw
+executor stream retains its first 1 MiB while draining later bytes;
+`output.truncated`/`output.finished` report loss. Files follow attempt retention,
+but removing the live endpoint does not remove the diagnostic files. Diagnostic
+I/O failure does not replace the original failure or make execution successful.
+Structured metadata excludes authentication tokens and settings/environment
+payloads; captured stdout/stderr remains the process's own output.
+
+`journal_writer.active_read` identifies the current read command, its monotonic
+start and observed age; `read_queue_depth` counts waiting reads. These are
+separate from write `busy` and `queue_depth`. The writer trace separates queue
+wait, SQLite opening/quick_check, execution and response delivery; client traces
+measure IPC. Routine fast result polls are not logged individually. Read
+observations do not introduce a new watchdog or change restart policy.
+Integrity-check frequency, COMMIT acknowledgement and replay behavior are
+unchanged.
+
 ## Template reload audit
 
 Reload uses a root `reload_template` operation. Its records include full old and

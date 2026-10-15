@@ -111,7 +111,12 @@ class ParticipantServer:
         self._token_path.write_text(self._token, encoding="utf-8")
         self._token_path.chmod(0o600)
         self._server = await asyncio.start_server(self._handle_client, "127.0.0.1", 0)
+        diagnostics = self._logger._startup_diagnostics
+        if diagnostics is not None:
+            diagnostics.record("listener.ready")
         try:
+            if diagnostics is not None:
+                diagnostics.record("endpoint.publish.begin")
             write_json(
                 self.endpoint_path,
                 {
@@ -125,6 +130,8 @@ class ParticipantServer:
                     },
                 },
             )
+            if diagnostics is not None:
+                diagnostics.record("endpoint.published")
         except BaseException:
             await self.close()
             raise

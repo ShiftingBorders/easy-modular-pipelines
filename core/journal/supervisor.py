@@ -79,6 +79,8 @@ class JournalSupervisor:
             "queue_depth": 0,
             "queue_capacity": self.settings.queue_capacity,
             "busy": False,
+            "read_queue_depth": 0,
+            "active_read": None,
             "failure_detected_at": 0.0,
             "restarts": 0,
             "history_available": True,
@@ -190,7 +192,12 @@ class JournalSupervisor:
             process.start()
         finally:
             child.close()
-        self._change(writer_instance_id=instance, process=process_identity(process.pid))
+        self._change(
+            writer_instance_id=instance,
+            process=process_identity(process.pid),
+            active_read=None,
+            read_queue_depth=0,
+        )
 
     def _watch(self) -> None:
         deadline = time.monotonic() + self.settings.recovery_timeout_seconds
@@ -423,6 +430,8 @@ class JournalSupervisor:
             process=None,
             busy=False,
             queue_depth=0,
+            read_queue_depth=0,
+            active_read=None,
             recovery_started_at=None,
             recovery_seconds=elapsed,
         )

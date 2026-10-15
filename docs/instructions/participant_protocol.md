@@ -142,6 +142,14 @@ still acknowledge only committed records. Async application handlers should
 offload synchronous logger calls with `asyncio.to_thread` as described in
 [logging](../logging.md#writer-lifetime-and-recovery).
 
+For ordinary stages, executor startup has its own `start_timeout` budget from
+the runner's launch request through handshake; the earlier attempt deadline
+still applies. The executor's wait for execute after publishing its endpoint
+uses the control allowance, also excluding journal recovery. The runner checks
+the effective deadline again after journal/connection waits before dispatch.
+Cancellation or expiry cannot authorize a later execute. Startup failures enter
+stage retry/exhaustion policy only after the old work is confirmed stopped.
+
 ## Wire protocol
 
 Most Python modules should use the library classes above. For integrations

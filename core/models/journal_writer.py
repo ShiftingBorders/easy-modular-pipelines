@@ -66,6 +66,13 @@ class WriterRecoveryClock(_Document):
         return self.recovery_seconds + ongoing
 
 
+class WriterReadStatus(_Document):
+    command: Text
+    started_monotonic: float = Field(ge=0)
+    age_seconds: float = Field(ge=0)
+    diagnostic_id: UUIDText | None = None
+
+
 class WriterProcessStatus(_Document):
     state: Literal["ready", "storage_unavailable"]
     process: ProcessIdentity
@@ -73,6 +80,8 @@ class WriterProcessStatus(_Document):
     queue_depth: int = Field(ge=0)
     queue_capacity: int = Field(gt=0)
     busy: bool
+    read_queue_depth: int = Field(default=0, ge=0)
+    active_read: WriterReadStatus | None = None
     progress_at: float = Field(ge=0)
     db_path: AbsolutePath
     journal: JournalInformation
@@ -152,6 +161,7 @@ JournalCall = Annotated[
 
 class JournalRequest(_Document):
     token: str
+    diagnostic_id: UUIDText | None = None
     expected_journal: JournalIdentity | None = None
     read_only: bool = False
     min_free_bytes: int = Field(default=0, ge=0)

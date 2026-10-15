@@ -66,6 +66,7 @@ class OperationLogger:
         self._store: SQLiteEventStore | None = None
         self._opening_store = None
         self._request_timeout_seconds: float | None = None
+        self._startup_diagnostics = None
         self._context: JournalContext
         self._producer_instance_id: str | None = None
         self._sequence_number = 0
@@ -98,6 +99,9 @@ class OperationLogger:
             LoggingError: Configuration, storage, or retained identity checks fail.
         """
         self._check_process()
+        startup_started = time.monotonic()
+        if self._startup_diagnostics is not None:
+            self._startup_diagnostics.record("logger.open.begin")
         with self._lock:
             if self._store is not None:
                 raise LoggingStateError(
@@ -189,6 +193,9 @@ class OperationLogger:
             self._producer_instance_id = producer_instance_id
             self._sequence_number = 0
             self._failed = False
+            self._startup_diagnostics.record(
+                "logger.open.end", duration_seconds=time.monotonic() - startup_started
+            )
 
     def close(self) -> None:
         """Close storage without inventing outcomes for unfinished operations.
@@ -218,14 +225,25 @@ class OperationLogger:
 
     def _make_store(self, settings, context):
         from core.journal.client import _make_journal_store
+        from core.journal.startup_diagnostics import StartupDiagnostics
 
-        return _make_journal_store(
+        if self._startup_diagnostics is None:
+            self._startup_diagnostics = StartupDiagnostics(
+                settings.db_path.parent
+                / "startup"
+                / f"client-{self._process_id}-{uuid4().hex[:8]}.jsonl",
+                context.model_dump(),
+            )
+            self._startup_diagnostics.record("logger.open.begin")
+        store = _make_journal_store(
             self._config_path,
             settings,
             context,
             self._read_only,
             request_timeout_seconds=self._request_timeout_seconds,
         )
+        store._startup_diagnostics = self._startup_diagnostics
+        return store
 
     def _recovery_seconds(self) -> float:
         """Owner-observed outage duration, independent of the blocked write lock."""
@@ -243,6 +261,18 @@ class OperationLogger:
         store = self._store or self._opening_store
         if isinstance(store, JournalClient):
             store.request_close()
+
+    def _new_startup_reader(self):
+        """Isolate cancellable startup observations from obligatory journal writes."""
+        from core.journal.client import JournalClient
+
+        self._check_process()
+        self._require_open()
+        if not isinstance(self._store, JournalClient):
+            raise LoggingStateError(
+                "Startup observation requires a live journal writer."
+            )
+        return self._store._new_startup_reader()
 
     def __enter__(self) -> Self:
         """Open the logger and return it for a with block."""

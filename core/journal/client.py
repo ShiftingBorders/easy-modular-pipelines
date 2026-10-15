@@ -78,6 +78,8 @@ class JournalClient:
         self.endpoint_path = configuration.writer_endpoint_path
         self._managed = self.endpoint_path is not None
         self._failed = False
+        self._startup_diagnostics = None
+        self._diagnostic_id: str | None = None
         # Optional telemetry can select a finite delivery budget. Ordinary
         # journal calls retain their COMMIT wait across managed recovery.
         self._request_timeout_seconds = request_timeout_seconds
@@ -88,6 +90,9 @@ class JournalClient:
         )
 
     def open(self) -> None:
+        started = time.monotonic()
+        if self._startup_diagnostics is not None:
+            self._startup_diagnostics.record("journal.client.open.begin")
         if self.endpoint_path is None:
             pointer = discovery_path(self.db_path)
             if pointer.exists():
@@ -115,6 +120,13 @@ class JournalClient:
         ).model_dump()
         self._expected = {key: info[key] for key in ("journal_id", "generation")}
         self._journal_id, self._generation = info["journal_id"], info["generation"]
+        if self._startup_diagnostics is not None:
+            self._startup_diagnostics.record(
+                "journal.client.open.end",
+                duration_seconds=time.monotonic() - started,
+                journal_id=self._journal_id,
+                generation=self._generation,
+            )
 
     def request_close(self) -> None:
         self._cancelled.set()
@@ -124,6 +136,23 @@ class JournalClient:
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+    def _new_startup_reader(self):
+        """Create an independent read connection bound to this verified journal.
+
+        No open probe or writer is started here. Each read still validates the
+        expected generation at the writer. Closing it cannot cancel a write.
+        """
+        configuration = self.configuration.model_copy(
+            update={
+                "open_mode": "existing",
+                "expected_journal": self._expected,
+                "writer_endpoint_path": self.endpoint_path,
+            }
+        )
+        return JournalClient(
+            self.config_path, configuration, self._diagnostic_context, True
+        )
 
     def close(self) -> None:
         self.request_close()
@@ -167,6 +196,7 @@ class JournalClient:
 
     def _call(self, call: dict):
         with self._lock:
+            self._diagnostic_id = str(uuid4())
             recovery_started = None
             deadline = (
                 None
@@ -267,19 +297,37 @@ class JournalClient:
 
     def _exchange(self, call: dict, deadline: float | None) -> JournalReply:
         """Send one attempt; the caller owns replay and storage-error policy."""
+        started = time.monotonic()
         endpoint = self._endpoint()
+        if call["command"] == "open" and self._startup_diagnostics is not None:
+            self._startup_diagnostics.record(
+                "journal.endpoint.read",
+                command="open",
+                duration_seconds=time.monotonic() - started,
+                diagnostic_id=self._diagnostic_id,
+                writer_instance_id=endpoint.writer_instance_id,
+            )
         if self._socket_instance_id != endpoint.writer_instance_id:
             self._disconnect()
         if self._socket is None:
+            connecting = time.monotonic()
             self._socket = socket.create_connection(
                 (endpoint.endpoint.host, endpoint.endpoint.port), timeout=1
             )
             self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._socket_instance_id = endpoint.writer_instance_id
+            if self._startup_diagnostics is not None:
+                self._startup_diagnostics.record(
+                    "journal.ipc.connected",
+                    duration_seconds=time.monotonic() - connecting,
+                    writer_instance_id=endpoint.writer_instance_id,
+                    diagnostic_id=self._diagnostic_id,
+                )
         token = Path(endpoint.endpoint.token_file).read_text(encoding="utf-8")
         request = JournalRequest.model_validate(
             {
                 "token": token,
+                "diagnostic_id": self._diagnostic_id,
                 "expected_journal": self._expected,
                 "read_only": self._read_only,
                 "min_free_bytes": self.configuration.min_free_bytes,
@@ -289,7 +337,26 @@ class JournalClient:
         if deadline is not None:
             self._socket.settimeout(max(0.001, min(1, deadline - time.monotonic())))
         self._socket.sendall(encode_frame(request.model_dump(), validate=False))
-        return self._receive_reply(deadline)
+        if call["command"] == "open" and self._startup_diagnostics is not None:
+            self._startup_diagnostics.record(
+                "journal.request.sent",
+                command="open",
+                writer_instance_id=endpoint.writer_instance_id,
+                diagnostic_id=self._diagnostic_id,
+            )
+        reply = self._receive_reply(deadline)
+        duration = time.monotonic() - started
+        if self._startup_diagnostics is not None and (
+            call["command"] == "open" or duration >= 0.05
+        ):
+            self._startup_diagnostics.record(
+                "journal.reply.received",
+                command=call["command"],
+                duration_seconds=duration,
+                writer_instance_id=endpoint.writer_instance_id,
+                diagnostic_id=self._diagnostic_id,
+            )
+        return reply
 
     def _receive_reply(self, deadline: float | None) -> JournalReply:
         next_probe = time.monotonic() + 0.5

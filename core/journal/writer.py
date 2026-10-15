@@ -21,6 +21,7 @@ from core.journal.events import (
     LoggingStorageError,
 )
 from core.journal.settings import _load_logging_settings
+from core.journal.startup_diagnostics import StartupDiagnostics
 from core.journal.storage import SQLiteEventStore
 from core.models.journal_writer import (
     JournalAppend,
@@ -89,6 +90,8 @@ class JournalWriter:
             max_workers=1, thread_name_prefix="journal-read"
         )
         self._readers_waiting = 0
+        self._active_read: tuple[str, float, str | None] | None = None
+        self._startup = StartupDiagnostics(self.directory / "startup.jsonl", {})
         self._store = None
         self._reader = None
         self._server = None
@@ -132,6 +135,8 @@ class JournalWriter:
     def _open_storage(self) -> None:
         from core.journal.supervisor import standalone_directory
 
+        started = time.monotonic()
+        self._startup.record("writer.open.begin", writer_instance_id=self.instance_id)
         configuration, context = _load_logging_settings(self.config_path)
         try:
             self._lease = _open_file_lock(
@@ -144,6 +149,7 @@ class JournalWriter:
         self._configuration = configuration
         self._context = context
         self._store = SQLiteEventStore._from_settings(configuration, context, False)
+        self._store._startup_diagnostics = self._startup
         self._store._report_local_failures = False
         self._store.open()
         self._journal_info = self._store.get_journal_info()
@@ -157,7 +163,13 @@ class JournalWriter:
             }
         )
         self._reader = SQLiteEventStore._from_settings(reader_settings, context, True)
+        self._reader._startup_diagnostics = self._startup
         self._reader.open()
+        self._startup.record(
+            "writer.open.end",
+            writer_instance_id=self.instance_id,
+            duration_seconds=time.monotonic() - started,
+        )
         notice = self.directory / "replacement.json"
         if notice.exists():
             document = read_json(notice)
@@ -239,6 +251,7 @@ class JournalWriter:
         )
 
     def status(self) -> dict:
+        active = self._active_read
         return {
             "state": "storage_unavailable" if self._storage_error else "ready",
             "process": self._identity,
@@ -246,6 +259,15 @@ class JournalWriter:
             "queue_depth": self._queue.qsize(),
             "queue_capacity": self.settings.queue_capacity,
             "busy": self._busy,
+            "read_queue_depth": max(0, self._readers_waiting - int(active is not None)),
+            "active_read": None
+            if active is None
+            else {
+                "command": active[0],
+                "started_monotonic": active[1],
+                "age_seconds": max(0, time.monotonic() - active[1]),
+                "diagnostic_id": active[2],
+            },
             "progress_at": self._progress,
             "db_path": str(self._configuration.db_path),
             "journal": self._journal_info,
@@ -329,8 +351,9 @@ class JournalWriter:
                     try:
                         reply = await asyncio.get_running_loop().run_in_executor(
                             self._read_executor,
-                            self._apply_read,
+                            self._read_with_timing,
                             request,
+                            time.monotonic(),
                         )
                     finally:
                         self._readers_waiting -= 1
@@ -340,8 +363,17 @@ class JournalWriter:
                     future = asyncio.get_running_loop().create_future()
                     await self._queue.put((request, future))
                     reply = await asyncio.shield(future)
+                delivered = time.monotonic()
                 writer.write(encode_frame(reply, validate=False))
                 await writer.drain()
+                if request.call.command == "open":
+                    self._startup.record(
+                        "writer.reply.sent",
+                        command="open",
+                        writer_instance_id=self.instance_id,
+                        diagnostic_id=request.diagnostic_id,
+                        duration_seconds=time.monotonic() - delivered,
+                    )
         except (OSError, ValueError, asyncio.IncompleteReadError, ConnectionError):
             pass
         except Exception as error:  # noqa: BLE001 - Recover from infrastructure failures rather than leaving a broken worker advertised.
@@ -406,6 +438,36 @@ class JournalWriter:
                     retryable = self.managed
             return {"ok": False, "error": writer_error(error), "retryable": retryable}
 
+    def _read_with_timing(self, request: JournalRequest, queued: float) -> dict:
+        """Expose read progress independently of the write worker and its queue."""
+        started = time.monotonic()
+        wait = max(0, started - queued)
+        command = request.call.command
+        self._active_read = (command, started, request.diagnostic_id)
+        detailed = command == "open" or command.startswith("export_") or wait >= 0.05
+        if detailed:
+            self._startup.record(
+                "writer.read.started",
+                command=command,
+                queue_wait_seconds=wait,
+                writer_instance_id=self.instance_id,
+                diagnostic_id=request.diagnostic_id,
+            )
+        try:
+            return self._apply_read(request)
+        finally:
+            duration = time.monotonic() - started
+            if detailed or duration >= 0.05:
+                self._startup.record(
+                    "writer.read.finished",
+                    command=command,
+                    queue_wait_seconds=wait,
+                    duration_seconds=duration,
+                    writer_instance_id=self.instance_id,
+                    diagnostic_id=request.diagnostic_id,
+                )
+            self._active_read = None
+
     def _apply_read(self, request: JournalRequest) -> dict:
         try:
             if request.call.command == "open":
@@ -441,6 +503,8 @@ class JournalWriter:
             update={"open_mode": "existing", "expected_journal": expected}
         )
         probe = SQLiteEventStore._from_settings(settings, self._context, True)
+        probe._startup_diagnostics = self._startup
+        probe._startup_diagnostic_id = request.diagnostic_id
         try:
             probe.open()
             return probe.get_journal_info()

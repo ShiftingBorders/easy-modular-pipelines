@@ -54,6 +54,7 @@ from core.experiments.state import (
 )
 from core.journal.events import LoggingError, encode_event
 from core.journal.logger import Operation, OperationLogger
+from core.journal.startup_diagnostics import StartupDiagnostics, describe_startup_error
 from core.models.experiment_registry import RegistryEntry
 from core.models.experiment_template import (
     ExperimentTemplate,
@@ -3548,6 +3549,22 @@ class ExperimentRunner:
                 },
             )
 
+    def _failure_diagnostics(
+        self, context: JsonObject
+    ) -> tuple[StartupDiagnostics, JsonObject]:
+        """Select independent failure evidence and retain attempt coordinates before cleanup."""
+        context = dict(context)
+        directory = self._project_root / "controller"
+        state = self._state
+        if state is not None:
+            context.update(experiment_id=state.experiment_id, run_id=state.run_id)
+            directory = state.experiment_directory / "runner"
+            attempt = state.active_attempt
+            if attempt is not None:
+                context.update(self._stages._context(state, attempt))
+                directory = attempt.artifacts_directory
+        return StartupDiagnostics(directory / "failure.jsonl", context), context
+
     async def _fail(self, error: Exception, context: JsonObject) -> None:
         """Stop owned work, retain shutdown errors, and publish failed state or emergency diagnostics.
 
@@ -3561,55 +3578,30 @@ class ExperimentRunner:
                 proceeds.
             context: Journal/participant coordinates associated with this operation.
         """
-        self._error = {"type": type(error).__name__, "message": str(error)}
+        diagnostics, context = self._failure_diagnostics(context)
+        error_id = uuid4().hex
+        diagnostics.record(
+            "runner.failed", error=describe_startup_error(error), error_id=error_id
+        )
+        self._error = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "error_id": error_id,
+            "occurred_at": datetime.now(UTC).isoformat(),
+        }
         self._stop_requested = True
         await self._cancel_control_tasks()
         if self._state is not None:
-            if self._stage_task is not None and not self._stage_task.done():
-                self._stage_task.cancel()
-                await asyncio.gather(self._stage_task, return_exceptions=True)
-            try:
-                self._termination_confirmed = await self._stages.interrupt(
-                    self._state, "failure"
-                )
-                if not self._termination_confirmed:
-                    self._error["interruption_error"] = (
-                        "Stage termination is unconfirmed."
-                    )
-            except Exception as interruption_error:  # noqa: BLE001 - Preserve both original and shutdown failures.
-                self._termination_confirmed = False
-                self._error["interruption_error"] = str(interruption_error)
-            try:
-                results = await self._services.stop_all(self._state)
-                self._termination_confirmed = all(
-                    result["stopped"] for result in results.values()
-                ) and (
-                    self._termination_confirmed
-                    or (
-                        self._state.active_attempt is not None
-                        and self._state.active_attempt.service_id is not None
-                        and self._stages.termination_confirmed(self._state)
-                    )
-                )
-                if any(
-                    not result["stopped"] or result["error"]
-                    for result in results.values()
-                ):
-                    self._error["service_shutdown"] = results
-            except Exception as service_error:  # noqa: BLE001 - Shutdown failures must not hide the experiment failure.
-                self._termination_confirmed = False
-                self._error["service_shutdown_error"] = (
-                    f"{type(service_error).__name__}: {service_error}"
-                )
-            finally:
-                await self._services.close()
+            await self._stop_failed_participants(self._state)
             self._state.phase = "failed"
             self._publish_resources()
             try:
                 await asyncio.to_thread(
                     self._journal.client.record_error,
                     error,
-                    context={"experiment_id": self._state.experiment_id},
+                    context=context,
+                    error_id=error_id,
+                    include_traceback=True,
                 )
                 await self._save_state_async()
             except Exception as logging_error:  # noqa: BLE001 - Emergency storage must not recurse into the logger.
@@ -3622,12 +3614,51 @@ class ExperimentRunner:
                 self._project_root / "controller" / f"failure-{uuid4()}.json",
                 {**self._error, "experiment_id": self._requested_id},
             )
+        diagnostics.record(
+            "cleanup.finished", error_id=error_id, stopped=self._termination_confirmed
+        )
         if self._step_future is not None:
             if not self._step_future.done():
                 self._step_future.set_exception(error)
             self._step_future = None
         if self._notify is not None:
             self._notify(self.get_state())
+
+    async def _stop_failed_participants(self, state: RunnerState) -> None:
+        """Stop both participant kinds, retaining secondary failures independently."""
+        if self._stage_task is not None and not self._stage_task.done():
+            self._stage_task.cancel()
+            await asyncio.gather(self._stage_task, return_exceptions=True)
+        try:
+            self._termination_confirmed = await self._stages.interrupt(state, "failure")
+            if not self._termination_confirmed:
+                self._error["interruption_error"] = "Stage termination is unconfirmed."
+        except Exception as interruption_error:  # noqa: BLE001 - Preserve the primary failure.
+            self._termination_confirmed = False
+            self._error["interruption_error"] = str(interruption_error)
+        try:
+            results = await self._services.stop_all(state)
+            self._termination_confirmed = all(
+                result["stopped"] for result in results.values()
+            ) and (
+                self._termination_confirmed
+                or (
+                    state.active_attempt is not None
+                    and state.active_attempt.service_id is not None
+                    and self._stages.termination_confirmed(state)
+                )
+            )
+            if any(
+                not result["stopped"] or result["error"] for result in results.values()
+            ):
+                self._error["service_shutdown"] = results
+        except Exception as service_error:  # noqa: BLE001 - Cleanup cannot replace the original exception.
+            self._termination_confirmed = False
+            self._error["service_shutdown_error"] = (
+                f"{type(service_error).__name__}: {service_error}"
+            )
+        finally:
+            await self._services.close()
 
     def _require_active(self) -> RunnerState:
         """Return selected active state, rejecting terminal experiments and pending rebuilds.

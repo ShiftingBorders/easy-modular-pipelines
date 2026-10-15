@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -34,7 +36,12 @@ from core.experiments.state import (
     state_from_document,
     state_to_document,
 )
-from core.journal.events import LoggingError
+from core.journal.events import LoggingError, LoggingStorageError
+from core.journal.startup_diagnostics import (
+    StartupDiagnostics,
+    capture_bootstrap_stream,
+    describe_startup_error,
+)
 from core.models.experiment_template import (
     ModuleReference,
     ServiceCallDefinition,
@@ -68,6 +75,22 @@ from core.primitives.processes import process_identity
 
 if TYPE_CHECKING:
     from core.journal.logger import OperationLogger
+
+
+@dataclass
+class _ExecutorStartup:
+    """One owned launch; timestamps and recovery durations are monotonic seconds."""
+
+    attempt_id: str
+    started: float
+    timeout: float
+    recovery_baseline: float
+    diagnostics: StartupDiagnostics
+    dispatched: bool = False
+
+
+class _ExecutorExited(RuntimeError):
+    """The owned executor exited before execute was dispatched."""
 
 
 def _record_runner_checkpoint(logger: OperationLogger, state: RunnerState) -> None:
@@ -128,6 +151,9 @@ class StageRunner:
         self._executor_identities: dict[str, ProcessIdentity | JsonObject | None] = {}
         self._notify_resources = notify_resources
         self._journal_deadlines: dict[str, float] = {}
+        self._startup: _ExecutorStartup | None = None
+        self._startup_results: dict[str, StageOutcomeResult] = {}
+        self._output_threads: dict[str, list[threading.Thread]] = {}
 
     def bind_services(self, services) -> None:
         """Set the service manager used for queued DAG calls and interruption.
@@ -181,7 +207,9 @@ class StageRunner:
                 )
             )
             recovered = None
-            response = await self._collect_result(state, attempt)
+            response = self._startup_results.pop(attempt.attempt_id, None)
+            if response is None:
+                response = await self._collect_result(state, attempt)
             await asyncio.to_thread(
                 self._journal.client.record_event,
                 "stage.finished",
@@ -411,9 +439,7 @@ class StageRunner:
             return await self._start_service_call(
                 state, attempt, instance, launch, deadline
             )
-        return await self._start_executor(
-            attempt, attempt.attempt_id, attempt.artifacts_directory, launch, deadline
-        )
+        return await self._start_executor(state, attempt, launch)
 
     def _new_stage_attempt(
         self,
@@ -652,31 +678,183 @@ class StageRunner:
 
     async def _start_executor(
         self,
+        state: RunnerState,
         attempt: StageAttempt,
-        attempt_id: str,
-        directory: Path,
         launch: PreparedLaunch,
-        deadline: float | None,
     ) -> StageAttempt:
         """Write launch.json, spawn the executor, and await its endpoint or journal outcome.
 
         Args:
+            state: Validated template budgets and mutable accepted attempt state.
             attempt: Stage attempt carrying fixed inputs, identity, timing, and
                 execution observations.
-            attempt_id: UUID of the stage attempt being launched or reconciled.
-            directory: Absolute attempt artifact directory receiving launch.json.
             launch: Validated fixed participant launch inputs and runtime paths.
-            deadline: Absolute monotonic deadline in seconds, or None when
-                unbounded.
 
         Returns:
             The admitted attempt after spawning and endpoint/result startup
             reconciliation.
         """
+        directory = attempt.artifacts_directory
+        attempt_id = attempt.attempt_id
         launch_path = directory / "launch.json"
+        self._startup = _ExecutorStartup(
+            attempt_id,
+            time.monotonic(),
+            float(state.template.start_timeout),
+            self._journal.client._recovery_seconds(),
+            StartupDiagnostics(
+                directory / "startup-runner.jsonl", self._context(state, attempt)
+            ),
+        )
+        self._startup.diagnostics.record(
+            "spawn.requested", **self._startup_details(attempt)
+        )
         write_json(launch_path, launch.model_dump(mode="json", exclude_unset=True))
-        await self._spawn_executor(attempt, attempt_id, launch_path)
-        return await self._wait_executor_startup(attempt, attempt_id, launch, deadline)
+        try:
+            if self._startup_remaining(attempt) <= 0:
+                raise TimeoutError("Executor startup deadline expired.")
+            await self._spawn_executor(attempt, attempt_id, launch_path)
+            return await self._wait_executor_startup(attempt, launch)
+        except asyncio.CancelledError:
+            self._startup.diagnostics.record(
+                "startup.cancelled", **self._startup_details(attempt)
+            )
+            raise
+        except (TimeoutError, _ExecutorExited, OSError) as error:
+            await self._handle_startup_failure(state, attempt, error)
+            return attempt
+
+    def _startup_details(self, attempt: StageAttempt) -> JsonObject:
+        startup = self._startup
+        recovery = max(
+            0, self._journal.client._recovery_seconds() - startup.recovery_baseline
+        )
+        elapsed = max(0, time.monotonic() - startup.started)
+        deadline = startup.started + startup.timeout + recovery
+        source = "start_timeout"
+        timeout = startup.timeout
+        stage_deadline = self._deadline(attempt)
+        if stage_deadline is not None and stage_deadline <= deadline:
+            deadline, source, timeout = (
+                stage_deadline,
+                "timeout_seconds",
+                attempt.timeout_seconds,
+            )
+            elapsed = max(0, time.monotonic() - attempt.queued_monotonic)
+            recovery = max(
+                0,
+                self._journal.client._recovery_seconds()
+                - self._journal_deadlines[attempt.attempt_id],
+            )
+        return {
+            "timeout_seconds": timeout,
+            "timeout_source": source,
+            "deadline_monotonic": deadline,
+            "wall_elapsed_seconds": elapsed,
+            "recovery_seconds": recovery,
+            "charged_elapsed_seconds": max(0, elapsed - recovery),
+        }
+
+    def _startup_remaining(self, attempt: StageAttempt) -> float:
+        return self._startup_details(attempt)["deadline_monotonic"] - time.monotonic()
+
+    async def _handle_startup_failure(
+        self, state: RunnerState, attempt: StageAttempt, error: Exception
+    ) -> None:
+        """Retain the failure before cleanup; only stopped work can enter retries."""
+        diagnostics = self._startup.diagnostics
+        details = self._startup_details(attempt)
+        error_id = uuid4().hex
+        stage_timeout = details["timeout_source"] == "timeout_seconds" and isinstance(
+            error, TimeoutError
+        )
+        code = (
+            "executor_startup_timeout"
+            if isinstance(error, TimeoutError)
+            else "executor_startup_failed"
+        )
+        diagnostics.record(
+            "startup.failed",
+            **details,
+            error_id=error_id,
+            error=describe_startup_error(error),
+            last_phase=diagnostics.last_phase,
+        )
+        response = await self._accept(
+            state,
+            attempt,
+            {
+                "result": "fail",
+                "data": {"reason": "timeout" if stage_timeout else code},
+                "error": {"code": code, "message": str(error)},
+            },
+            "timed_out" if stage_timeout else "failed",
+        )
+        stopped, cleanup_error = await self._cleanup_startup(
+            state, attempt, code, error_id
+        )
+        if not stopped:
+            attempt.outcome = "unknown"
+            await self._save_state(state)
+        self._startup_results[attempt.attempt_id] = response
+        await asyncio.to_thread(
+            self._journal.client.record_error,
+            error,
+            error_id=error_id,
+            error_code=code,
+            include_traceback=True,
+            context=self._context(state, attempt),
+        )
+        if cleanup_error is not None:
+            await asyncio.to_thread(
+                self._journal.client.record_error,
+                cleanup_error,
+                caused_by_error_id=error_id,
+                include_traceback=True,
+                context=self._context(state, attempt),
+            )
+
+    async def _cleanup_startup(
+        self,
+        state: RunnerState,
+        attempt: StageAttempt,
+        reason: str,
+        error_id: str,
+    ) -> tuple[bool, Exception | None]:
+        """Confirm owned startup work stopped without replacing the primary failure."""
+        stopped = False
+        cleanup_error = None
+        try:
+            stopped = await self.interrupt(state, reason)
+            if stopped and self._process is not None:
+                stopped = False
+                try:
+                    await asyncio.to_thread(
+                        self._process.wait, state.template.start_timeout
+                    )
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    stopped = True
+            if stopped:
+                await self._finish_output(attempt.request_id)
+        except Exception as failure:  # noqa: BLE001 - A cleanup failure must not replace startup evidence.
+            stopped = False
+            cleanup_error = failure
+        finally:
+            self._startup.diagnostics.record(
+                "cleanup.finished",
+                stopped=stopped,
+                error_id=error_id,
+                error=None
+                if cleanup_error is None
+                else describe_startup_error(cleanup_error),
+            )
+        return stopped, cleanup_error
+
+    async def _finish_output(self, request_id: str) -> None:
+        for thread in self._output_threads.pop(request_id, []):
+            await asyncio.to_thread(thread.join, 1)
 
     async def _spawn_executor(
         self, attempt: StageAttempt, attempt_id: str, launch_path: Path
@@ -709,101 +887,127 @@ class StageRunner:
                 ],
                 cwd=library_root,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         )
+        cancellation = None
         try:
             self._process = await asyncio.shield(spawn)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             self._process = await spawn
-            self._executor_processes.append((self._process, attempt.request_id))
-            raise
+            cancellation = error
         except OSError:
             self._unstarted_attempt_id = attempt_id
             raise
         self._executor_processes.append((self._process, attempt.request_id))
+        diagnostics = self._startup.diagnostics
+        diagnostics.record("spawn.returned", process_id=self._process.pid)
+        threads = []
+        for name in ("stdout", "stderr"):
+            thread = threading.Thread(
+                target=capture_bootstrap_stream,
+                args=(
+                    getattr(self._process, name),
+                    launch_path.parent / f"executor.{name}.log",
+                    name,
+                    diagnostics,
+                ),
+                name=f"executor-{name}",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+        self._output_threads[attempt.request_id] = threads
+        if cancellation is not None:
+            raise cancellation
 
     async def _wait_executor_startup(
         self,
         attempt: StageAttempt,
-        attempt_id: str,
         launch: PreparedLaunch,
-        deadline: float | None,
     ) -> StageAttempt:
         """Wait for the matching endpoint/result and send execute within the startup deadline.
 
         Args:
             attempt: Stage attempt carrying fixed inputs, identity, timing, and
                 execution observations.
-            attempt_id: UUID of the stage attempt being launched or reconciled.
             launch: Validated fixed participant launch inputs and runtime paths.
-            deadline: Absolute monotonic deadline in seconds, or None when
-                unbounded.
 
         Returns:
             The supplied attempt once execute was sent or a matching journal result
             is already available.
         """
-        startup_deadline = time.monotonic() + launch.control_timeout_seconds
-        deadline = self._deadline(attempt)
-        if deadline is not None:
-            startup_deadline = min(startup_deadline, deadline)
-        recovery_baseline = self._journal.client._recovery_seconds()
-        while True:
-            extension = max(
-                0, self._journal.client._recovery_seconds() - recovery_baseline
-            )
-            if time.monotonic() >= startup_deadline + extension:
-                break
-            if (
-                await asyncio.to_thread(
-                    self._journal.client.read_command_result, attempt.request_id
-                )
-                is not None
-            ):
-                return attempt
-            if attempt.endpoint_path.is_file():
+        reader = self._journal.client._new_startup_reader()
+        reader._startup_diagnostics = self._startup.diagnostics
+        try:
+            while True:
+                remaining = self._startup_remaining(attempt)
+                if remaining <= 0:
+                    raise TimeoutError("Executor startup deadline expired.")
+                reader._request_timeout_seconds = remaining
                 try:
-                    endpoint = read_json(attempt.endpoint_path)
-                    if endpoint.get("participant_instance_id") != attempt_id:
+                    result = await asyncio.to_thread(
+                        reader.read_command_result, attempt.request_id
+                    )
+                except LoggingStorageError as error:
+                    if self._startup_remaining(attempt) <= 0:
+                        raise TimeoutError(
+                            "Executor startup deadline expired."
+                        ) from error
+                    if getattr(error, "retryable", False):
                         await asyncio.sleep(0.02)
                         continue
-                    extension = max(
-                        0, self._journal.client._recovery_seconds() - recovery_baseline
-                    )
-                    await self._connect(
-                        attempt,
-                        max(0.001, startup_deadline + extension - time.monotonic()),
-                    )
-                    self._call_future = asyncio.create_task(
-                        self._connection.request(
-                            attempt.request_id,
-                            "execute",
-                            launch.call.model_dump(mode="json", exclude_unset=True),
-                            deadline_monotonic=self._deadline(attempt),
-                        )
-                    )
+                    raise
+                if result is not None:
                     return attempt
-                except (OSError, EOFError):
-                    if (
-                        await asyncio.to_thread(
-                            self._journal.client.read_command_result, attempt.request_id
-                        )
-                        is not None
-                    ):
-                        return attempt
-                    if self._process.poll() is not None:
-                        raise
-            if self._process.poll() is not None:
-                raise RuntimeError(
-                    "Executor exited before publishing its endpoint or journal result."
+                if self._startup_remaining(attempt) <= 0:
+                    raise TimeoutError("Executor startup deadline expired.")
+                if await self._dispatch_startup(attempt, launch):
+                    return attempt
+                if self._process.poll() is not None:
+                    raise _ExecutorExited(
+                        "Executor exited before publishing its endpoint or journal result."
+                    )
+                await asyncio.sleep(0.02)
+        finally:
+            reader.request_close()
+            await asyncio.to_thread(reader.close)
+
+    async def _dispatch_startup(
+        self,
+        attempt: StageAttempt,
+        launch: PreparedLaunch,
+    ) -> bool:
+        """Verify the endpoint and remaining budget before admitting execute once."""
+        if not attempt.endpoint_path.is_file():
+            return False
+        try:
+            endpoint = await asyncio.to_thread(read_json, attempt.endpoint_path)
+            if endpoint.get("participant_instance_id") != attempt.attempt_id:
+                return False
+            await self._connect(attempt, max(0.001, self._startup_remaining(attempt)))
+            self._startup.diagnostics.record("endpoint.connected")
+            if self._startup_remaining(attempt) <= 0:
+                raise TimeoutError("Executor startup deadline expired.")
+            self._startup.dispatched = True
+            self._call_future = asyncio.create_task(
+                self._connection.request(
+                    attempt.request_id,
+                    "execute",
+                    launch.call.model_dump(mode="json", exclude_unset=True),
+                    deadline_monotonic=self._deadline(attempt),
                 )
-            await asyncio.sleep(0.02)
-        if deadline is not None and time.monotonic() >= deadline + extension:
-            return attempt
-        raise TimeoutError("Executor startup deadline expired.")
+            )
+            self._startup.diagnostics.record(
+                "execute.sent", **self._startup_details(attempt)
+            )
+            return True
+        except (OSError, EOFError):
+            if self._startup_remaining(attempt) <= 0:
+                raise TimeoutError("Executor startup deadline expired.")
+            return False
 
     def _deadline(self, attempt: StageAttempt) -> float | None:
         """Return the attempt's monotonic deadline from queue time, or None when unbounded."""
@@ -1163,6 +1367,8 @@ class StageRunner:
         except LoggingError:
             # Mandatory journal failure does not disable emergency interruption.
             pass
+        if self._startup_process_exited(attempt):
+            return True
         if attempt.service_id is not None:
             instance = state.services.get(attempt.service_id)
             if instance is None:
@@ -1228,6 +1434,8 @@ class StageRunner:
                 if self._connection is not None:
                     await self._connection.close()
                     self._connection = None
+            if self._startup_process_exited(attempt):
+                return True
             if attempt.process_identity is not None:
                 try:
                     if process_identity(
@@ -1452,6 +1660,8 @@ class StageRunner:
         attempt = state.active_attempt
         if attempt is None or self._unstarted_attempt_id == attempt.attempt_id:
             return True
+        if self._startup_process_exited(attempt):
+            return True
         if attempt.service_id is not None:
             instance = state.services.get(attempt.service_id)
             return instance is not None and (
@@ -1477,6 +1687,17 @@ class StageRunner:
             if getattr(error, "winerror", None) in (87, 1168):
                 return True
             raise
+
+    def _startup_process_exited(self, attempt: StageAttempt) -> bool:
+        """An owned, exited executor that never received execute cannot own module work."""
+        return (
+            self._startup is not None
+            and self._startup.attempt_id == attempt.attempt_id
+            and not self._startup.dispatched
+            and self._process_attempt_id == attempt.attempt_id
+            and self._process is not None
+            and self._process.poll() is not None
+        )
 
     async def _save_state(self, state: RunnerState, *, checkpoint: bool = True) -> None:
         # Retry/input ownership must survive loss of the optional state.json
@@ -1537,6 +1758,7 @@ class StageRunner:
                     process.wait,
                     timeout=30 if state is None else state.template.start_timeout,
                 )
+                await self._finish_output(request_id)
         self._executor_processes = remaining
         if state is not None:
             await self._wait_accepted_executors(state)
