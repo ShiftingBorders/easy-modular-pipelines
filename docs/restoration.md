@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/logo-restore-dark.svg" alt="Snapshots and experiment recovery" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-restore-dark.svg">
+    <img src="assets/logo-restore-light.svg" alt="Snapshots and experiment recovery" width="420">
+  </picture>
 </p>
 
 # Snapshots, rollbacks, and recovery

@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/logo-compare-dark.svg" alt="Module identity and integrity checks" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-compare-dark.svg">
+    <img src="assets/logo-compare-light.svg" alt="Module identity and integrity checks" width="420">
+  </picture>
 </p>
 
 # Module identity and integrity checks

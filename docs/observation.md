@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/logo-observe-dark.svg" alt="Execution history and observation" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-observe-dark.svg">
+    <img src="assets/logo-observe-light.svg" alt="Execution history and observation" width="420">
+  </picture>
 </p>
 
 # Execution history and observation

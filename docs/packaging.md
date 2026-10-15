@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/logo-packing-dark.svg" alt="Experiment packaging and exchange" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-packing-dark.svg">
+    <img src="assets/logo-packing-light.svg" alt="Experiment packaging and exchange" width="420">
+  </picture>
 </p>
 
 # Experiment packaging, exchange, and installation
