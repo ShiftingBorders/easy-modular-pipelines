@@ -35,7 +35,13 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
             "participant_id": str(uuid4()),
             "participant_instance_id": str(uuid4()),
         }
-        self.logger = OperationLogger(write_settings(self.root, context=self.identity))
+        # Lock failure and recovery-open both wait; their duration is not a
+        # participant protocol requirement.
+        self.logger = OperationLogger(
+            write_settings(
+                self.root, context=self.identity, busy_timeout_seconds=0.05
+            )
+        )
         self.logger.open()
         self.addCleanup(self.logger.close)
         self.entered, self.release = asyncio.Event(), asyncio.Event()

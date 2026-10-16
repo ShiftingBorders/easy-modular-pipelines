@@ -398,6 +398,18 @@ class RunnerStateStore:
         write_json(destination, document)
 
 
+def _resolve_state_path(path: Path) -> Path:
+    """Resolve links, repeating the lookup once for an NTFS delete-pending name."""
+    resolved = path.resolve()
+    if os.name == "nt" and tuple(
+        part.casefold() for part in resolved.parts[1:3]
+    ) == ("$extend", "$deleted"):
+        # An endpoint can be deleted while Windows resolves its open handle.
+        # Look up the original name again; containment still checks the result.
+        resolved = path.resolve()
+    return resolved
+
+
 def _relative_state_path(path: Path, root: Path) -> Path:
     """Compare resolved paths using the same Windows namespace spelling."""
     if os.name == "nt":
@@ -542,7 +554,7 @@ def state_to_document(state: RunnerState) -> JsonObject:
             saved[name] = (
                 None
                 if path is None
-                else _relative_state_path(path.resolve(), root).as_posix()
+                else _relative_state_path(_resolve_state_path(path), root).as_posix()
             )
         document["services"][service_id] = saved
     if state.active_attempt is not None:
@@ -564,7 +576,7 @@ def state_to_document(state: RunnerState) -> JsonObject:
         attempt["endpoint_path"] = (
             None
             if endpoint is None
-            else _relative_state_path(endpoint.resolve(), root).as_posix()
+            else _relative_state_path(_resolve_state_path(endpoint), root).as_posix()
         )
         document["active_attempt"] = attempt
     return copy_json_object(document, "runner state")
@@ -579,7 +591,7 @@ def state_from_document(root: Path, document: JsonObject) -> RunnerState:
 
 def _saved_path(root: Path, relative: str, label: str) -> Path:
     path = Path(relative)
-    resolved = (root / path).resolve()
+    resolved = _resolve_state_path(root / path)
     if path.anchor:
         raise ValueError(f"Saved {label} escapes the experiment.")
     try:

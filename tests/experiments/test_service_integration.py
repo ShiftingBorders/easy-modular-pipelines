@@ -224,7 +224,9 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(retry["result"], "success", retry)
             self.assertEqual(retry["data"]["action"], "ready")
             self.assertEqual(len(runner._state.services), 2)
-            self.assertTrue(all(item.ready for item in runner._state.services.values()))
+            self.assertTrue(
+                all(item.ready for item in runner._state.services.values())
+            )
             self.assertEqual(w.stage_trace(), [])
             self.assertEqual(runner.get_state()["mode"], "paused")
             await w.session.send("resume")
@@ -480,7 +482,7 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_mandatory_journal_failure_stops_every_participant(self):
-        """C4/D5: actual SQLite writer contention fails supervision and shuts down all owned work."""
+        """C4/D5: aborting a locked mandatory checkpoint shuts down all owned work."""
         async with asyncio.timeout(120):
             w = self.w
             w.service()
@@ -489,21 +491,50 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 w.template([w.stage(settings={"gate": str(w.gate())})]), paused=False
             )
             _, stage = await w.session.ready_attempt()
+            self.assertTrue(all(item.ready for item in runner._state.services.values()))
             identities = [
                 item.process_identity.model_dump()
                 for item in runner._state.services.values()
             ]
+            await wait_for(
+                lambda: not runner._journal._supervisor.get_status()["busy"]
+            )
             lock = sqlite3.connect(
                 runner._state.experiment_directory / "journals/events.sqlite"
             )
             lock.execute("BEGIN IMMEDIATE")
+            pause = w.session.post("pause")
+            failure = None
             try:
                 await wait_for(
-                    lambda: runner.get_state()["phase"] == "failed", timeout=60
+                    lambda: runner._journal._supervisor.get_status()["busy"]
                 )
+                self.assertFalse(pause.done())
+                self.assertTrue(process_running(stage["pid"]))
+                self.assertTrue(
+                    all(process_running(item["pid"]) for item in identities)
+                )
+                # A temporary lock retains mandatory work. Explicit client abort
+                # turns this into a failed checkpoint and emergency shutdown.
+                runner._journal.client._interrupt_waiting()
+                await wait_for(lambda: runner.get_state()["error"] is not None)
+            except BaseException as error:
+                failure = error
+                raise
             finally:
+                runner._journal.client._interrupt_waiting()
                 lock.rollback()
                 lock.close()
+                try:
+                    response = await asyncio.wait_for(asyncio.shield(pause), 45)
+                except BaseException as cleanup_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(
+                        f"Waiting for failed pause also failed: {cleanup_error!r}"
+                    )
+            self.assertEqual(response["error"]["code"], "journal_unavailable", response)
+            self.assertEqual(runner.get_state()["phase"], "failed")
             self.assertFalse(process_running(stage["pid"]))
             self.assertTrue(
                 all(not process_running(item["pid"]) for item in identities)

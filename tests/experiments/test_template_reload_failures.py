@@ -9,13 +9,29 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from core.experiments.state import RunnerStateStore, state_to_document
+from core.journal.client import JournalClient
 from core.journal.events import JournalGenerationChanged, LoggingStorageError
-from core.journal.storage import SQLiteEventStore
 from tests.helpers.reload import candidate, events, trace, workspace
 from tests.helpers.services import wait_for
 
 
 class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
+    def _assert_runner_state_unchanged(self, before, after):
+        """Preserve execution and journal ownership while activity observations advance."""
+        for observation in (before, after):
+            observation.pop("observed_at")
+            for service in observation["services"]:
+                service.pop("last_status")
+            for field in (
+                "queue_depth",
+                "busy",
+                "read_queue_depth",
+                "active_read",
+                "progress_at",
+            ):
+                observation["journal_writer"].pop(field)
+        self.assertEqual(after, before)
+
     async def test_rejected_preparation_preserves_last_attempt_and_execution_rr09(self):
         for problem, continuation in (
             ("hash", "step"),
@@ -86,9 +102,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                         await runner.reload_template(path)
 
                 after = runner.get_state()
-                before.pop("observed_at")
-                after.pop("observed_at")
-                self.assertEqual(after, before)
+                self._assert_runner_state_unchanged(before, after)
                 self.assertIs(runner._last_attempt, attempt)
                 self.assertEqual(runner._last_response, response)
                 after_state = state_to_document(runner._state)
@@ -456,12 +470,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                     save.assert_not_awaited()
                     stop.assert_not_awaited()
                     after = runner.get_state()
-                    before.pop("observed_at")
-                    after.pop("observed_at")
-                    for observation in (before, after):
-                        for service in observation["services"]:
-                            service.pop("last_status")
-                    self.assertEqual(after, before)
+                    self._assert_runner_state_unchanged(before, after)
                     state_after = state_to_document(runner._state)
                     # Heartbeat requests may be journaled while preparing the
                     # candidate. Previously reserved IDs must remain reserved.
@@ -628,7 +637,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         work = await self.make_run()
         runner = work.runner
         old = candidate(work)
-        append = SQLiteEventStore.append
+        append = JournalClient.append
 
         def fail(store, event):
             if event["event_type"] == "reload.candidate":
@@ -639,7 +648,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         document["stages"][0]["settings"]["echo"] = "candidate"
         try:
             with (
-                patch.object(SQLiteEventStore, "append", fail),
+                patch.object(JournalClient, "append", fail),
                 self.assertRaises(LoggingStorageError),
             ):
                 await runner.reload_template(work.files.write_template(document))
@@ -694,7 +703,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         work = await self.make_run()
         runner = work.runner
         old_revision = runner._state.template_revision_id
-        append = SQLiteEventStore.append
+        append = JournalClient.append
         fired = False
 
         def commit_then_fail(store, event):
@@ -713,7 +722,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
         document = candidate(work)
         document["stages"][0]["settings"]["echo"] = "committed"
         with (
-            patch.object(SQLiteEventStore, "append", commit_then_fail),
+            patch.object(JournalClient, "append", commit_then_fail),
             self.assertRaises(LoggingStorageError),
         ):
             await runner.reload_template(work.files.write_template(document))
@@ -792,12 +801,7 @@ class TemplateReloadFailureTests(unittest.IsolatedAsyncioTestCase):
                 unfreeze.assert_awaited_once()
                 stop.assert_not_awaited()
                 after = runner.get_state()
-                before.pop("observed_at")
-                after.pop("observed_at")
-                for observation in (before, after):
-                    for service in observation["services"]:
-                        service.pop("last_status")
-                self.assertEqual(after, before)
+                self._assert_runner_state_unchanged(before, after)
                 self.assertEqual(
                     runner._state.template.model_dump(exclude_unset=True), original
                 )

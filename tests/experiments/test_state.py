@@ -594,24 +594,43 @@ class RunnerStateTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows realpath namespace race")
     def test_disappearing_stage_and_service_endpoints_survive_state_round_trip(self):
-        """Delete the real file between realpath's two native calls."""
+        """Deleted endpoints retain their original name, including NTFS tombstones."""
         import ntpath
 
         participants = self._add_path_participants()
         native = ntpath._getfinalpathname
+        tombstone = "\\\\?\\" + str(
+            Path(self.root.anchor) / "$Extend" / "$Deleted" / "fixture-endpoint"
+        )
         for participant in participants:
             endpoint = participant.endpoint_path
-            for operation in ("save", "load"):
-                with self.subTest(participant=endpoint.name, operation=operation):
+            for operation, returned_name in (
+                ("save", "original"),
+                ("load", "original"),
+                ("save", "tombstone"),
+                ("load", "tombstone"),
+            ):
+                with self.subTest(
+                    participant=endpoint.name,
+                    operation=operation,
+                    returned_name=returned_name,
+                ):
                     endpoint.write_text("{}", encoding="utf-8")
                     document = state_to_document(self.state)
                     removed = []
 
-                    def resolve_and_remove(path, endpoint=endpoint, removed=removed):
+                    def resolve_and_remove(
+                        path,
+                        endpoint=endpoint,
+                        removed=removed,
+                        returned_name=returned_name,
+                    ):
                         result = native(path)
                         if not removed and Path(path) == endpoint:
                             endpoint.unlink()
                             removed.append(path)
+                            if returned_name == "tombstone":
+                                return tombstone
                         return result
 
                     with patch.object(ntpath, "_getfinalpathname", resolve_and_remove):
@@ -623,6 +642,59 @@ class RunnerStateTests(unittest.TestCase):
                     self.assertEqual(removed, [str(endpoint)])
                     self.assertFalse(endpoint.exists())
                     self.assertEqual(state_to_document(restored), document)
+
+    @unittest.skipUnless(os.name == "nt", "Windows NTFS delete-pending paths")
+    def test_deleted_endpoint_retry_rejects_outside_and_persistent_tombstones(self):
+        """A fresh resolution cannot authorize escapes or become an unbounded retry."""
+        import ntpath
+
+        participants = self._add_path_participants()
+        native = ntpath._getfinalpathname
+        tombstone = "\\\\?\\" + str(
+            Path(self.root.anchor) / "$Extend" / "$Deleted" / "fixture-endpoint"
+        )
+        outside = self.workspace.root / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        for participant in participants:
+            endpoint = participant.endpoint_path
+            for operation, second in (
+                ("save", "outside"),
+                ("load", "outside"),
+                ("save", "tombstone"),
+                ("load", "tombstone"),
+            ):
+                with self.subTest(
+                    participant=endpoint.name, operation=operation, second=second
+                ):
+                    endpoint.write_text("{}", encoding="utf-8")
+                    document = state_to_document(self.state)
+                    calls = []
+
+                    def resolve_deleted(
+                        path, endpoint=endpoint, calls=calls, second=second
+                    ):
+                        if Path(path) != endpoint:
+                            return native(path)
+                        calls.append(path)
+                        if len(calls) == 1:
+                            endpoint.unlink()
+                            return tombstone
+                        if len(calls) > 2:
+                            raise AssertionError(
+                                "Deleted endpoint resolved more than twice."
+                            )
+                        return native(outside) if second == "outside" else tombstone
+
+                    with (
+                        patch.object(ntpath, "_getfinalpathname", resolve_deleted),
+                        self.assertRaises(ValueError),
+                    ):
+                        if operation == "save":
+                            state_to_document(self.state)
+                        else:
+                            state_from_document(self.root, document)
+                    self.assertLessEqual(len(calls), 2)
+                    self.assertFalse(endpoint.exists())
 
     def test_saved_participant_paths_still_reject_absolute_and_parent_paths(self):
         """Both stage and service paths retain their experiment boundary."""

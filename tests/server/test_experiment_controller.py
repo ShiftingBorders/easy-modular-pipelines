@@ -84,7 +84,7 @@ class ExperimentControllerTests(unittest.IsolatedAsyncioTestCase):
             args={"position": 2},
         )
         with patch.object(
-            self.session.runner, "move", new=AsyncMock(return_value={})
+            self.session.runner, "_move", new=AsyncMock(return_value={})
         ) as move:
             response = await controller._execute_command(request)
         self.assertEqual(response.result, "success")
@@ -494,39 +494,56 @@ class ExperimentControllerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_budget_is_not_reset_by_success_or_a_new_cycle(self):
         """C5/C6: stage retries remain spent across success and epoch boundaries."""
-        async with asyncio.timeout(30):
-            module = self.workspace.module()
-            first = self.workspace.stage(
-                module,
-                settings={"label": "A", "failures": 1},
-                retries=1,
-                on_exhausted="skip",
-            )
-            second = self.workspace.stage(module, settings={"label": "B"})
-            await self.session.launch(
-                self.workspace.template([first, second], cycles=2), paused=False
-            )
-            await wait_until(
-                lambda: (
-                    self.session.runner.get_state()["phase"] in ("completed", "failed")
+        try:
+            async with asyncio.timeout(30):
+                module = self.workspace.module()
+                first = self.workspace.stage(
+                    module,
+                    settings={"label": "A", "failures": 1},
+                    retries=1,
+                    on_exhausted="skip",
                 )
-            )
-            self.assertEqual(self.session.runner.get_state()["phase"], "completed")
-            starts = [row for row in self.trace() if row["event"] == "start"]
-            self.assertEqual(
-                [
-                    (row["cycle"], row["attempt"])
-                    for row in starts
-                    if row["label"] == "A"
-                ],
-                [(1, 1), (1, 2), (2, 1)],
-            )
-            self.assertEqual(
-                self.session.runner._state.stage_retry_counts[first["stage_id"]], 1
-            )
-            self.assertIsNone(
-                [row for row in starts if row["label"] == "B"][-1]["input"]
-            )
+                second = self.workspace.stage(module, settings={"label": "B"})
+                await self.session.launch(
+                    self.workspace.template([first, second], cycles=2), paused=False
+                )
+                await wait_until(
+                    lambda: (
+                        self.session.runner.get_state()["phase"]
+                        in ("completed", "failed")
+                    ),
+                    timeout=30,
+                )
+                self.assertEqual(
+                    self.session.runner.get_state()["phase"], "completed"
+                )
+                starts = [row for row in self.trace() if row["event"] == "start"]
+                self.assertEqual(
+                    [
+                        (row["cycle"], row["attempt"])
+                        for row in starts
+                        if row["label"] == "A"
+                    ],
+                    [(1, 1), (1, 2), (2, 1)],
+                )
+                self.assertEqual(
+                    self.session.runner._state.stage_retry_counts[first["stage_id"]],
+                    1,
+                )
+                self.assertIsNone(
+                    [row for row in starts if row["label"] == "B"][-1]["input"]
+                )
+        except TimeoutError as error:
+            try:
+                runner = self.session.runner
+                error.add_note(f"Runner state: {runner.get_state()!r}")
+                trace = self.trace() if runner._state is not None else []
+                error.add_note(f"Stage trace: {trace!r}")
+            except Exception as diagnostic_error:  # noqa: BLE001 - Preserve timeout.
+                error.add_note(
+                    f"Could not collect timeout diagnostics: {diagnostic_error!r}"
+                )
+            raise
 
     async def test_terminal_states_reject_advancement_and_id_reuse(self):
         """C11: stopped, completed, and failed instances have explicit command outcomes."""

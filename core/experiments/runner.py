@@ -84,7 +84,7 @@ from core.primitives.json_values import (
     require_text,
 )
 from core.primitives.processes import process_identity
-from core.primitives.tasks import _await_read_task
+from core.primitives.tasks import _await_outcome, _await_read_task
 
 
 class ExperimentRunner:
@@ -171,6 +171,9 @@ class ExperimentRunner:
         self._last_response: StageOutcomeResult | None = None
         self._last_snapshot = None
         self._error = None
+        self._failure_task: asyncio.Task[None] | None = None
+        self._failure_waiters: set[asyncio.Task] = set()
+        self._failure_waiters_changed = asyncio.Event()
         self._notify = notify
         self._closed = False
         self._stop_requested = False
@@ -225,6 +228,8 @@ class ExperimentRunner:
             raise RuntimeError(
                 "Previous participant termination is unconfirmed; no new experiment may start."
             )
+        if self._failure_task is not None and not self._failure_task.done():
+            raise RuntimeError("Wait for failure cleanup before starting a run.")
         if type(delayed_start) is not bool or type(continue_run) is not bool:
             raise TypeError("Run flags must be booleans.")
         if continue_run and (experiment_id is None or template_path is not None):
@@ -264,6 +269,8 @@ class ExperimentRunner:
         service/snapshot coordinators, and rebinds stage calls to the new manager.
         Participant shutdown must already have been confirmed by run admission.
         """
+        if self._failure_task is not None:
+            await self._cancel_control_tasks()
         await self._services.close()
         self._services = ServiceManager(
             self._launcher,
@@ -313,6 +320,7 @@ class ExperimentRunner:
         self._state = None
         self._publish_resources()
         self._error = None
+        self._failure_task = None
         self._last_attempt = None
         self._last_response = None
         self._last_snapshot = None
@@ -456,41 +464,39 @@ class ExperimentRunner:
         user's pause or restart an experiment that has been stopped.
         """
         while not self._stop_requested:
-            supervisor = getattr(self._journal, "_supervisor", None)
-            state = self._state
-            if (
-                supervisor is not None
-                and state is not None
-                and (self._journal._opened or self._journal._opening)
-            ):
-                status = supervisor.get_status()
-                reason = None
-                if not status.get("history_available", True):
-                    reason = "journal_history_unavailable"
-                elif status["state"] in (
-                    "starting",
-                    "restarting",
-                    "storage_unavailable",
-                ):
-                    reason = "journal_" + status["state"]
-                if reason is not None:
-                    self._journal_pause_reason = reason
-                    state.mode = "paused"
-                    # Journal readiness does not complete DAG/service preparation.
-                    if (
-                        self._ready.is_set()
-                        and state.active_attempt is None
-                        and state.phase == "starting"
-                    ):
-                        state.phase = "waiting"
-                elif (
-                    self._journal_pause_reason is not None
-                    and status["state"] == "ready"
-                ):
-                    self._journal_pause_reason = None
-                    state.mode = self._desired_mode
-                    self._wake.set()
+            self._update_journal_pause()
             await asyncio.sleep(0.1)
+
+    def _update_journal_pause(self) -> None:
+        """Apply current journal availability without changing the requested mode."""
+        supervisor = getattr(self._journal, "_supervisor", None)
+        state = self._state
+        if (
+            supervisor is None
+            or state is None
+            or not (self._journal._opened or self._journal._opening)
+        ):
+            return
+        status = supervisor.get_status()
+        reason = None
+        if not status.get("history_available", True):
+            reason = "journal_history_unavailable"
+        elif status["state"] in ("starting", "restarting", "storage_unavailable"):
+            reason = "journal_" + status["state"]
+        if reason is not None:
+            self._journal_pause_reason = reason
+            state.mode = "paused"
+            # Journal readiness does not complete DAG/service preparation.
+            if (
+                self._ready.is_set()
+                and state.active_attempt is None
+                and state.phase == "starting"
+            ):
+                state.phase = "waiting"
+        elif self._journal_pause_reason is not None and status["state"] == "ready":
+            self._journal_pause_reason = None
+            state.mode = self._desired_mode
+            self._wake.set()
 
     async def _prepare_dag_state(self) -> RunnerState | None:
         """Prepare/recover selected state and apply pending decisions before scheduling work.
@@ -535,6 +541,8 @@ class ExperimentRunner:
             else ("waiting" if state.mode == "paused" else "starting")
         )
         await self._save_state_async()
+        # Preparation can finish between periodic journal observations.
+        self._update_journal_pause()
         self._ready.set()
         if state.active_attempt is not None:
             self._idle.clear()
@@ -1209,6 +1217,7 @@ class ExperimentRunner:
             raise RuntimeError("There is no experiment to resume.")
         await self._ready.wait()
         state = self._require_active()
+        self._update_journal_pause()
         if self._journal_pause_reason is not None:
             raise RuntimeError(f"Experiment is paused: {self._journal_pause_reason}.")
         if any(
@@ -1435,33 +1444,65 @@ class ExperimentRunner:
         return self.get_state()
 
     async def _cancel_control_tasks(self) -> None:
-        """Cancel service-control, maintenance, and DAG tasks other than the current task.
+        """Cancel active work, allowing failed callers to hand cleanup to one owner.
 
-        Awaits cancellation of other service-control, maintenance, and DAG tasks.
-        Skipping the current task avoids cancelling or awaiting the shutdown
-        operation itself.
+        A failure waiter has finished its operation cleanup and is quiescent.
+        Joining that caller would make failure cleanup wait for itself.
         """
-        if (
-            self._service_control_task is not None
-            and self._service_control_task is not asyncio.current_task()
-            and not self._service_control_task.done()
-        ):
-            self._service_control_task.cancel()
-            await asyncio.gather(self._service_control_task, return_exceptions=True)
-        if (
-            self._maintenance_task is not None
-            and self._maintenance_task is not asyncio.current_task()
-            and not self._maintenance_task.done()
-        ):
-            self._maintenance_task.cancel()
-            await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        if (
-            self._task is not None
-            and self._task is not asyncio.current_task()
-            and not self._task.done()
-        ):
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+        current = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in (self._service_control_task, self._maintenance_task, self._task)
+            if task is not None and task is not current
+        )
+        for task in tasks:
+            # One owner performs cancellation. Other callers join it below.
+            if (
+                self._failure_task is not None
+                and self._failure_task is not current
+                and not self._failure_task.done()
+            ):
+                break
+            if task.done() or task in self._failure_waiters:
+                continue
+            if (
+                task is self._task
+                and self._failure_task is not None
+                and self._failure_task.done()
+            ):
+                # Completed failure cleanup has stopped this DAG. Drain its
+                # finalizers below; new DAGs reset failure ownership.
+                continue
+            if not task.cancelling():
+                task.cancel()
+            await self._wait_control_cancellation(task)
+        # Cancellation cleanup may have started the failure operation just now.
+        failure = self._failure_task
+        if failure is not None and failure is not current and not failure.done():
+            await self._join_failure_cleanup(failure)
+        if failure is not current:
+            # Failed callers still run their own finally blocks after the shared
+            # cleanup. Drain the captured generation before closing or rebinding.
+            finalizers = [task for task in tasks if task is not failure]
+            if finalizers:
+                await _await_read_task(
+                    asyncio.gather(*finalizers, return_exceptions=True)
+                )
+
+    async def _wait_control_cancellation(self, task: asyncio.Task) -> None:
+        """Wait until work finishes or enters the quiescent failure-waiter set."""
+        while not task.done() and task not in self._failure_waiters:
+            self._failure_waiters_changed.clear()
+            if task.done() or task in self._failure_waiters:
+                break
+            changed = asyncio.create_task(self._failure_waiters_changed.wait())
+            try:
+                await asyncio.wait((task, changed), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                changed.cancel()
+                await asyncio.gather(changed, return_exceptions=True)
+        if task.done():
+            await asyncio.gather(task, return_exceptions=True)
 
     async def rerun(
         self,
@@ -2840,6 +2881,8 @@ class ExperimentRunner:
         snapshot_id = str(UUID(require_text(snapshot_id, "snapshot_id")))
         if self._closed or self._state is None:
             raise RuntimeError("Select an experiment before rollback.")
+        if self._failure_task is not None and not self._failure_task.done():
+            raise RuntimeError("Wait for failure cleanup before rollback.")
         state = self._state
         if state.pending_rebuild is not None:
             raise RuntimeError(
@@ -2874,14 +2917,22 @@ class ExperimentRunner:
         self._maintenance = True
         self._maintenance_task = asyncio.current_task()
         previous_phase = state.phase
-        state.phase = "restoring"
-        self._publish_resources()
         try:
-            # Reopening also permits rollback after an earlier journal writer failure.
-            await asyncio.to_thread(
-                self._journal.close,
-            )
-            await self._journal._run_transition(self._journal.open, state, create=False)
+            if self._failure_task is not None:
+                await self._cancel_control_tasks()
+                # This admitted restoration owns a new failure scope. Old DAG
+                # finalizers have finished before the journal is replaced.
+                self._failure_task = None
+            state.phase = "restoring"
+            self._publish_resources()
+            # A live DAG still has service consumers of this journal. Restore
+            # closes it after stopping those consumers; an earlier failed run
+            # can instead need its journal reopened before restoration begins.
+            if self._task is None or self._task.done():
+                await self._journal._run_transition(self._journal.close)
+                await self._journal._run_transition(
+                    self._journal.open, state, create=False
+                )
             await self._snapshots.restore(
                 state, snapshot_id, suspend_resources=self._suspend_resources
             )
@@ -2925,10 +2976,9 @@ class ExperimentRunner:
             state: Runner state providing the selected template, cursor, and
                 participant ownership.
         """
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+        await self._cancel_control_tasks()
         self._error = None
+        self._failure_task = None
         self._stop_requested = False
         self._termination_confirmed = True
         self._pending_advance = state.pending_advance
@@ -2984,6 +3034,7 @@ class ExperimentRunner:
         self._continue_source = None
         self._last_attempt = self._last_response = None
         self._error = None
+        self._failure_task = None
         self._maintenance = True
         self._maintenance_task = asyncio.current_task()
         try:
@@ -3052,6 +3103,8 @@ class ExperimentRunner:
         """
         if self._closed or self._maintenance:
             raise RuntimeError("Runner is closed or already restoring an experiment.")
+        if self._failure_task is not None and not self._failure_task.done():
+            raise RuntimeError("Wait for failure cleanup before recovery.")
         if (
             self._state is not None
             and self._state.pending_rebuild is not None
@@ -3061,6 +3114,8 @@ class ExperimentRunner:
                 "Recover the selected experiment's pending rebuild before "
                 "switching to another experiment."
             )
+        if self._failure_task is not None:
+            await self._cancel_control_tasks()
         if self._task is not None and not self._task.done():
             if (
                 self._requested_id != experiment_id
@@ -3568,6 +3623,31 @@ class ExperimentRunner:
         return StartupDiagnostics(directory / "failure.jsonl", context), context
 
     async def _fail(self, error: Exception, context: JsonObject) -> None:
+        """Join the first failure's cleanup without a cancellation dependency cycle."""
+        if self._failure_task is None:
+            self._failure_task = asyncio.create_task(
+                self._complete_failure(error, context), name="runner-failure-cleanup"
+            )
+        await self._join_failure_cleanup(self._failure_task)
+
+    async def _join_failure_cleanup(self, failure: asyncio.Task[None]) -> None:
+        """Mark this caller quiescent until shared cleanup and cancellation settle."""
+        caller = asyncio.current_task()
+        self._failure_waiters.add(caller)
+        self._failure_waiters_changed.set()
+        try:
+            await asyncio.shield(failure)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await _await_outcome(failure)
+            except BaseException as cleanup_error:  # noqa: BLE001 - Reap shared cleanup while preserving caller cancellation.
+                cancellation.add_note(f"Failure cleanup also failed: {cleanup_error}")
+            raise
+        finally:
+            self._failure_waiters.discard(caller)
+            self._failure_waiters_changed.set()
+
+    async def _complete_failure(self, error: Exception, context: JsonObject) -> None:
         """Stop owned work, retain shutdown errors, and publish failed state or emergency diagnostics.
 
         Retains the primary failure, attempts both stage and service shutdown, and
@@ -3621,7 +3701,9 @@ class ExperimentRunner:
         )
         if self._step_future is not None:
             if not self._step_future.done():
-                self._step_future.set_exception(error)
+                # Audit already retained the full trace. The step consumer must
+                # not receive frames from the DAG still awaiting this cleanup.
+                self._step_future.set_exception(error.with_traceback(None))
             self._step_future = None
         if self._notify is not None:
             self._notify(self.get_state())
@@ -3963,16 +4045,7 @@ class ExperimentRunner:
         """
         self._closed = True
         self._publish_resources()
-        if (
-            self._maintenance_task is not None
-            and self._maintenance_task is not asyncio.current_task()
-            and not self._maintenance_task.done()
-        ):
-            self._maintenance_task.cancel()
-            await asyncio.gather(self._maintenance_task, return_exceptions=True)
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+        await self._cancel_control_tasks()
         await self._stages.close()
         await self._services.close()
         if self._step_future is not None:
@@ -4003,3 +4076,4 @@ class ExperimentRunner:
                         },
                     )
         await asyncio.to_thread(self._journal.close)
+        self._failure_task = None

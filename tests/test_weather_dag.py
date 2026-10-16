@@ -29,6 +29,7 @@ from tests.helpers.dag import REPOSITORY, process_running, terminate_owned, wait
 class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.w = ArchiveWorkspace()
+        self.addCleanup(self._assert_owned_launches_reaped)
         self.addAsyncCleanup(self.w.close)
         self.template = self.w.template()
         references = {}
@@ -91,6 +92,18 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         self.path = self.w.source / "template.yaml"
         self.code_before = inventory(self.w.source / "modules")
         self.runner = self.new_runner()
+
+    def _assert_owned_launches_reaped(self):
+        for runner in self.w.runners:
+            processes = [
+                *runner._services._processes.values(),
+                *(process for process, _ in runner._stages._executor_processes),
+            ]
+            for process in processes:
+                self.assertIsNotNone(
+                    process.returncode,
+                    f"Owned subprocess {process.pid} was not reaped.",
+                )
 
     def new_runner(self):
         runner = ExperimentRunner(

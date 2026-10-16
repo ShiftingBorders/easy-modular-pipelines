@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -218,6 +219,12 @@ class ExtendedContextTests(unittest.TestCase):
         self.assertEqual(
             validate_context(dict.fromkeys(BASE_CONTEXT)), dict.fromkeys(BASE_CONTEXT)
         )
+        context = {"module_name": "Привет 🌍", "process_id": 2**200}
+        copied = validate_context(context)
+        self.assertEqual(copied, context)
+        self.assertIsNot(copied, context)
+        context["module_name"] = "changed"
+        self.assertEqual(copied["module_name"], "Привет 🌍")
 
     def test_invalid_context_counters_and_identifiers(self):
         """B2/B8: no coercion of identifiers or positive integer counters."""
@@ -233,6 +240,48 @@ class ExtendedContextTests(unittest.TestCase):
                     self.assertRaises((ValueError, TypeError)),
                 ):
                     validate_context({field: value})
+
+        class ContextMapping(dict):
+            pass
+
+        class TextValue(str):
+            pass
+
+        class CounterValue(int):
+            pass
+
+        cycle = []
+        cycle.append(cycle)
+        for label, context, error in (
+            ("mapping subclass", ContextMapping(run_id="run"), TypeError),
+            ("key subclass", {TextValue("run_id"): "run"}, TypeError),
+            ("text subclass", {"run_id": TextValue("run")}, TypeError),
+            ("counter subclass", {"process_id": CounterValue(1)}, TypeError),
+            ("non-string key", {1: "run"}, TypeError),
+            ("surrogate value", {"run_id": "\ud800"}, ValueError),
+            ("surrogate key", {"\ud800": None}, ValueError),
+            ("nonfinite counter", {"process_id": float("inf")}, ValueError),
+            ("cyclic value", {"run_id": cycle}, ValueError),
+        ):
+            with self.subTest(label=label), self.assertRaises(error):
+                validate_context(context)
+        self._assert_context_integer_digit_limit()
+
+    def _assert_context_integer_digit_limit(self):
+        original_limit = sys.get_int_max_str_digits()
+        minimum_limit = sys.int_info.str_digits_check_threshold
+        over_limit = 10**minimum_limit
+        try:
+            sys.set_int_max_str_digits(minimum_limit)
+            context = {"process_id": over_limit // 10}
+            self.assertEqual(validate_context(context), context)
+            with self.assertRaises(ValueError):
+                validate_context({"process_id": over_limit})
+            sys.set_int_max_str_digits(0)
+            context = {"process_id": over_limit}
+            self.assertEqual(validate_context(context), context)
+        finally:
+            sys.set_int_max_str_digits(original_limit)
 
     def test_checkpoint_shape_and_uuid_validation(self):
         """D1: checkpoint counters and ownership cannot be confused."""

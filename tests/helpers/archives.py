@@ -394,6 +394,14 @@ class ArchiveWorkspace:
                     await wait_until(
                         lambda pid=data[key]["pid"]: not process_running(pid)
                     )
+        # A detached runner can retain a Popen whose child was stopped through
+        # another owner. Reap those handles after native termination is complete.
+        for runner in self.runners:
+            for owner in (runner._stages, runner._services):
+                try:
+                    await owner.close()
+                except Exception as error:  # noqa: BLE001 - Reap every fixture owner before reporting cleanup failure.
+                    failure = failure or error
         for hashes, storage in self.clients:
             storage.close()
             hashes.close_connection()

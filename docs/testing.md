@@ -180,14 +180,30 @@ The Heilbronn regression is self-contained: compressed extracted events and
 fixed reference results live in `tests/dashboard_tests/fixtures/heilbronn`.
 No original experiment directory or network access is needed to run it.
 
-Browser checks use a 500-event history and require each sampled ready-page
-navigation, including the first opening of a stopped uncached history, to
-finish within 200 ms; loading placeholders do not count. Run
-latency checks without unrelated host benchmarks. Resource tests include the
+Browser checks use a 500-event history and require each sampled warm-page
+navigation to finish within 200 ms. The first opening of a stopped uncached
+history is measured for diagnostics without a latency assertion.
+Each interval starts before navigation and ends after
+the matching successful DOM update and two animation frames; loading and
+error pages do not count as ready. A mutation observer detects readiness
+without polling. The test samples eight warm pages five times each and one
+cold opening. The normal periodic refresh stays active during measurement;
+the forced refresh that checks row preservation starts after the cold sample.
+
+Run latency checks without unrelated host benchmarks. Separate profiling runs
+add overhead and should not be used as latency baselines. Raw and performance
+reports are saved before assertions in a unique
+`.artifacts/logs/dashboard-browser-<run-id>/` directory, with latest copies at
+`dashboard-browser-results-<platform>.json` and
+`dashboard-browser-performance-<platform>.json` in the logs directory.
+Reports include navigation, DOM and frame timestamps, full HTTP resource
+timings, refresh markers, environment details, and memory usage.
+
+Resource tests include the
 dashboard process and its cache subprocesses: 2,000,000,000 bytes with zero or
 one caching experiment, 4,000,000,000 bytes with multiple concurrent builds.
-Reports are written under `.artifacts/logs/`. A delay beyond 300 ms is allowed
-only while a large, previously uncached experiment is actively being built,
+A delay beyond 300 ms is allowed only while a large, previously uncached
+experiment is actively being built,
 with the initial-build notice visible in dashboard.
 
 The live external ICMP scenario is opt-in. In PowerShell:

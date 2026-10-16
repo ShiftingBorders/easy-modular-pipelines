@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
 import sqlite3
+import stat
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -110,6 +112,19 @@ def _controlled_writer(
                             patch.object(
                                 writer._reader, "_validate_snapshot_source", validate
                             )
+                        )
+                        result = None
+                    elif action == "snapshot_directory_sync":
+                        original_fsync = os.fsync
+
+                        def sync_directory(descriptor, original=original_fsync):
+                            result = original(descriptor)
+                            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                                observe(True)
+                            return result
+
+                        patches.enter_context(
+                            patch.object(os, "fsync", sync_directory)
                         )
                         result = None
                     elif action == "backup_progress":

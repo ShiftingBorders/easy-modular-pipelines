@@ -139,8 +139,29 @@ def _validated_checkpoint(value: object, key: str) -> JournalCheckpoint | None:
     return JournalCheckpoint.model_validate(value, context={"key": key})
 
 
+def _copy_context_values(value: object) -> JsonObject:
+    """Detach flat scalar input while retaining the JSON copier's rejection rules."""
+    flat = type(value) is dict and all(
+        type(name) is str and (item is None or type(item) in (str, int))
+        for name, item in value.items()
+    )
+    if not flat:
+        return copy_json_object(value, "operation_context")
+    try:
+        for name, item in value.items():
+            name.encode("utf-8")
+            if type(item) is str:
+                item.encode("utf-8")
+            elif type(item) is int:
+                # JSON serialization also enforces Python's decimal digit limit.
+                str(item)
+    except UnicodeEncodeError as error:
+        raise ValueError("operation_context contains invalid Unicode.") from error
+    return dict(value)
+
+
 def validate_context(value: object) -> JsonObject:
-    context = copy_json_object(value, "operation_context")
+    context = _copy_context_values(value)
     text_fields = CONTEXT_TEXT_FIELDS
     integer_fields = {"attempt_number", "process_id", "cycle_number", "stage_position"}
     unknown = context.keys() - text_fields - integer_fields

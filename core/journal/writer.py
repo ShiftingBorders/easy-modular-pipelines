@@ -239,6 +239,18 @@ class JournalWriter:
         if self.control is not None:
             self.control.close()
             self.control = None
+        if os.name == "posix":
+            from multiprocessing import resource_tracker
+
+            # This writer owns no tracked shared memory or semaphores. Retaining
+            # the inherited pipe would make an ancestor wait for its tracker
+            # until this independent writer expires. CPython 3.12's _stop()
+            # returns without closing inherited descriptors when _pid is None.
+            tracker = resource_tracker._resource_tracker
+            with tracker._lock:
+                if tracker._pid is None and tracker._fd is not None:
+                    os.close(tracker._fd)
+                    tracker._fd = None
         self.managed = False
         self._last_request = time.monotonic()
         self._publish_endpoint()

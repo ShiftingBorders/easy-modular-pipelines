@@ -2,11 +2,11 @@
 
 import asyncio
 import os
+import sqlite3
 import subprocess
 import unittest
 from uuid import UUID, uuid5
 
-from core.journal.logger import OperationLogger
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import REPOSITORY, process_running
 from tests.helpers.snapshots import SnapshotWorkspace
@@ -175,18 +175,20 @@ class SnapshotTransactionTests(unittest.IsolatedAsyncioTestCase):
         root = runner._state.experiment_directory
         sentinel = root / "shared_data/sentinel"
         sentinel.write_bytes(b"keep")
-        reader = OperationLogger(runner._journal.reader_config_path)
-        reader.open()
+        database = root / "journals/events.sqlite"
+        reader = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
         try:
+            # Live OperationLogger reads use IPC and do not retain this OS handle.
+            reader.execute("SELECT COUNT(*) FROM events").fetchone()
             with self.assertRaises(PermissionError):
-                await runner.rollback(snapshot["snapshot_id"])
+                await asyncio.wait_for(runner.rollback(snapshot["snapshot_id"]), 30)
             self.assertEqual(sentinel.read_bytes(), b"keep")
         finally:
             reader.close()
         experiment_id = runner._state.experiment_id
         await runner.close()
         recovered = w.replacement()
-        await recovered.recover(experiment_id)
+        await asyncio.wait_for(recovered.recover(experiment_id), 30)
         self.assertEqual(recovered.get_state()["phase"], "waiting")
         self.assertFalse(sentinel.exists())
 

@@ -4,6 +4,7 @@ import asyncio
 import copy
 import os
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,60 @@ from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
 
 
 class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rollback_drains_service_monitor_before_closing_its_journal(self):
+        work = self._workspace()
+        runner = await work.launch()
+        snapshot = await runner.snapshot()
+        manager = runner._services
+        loop = asyncio.get_running_loop()
+        monitor_entered = asyncio.Event()
+        journal_closed = asyncio.Event()
+        monitor_cancelled = asyncio.Event()
+        release_close = threading.Event()
+        poll_result = manager._poll_result
+        close_journal = runner._journal.close
+        armed = True
+
+        async def held_result_read(state, service_id):
+            nonlocal armed
+            if armed:
+                armed = False
+                monitor_entered.set()
+                try:
+                    await journal_closed.wait()
+                    await asyncio.to_thread(runner._journal.client.get_journal_info)
+                except asyncio.CancelledError:
+                    monitor_cancelled.set()
+                    raise
+                finally:
+                    release_close.set()
+            await poll_result(state, service_id)
+
+        def observed_close():
+            close_journal()
+            loop.call_soon_threadsafe(journal_closed.set)
+            if not release_close.wait(10):
+                raise AssertionError("Service monitor did not leave its journal read.")
+
+        with (
+            patch.object(manager, "_poll_result", new=held_result_read),
+            patch.object(runner._journal, "close", new=observed_close),
+        ):
+            try:
+                manager._changed.set()
+                await asyncio.wait_for(monitor_entered.wait(), 10)
+                result = await asyncio.wait_for(
+                    runner.rollback(snapshot["snapshot_id"]), 60
+                )
+                await asyncio.wait_for(runner._ready.wait(), 15)
+                self.assertEqual(result["snapshot_id"], snapshot["snapshot_id"])
+                self.assertTrue(monitor_cancelled.is_set())
+                self.assertEqual(runner.get_state()["phase"], "waiting")
+                self.assertEqual(await work.value(), 0)
+            finally:
+                journal_closed.set()
+                release_close.set()
+
     async def test_snapshot_after_adds_only_marked_epoch_boundaries(self):
         for mode, first_count, second_count in (
             ("off", 0, 0), ("after_stage", 1, 2), ("after_epoch", 1, 1),

@@ -16,6 +16,7 @@ from tests.helpers.dag import (
     terminate_owned,
     wait_until,
 )
+from tests.helpers.logging_process import read_database
 from tests.helpers.resources import (
     DEFAULT_CONFIG,
     controlled_collector,
@@ -101,9 +102,26 @@ class ResourceControllerTests(unittest.IsolatedAsyncioTestCase):
             page = await self.session.send("stats.resources.history", {"limit": 2})
             self.assertEqual(page["result"], "success")
             self.assertLessEqual(len(page["data"]["samples"]), 2)
+            old_database = (
+                runner._state.experiment_directory / "journals" / "events.sqlite"
+            )
             old_reader = OperationLogger(runner._journal.reader_config_path)
             old_reader.open()
             self.addCleanup(old_reader.close)
+            restarted_collector = collector.get_status()["collector_id"]
+            # RAM observations include samples whose optional journal write was
+            # skipped. Keep the stage alive until this worker commits its sample.
+            await wait_until(
+                lambda: any(
+                    item["context"].get("attempt_id") == attempt
+                    and "process_cpu_percent" in item["data"]["resources"]
+                    and item["data"]["resources"]["process_cpu_percent"]["attributes"][
+                        "collector_id"
+                    ]
+                    == restarted_collector
+                    for item in events(old_reader, "resources.recorded")
+                )
+            )
             gate.touch()
             await wait_until(lambda: runner.get_state()["phase"] == "completed")
             self.assertTrue((directory / "output.json").is_file())
@@ -148,7 +166,14 @@ class ResourceControllerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(
                 lambda: events(runner._journal.client, "resources.recorded")
             )
-            self.assertEqual(len(events(old_reader, "resources.recorded")), count)
+            # The old managed writer has stopped; inspect its committed database
+            # without reopening a writable client and starting another writer.
+            old_records = [
+                item
+                for item in read_database(old_database)
+                if item["event_type"] == "resources.recorded"
+            ]
+            self.assertEqual(len(old_records), count)
             for item in events(runner._journal.client, "resources.recorded"):
                 self.assertEqual(
                     item["context"]["experiment_id"], second["experiment_id"]

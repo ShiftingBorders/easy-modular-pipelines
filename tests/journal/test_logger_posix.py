@@ -1,14 +1,13 @@
 """Approved POSIX-only A7/E3/F3 cases; never launch Linux or WSL from Windows."""
 
 import os
-import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from core.journal.events import LoggingStateError, LoggingStorageError
 from core.journal.logger import OperationLogger
+from tests.helpers.journal_owner import WriterOwner
 from tests.helpers.logging_fixtures import write_context_settings
 from tests.helpers.logging_process import (
     SCRATCH_ROOT,
@@ -31,11 +30,11 @@ class PosixJournalTests(unittest.TestCase):
         self.config = write_context_settings(self.folder)
         self.path = self.folder / "events.db"
         self.logger = OperationLogger(self.config)
-        self.addCleanup(self.logger.close)
-        self.logger.open()
 
     def test_forked_clients_are_rejected_and_child_owns_a_new_connection(self):
         """A7: inherited clients fail before using locks; an explicit child client works."""
+        self.addCleanup(self.logger.close)
+        self.logger.open()
         self.logger.close()
         existing_settings(self.config)
         child_config = write_context_settings(self.folder / "child")
@@ -56,6 +55,8 @@ class PosixJournalTests(unittest.TestCase):
 
     def test_unlinked_open_database_is_detected_without_recreation(self):
         """E3: the old descriptor cannot hide removal of the journal pathname."""
+        self.addCleanup(self.logger.close)
+        self.logger.open()
         self.logger.record_event("prefix")
         self.path.unlink()
         with self.assertRaises(LoggingStorageError):
@@ -71,15 +72,13 @@ class PosixJournalTests(unittest.TestCase):
 
     def test_snapshot_publication_syncs_the_destination_directory(self):
         """F3: POSIX publication includes the containing directory's durability step."""
+        owner = WriterOwner(self.config).open()
+        self.addCleanup(owner.close)
+        self.addCleanup(self.logger.close)
+        self.logger.open()
         self.logger.record_event("prefix")
-        original = os.fsync
         synced = []
-
-        def observe(descriptor):
-            synced.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
-            return original(descriptor)
-
-        with patch("os.fsync", side_effect=observe):
+        with owner.observe("snapshot_directory_sync", synced.append):
             manifest = self.logger.export_snapshot(
                 self.folder / "snapshot", min_free_bytes=0
             )

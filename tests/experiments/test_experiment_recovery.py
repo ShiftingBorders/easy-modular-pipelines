@@ -35,6 +35,7 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             original_attempt = runner._state.active_attempt
+            await wait_for((original_attempt.artifacts_directory / "ready.json").is_file)
             request_id = original_attempt.request_id
             experiment_id = runner._state.experiment_id
             await runner.close()
@@ -148,6 +149,7 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         attempt = runner._state.active_attempt
+        await wait_for((attempt.artifacts_directory / "ready.json").is_file)
         record = read_json(attempt.artifacts_directory / "process.json")
         experiment_id = runner._state.experiment_id
         await runner.close()
@@ -259,7 +261,9 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(runner._state.mode, "paused")
         gate.touch()
-        await wait_for(lambda runner=runner: runner._state.active_attempt is None, 30)
+        await wait_for(
+            lambda: runner._state.active_attempt is None and runner._idle.is_set(), 30
+        )
         self.assertEqual(runner._state.last_result["trail"], ["A"])
         self.assertEqual(
             runner._state.stage_attempt_numbers[w.stages[0]["stage_id"]], 1
@@ -330,7 +334,16 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
             runner._state.active_attempt.process_identity.model_dump(), record["stage"]
         )
         gate.touch()
-        await wait_for(lambda: runner._state.active_attempt is None, 30)
+        try:
+            await wait_for(lambda: runner._state.active_attempt is None, 30)
+        except TimeoutError as error:
+            try:
+                error.add_note(f"Runner state: {runner.get_state()!r}")
+                trace = root / "shared_data/trace.jsonl"
+                error.add_note(f"Stage trace: {trace.read_text(encoding='utf-8')}")
+            except Exception as diagnostic_error:  # noqa: BLE001 - Preserve timeout.
+                error.add_note(f"Could not read recovery diagnostics: {diagnostic_error!r}")
+            raise
         self.assertEqual(runner._state.last_result["trail"], ["A"])
         self.assertEqual(
             runner._state.stage_attempt_numbers[w.stages[0]["stage_id"]], 1
@@ -359,6 +372,14 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         active_id = instance.active_request.request_id
         queued_id = instance.pending_requests[0].request_id
         sent_at = instance.active_request.sent_monotonic
+        # Active ownership is saved before transmission. Detach only after the
+        # real service has entered the held request this recovery must preserve.
+        await wait_for(
+            lambda: any(
+                row["event"] == "work_started" and row["request_id"] == active_id
+                for row in w.files.trace(w.socket)
+            )
+        )
         experiment_id = runner._state.experiment_id
         await runner.close()
         await asyncio.gather(request, queued, return_exceptions=True)
@@ -370,10 +391,18 @@ class ExperimentRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered.active_request.sent_monotonic, sent_at)
         self.assertEqual(recovered.pending_requests[0].request_id, queued_id)
         gate.touch()
-        await wait_for(
-            lambda: recovered.active_request is None and not recovered.pending_requests,
-            30,
-        )
+        try:
+            await wait_for(
+                lambda: recovered.active_request is None and not recovered.pending_requests,
+                30,
+            )
+        except TimeoutError as error:
+            try:
+                error.add_note(f"Runner state: {runner.get_state()!r}")
+                error.add_note(f"Service trace: {w.files.trace(w.socket)!r}")
+            except Exception as diagnostic_error:  # noqa: BLE001 - Preserve timeout.
+                error.add_note(f"Could not read recovery diagnostics: {diagnostic_error!r}")
+            raise
         starts = [
             row["request_id"]
             for row in w.files.trace(w.socket)

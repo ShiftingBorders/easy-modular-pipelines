@@ -174,19 +174,32 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(w.trace(definition), [])
 
     async def test_locked_mandatory_journal_prevents_spawn(self):
-        """A/D: a real conflicting SQLite transaction blocks mandatory intent, not just its acknowledgement."""
+        """A/D: a locked mandatory write prevents spawn and may be explicitly aborted."""
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service()
+            w.publish_service_definitions()
+            await wait_for(lambda: not w.journal._supervisor.get_status()["busy"])
             locked = sqlite3.connect(w.experiment / "journals/events.sqlite")
             locked.execute("BEGIN IMMEDIATE")
+            starting = asyncio.create_task(w.manager.start_all(w.state))
             try:
+                await wait_for(lambda: w.journal._supervisor.get_status()["busy"])
+                self.assertFalse(starting.done())
+                self.assertEqual(w.trace(definition), [])
+                self.assertEqual(w.manager._processes, {})
+                # Managed mandatory writes wait for recovery. Abort the caller
+                # explicitly, as emergency shutdown does, before joining cleanup.
+                w.journal.client._interrupt_waiting()
                 with self.assertRaises(LoggingError):
-                    w.publish_service_definitions()
-                    await w.manager.start_all(w.state)
+                    await asyncio.wait_for(asyncio.shield(starting), 15)
             finally:
+                w.journal.client._interrupt_waiting()
                 locked.rollback()
                 locked.close()
+                await asyncio.wait_for(
+                    asyncio.gather(starting, return_exceptions=True), 15
+                )
             self.assertEqual(w.trace(definition), [])
             self.assertEqual(w.manager._processes, {})
             self.assertTrue(
@@ -210,20 +223,33 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(w.trace(invalid), [])
 
     async def test_logger_failure_during_stop_still_attempts_all_owned_services(self):
-        """D: real SQLite contention cannot prevent shutdown and emergency diagnostics."""
+        """D: aborting blocked journal delivery still stops every owned service."""
         async with asyncio.timeout(120):
             w = self.w
             w.service()
             w.service()
             w.publish_service_definitions()
             await w.manager.start_all(w.state)
+            await wait_for(lambda: not w.journal._supervisor.get_status()["busy"])
             locked = sqlite3.connect(w.experiment / "journals/events.sqlite")
             locked.execute("BEGIN IMMEDIATE")
+            stopping = asyncio.create_task(w.manager.stop_all(w.state))
             try:
-                results = await w.manager.stop_all(w.state)
+                await wait_for(lambda: w.journal._supervisor.get_status()["busy"])
+                self.assertFalse(stopping.done())
+                w.journal.client._interrupt_waiting()
+                await wait_for(
+                    lambda: any(
+                        (w.experiment / "runner").glob("service-stop-*.emergency.json")
+                    )
+                )
             finally:
+                # Participant clients can finish their own shutdown records once
+                # the failed runner client has entered emergency cleanup.
+                w.journal.client._interrupt_waiting()
                 locked.rollback()
                 locked.close()
+                results = await asyncio.wait_for(asyncio.shield(stopping), 45)
             for sid, result in results.items():
                 self.assertTrue(result["stopped"], result)
                 self.assertTrue(result["error"])

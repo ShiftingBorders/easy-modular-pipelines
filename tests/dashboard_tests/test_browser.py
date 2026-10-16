@@ -6,8 +6,10 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -48,11 +50,82 @@ BROWSER = (
 )
 
 
+def _write_browser_reports(directory, result, event_loop, worker_pids):
+    """Retain raw and performance evidence before any functional or timing assertion."""
+    directory.mkdir(parents=True, exist_ok=True)
+    logs = directory.parent
+    for path in (
+        directory / "results.json",
+        logs / f"dashboard-browser-results-{os.name}.json",
+    ):
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    memory = psutil.Process().memory_info().rss + sum(
+        psutil.Process(pid).memory_info().rss for pid in worker_pids
+    )
+    report = {
+        "run_id": directory.name,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "platform": os.name,
+        "python": sys.version,
+        "events": result.get("historyEvents"),
+        "event_loop": event_loop,
+        "page_timings_ms": result.get("pageTimings"),
+        "cold_open_ms": result.get("coldOpenMs"),
+        "http_timings_ms": result.get("httpTimings"),
+        "navigation_timings": result.get("navigationTimings"),
+        "http_requests": result.get("httpRequests"),
+        "refresh_markers": result.get("refreshMarkers"),
+        "cold_refresh": result.get("coldRefresh"),
+        "environment": result.get("measurementEnvironment"),
+        "dashboard_tree_rss_bytes": memory,
+    }
+    for path in (
+        directory / "performance.json",
+        logs / f"dashboard-browser-performance-{os.name}.json",
+    ):
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return memory
+
+
 @unittest.skipUnless(
     BROWSER.is_file() and shutil.which("node"),
     "Chromium-compatible browser and Node with built-in WebSocket required",
 )
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
+    def _assert_navigation_timings(self, result):
+        pages = (
+            "overview",
+            "experiments",
+            "modules",
+            "errors",
+            "artifacts",
+            "events",
+            "resources",
+            "settings",
+        )
+        self.assertEqual(set(result["pageTimings"]), set(pages))
+        details = result["navigationTimings"]
+        self.assertEqual(len(details), 41)
+        cold = [row for row in details if row["temperature"] == "cold"]
+        self.assertEqual(len(cold), 1)
+        self.assertEqual(cold[0]["experiment"], "cold-test")
+        self.assertEqual(result["coldOpenMs"], cold[0]["durationMs"])
+        self.assertGreaterEqual(
+            result["coldRefresh"]["triggeredAt"], cold[0]["endedAt"]
+        )
+        for page in pages:
+            with self.subTest(page=page):
+                timings = result["pageTimings"][page]
+                samples = [
+                    row
+                    for row in details
+                    if row["temperature"] == "warm" and row["page"] == page
+                ]
+                self.assertEqual(len(timings), 5)
+                self.assertEqual([row["sample"] for row in samples], list(range(5)))
+                self.assertEqual(timings, [row["durationMs"] for row in samples])
+                self.assertLessEqual(max(timings), 200, f"{page}: {timings}")
+
     async def test_all_screens_filters_bookmarks_forecast_alerts_and_keyboard(self):
         """T079/T080/T081/T082/T083/T084/T085/T086/T087/T091: real DOM and 500-event latency."""
         tmp = temporary_directory()
@@ -147,6 +220,9 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             last_port_error = None
             port_attempts = 0
             stdout = stderr = b""
+            report_directory = (
+                PROJECT_ROOT / ".artifacts/logs" / f"dashboard-browser-{uuid4()}"
+            )
             try:
                 async with asyncio.timeout(15):
                     while not server.started:
@@ -223,13 +299,15 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.wait_for(node.wait(), 10)
                 self.assertEqual(node.returncode, 0, stderr.decode(errors="replace"))
                 result = json.loads(stdout)
-                raw_report = (
-                    PROJECT_ROOT
-                    / ".artifacts/logs"
-                    / f"dashboard-browser-results-{os.name}.json"
+                memory = _write_browser_reports(
+                    report_directory,
+                    result,
+                    server.config.get_loop_factory().__name__,
+                    [
+                        process.pid
+                        for process in app.state.views._cache_pool._processes.values()
+                    ],
                 )
-                raw_report.parent.mkdir(parents=True, exist_ok=True)
-                raw_report.write_text(json.dumps(result, indent=2), encoding="utf-8")
                 self.assertEqual(result["runtimeErrors"], [])
                 self.assertTrue(
                     all(
@@ -272,37 +350,8 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["coldHistoryEvents"], 500)
                 self.assertTrue(result["coldRefreshPending"])
                 self.assertEqual(result["coldRowsWhileRefreshing"], 200)
-                self.assertLessEqual(result["coldOpenMs"], 200)
-                for page, timings in result["pageTimings"].items():
-                    with self.subTest(page=page):
-                        self.assertLessEqual(max(timings), 200, f"{page}: {timings}")
-                memory = psutil.Process().memory_info().rss
-                memory += sum(
-                    psutil.Process(process.pid).memory_info().rss
-                    for process in app.state.views._cache_pool._processes.values()
-                )
+                self._assert_navigation_timings(result)
                 self.assertLessEqual(memory, 2_000_000_000)
-                report_path = (
-                    PROJECT_ROOT
-                    / ".artifacts/logs"
-                    / f"dashboard-browser-performance-{os.name}.json"
-                )
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(
-                    json.dumps(
-                        {
-                            "platform": os.name,
-                            "events": 500,
-                            "event_loop": server.config.get_loop_factory().__name__,
-                            "page_timings_ms": result["pageTimings"],
-                            "cold_open_ms": result["coldOpenMs"],
-                            "http_timings_ms": result["httpTimings"],
-                            "dashboard_tree_rss_bytes": memory,
-                        },
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
             except Exception as failure:
                 destination = (
                     PROJECT_ROOT / ".artifacts/ci-failures" / f"browser-{uuid4()}.json"
@@ -317,6 +366,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                     else browser.returncode,
                     "port_attempts": port_attempts,
                     "last_port_error": last_port_error,
+                    "report_directory": str(report_directory),
                     "port_text": port_text[:1024],
                     "node_stdout": stdout[-65536:].decode("utf-8", errors="replace"),
                     "node_stderr": stderr[-65536:].decode("utf-8", errors="replace"),

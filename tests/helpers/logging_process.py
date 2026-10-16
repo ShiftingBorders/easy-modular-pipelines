@@ -99,6 +99,9 @@ def stop_journal_writers(root: Path) -> None:
     """Reap only standalone writers whose DB, runtime and command belong to a fixture."""
     import psutil
 
+    from core.journal.settings import _load_logging_settings
+    from core.journal.supervisor import owner_active, stop_standalone
+    from core.models.journal_writer import WriterEndpoint
     from core.primitives.json_files import read_json
     from tests.helpers.dag import terminate_owned
 
@@ -125,6 +128,21 @@ def stop_journal_writers(root: Path) -> None:
             process = psutil.Process(identity["pid"])
             arguments = process.cmdline()
             if "core.journal.writer" not in arguments or "--runtime" not in arguments:
+                # A managed writer keeps its spawn command after its owner dies.
+                # Its published standalone endpoint and worker configuration
+                # identify the fixture journal without stopping a live owner.
+                worker_config = runtime / "worker.json"
+                if (
+                    "--multiprocessing-fork" not in arguments
+                    or not worker_config.is_file()
+                    or endpoint["managed"]
+                    or owner_active(runtime)
+                ):
+                    continue
+                configuration, _context = _load_logging_settings(worker_config)
+                if configuration.db_path.resolve() != Path(endpoint["db_path"]).resolve():
+                    raise ValueError("Detached writer has a different journal database.")
+                stop_standalone(WriterEndpoint.model_validate(endpoint))
                 continue
             if Path(arguments[arguments.index("--runtime") + 1]).resolve() != runtime:
                 continue

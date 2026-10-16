@@ -3,8 +3,13 @@
 import asyncio
 import multiprocessing
 import os
+import threading
+from pathlib import Path
 from unittest.mock import patch
 
+from core.experiments.runner import ExperimentRunner
+from core.journal.logger import OperationLogger
+from core.journal.supervisor import JournalSupervisor
 from core.primitives.json_files import read_json
 from core.server.runtime import ServerRuntime
 from core.server.settings import load_server_settings
@@ -13,6 +18,60 @@ from tests.helpers.http_runtime import HTTPServer, ServerTestCase
 
 
 class ServerLifecycleTests(ServerTestCase):
+    async def test_ready_runner_can_resume_before_next_journal_watch(self):
+        writer_release = threading.Event()
+        watcher_release = asyncio.Event()
+        startup_observed = asyncio.Event()
+        watcher_task = None
+        watch = ExperimentRunner._watch_journal
+        spawn = JournalSupervisor._spawn
+        sleep = asyncio.sleep
+
+        async def observe_journal(runner):
+            nonlocal watcher_task
+            watcher_task = asyncio.current_task()
+            await watch(runner)
+
+        async def hold_next_watch(delay, result=None):
+            # Only the runner watcher is delayed; journal I/O and preparation
+            # continue on their real tasks and threads.
+            if (
+                asyncio.current_task() is watcher_task
+                and self.w.runner._journal_pause_reason == "journal_starting"
+            ):
+                startup_observed.set()
+                writer_release.set()
+                await watcher_release.wait()
+            return await sleep(delay, result)
+
+        def start_after_observation(supervisor):
+            if (
+                supervisor.directory.is_relative_to(self.w.source)
+                and not writer_release.wait(15)
+            ):
+                raise TimeoutError("Runner did not observe journal startup.")
+            return spawn(supervisor)
+
+        async with asyncio.timeout(45):
+            with (
+                patch.object(ExperimentRunner, "_watch_journal", new=observe_journal),
+                patch.object(JournalSupervisor, "_spawn", new=start_after_observation),
+                patch("core.experiments.runner.asyncio.sleep", new=hold_next_watch),
+            ):
+                try:
+                    await self.w.prepare(stopped=False)
+                    runner = self.w.runner
+                    self.assertTrue(startup_observed.is_set())
+                    self.assertEqual(
+                        runner._journal._supervisor.get_status()["state"], "ready"
+                    )
+                    self.assertEqual(runner.get_state()["phase"], "waiting")
+                    await runner.resume()
+                    self.assertEqual(runner.get_state()["mode"], "running")
+                finally:
+                    writer_release.set()
+                    watcher_release.set()
+
     async def test_listener_and_token_errors_precede_controller_start(self):
         for settings, env, expected in (
             ({"host": "0.0.0.0"}, {}, "non-loopback"),
@@ -146,6 +205,11 @@ class ServerLifecycleTests(ServerTestCase):
 
     async def test_blocked_response_reader_does_not_hold_watchdog_or_http_exit(self):
         server = await self.start_server(fault_mode="controlled")
+        reader_config = next(
+            (server.project / "controller/server").glob("*/reader.json")
+        )
+        endpoint = Path(read_json(reader_config)["logging"]["writer_endpoint_path"])
+        writer_identity = read_json(endpoint)["process"]
         receipt = await server.submit("fixture.wait")
         await wait_until((server.control / "command.entered").exists)
         (server.control / "block-response").touch()
@@ -158,6 +222,14 @@ class ServerLifecycleTests(ServerTestCase):
         self.assertIn(
             "corrupted IPC reader", (server.control / "server.log").read_text()
         )
+        self.assertTrue(process_running(writer_identity["pid"]))
+        with OperationLogger(reader_config, read_only=True) as reader:
+            events = reader.read_events(limit=100)["events"]
+        self.assertIn(
+            "server.controller_started",
+            [item["event"]["event_type"] for item in events],
+        )
+        self.assertEqual(read_json(endpoint)["process"], writer_identity)
 
     async def test_blocked_request_reader_does_not_hold_orphan_shutdown(self):
         server = await self.start_server(fault_mode="controlled")
@@ -205,8 +277,7 @@ class ServerLifecycleTests(ServerTestCase):
             (await server.get("/commands/" + receipt["command_id"]))["state"], "pending"
         )
         (server.control / "snapshot.release").touch()
-        self.assertEqual(
-            (await server.result(receipt["command_id"]))["state"], "succeeded"
-        )
+        result = await server.result(receipt["command_id"])
+        self.assertEqual(result["state"], "succeeded", result)
         state = await server.wait_state("completed")
         self.assertTrue(state["snapshot"]["valid"], state)

@@ -238,6 +238,13 @@ async def run_owner(options):
                     or runner._state.active_attempt.process_identity is None
                 ):
                     await asyncio.sleep(0.05)
+                if options.phase in ("stage_running", "stage_without_state"):
+                    ready = runner._state.active_attempt.artifacts_directory / "ready.json"
+                    while not ready.is_file():
+                        if step.done():
+                            await step
+                            raise RuntimeError("Stage completed before publishing readiness.")
+                        await asyncio.sleep(0.05)
                 halt("stage_running")
                 halt("stage_without_state")
                 if options.phase == "service_work":

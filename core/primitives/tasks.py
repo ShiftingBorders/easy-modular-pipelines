@@ -4,7 +4,7 @@ import asyncio
 from threading import Event
 
 
-async def _await_outcome[T](operation: asyncio.Task[T]) -> T:
+async def _await_outcome[T](operation: asyncio.Future[T]) -> T:
     """Wait for the actual outcome, even if the caller is cancelled."""
     while True:
         try:
@@ -14,7 +14,9 @@ async def _await_outcome[T](operation: asyncio.Task[T]) -> T:
                 raise
 
 
-async def _await_read_task[T](reading: asyncio.Task[T], cancelled: Event | None = None) -> T:
+async def _await_read_task[T](
+    reading: asyncio.Future[T], cancelled: Event | None = None
+) -> T:
     """Preserve caller cancellation after joining readers of replaceable files.
 
     An optional event lets cooperative workers stop scheduling or reading early.
