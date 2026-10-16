@@ -1,28 +1,25 @@
 """Approved B/C/J: StageClient with real executor, subprocess, TCP and journal."""
 
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from core.models.participant_protocol import ModuleProgress
 from core.participants.stage_client import StageClient
-from tests.helpers.dag import DagSession, DagWorkspace, wait_until
+from tests.helpers.dag import TEMP_ROOT, DagSession, DagWorkspace, wait_until
 
 
-class StageClientTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.w = DagWorkspace()
-        self.addCleanup(self.w.close)
-        self.session = DagSession(self.w)
-        await self.session.start()
-        self.addAsyncCleanup(self.session.close)
-        self.module = self.w.module(
-            source=Path(__file__).parents[1] / "helpers/stage_client_probe.py"
-        )
+class StageClientModelTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
 
     def test_constructor_has_no_io_and_unopened_calls_fail(self):
         with patch.object(Path, "open", side_effect=AssertionError("constructor I/O")):
-            client = StageClient(self.w.root / "missing.json")
+            client = StageClient(self.root / "missing.json")
         with self.assertRaises(RuntimeError):
             client.cancel_requested()
         with self.assertRaises(RuntimeError):
@@ -30,7 +27,7 @@ class StageClientTests(unittest.IsolatedAsyncioTestCase):
         client.close()
 
     async def test_progress_model_reaches_logger_before_public_json_request(self):
-        client = StageClient(self.w.root / "context.json")
+        client = StageClient(self.root / "context.json")
         client._logger = Mock()
         client._connection = Mock()
 
@@ -50,6 +47,18 @@ class StageClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(progress, ModuleProgress)
         await client._send(command, progress)
         client._connection.request.assert_awaited_once()
+
+
+class StageClientTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.w = DagWorkspace()
+        self.addCleanup(self.w.close)
+        self.session = DagSession(self.w)
+        await self.session.start()
+        self.addAsyncCleanup(self.session.close)
+        self.module = self.w.module(
+            source=Path(__file__).parents[1] / "helpers/stage_client_probe.py"
+        )
 
     async def test_progress_state_and_cooperative_cancellation(self):
         gate = self.w.gate()

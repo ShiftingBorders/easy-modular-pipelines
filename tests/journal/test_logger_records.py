@@ -380,6 +380,7 @@ class OperationLoggerRecordsTests(unittest.TestCase):
 
     def test_matching_responses_in_both_orders_share_an_event_and_keep_authors(self):
         service = self.service_client()
+        self.assertIsNone(self.logger.read_command_result("unknown"))
         clients = {"runner": self.logger, "participant": service}
         for first, second in (("runner", "participant"), ("participant", "runner")):
             with self.subTest(first=first):
@@ -388,6 +389,10 @@ class OperationLoggerRecordsTests(unittest.TestCase):
                 first_id = clients[first].record_command_result(
                     request, response, author=first, outcome="succeeded"
                 )
+                if first == "participant":
+                    provisional = self.logger.read_command_result(request)
+                    self.assertTrue(provisional["provisional"])
+                    self.assertEqual(provisional["author"], "participant")
                 before = read_database(self.db_path)
                 reordered = {"result": "success", "data": {"b": [None, False], "a": 1}}
                 second_id = clients[second].record_command_result(
@@ -418,16 +423,6 @@ class OperationLoggerRecordsTests(unittest.TestCase):
             [e["sequence_number"] for e in own_events],
             list(range(1, len(own_events) + 1)),
         )
-
-    def test_service_result_is_provisional_until_runner_confirmation(self):
-        service = self.service_client()
-        self.assertIsNone(self.logger.read_command_result("unknown"))
-        service.record_command_result(
-            "provisional", {}, author="participant", outcome="succeeded"
-        )
-        result = self.logger.read_command_result("provisional")
-        self.assertTrue(result["provisional"])
-        self.assertEqual(result["author"], "participant")
 
     def test_conflicting_responses_keep_runner_and_retain_ignored_service_payload(self):
         service = self.service_client()

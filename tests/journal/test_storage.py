@@ -42,8 +42,8 @@ class SQLiteEventStoreTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.store.open()
 
-    def test_schema_reopens_and_writer_uses_wal_full(self):
-        """STORE-01, STORE-02: verify durability settings on the writer itself."""
+    def test_wal_full_writer_commits_detached_events_before_close_and_reopens(self):
+        """STORE-01..03: commit visibility, detached input, identity and durable settings."""
         connection = self.store._connection
         self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 2)
@@ -52,10 +52,16 @@ class SQLiteEventStoreTests(unittest.TestCase):
             self.assertEqual(UUID(value).hex, value)
         self.assertNotEqual(identity["journal_id"], identity["generation"])
         self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
-        self.store.append(event_fixture())
+        event = event_fixture()
+        expected = event_fixture()
+        self.store.append(event)
+        self.assertEqual(read_database(self.db_path), [expected])
+        event["data"]["number"] = 99
+        self.assertEqual(read_database(self.db_path), [expected])
         self.store.close()
         self.store.open()
-        self.assertEqual(read_database(self.db_path), [event_fixture()])
+        self.assertEqual(read_database(self.db_path), [expected])
+        self.assertEqual(journal_identity(self.db_path), identity)
         self.assertEqual(
             self.store._connection.execute("PRAGMA synchronous").fetchone()[0], 2
         )
@@ -135,14 +141,6 @@ class SQLiteEventStoreTests(unittest.TestCase):
             store.open()
         self.assertIs(caught.exception.__cause__, primary)
         connection.close.assert_called_once()
-
-    def test_acknowledged_append_is_visible_to_independent_reader(self):
-        """STORE-03: commit is visible before the writer closes; input mutation is detached."""
-        event = event_fixture()
-        expected = event_fixture()
-        self.store.append(event)
-        event["data"]["number"] = 99
-        self.assertEqual(read_database(self.db_path), [expected])
 
     def test_duplicate_identities_never_add_a_second_record(self):
         """STORE-03: event ID and source/sequence collisions are rejected, not counted twice."""

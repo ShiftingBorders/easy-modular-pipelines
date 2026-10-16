@@ -35,6 +35,8 @@ from tests.helpers.dag import wait_until
 class ViewTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_records_and_receipts_survive_until_json_publication(self):
         receipt = await self.views.command({"command": "pause"})
+        self.assertEqual(receipt["state"], "pending")
+        self.assertTrue(self.views._commands[0].polling)
         record = self.views._commands[0]
         self.assertIsInstance(record, LocalCommandRecord)
         self.assertIsInstance(record.result, CommandReceipt)
@@ -43,6 +45,8 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         receipt["state"] = "external"
         self.assertEqual(record.model_dump(exclude_unset=True), original)
         emitted = await self.views.command_result(record.command_id)
+        self.assertEqual(emitted["result"], "success")
+        self.assertFalse(self.views._commands[0].polling)
         current = self.views._commands[0]
         self.assertIsInstance(current.result, CommandReceipt)
         self.assertEqual(current.status, "succeeded")
@@ -53,6 +57,12 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             (self.config["state_directory"] / "commands.json").read_text()
         )
         self.assertEqual(saved["items"][0], current.model_dump(exclude_unset=True))
+        with self.assertRaises(SystemAPIError) as duplicate:
+            await self.views.command(
+                {"command": "pause", "command_id": record.command_id}
+            )
+        self.assertEqual(duplicate.exception.status_code, 409)
+        self.api.submit.assert_awaited_once()
 
     async def test_live_observation_models_survive_transport_failure_and_output_mutation(
         self,
@@ -149,26 +159,47 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.views.settings = _update_model(self.views.settings, project_root=self.root)
         self.views._cache_pool = Mock()
         receipt = await self.views.command({"command": "pause"})
-        entered, release = asyncio.Event(), asyncio.Event()
+        entered, release, joined = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        shield = asyncio.shield
+        waiters = []
+
+        def observe_refresh(task):
+            if task in self.views._command_history_tasks.values():
+                waiters.append(asyncio.current_task())
+                if len(waiters) == 2:
+                    joined.set()
+            return shield(task)
 
         async def refresh(identifier):
             self.assertEqual(identifier, "exp")
             entered.set()
             await release.wait()
 
-        with patch.object(
-            self.views, "_refresh_command_history", side_effect=refresh
-        ) as update:
+        with (
+            patch.object(
+                self.views, "_refresh_command_history", side_effect=refresh
+            ) as update,
+            patch("dashboard.views.asyncio.shield", side_effect=observe_refresh),
+        ):
             first = asyncio.create_task(
                 self.views.command_result(receipt["command_id"])
             )
-            await entered.wait()
-            second = asyncio.create_task(
-                self.views.command_result(receipt["command_id"])
-            )
-            await asyncio.sleep(0)
-            release.set()
-            results = await asyncio.gather(first, second)
+            tasks = [first]
+            try:
+                await asyncio.wait_for(entered.wait(), 10)
+                second = asyncio.create_task(
+                    self.views.command_result(receipt["command_id"])
+                )
+                tasks.append(second)
+                await asyncio.wait_for(joined.wait(), 10)
+                self.assertEqual(waiters, [first, second])
+                release.set()
+                results = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         update.assert_awaited_once_with("exp")
         self.assertTrue(all(result["result"] == "success" for result in results))
         self.api.submit.assert_awaited_once()
@@ -290,8 +321,8 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.views._resource_at = 0
         pending = asyncio.create_task(self.views._refresh_resources())
         try:
-            await started.wait()
-            result = await asyncio.wait_for(self.views.compute({}), 0.5)
+            await asyncio.wait_for(started.wait(), 10)
+            result = await asyncio.wait_for(self.views.compute({}), 10)
             self.assertEqual(result["metrics"]["cpu"]["value"], 25)
             self.assertFalse(pending.done())
             self.views._resource_observed_at -= 4
@@ -347,20 +378,6 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.views._resource_at = 0
         await self.views._refresh_resources()
         self.assertTrue((await self.views.compute({}))["error"])
-
-    async def test_commands_persist_before_submission_and_pending_is_not_success(self):
-        receipt = await self.views.command({"command": "pause"})
-        self.assertEqual(receipt["state"], "pending")
-        self.assertTrue(self.views._commands[0].polling)
-        result = await self.views.command_result(receipt["command_id"])
-        self.assertEqual(result["result"], "success")
-        self.assertFalse(self.views._commands[0].polling)
-        with self.assertRaises(SystemAPIError) as duplicate:
-            await self.views.command(
-                {"command": "pause", "command_id": receipt["command_id"]}
-            )
-        self.assertEqual(duplicate.exception.status_code, 409)
-        self.api.submit.assert_awaited_once()
 
     async def test_failure_before_send_leaves_no_command_or_network_side_effect(self):
         with (

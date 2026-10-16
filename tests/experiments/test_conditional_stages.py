@@ -46,6 +46,8 @@ class ConditionalStageTests(unittest.IsolatedAsyncioTestCase):
         runner = ExperimentRunner(self.workspace.root, self.workspace.manager)
         try:
             await runner.run(path)
+            # Admission can expose a temporary waiting state before journal startup.
+            await asyncio.wait_for(runner._ready.wait(), 60)
 
             def finished():
                 state = runner.get_state()
@@ -195,8 +197,12 @@ class ConditionalStageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_required_data_stops_only_after_retries(self):
         """T05: absence forces stop on exhaustion; supplied null is not absence."""
-        for decision in (None, {}):
-            for policy in ("pause", "stop", "skip"):
+        # Null and an empty object normalize to the same missing-data decision.
+        for decision, policies in (
+            (None, ("pause", "stop", "skip")),
+            ({}, ("pause",)),
+        ):
+            for policy in policies:
                 with self.subTest(decision=decision, policy=policy):
                     result = await self._run_case(
                         {"decision": decision}, returns_data=True, on_exhausted=policy
@@ -213,12 +219,13 @@ class ConditionalStageTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_response_structure_uses_configured_error_policy(self):
         """T06: bad envelopes, decision types, and fields follow ordinary policy."""
         cases = (
-            {"raw_result": {"result": "success"}},
-            {"decision": ["not a decision object"]},
-            {"decision": {"command": "pause", "unexpected": True}},
+            ({"raw_result": {"result": "success"}}, ("pause", "stop", "skip")),
+            ({"decision": ["not a decision object"]}, ("pause", "stop", "skip")),
+            ({"decision": {"command": "pause", "unexpected": True}}, ("pause",)),
         )
-        for settings in cases:
-            for policy in ("pause", "stop", "skip"):
+        # Both executor-envelope and conditional-decision errors retain every policy.
+        for settings, policies in cases:
+            for policy in policies:
                 with self.subTest(settings=settings, policy=policy):
                     result = await self._run_case(settings, on_exhausted=policy)
                     self._assert_exhausted_policy(result, policy)

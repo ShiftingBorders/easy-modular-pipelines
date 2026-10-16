@@ -33,7 +33,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
             recorded.document(),
             self.views.journals.scheduling_states(self.views._registry)["running"],
         )
-        path = self.workspaces[0].directory / "runner/state.json"
+        path = self.root / "project/experiments/running/runner/state.json"
         path.write_text(
             json.dumps({"phase": "waiting", "template": {}}), encoding="utf-8"
         )
@@ -57,7 +57,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_progress_and_failures_remain_models_until_submission(self):
         await self.views.experiment("stopped", "summary", {})
-        identity = self.workspaces[2].identity
+        identity = self.stopped_workspace.identity
         target = {
             **identity,
             "schema_version": 2,
@@ -111,7 +111,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)
         self.root = Path(temporary.name)
-        self.workspaces = []
+        registry = {}
         for identifier, phase, mode in (
             ("running", "stage_running", "running"),
             ("paused", "waiting", "paused"),
@@ -121,13 +121,24 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
             ("idle", "idle", "paused"),
         ):
             data = history(((1, 2),))
-            data["state"].update(phase=phase, mode=mode)
-            workspace = JournalWorkspace(
-                self.root / "project", data, identifier=identifier, folder=identifier
-            )
-            self.workspaces.append(workspace)
-            self.addCleanup(workspace.close)
-            workspace.close()
+            data["state"].update(experiment_id=identifier, phase=phase, mode=mode)
+            registry[identifier] = identifier
+            if identifier == "stopped":
+                # Only the explicitly opened history exercises source reading.
+                self.stopped_workspace = JournalWorkspace(
+                    self.root / "project", data, identifier=identifier, folder=identifier
+                )
+                self.addCleanup(self.stopped_workspace.close)
+                self.stopped_workspace.close()
+            else:
+                directory = self.root / "project/experiments" / identifier / "runner"
+                directory.mkdir(parents=True)
+                (directory / "state.json").write_text(
+                    json.dumps(data["state"]), encoding="utf-8"
+                )
+        (self.root / "project/experiments.json").write_text(
+            json.dumps(registry), encoding="utf-8"
+        )
         self.settings = load_settings(
             write_settings(self.root, project_root=str(self.root / "project"))
         )
@@ -181,7 +192,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         """T024/T052: completion ends an explicit stopped build."""
         await self.views.experiment("stopped", "summary", {})
         future = self.views._cache_jobs["stopped"]
-        identity = self.workspaces[2].identity
+        identity = self.stopped_workspace.identity
         future.set_result(
             {
                 "experiment_id": "stopped",
@@ -203,7 +214,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_state_transition_changes_background_selection(self):
         """T052/T055: transitions to and from stopped follow runner metadata."""
-        path = self.workspaces[0].directory / "runner/state.json"
+        path = self.root / "project/experiments/running/runner/state.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document.update(phase="stopped", mode="paused")
         path.write_text(json.dumps(document), encoding="utf-8")
@@ -218,7 +229,7 @@ class CachePolicyTests(unittest.IsolatedAsyncioTestCase):
         """T056/T087: slow initial construction remains explicitly visible."""
         await self.views.experiment("stopped", "summary", {})
         future = self.views._cache_jobs["stopped"]
-        identity = self.workspaces[2].identity
+        identity = self.stopped_workspace.identity
         target = {
             **identity, "schema_version": 2,
             "event_count": 10000, "cursor": 10000, "change_cursor": 10000,

@@ -20,7 +20,7 @@ from core.participants.server import ParticipantServer
 from core.primitives.json_files import read_json, write_json
 from core.primitives.processes import process_identity
 from tests.helpers.dag import TEMP_ROOT, wait_until
-from tests.helpers.logging_process import write_settings
+from tests.helpers.logging_process import stop_journal_writers, write_settings
 
 
 class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -29,6 +29,7 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.folder = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.folder.cleanup)
         self.root = Path(self.folder.name).resolve()
+        self.addCleanup(stop_journal_writers, self.root)
         self.identity = {
             "experiment_id": "protocol-test",
             "participant_id": str(uuid4()),
@@ -161,50 +162,46 @@ class ParticipantProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.identity["participant_id"],
         )
 
-    async def test_handler_receives_json_and_optional_result_fields_stay_present(self):
-        captured = []
-        expected = {
+    async def test_json_and_model_handler_results_preserve_requests_wire_and_journal(self):
+        json_result = {
             "result": "success",
             "data": {"value": [1, 1.0, True, None]},
             "error": None,
             "execution": {"opaque": {"value": "данные"}},
         }
 
-        async def handler(request):
-            captured.append(request)
-            self.assertIsInstance(request, dict)
-            return expected
+        model_result = {"result": "success", "data": {"existing": True}}
+        for variant, result, expected, args in (
+            ("json", json_result, json_result, {"application": True}),
+            ("model", ParticipantResult(**model_result), model_result, {}),
+        ):
+            with self.subTest(variant=variant):
+                captured = []
 
-        identifier = str(uuid4())
-        with patch.object(self.server, "_handler", handler):
-            reply = await self.connection.request(
-                identifier, "echo", {"application": True}, timeout_seconds=2
-            )
-        self.assertEqual(captured[0]["request_id"], identifier)
-        self.assertEqual(captured[0]["args"], {"application": True})
-        self.assertEqual(
-            reply,
-            {
-                "protocol_version": 2,
-                "message_type": "response",
-                "request_id": identifier,
-                **expected,
-            },
-        )
-        self.assertEqual(
-            self.logger.read_command_result(identifier)["response"], expected
-        )
+                async def handler(request, *, result=result, captured=captured):
+                    captured.append(request)
+                    self.assertIsInstance(request, dict)
+                    return result
 
-    async def test_handler_existing_result_model_preserves_legacy_validation(self):
-        async def handler(request):
-            return ParticipantResult(result="success", data={"existing": True})
-
-        with patch.object(self.server, "_handler", handler):
-            reply = await self.connection.request(
-                str(uuid4()), "echo", {}, timeout_seconds=2
-            )
-        self.assertEqual(reply["result"], "success")
-        self.assertEqual(reply["data"], {"existing": True})
+                identifier = str(uuid4())
+                with patch.object(self.server, "_handler", handler):
+                    reply = await self.connection.request(
+                        identifier, "echo", args, timeout_seconds=2
+                    )
+                self.assertEqual(captured[0]["request_id"], identifier)
+                self.assertEqual(captured[0]["args"], args)
+                self.assertEqual(
+                    reply,
+                    {
+                        "protocol_version": 2,
+                        "message_type": "response",
+                        "request_id": identifier,
+                        **expected,
+                    },
+                )
+                self.assertEqual(
+                    self.logger.read_command_result(identifier)["response"], expected
+                )
 
     async def test_handler_request_edits_reach_completion_observer(self):
         identifier, edited = str(uuid4()), str(uuid4())

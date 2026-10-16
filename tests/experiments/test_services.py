@@ -1,11 +1,14 @@
 """Approved services.md A-D/G: actual services, queues and default timers."""
 
 import asyncio
+import json
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core.experiments.state import _process_identity_pid
+from core.models.participant_protocol import ParticipantResult
 from core.primitives.json_files import read_json
 from tests.helpers.dag import process_running, terminate_owned
 from tests.helpers.services import ServiceWorkspace, wait_for
@@ -16,14 +19,19 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.workspace = ServiceWorkspace()
         self.addAsyncCleanup(self.workspace.close)
 
-    async def test_socket_start_context_streams_and_real_shutdown(self):
-        """A/B/D: exact identities, immutable code, actual context and confirmed shutdown."""
+    async def test_foreign_cwd_lifecycle_preserves_context_and_typed_shutdown(self):
+        """A/B/D/G: caller paths, immutable code, context and typed, confirmed shutdown."""
         async with asyncio.timeout(120):
             w = self.workspace
             definition = w.service()
             sid = definition["service_id"]
-            w.publish_service_definitions()
-            self.assertEqual(await w.manager.start_all(w.state), "ready")
+            previous = Path.cwd()
+            try:
+                os.chdir(w.root)
+                w.publish_service_definitions()
+                self.assertEqual(await w.manager.start_all(w.state), "ready")
+            finally:
+                os.chdir(previous)
             instance = w.state.services[sid]
             self.assertNotEqual(
                 _process_identity_pid(instance.process_identity), os.getpid()
@@ -39,10 +47,31 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance.endpoint_path.is_file())
             w.assembler.check_module(w.state, definition)
             self.assertEqual(w.state.mode, "paused")
+            self.assertEqual(w.state.stage_position, 1)
+            self.assertIsNone(w.state.last_result)
             reply = await w.manager.request(w.state, sid, "echo", {"value": 42})
             self.assertEqual(reply["data"], {"value": 42})
-            result = await w.manager.stop_all(w.state)
+            token = (instance.artifacts_directory / "service.token").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(token, json.dumps(w.events()))
+            with patch.object(
+                w.manager,
+                "_record_service_stop_outcome",
+                wraps=w.manager._record_service_stop_outcome,
+            ) as record:
+                result = await w.manager.stop_all(w.state)
+            state, service_id, request_id, response, _, _ = record.call_args.args
+            self.assertIs(state, w.state)
+            self.assertIsInstance(response, ParticipantResult)
             self.assertTrue(result[sid]["stopped"], result)
+            self.assertEqual(service_id, sid)
+            stored = w.journal.client.read_command_result(request_id)
+            self.assertEqual(
+                stored["response"], response.model_dump(exclude_unset=True)
+            )
+            self.assertEqual(set(stored["response"]), {"result", "data"})
+            self.assertEqual(stored["outcome"], "succeeded")
             self.assertFalse(
                 process_running(_process_identity_pid(instance.process_identity))
             )
@@ -122,9 +151,8 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         """D10/D11: command preparation precedes readiness; shutdown confirms exit."""
         async with asyncio.timeout(120):
             w = self.workspace
-            socket = w.service(implementation="action")
-            commands = w.service(interface="commands", implementation="action")
-            control = w.controls[commands["service_id"]]
+            definition = w.service(implementation="action")
+            control = w.controls[definition["service_id"]]
             (control / "hold-start").touch()
             w.publish_service_definitions()
             starting = asyncio.create_task(w.manager.start_all(w.state))
@@ -135,8 +163,7 @@ class ServiceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (control / "hold-start").unlink()
             self.assertEqual(await starting, "ready")
             results = await w.manager.stop_all(w.state)
-            self.assertTrue(results[socket["service_id"]]["stopped"], results)
-            self.assertTrue(results[commands["service_id"]]["stopped"], results)
+            self.assertTrue(results[definition["service_id"]]["stopped"], results)
             await wait_for(lambda: (control / "action-stop.json").exists())
             self.assertFalse(process_running(command_pid))
 

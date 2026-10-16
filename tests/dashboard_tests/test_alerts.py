@@ -44,9 +44,16 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
             await self.rule(threshold=80)
         self.assertEqual(self.monitor.status(), before)
         self.assertIs(self.monitor.incidents[0], incident)
+        self.assertEqual(self.monitor.rules[0].threshold, 90)
+        self.assertEqual(self.monitor.incidents[0].status, "active")
         await self.rule(threshold=80)
         self.assertEqual(incident.status, "active")
         self.assertEqual(self.monitor.incidents[0].status, "closed")
+        await self.evaluate()
+        self.assertEqual(self.monitor.status()["active_count"], 1)
+        await self.monitor.configure(delete="rule")
+        self.assertEqual(self.monitor.incidents[-1].resolution, "configuration_changed")
+        self.assertEqual(self.monitor.status()["active_count"], 0)
 
     async def test_queued_active_notification_observes_a_closed_replacement(self):
         await self.monitor.configure(
@@ -251,20 +258,6 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         self.views.models.return_value[0][1]["errors"].clear()
         await self.evaluate()
         self.assertEqual(self.monitor.status()["active_count"], 1)
-
-    async def test_rule_edit_delete_and_write_failure_have_explicit_outcomes(self):
-        rule = await self.rule()
-        await self.evaluate()
-        with (
-            patch.object(self.monitor, "_write", side_effect=OSError("disk full")),
-            self.assertRaises(OSError),
-        ):
-            await self.monitor.configure({**rule, "threshold": 100})
-        self.assertEqual(self.monitor.rules[0].threshold, 90)
-        self.assertEqual(self.monitor.incidents[0].status, "active")
-        await self.monitor.configure(delete="rule")
-        self.assertEqual(self.monitor.incidents[0].resolution, "configuration_changed")
-        self.assertEqual(self.monitor.status()["active_count"], 0)
 
     async def test_restart_preserves_incident_but_not_freshness_and_corruption_is_rejected(
         self,

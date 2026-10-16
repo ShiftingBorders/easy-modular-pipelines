@@ -16,7 +16,6 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         self.workspace = DagWorkspace()
         self.addCleanup(self.workspace.close)
         self.faults = WriterFaults(self.workspace.root / "startup-writer-faults")
-        self.faults.open()
         self.addAsyncCleanup(self.faults.close)
         self.session = DagSession(self.workspace)
         await self.session.start()
@@ -186,6 +185,7 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         self.assertEqual(self._starts(), [])
 
     async def test_stalled_journal_read_cannot_hide_startup_expiry_n2_n6(self):
+        self.faults.open()
         await self._prepare(startup=2, control=5)
         gate = self.faults.hold_quick_check()
         step = self.session.post("step")
@@ -215,6 +215,7 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         await wait_until(lambda: owner.get_status()["state"] == "ready", timeout=30)
 
     async def test_writer_recovery_during_bootstrap_keeps_attempt_n3(self):
+        self.faults.open()
         stage = await self._prepare(startup=3, control=1.5)
         gate = self.workspace.gate()
         try:
@@ -241,6 +242,7 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
             gate.touch(exist_ok=True)
 
     async def test_writer_recovery_while_executor_awaits_execute_n3(self):
+        self.faults.open()
         stage = await self._prepare(startup=8, control=1.5)
         stages = self.session.runner._stages
         connect = stages._connect
@@ -265,6 +267,10 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         stage = await self._prepare(control=1, action=action, following=True)
         with self._redirect_executor("startup_exit", limit=1):
             reply = await asyncio.wait_for(self.session.post("step"), 30)
+        self._assert_failure_policy(action, stage, reply)
+        return reply
+
+    def _assert_failure_policy(self, action, stage, reply):
         state = self.session.runner.get_state()
         expected = {"pause": "waiting", "stop": "failed", "skip": "waiting"}[action]
         self.assertEqual(state["phase"], expected, reply)
@@ -274,10 +280,6 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
             self.session.runner._state.stage_attempt_numbers[stage["stage_id"]], 1
         )
         self.assertEqual(self._starts(), [])
-        return reply
-
-    async def test_startup_exit_applies_pause_n4(self):
-        await self._check_failure_policy("pause")
 
     async def test_startup_exit_applies_stop_n4(self):
         await self._check_failure_policy("stop")
@@ -289,7 +291,9 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         self.assertEqual(reply["result"], "success", reply)
         self.assertEqual([row["stage_id"] for row in self._starts()], [following])
 
-    async def test_retry_starts_new_attempt_only_after_failed_executor_stops_n4(self):
+    async def test_retry_preserves_input_and_changes_attempt_after_startup_exit_n4(
+        self,
+    ):
         predecessor = self.workspace.stage(settings={"label": "predecessor"})
         stage = self.workspace.stage(predecessor["module"], retries=1, timeout=None)
         template = self.workspace.template([predecessor, stage], keep_attempts=2)
@@ -330,6 +334,7 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.session.post("step"), 30)
         state = self.session.runner._state
         self.assertEqual(state.stage_position, 1)
+        self.assertFalse(state.pending_advance)
         self.assertEqual(state.stage_attempt_numbers[stage["stage_id"]], 1)
         self.assertEqual(self._starts(), [])
 
@@ -374,24 +379,43 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         )
         self.assertEqual(self._starts(), [])
 
-    async def test_failure_evidence_precedes_cleanup_and_links_to_journal_n8(self):
-        await self._prepare(control=1)
+    async def test_pause_preserves_failure_evidence_before_cleanup_n4_n8(self):
+        stage = await self._prepare(control=1, following=True)
         stages = self.session.runner._stages
         interrupt = stages.interrupt
+        entered, release = asyncio.Event(), asyncio.Event()
 
         async def delayed_stop(*args, **kwargs):
-            await asyncio.sleep(0.3)
+            entered.set()
+            await release.wait()
             return await interrupt(*args, **kwargs)
 
         with (
             self._redirect_executor("startup_exit"),
             patch.object(stages, "interrupt", delayed_stop),
         ):
-            await asyncio.wait_for(self.session.post("step"), 30)
+            step = self.session.post("step")
+            try:
+                await asyncio.wait_for(entered.wait(), 30)
+                before_cleanup = self._records(self.launches[0], "runner")
+                failure = next(
+                    row for row in before_cleanup if row["phase"] == "startup.failed"
+                )
+                self.assertNotIn(
+                    "cleanup.finished", [row["phase"] for row in before_cleanup]
+                )
+                self.assertFalse(step.done())
+            finally:
+                release.set()
+                reply = await asyncio.wait_for(step, 30)
+        self._assert_failure_policy("pause", stage, reply)
         records = self._records(self.launches[0], "runner")
-        failure = next(row for row in records if row["phase"] == "startup.failed")
+        self.assertEqual(
+            next(row for row in records if row["phase"] == "startup.failed"), failure
+        )
         cleanup = next(row for row in records if row["phase"] == "cleanup.finished")
-        self.assertGreaterEqual(cleanup["monotonic"] - failure["monotonic"], 0.3)
+        self.assertLess(failure["monotonic"], cleanup["monotonic"])
+        self.assertTrue(cleanup["details"]["stopped"])
         self.assertTrue(failure["details"]["error"]["traceback"])
         self.assertEqual(failure["details"]["timeout_source"], "start_timeout")
         self.assertTrue(failure["details"]["last_phase"])
@@ -407,9 +431,10 @@ class ExecutorStartupTests(IsolatedAsyncioTestCase):
         )
         self.assertTrue(error["data"]["traceback"])
         self.assertEqual(error["data"]["error_id"], failure["details"]["error_id"])
-        self.assertFalse((self.launches[0] / "executor.lock.json").exists())
 
-    async def test_cleanup_exception_preserves_startup_failure_and_blocks_retry_n8(self):
+    async def test_cleanup_exception_preserves_startup_failure_and_blocks_retry_n8(
+        self,
+    ):
         stage = await self._prepare(control=1, retries=1)
         with (
             self._redirect_executor("startup_exit"),

@@ -11,9 +11,10 @@ from tests.helpers.services import ServiceWorkspace, wait_for
 
 
 class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.w = ServiceWorkspace()
-        self.addAsyncCleanup(self.w.close)
+    def _workspace(self) -> ServiceWorkspace:
+        work = ServiceWorkspace()
+        self.addAsyncCleanup(work.close)
+        return work
 
     async def test_retry_budgets_pause_stop_and_manual_restart(self):
         """D: one initial launch plus three automatic attempts, preserving counts on manual recovery."""
@@ -53,7 +54,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_skip_continues_recovery_beyond_the_budget(self):
         """D: service skip means unlimited recovery, never advancing with an unavailable service."""
         async with asyncio.timeout(180):
-            w = self.w
+            w = self._workspace()
             definition = w.service()
             definition["errors"]["on_exhausted"] = "skip"
             sid = definition["service_id"]
@@ -81,7 +82,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelling_startup_stops_the_already_created_process(self):
         """A: cancelling readiness cannot leave a half-started owned process running."""
         async with asyncio.timeout(120):
-            w = self.w
+            w = self._workspace()
             definition = w.service()
             sid = definition["service_id"]
             (w.controls[sid] / "hold-start").touch()
@@ -102,7 +103,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelling_a_work_waiter_does_not_replay_or_cancel_sent_work(self):
         """C: abandoning an await leaves exactly one actual command and a journaled outcome."""
         async with asyncio.timeout(120):
-            w = self.w
+            w = self._workspace()
             definition = w.service()
             sid = definition["service_id"]
             w.publish_service_definitions()
@@ -147,7 +148,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_unconfirmed_stop_cannot_launch_another_instance(self):
         """D: a real unresponsive peer plus denied owned kill cannot authorize a second copy."""
         async with asyncio.timeout(180):
-            w = self.w
+            w = self._workspace()
             definition = w.service()
             sid = definition["service_id"]
             w.publish_service_definitions()
@@ -191,7 +192,7 @@ class ServicePolicyTests(unittest.IsolatedAsyncioTestCase):
     ):
         """D11: process termination cannot turn a rejected internal stop into success."""
         async with asyncio.timeout(120):
-            w = self.w
+            w = self._workspace()
             definition = w.service(implementation="action")
             w.publish_service_definitions()
             await w.manager.start_all(w.state)

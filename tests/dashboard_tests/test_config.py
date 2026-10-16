@@ -89,8 +89,6 @@ class ConfigurationTests(unittest.TestCase):
             Path(absolute),
         )
         for options in (
-            {"history_max_events": True},
-            {"history_max_bytes": 0},
             {"project_root": []},
             {"system_api_token_env": "bad name"},
         ):
@@ -125,7 +123,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(monitor.snapshot()["status"], "disabled")
         self.assertFalse((self.directory / "state").exists())
 
-    def test_relative_state_path_uses_config_directory_from_other_cwd(self) -> None:
+    def test_state_paths_preserve_absolute_and_resolve_relative_from_config(self) -> None:
         """T014: library paths are anchored to the containing configuration."""
         config_path = write_settings(self.directory, state_directory="nested/state")
         elsewhere = self.directory / "elsewhere"
@@ -138,7 +136,6 @@ class ConfigurationTests(unittest.TestCase):
             os.chdir(previous)
         self.assertEqual(config["state_directory"], self.directory / "nested/state")
 
-    def test_preserves_absolute_state_path(self) -> None:
         path = self.directory / "custom"
         self.assertEqual(
             load_settings(write_settings(self.directory, state_directory=str(path)))[

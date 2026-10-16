@@ -29,6 +29,7 @@ WRITE_HEADERS = {"X-Dashboard-Request": "1", "Origin": "http://dashboard.test"}
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_queries_reach_consumers_as_models_without_dump(self):
+        await self._open_application(with_history=True)
         views = self.app.state.views
         with (
             patch.object(views, "compute", wraps=views.compute) as compute,
@@ -54,6 +55,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ViewQuery.from_query(query).compact, "1")
 
     async def test_http_resource_thresholds_consume_retained_alert_rules(self):
+        await self._open_application()
         rule = {
             "id": "cpu-rule",
             "name": "CPU threshold",
@@ -75,6 +77,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response.json()["metrics"]["cpu"].get("exceeded", False))
 
     async def test_local_page_success_does_not_change_global_runtime_connection(self):
+        await self._open_application()
         self.app.state.views._live_available = False
         self.app.state.views._live_error = "offline"
         for page in ("overview", "experiments", "modules", "compute", "alerts"):
@@ -98,12 +101,19 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
-        self.workspace = JournalWorkspace(self.directory / "project")
-        self.addCleanup(self.workspace.close)
+
+    async def _open_application(self, *, with_history=False):
+        project = self.directory / "project"
+        if with_history:
+            self.workspace = JournalWorkspace(project)
+            self.addCleanup(self.workspace.close)
+        else:
+            project.mkdir()
+            (project / "experiments.json").write_text("{}", encoding="utf-8")
         self.config = write_settings(
             self.directory,
             system_api_url="http://upstream.test/api/",
-            project_root=str(self.workspace.root),
+            project_root=str(project),
         )
         self.upstream_requests = []
         self.action = None
@@ -168,6 +178,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_application_information_identifies_dashboard_host(self) -> None:
+        await self._open_application()
         response = await self.http.get("/api/application")
         self.assertEqual(response.status_code, 200)
         self.assertIn("cache_activity", response.json())
@@ -177,6 +188,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_details_and_final_utf8_response_limit(self):
         """T067/T070/T071/T072: compact references, generation checks and wire limits."""
+        await self._open_application(with_history=True)
         path = "/api/system/experiments/exp-test/"
         response = await self.http.get(
             path + "parameters", params={"compact": "1", "limit": 1}
@@ -213,6 +225,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cache_publication_descriptors_are_bounded_and_filter_specific(self):
         """T068/T069: bounded paging sessions reject mismatched selection."""
+        await self._open_application(with_history=True)
         path = "/api/system/experiments/exp-test/events"
         for _ in range(20):
             response = await self.http.get(path, params={"compact": "1", "limit": 1})
@@ -226,6 +239,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_detail_references_return_client_errors(self):
         """T071/T072: malformed JSON and invalid reference shapes never become 500s."""
+        await self._open_application(with_history=True)
         base = "/api/system/experiments/exp-test/"
         document = (
             await self.http.get(base + "parameters", params={"compact": "1"})
@@ -246,6 +260,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 400, response.text)
 
     async def test_html_scripts_fonts_and_api_schema_are_served(self) -> None:
+        await self._open_application()
         for path, content_type in [
             ("/", "text/html"),
             ("/static/app.js", "javascript"),
@@ -269,6 +284,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_root_routes_combine_local_history_and_cached_live_sources(self):
+        await self._open_application(with_history=True)
         for resource in [
             "overview",
             "experiments",
@@ -295,6 +311,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_experiment_routes_read_real_local_journal_and_page_it(self):
+        await self._open_application(with_history=True)
         for view in [
             "summary",
             "runs",
@@ -335,6 +352,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_resources_and_bad_identifiers_never_reach_upstream(
         self,
     ) -> None:
+        await self._open_application()
         for path in [
             "/api/system/private",
             "/api/system/experiments/exp-test/delete",
@@ -349,6 +367,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_query_validation_rejects_unknown_large_and_out_of_range_values(
         self,
     ) -> None:
+        await self._open_application()
         for params in [
             {"db_path": "secret"},
             {"q": "x" * 4097},
@@ -374,6 +393,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_nonfinite_and_corrupt_resources_are_visible_without_fake_zero(self):
+        await self._open_application()
         for response in [
             httpx.Response(200, content=b'{"cpu":NaN}'),
             httpx.Response(200, content=b'{"metrics":'),
@@ -401,6 +421,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.http.get("/api/icmp")).status_code, 200)
 
     async def test_resource_disconnect_and_recovery_preserve_dashboard(self):
+        await self._open_application()
         async def fail(request):
             raise httpx.ReadError("source disconnected")
 
@@ -420,6 +441,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_pending_source_does_not_block_pages_or_local_icmp(self):
+        await self._open_application()
         started, release = asyncio.Event(), asyncio.Event()
 
         async def respond(request):
@@ -431,14 +453,14 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.app.state.views._resource_at = 0
         pending = asyncio.create_task(self.app.state.views._refresh_resources())
         try:
-            await asyncio.wait_for(started.wait(), 1)
-            page = await asyncio.wait_for(self.http.get("/api/system/compute"), 1)
+            await asyncio.wait_for(started.wait(), 10)
+            page = await asyncio.wait_for(self.http.get("/api/system/compute"), 10)
             self.assertEqual(page.status_code, 200)
             await self.http.put(
                 "/api/icmp/settings", headers=WRITE_HEADERS, json=icmp_settings()
             )
             result = await asyncio.wait_for(
-                self.http.post("/api/icmp/probe", headers=WRITE_HEADERS), 1
+                self.http.post("/api/icmp/probe", headers=WRITE_HEADERS), 10
             )
             self.assertEqual(result.json()["status"], "reply")
             self.assertFalse(pending.done())
@@ -451,6 +473,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_icmp_configuration_and_probe_persist_on_dashboard_host(self) -> None:
+        await self._open_application()
         response = await self.http.put(
             "/api/icmp/settings", headers=WRITE_HEADERS, json=icmp_settings()
         )
@@ -471,6 +494,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_cross_origin_or_unmarked_writes_without_changes(
         self,
     ) -> None:
+        await self._open_application()
         original = (await self.http.get("/api/icmp")).json()["settings"]
         for headers in [
             {},
@@ -500,6 +524,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_oversized_nonjson_and_invalid_configuration_bodies(
         self,
     ) -> None:
+        await self._open_application()
         self.assertEqual(
             (
                 await self.http.put(
@@ -526,6 +551,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_config_write_failure_preserves_previous_settings(self) -> None:
+        await self._open_application()
         old = (await self.http.get("/api/icmp")).json()["settings"]
         with patch.object(
             self.app.state.icmp, "_write", side_effect=PermissionError("read only")
@@ -538,6 +564,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.probes, [])
 
     async def test_disabled_probe_has_no_side_effects(self) -> None:
+        await self._open_application()
         self.assertEqual(
             (
                 await self.http.post("/api/icmp/probe", headers=WRITE_HEADERS)
@@ -547,6 +574,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.probes, [])
 
     async def test_lifespan_closes_http_client_monitor_and_state_lock(self) -> None:
+        await self._open_application()
         state_path = self.app.state.settings.state_directory
         await self.stack.aclose()
         self.assertTrue(self.upstream.is_closed)
@@ -558,6 +586,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         await replacement.close()
 
     async def test_failed_startup_closes_upstream_client(self) -> None:
+        await self._open_application()
         directory = self.directory / "broken"
         directory.mkdir()
         config = write_settings(directory)

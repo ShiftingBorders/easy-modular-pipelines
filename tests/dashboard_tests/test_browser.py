@@ -220,7 +220,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     if node.returncode is None:
                         node.kill()
-                        await node.wait()
+                        await asyncio.wait_for(node.wait(), 10)
                 self.assertEqual(node.returncode, 0, stderr.decode(errors="replace"))
                 result = json.loads(stdout)
                 raw_report = (
@@ -247,6 +247,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("3 h", result["forecastText"])
                 self.assertEqual(result["refreshChoices"][0], "1")
                 self.assertEqual(result["refreshChoices"][-1], "600")
+                self.assertTrue(result["periodicRefreshObserved"])
                 self.assertIn("custom", result["rangeChoices"])
                 self.assertFalse(result["gpuVisible"])
                 self.assertEqual(result["bell"], "1")
@@ -263,6 +264,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result["previousDataRetained"])
                 self.assertTrue(result["detailRaceSafe"])
                 self.assertTrue(result["paginationRetained"])
+                self.assertEqual(result["paginationRequestsOnRefresh"], 0)
                 self.assertTrue(result["settingsModeRetained"])
                 self.assertTrue(result["initialCacheNotice"])
                 self.assertEqual(result["historyEvents"], 500)

@@ -1,6 +1,7 @@
 
 """Approved D: local SQLite history, immutable snapshots, paths and publication limits."""
 
+import asyncio
 import json
 import sqlite3
 import subprocess
@@ -136,7 +137,7 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
             write_json(path, {"readers_closed": True})
             self.assertEqual(read_object(path), {"readers_closed": True})
 
-    def test_separate_dashboard_reader_observes_only_complete_publications(self):
+    async def test_separate_dashboard_reader_observes_only_complete_publications(self):
         """Use real processes and file sharing on both Windows and Linux."""
         path = self.root / "metadata.json"
         write_json(path, {"sequence": 0, "payload": "0" * 1024})
@@ -156,25 +157,30 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
             sys.stdin.readline()
             print(json.dumps(read_object(path)), flush=True)
         ''')
-        process = subprocess.Popen(
-            [sys.executable, "-B", "-c", code, str(path)],
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-B", "-c", code, str(path),
             cwd=Path(__file__).resolve().parents[2],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
-            self.assertEqual(process.stdout.readline().strip(), "ready")
+            ready = await asyncio.wait_for(process.stdout.readline(), 10)
+            if not ready:
+                _, errors = await asyncio.wait_for(process.communicate(), 10)
+                self.fail(f"Publication reader exited before readiness: {errors!r}")
+            self.assertEqual(ready.strip(), b"ready")
             for sequence in range(1, 151):
                 write_json(path, {"sequence": sequence, "payload": str(sequence) * 1024})
-            output, errors = process.communicate("done\n", timeout=20)
+            output, errors = await asyncio.wait_for(process.communicate(b"done\n"), 20)
             self.assertEqual(process.returncode, 0, errors)
             self.assertEqual(json.loads(output), {"sequence": 150, "payload": "150" * 1024})
             self.assertEqual(list(self.root.glob(".publish-*")), [])
         finally:
-            if process.poll() is None:
+            if process.returncode is None:
                 process.kill()
-            process.communicate(timeout=10)
+            await asyncio.wait_for(process.communicate(), 10)
 
     async def test_readonly_snapshot_is_reused_and_not_mutated_by_later_ingestion(self):
         before = self.reader.load("exp-test")

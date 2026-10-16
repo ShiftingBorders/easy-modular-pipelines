@@ -104,18 +104,16 @@ class SystemAPIClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(actual["metrics"]["vram"]["value"])
 
-    async def test_preserves_empty_list_and_contextual_journal_page(self) -> None:
+    async def test_preserves_empty_missing_and_contextual_payloads(self) -> None:
         event_page = json.loads((FIXTURES / "events.json").read_text())
-        for expected in [{"items": []}, event_page]:
-            self.responses.append(httpx.Response(200, json=expected))
-            self.assertEqual(
-                await self.client.read("experiments/exp-test/events"), expected
-            )
-
-    async def test_missing_list_is_preserved_for_the_view_to_reject(self) -> None:
-        self.responses.append(httpx.Response(200, json={"observed_at": None}))
-        result = await self.client.read("experiments")
-        self.assertNotIn("items", result)
+        for name, path, expected in (
+            ("empty", "experiments/exp-test/events", {"items": []}),
+            ("contextual", "experiments/exp-test/events", event_page),
+            ("missing", "experiments", {"observed_at": None}),
+        ):
+            with self.subTest(payload=name):
+                self.responses.append(httpx.Response(200, json=expected))
+                self.assertEqual(await self.client.read(path), expected)
 
     async def test_closed_client_reports_not_connected(self) -> None:
         underlying = self.client._client
@@ -235,10 +233,11 @@ class SystemAPIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, "response_too_large")
 
     async def test_total_deadline_covers_streaming_not_just_headers(self) -> None:
-        stream = ResponseStream([b'{"value":', b"1}"], delay=0.2)
+        stream = ResponseStream([b'{"value":', b"1}"], blocked_after=1)
         self.responses.append(httpx.Response(200, stream=stream))
         with self.assertRaises(SystemAPIError) as caught:
-            await asyncio.wait_for(self.client.read("compute"), 2)
+            await asyncio.wait_for(self.client.read("compute"), 10)
+        self.assertTrue(stream.reading.is_set())
         self.assertEqual(caught.exception.code, "timeout")
         self.assertTrue(stream.closed)
 
@@ -254,13 +253,19 @@ class SystemAPIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stream.closed)
 
     async def test_request_cancellation_releases_stream_and_propagates(self) -> None:
-        stream = ResponseStream([b"{}"], delay=1)
+        stream = ResponseStream([b"{}"], blocked_after=0)
+        self.client.timeout = 30
         self.responses.append(httpx.Response(200, stream=stream))
         task = asyncio.create_task(self.client.read("compute"))
-        await asyncio.sleep(0)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(stream.reading.wait(), 10)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        finally:
+            stream.release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         self.assertTrue(stream.closed)
 
     async def test_real_http_client_ignores_environment_proxy_and_closes(self) -> None:

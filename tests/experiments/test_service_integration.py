@@ -122,12 +122,11 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await wait_for(lambda: runner.get_state()["phase"] == "completed")
 
     async def test_ordered_services_pause_cycles_and_confirmed_completion(self):
-        """B1/C5/D3: all interfaces live across stages/cycles; the final step confirms shutdown."""
+        """B1/C5/D3: full/action services span stages/cycles; final step confirms shutdown."""
         async with asyncio.timeout(120):
             w = self.w
             first = w.service()
             second = w.service(implementation="action")
-            commands = w.service(implementation="action", interface="commands")
             stages = [
                 w.stage(settings={"label": "A"}),
                 w.stage(settings={"label": "B"}),
@@ -138,7 +137,7 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(w.trace(first)[0]["at"], w.trace(second)[0]["at"])
             await wait_for(
                 lambda: (
-                    w.files.controls[commands["service_id"]] / "action-start.json"
+                    w.files.controls[second["service_id"]] / "action-start.json"
                 ).exists()
             )
             sid = first["service_id"]
@@ -173,7 +172,7 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     )
             await wait_for(
                 lambda: (
-                    w.files.controls[commands["service_id"]] / "action-stop.json"
+                    w.files.controls[second["service_id"]] / "action-stop.json"
                 ).exists()
             )
 

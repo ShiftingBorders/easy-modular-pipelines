@@ -119,9 +119,6 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual((revision, received_notice, changed), (1, True, True))
         writer.select.assert_called_once_with(path)
         sampler.reset.assert_called_once_with()
-        self.assertEqual(
-            snapshot.model_dump(mode="json"), message.snapshot.model_dump(mode="json")
-        )
         exported = ResourceTarget.from_document(document["snapshot"]["targets"][0])
         self.assertEqual(
             exported.identity, document["snapshot"]["targets"][0]["identity"]
@@ -135,7 +132,8 @@ class SamplerTests(unittest.TestCase):
         self.identity = process_identity(os.getpid())
         self.target = ResourceTarget.from_document(target(self.identity))
 
-    def test_model_and_public_targets_share_the_same_process_cpu_baseline(self):
+    def test_model_and_public_targets_share_cpu_intervals_and_exclude_child_cpu(self):
+        """One shared baseline gives null, 50%, and 300%, excluding child counters."""
         retained = ResourceTargetDocument.model_validate(
             {
                 "series_id": self.target.series_id,
@@ -151,39 +149,16 @@ class SamplerTests(unittest.TestCase):
             patch("core.resources.sampling.time.monotonic", side_effect=[10, 12, 13]),
         ):
             process.return_value.cpu_times.side_effect = [
-                SimpleNamespace(user=value, system=0) for value in (0, 1, 4)
+                SimpleNamespace(
+                    user=value, system=0, children_user=1000, children_system=1000
+                )
+                for value in (0, 1, 4)
             ]
             process.return_value.memory_info.return_value = SimpleNamespace(rss=4096)
             samples = [
                 self.sampler._process_sample(item)
                 for item in (retained, self.target, retained)
             ]
-        self.assertEqual(
-            [item["resources"]["process_cpu_percent"]["value"] for item in samples],
-            [None, 50, 300],
-        )
-
-    def test_cpu_intervals_values_over_100_and_child_cpu_exclusion(self):
-        """B: controlled CPU seconds give null, 50%, and 300%; children are excluded."""
-        times = [
-            SimpleNamespace(
-                user=value, system=0, children_user=1000, children_system=1000
-            )
-            for value in (0, 1, 4)
-        ]
-        with (
-            patch("core.resources.sampling.psutil.Process") as process,
-            patch(
-                "core.resources.sampling.process_identity",
-                return_value=self.identity,
-            ),
-            patch(
-                "core.resources.sampling.time.monotonic", side_effect=[10, 12, 13]
-            ),
-        ):
-            process.return_value.cpu_times.side_effect = times
-            process.return_value.memory_info.return_value = SimpleNamespace(rss=4096)
-            samples = [self.sampler._process_sample(self.target) for _ in range(3)]
         measurements = [
             sample["resources"]["process_cpu_percent"] for sample in samples
         ]

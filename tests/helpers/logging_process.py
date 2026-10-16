@@ -329,23 +329,6 @@ def main() -> None:
     config = Path(config_text)
     announce({"pid": os.getpid()})
 
-    if mode == "import":
-        with (
-            patch.object(
-                Path, "open", side_effect=AssertionError("Unexpected file open")
-            ),
-            patch.object(
-                sqlite3, "connect", side_effect=AssertionError("Unexpected DB open")
-            ),
-        ):
-            from core.journal.logger import OperationLogger
-            from core.journal.storage import SQLiteEventStore
-
-            OperationLogger(config)
-            SQLiteEventStore(config.parent / "not-created.db", **STORE_OPTIONS)
-        announce({"imported": True})
-        return
-
     from core.journal.logger import OperationLogger
 
     if mode == "read":

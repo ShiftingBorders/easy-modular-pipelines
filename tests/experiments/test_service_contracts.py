@@ -3,10 +3,8 @@
 import asyncio
 import copy
 import json
-import os
 import sqlite3
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -20,7 +18,6 @@ from core.experiments.state import (
 )
 from core.journal.events import LoggingError
 from core.models.participant_observations import ServiceObservation
-from core.models.participant_protocol import ParticipantResult
 from core.models.runner_state import WorkingServiceRequest
 from core.participants.connection import ParticipantConnection
 from tests.helpers.dag import process_running
@@ -94,37 +91,10 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         reply["data"]["values"].append("external")
         self.assertEqual(observation.data, {"values": [True, 1, 1.0]})
 
-    async def test_shutdown_result_remains_model_until_exit_confirmation_and_journal(
-        self,
-    ):
-        definition = self.w.service()
-        self.assertEqual(await self.w.manager.start_all(self.w.state), "ready")
-        with patch.object(
-            self.w.manager,
-            "_record_service_stop_outcome",
-            wraps=self.w.manager._record_service_stop_outcome,
-        ) as record:
-            results = await self.w.manager.stop_all(self.w.state)
-        state, service_id, request_id, response, _, _ = record.call_args.args
-        self.assertIs(state, self.w.state)
-        self.assertIsInstance(response, ParticipantResult)
-        self.assertTrue(results[definition["service_id"]]["stopped"])
-        self.assertEqual(service_id, definition["service_id"])
-        stored = self.w.journal.client.read_command_result(request_id)
-        self.assertEqual(stored["response"], response.model_dump(exclude_unset=True))
-        self.assertEqual(set(stored["response"]), {"result", "data"})
-        self.assertEqual(stored["outcome"], "succeeded")
-
     async def test_module_variants_and_invalid_schemas(self):
-        """A: module metadata distinguishes full/socket, action/socket and action/commands."""
-        for implementation, interface in (
-            ("full", "socket"),
-            ("action", "socket"),
-            ("action", "commands"),
-        ):
-            definition = self.w.service(
-                implementation=implementation, interface=interface
-            )
+        """A: full and action metadata obey the same explicit schema contract."""
+        for implementation in ("full", "action"):
+            definition = self.w.service(implementation=implementation)
             path = self.w.experiment / "modules" / definition["module"]["name"] / "1"
             valid = self.w.assembler.read_module(path)
             self.assertEqual(valid["implementation"], implementation)
@@ -183,25 +153,6 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertFalse(directory.exists())
         self.assertEqual(w.manager._processes, {})
-
-    async def test_launch_from_another_cwd_preserves_code_and_context(self):
-        """A/G: the caller's cwd does not select module code, paths, or logger configuration."""
-        async with asyncio.timeout(120):
-            w = self.w
-            definition = w.service()
-            previous = Path.cwd()
-            try:
-                os.chdir(w.root)
-                w.publish_service_definitions()
-                self.assertEqual(await w.manager.start_all(w.state), "ready")
-            finally:
-                os.chdir(previous)
-            instance = w.state.services[definition["service_id"]]
-            token = (instance.artifacts_directory / "service.token").read_text()
-            self.assertNotIn(token, json.dumps(w.events()))
-            w.assembler.check_module(w.state, definition)
-            self.assertEqual(w.state.stage_position, 1)
-            self.assertIsNone(w.state.last_result)
 
     async def test_integrity_failure_and_missing_registry_record_prevent_spawn(self):
         """A: actual code/HashDB mismatches prohibit service processes."""

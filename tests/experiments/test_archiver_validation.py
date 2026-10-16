@@ -20,6 +20,7 @@ from core.primitives.json_files import read_json, write_json
 from core.storage.errors import StorageCapacityError
 from tests.helpers.archives import (
     ArchiveTestCase,
+    ArchiveWorkspace,
     archive_members,
     inventory,
     write_archive,
@@ -27,9 +28,25 @@ from tests.helpers.archives import (
 
 
 class ArchiveValidationTests(ArchiveTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._archive_bytes = asyncio.run(cls._create_source_archive())
+
+    @staticmethod
+    async def _create_source_archive():
+        """Retain only a closed portable archive, never a live source runtime."""
+        workspace = ArchiveWorkspace()
+        try:
+            await workspace.prepare()
+            await workspace.create()
+            return workspace.archive.read_bytes()
+        finally:
+            await workspace.close()
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        await self.source_archive()
+        self.w.archive.write_bytes(self._archive_bytes)
         self.members = archive_members(self.w.archive)
         self.bad = self.w.root / "modified.tar.xz"
 
@@ -340,6 +357,12 @@ class ArchiveValidationTests(ArchiveTestCase):
         ):
             await self.w.importer.inspect(self.w.archive)
         self.assert_work_clean()
+
+
+class ArchiveSourceValidationTests(ArchiveTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await self.source_archive()
 
     async def test_real_directory_junction_is_rejected_without_following_it(self):
         """A/D: an owned junction/symlink cannot redirect source collection or cleanup."""

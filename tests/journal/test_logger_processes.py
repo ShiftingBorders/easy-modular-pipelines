@@ -19,6 +19,23 @@ from tests.helpers.logging_process import (
 )
 
 
+class LoggerImportTests(unittest.TestCase):
+    def test_import_and_construction_do_not_open_files_or_connections(self):
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=SCRATCH_ROOT)
+        self.addCleanup(cleanup_directory, temporary)
+        config = Path(temporary.name) / "unused.json"
+        worker = LoggingProcess(
+            "import", config, module_name="tests.helpers.logging_fixtures"
+        )
+        self.addCleanup(worker.close)
+        worker.start()
+        self.assertEqual(worker.receive(), {"imported": True})
+        self.assertEqual(worker.wait(), 0)
+        self.assertFalse(config.exists())
+        self.assertFalse((config.parent / "unopened.db").exists())
+
+
 class LoggerProcessTests(unittest.TestCase):
     def setUp(self):
         SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
@@ -49,14 +66,6 @@ class LoggerProcessTests(unittest.TestCase):
         self.addCleanup(worker.close)
         worker.start()
         return worker
-
-    def test_import_and_construction_do_not_open_files_or_connections(self):
-        config = self.folder / "unused.json"
-        worker = self.process("import", "import", config=config)
-        self.assertEqual(worker.receive(), {"imported": True})
-        self.assertEqual(worker.wait(), 0)
-        self.assertFalse(config.exists())
-        self.assertFalse((config.parent / "unopened.db").exists())
 
     def test_independent_processes_share_one_journal_without_losing_source_sequences(
         self,

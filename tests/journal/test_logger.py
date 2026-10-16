@@ -36,17 +36,6 @@ class OperationLoggerTests(unittest.TestCase):
         self.addCleanup(self.logger.close)
         self.logger.open()
 
-    def test_import_has_no_file_or_database_side_effects(self):
-        """LIFE-01: a fresh process imports helpers and constructs clients without I/O."""
-        config = self.folder / "missing-settings.json"
-        process = LoggingProcess("import", config)
-        self.addCleanup(process.close)
-        process.start()
-        self.assertEqual(process.receive(), {"imported": True})
-        self.assertEqual(process.wait(), 0)
-        self.assertFalse(config.exists())
-        self.assertFalse((self.folder / "not-created.db").exists())
-
     def test_open_close_and_reload_settings(self):
         """LIFE-02: repeated lifecycle calls are explicit and reopening reloads the file."""
         with self.assertRaises(LoggingStateError):

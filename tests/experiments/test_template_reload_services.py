@@ -4,18 +4,55 @@ import asyncio
 import copy
 import hashlib
 import json
+import subprocess
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+from core.experiments import services as service_runtime
 from core.experiments.state import _process_identity_pid
 from core.models.experiment_template import ExperimentTemplate
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import process_running
 from tests.helpers.reload import candidate, events, version, workspace
 from tests.helpers.services import wait_for
+
+
+def _launcher_wait_hooks(manager, launcher, outcome, waiting, expire):
+    """Hold timeout injection until the test observes real launcher cleanup."""
+    loop = asyncio.get_running_loop()
+    original_wait = launcher.wait
+    original_recovered_wait = manager._wait_launcher_exit
+
+    def wait_owned(timeout=None):
+        loop.call_soon_threadsafe(waiting.set)
+        if outcome == "timeout":
+            if not expire.wait(30):
+                raise AssertionError("Launcher timeout was not released.")
+            raise subprocess.TimeoutExpired(launcher.args, timeout)
+        return original_wait(timeout)
+
+    async def wait_recovered(identity, deadline):
+        waiting.set()
+        if outcome != "timeout":
+            return await original_recovered_wait(identity, deadline)
+        if not await asyncio.to_thread(expire.wait, 30):
+            raise AssertionError("Launcher timeout was not released.")
+        # Only this ownership check sees its deadline; background tasks keep real clocks.
+        observing = asyncio.current_task()
+
+        def boundary_time():
+            return deadline if asyncio.current_task() is observing else time.monotonic()
+
+        with patch.object(
+            service_runtime, "time", SimpleNamespace(monotonic=boundary_time)
+        ):
+            return await original_recovered_wait(identity, deadline)
+
+    return wait_owned, wait_recovered
 
 
 class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -171,7 +208,6 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
             for outcome in ("complete", "timeout", "cancel"):
                 with self.subTest(recovered=recovered, outcome=outcome):
                     work = await self.prepare()
-                    work.template["start_timeout"] = 2
                     work.template["services"][0]["settings"].update(
                         launch_child=True, launcher_cleanup=True
                     )
@@ -198,39 +234,56 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     controls = work.files.files.controls[sid]
                     gate = controls / "hold-launcher-cleanup"
                     gate.touch()
-                    task = asyncio.create_task(
-                        runner._services.prepare_rebuild(
-                            state, ExperimentTemplate.model_validate(document)
-                        )
+                    waiting = asyncio.Event()
+                    expire = threading.Event()
+                    original_wait = launcher.wait
+                    wait_owned, wait_recovered = _launcher_wait_hooks(
+                        runner._services, launcher, outcome, waiting, expire
                     )
-                    try:
-                        await wait_for(
-                            (controls / "launcher-cleanup-started.json").exists
-                        )
-                        self.assertIsNone(launcher.poll())
-                        self.assertFalse(task.done())
-                        if outcome == "complete":
-                            gate.unlink()
-                            await asyncio.wait_for(task, 15)
-                            self.assertIsNotNone(launcher.poll())
-                            self.assertTrue(
-                                (controls / "launcher-cleanup-finished").exists()
+                    with (
+                        patch.object(launcher, "wait", wait_owned),
+                        patch.object(
+                            runner._services, "_wait_launcher_exit", wait_recovered
+                        ),
+                    ):
+                        task = asyncio.create_task(
+                            runner._services.prepare_rebuild(
+                                state, ExperimentTemplate.model_validate(document)
                             )
-                        elif outcome == "timeout":
-                            with self.assertRaisesRegex(
-                                RuntimeError, "still owns runtime files"
-                            ):
-                                await asyncio.wait_for(task, 15)
-                        else:
-                            task.cancel()
-                            with self.assertRaises(asyncio.CancelledError):
-                                await task
-                    finally:
-                        gate.unlink(missing_ok=True)
-                        await asyncio.gather(task, return_exceptions=True)
-                        await asyncio.to_thread(launcher.wait, 15)
-                        write_json(process_file, record)
-                        runner._services._processes[sid] = launcher
+                        )
+                        try:
+                            await asyncio.wait_for(waiting.wait(), 30)
+                            await wait_for(
+                                (controls / "launcher-cleanup-started.json").exists
+                            )
+                            self.assertIsNone(launcher.poll())
+                            self.assertFalse(task.done())
+                            if outcome == "complete":
+                                gate.unlink()
+                                await asyncio.wait_for(task, 30)
+                                self.assertIsNotNone(launcher.poll())
+                                self.assertTrue(
+                                    (controls / "launcher-cleanup-finished").exists()
+                                )
+                            elif outcome == "timeout":
+                                expire.set()
+                                with self.assertRaisesRegex(
+                                    RuntimeError, "still owns runtime files"
+                                ):
+                                    await asyncio.wait_for(task, 30)
+                            else:
+                                task.cancel()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await task
+                        finally:
+                            expire.set()
+                            gate.unlink(missing_ok=True)
+                            if not task.done():
+                                task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                            await asyncio.to_thread(original_wait, 30)
+                            write_json(process_file, record)
+                            runner._services._processes[sid] = launcher
                     await work.close()
 
     async def test_mismatched_launcher_metadata_rejects_preparation_rr15(self):
@@ -416,7 +469,6 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
                 work = await self.prepare()
-                work.template["start_timeout"] = 5
                 work.template["services"][0]["settings"].update(
                     launch_child=True, launcher_cleanup=True
                 )
@@ -435,6 +487,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                 document["services"][0] = replacement
                 waiting = threading.Event()
                 finished = threading.Event()
+                expire = threading.Event()
                 original_wait = launcher.wait
                 waits = []
 
@@ -445,10 +498,19 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     waiting=waiting,
                     original_wait=original_wait,
                     finished=finished,
+                    expire=expire,
+                    cancel=cancel,
+                    launcher=launcher,
                 ):
                     waits.append(timeout)
                     waiting.set()
                     try:
+                        if not cancel:
+                            if not expire.wait(30):
+                                raise AssertionError(
+                                    "Launcher timeout was not released."
+                                )
+                            raise subprocess.TimeoutExpired(launcher.args, timeout)
                         return original_wait(timeout)
                     finally:
                         finished.set()
@@ -476,6 +538,10 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                                 await task
                             reset.assert_not_awaited()
                         else:
+                            await wait_for(
+                                (controls / "launcher-cleanup-started.json").exists
+                            )
+                            expire.set()
                             with self.assertRaisesRegex(
                                 RuntimeError, f"{sid} launcher still owns"
                             ):
@@ -519,6 +585,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(runner.get_state()["phase"], "waiting")
                     self.assertEqual(marker.read_text(encoding="utf-8"), "old data")
                 finally:
+                    expire.set()
                     gate.unlink(missing_ok=True)
                     if task is not None:
                         if not task.done():
@@ -588,7 +655,7 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         work = await self.prepare()
         # Use one real TCP service; the command proxy is unrelated to this boundary.
         work.template["services"] = [work.socket]
-        work.socket["heartbeat"] = {"interval_seconds": 0.1, "grace_seconds": 2}
+        work.socket["heartbeat"]["interval_seconds"] = 0.1
         resource = work.root / "resource.bin"
         resource.write_bytes(b"checked resource" * 4096)
         work.template["resources"] = [
@@ -606,28 +673,47 @@ class TemplateReloadServiceTests(unittest.IsolatedAsyncioTestCase):
         document["stages"][0]["settings"]["echo"] = "candidate"
         check = runner._assembler.check_resources
         loop_thread = threading.get_ident()
-        intervals = []
+        entered = [asyncio.Event(), asyncio.Event()]
+        release = [threading.Event(), threading.Event()]
+        loop = asyncio.get_running_loop()
+        checks = []
 
         def slow_check(state):
             self.assertNotEqual(threading.get_ident(), loop_thread)
-            start = time.monotonic()
-            time.sleep(3)
+            index = len(checks)
+            checks.append(state)
+            loop.call_soon_threadsafe(entered[index].set)
+            if not release[index].wait(30):
+                raise TimeoutError("Resource check was not released by the test.")
             check(state)
-            intervals.append((start, time.monotonic()))
 
         with patch.object(runner._assembler, "check_resources", slow_check):
-            await runner.reload_template(work.files.write_template(document))
-        self.assertEqual(len(intervals), 2)
-        for start, end in intervals:
-            self.assertGreater(end - start, work.socket["heartbeat"]["grace_seconds"])
-            heartbeats = [
-                row
-                for row in work.files.trace(work.socket)
-                if row["event"] == "received"
-                and row.get("command") == "heartbeat"
-                and start < row["at"] < end
-            ]
-            self.assertGreaterEqual(len(heartbeats), 2)
+            reload_task = asyncio.create_task(
+                runner.reload_template(work.files.write_template(document))
+            )
+            try:
+                for index in range(2):
+                    await asyncio.wait_for(entered[index].wait(), 30)
+                    # Observe accepted probes while this specific worker is held.
+                    for _ in range(2):
+                        previous = runner._state.services[sid].last_status.request_id
+                        await wait_for(
+                            lambda previous=previous: (
+                                runner._state.services[sid].last_status.request_id
+                                != previous
+                            )
+                        )
+                    self.assertFalse(reload_task.done())
+                    self.assertFalse(release[index].is_set())
+                    release[index].set()
+                await asyncio.wait_for(reload_task, 60)
+            finally:
+                for gate in release:
+                    gate.set()
+                if not reload_task.done():
+                    reload_task.cancel()
+                await asyncio.gather(reload_task, return_exceptions=True)
+        self.assertEqual(len(checks), 2)
         current = runner._state.services[sid]
         self.assertEqual(current.service_instance_id, instance)
         self.assertEqual(current.process_identity, process)

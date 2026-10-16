@@ -52,6 +52,16 @@ class ReadOnlyLoggerTests(unittest.TestCase):
     def test_live_reader_sees_new_events_and_rejected_write_does_not_poison_it(self):
         reader = self.reader()
         first = reader.read_events()
+        with (
+            patch.object(
+                reader._store,
+                "_call",
+                side_effect=AssertionError("write path reached"),
+            ),
+            self.assertRaises(LoggingStateError),
+        ):
+            reader._store.append(event_fixture())
+        self.assertEqual(reader.read_events()["events"], [])
         identity = self.writer.record_event("fixture.live")
         with self.assertRaises(LoggingStateError):
             reader.record_event("forbidden")
@@ -119,16 +129,3 @@ class ReadOnlyLoggerTests(unittest.TestCase):
         self.config.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(LoggingError):
             self.reader()
-
-    def test_low_level_append_is_blocked_before_health_checks(self):
-        reader = self.reader()
-        with (
-            patch.object(
-                reader._store,
-                "_call",
-                side_effect=AssertionError("write path reached"),
-            ),
-            self.assertRaises(LoggingStateError),
-        ):
-            reader._store.append(event_fixture())
-        self.assertEqual(reader.read_events()["events"], [])

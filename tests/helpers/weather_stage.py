@@ -15,12 +15,23 @@ def main():
         operation = client.settings["operation"]
         if operation == "wait":
             started = time.monotonic()
-            client.report_state({"phase": "waiting", "seconds": 40})
-            while time.monotonic() - started < 40:
-                if client.cancel_requested():
-                    client.fail({"reason": "cancelled"})
-                    return
-                time.sleep(0.25)
+            artifacts = Path(client.context["artifacts_directory"])
+            if client.settings.get("controlled_wait"):
+                client.report_state({"phase": "waiting", "controlled": True})
+                (artifacts / "wait-entered").touch()
+                while not (artifacts / "release-wait").is_file():
+                    if client.cancel_requested():
+                        client.fail({"reason": "cancelled"})
+                        return
+                    time.sleep(0.02)
+                (artifacts / "wait-finished").touch()
+            else:
+                client.report_state({"phase": "waiting", "seconds": 40})
+                while time.monotonic() - started < 40:
+                    if client.cancel_requested():
+                        client.fail({"reason": "cancelled"})
+                        return
+                    time.sleep(0.25)
             client.report_progress(1, "Ожидание завершено")
             client.succeed({"waited_seconds": time.monotonic() - started})
         elif operation == "format":

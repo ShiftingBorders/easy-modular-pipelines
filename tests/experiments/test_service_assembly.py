@@ -89,15 +89,14 @@ class ServiceAssemblyTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.w.close)
         self.assembler = ExperimentAssembler(self.w.root, self.w.manager)
 
-    async def test_all_service_interfaces_assign_ids_and_preserve_explicit_policies(
+    async def test_service_implementations_assign_ids_and_preserve_explicit_policies(
         self,
     ):
-        """A1/A2: full/socket, action/socket and action/commands assemble together."""
+        """A1/A2: full and action services assemble with generated and explicit IDs."""
         w = self.w
         services = [
             w.service(),
             w.service(implementation="action"),
-            w.service(implementation="action", interface="commands"),
         ]
         template = w.template(services=copy.deepcopy(services))
         del template["services"][0]["service_id"]
@@ -106,7 +105,7 @@ class ServiceAssemblyTests(unittest.IsolatedAsyncioTestCase):
             item["service_id"]
             for item in state.template.model_dump(exclude_unset=True)["services"]
         ]
-        self.assertEqual(len(set(identifiers)), 3)
+        self.assertEqual(len(set(identifiers)), 2)
         for identifier in identifiers:
             UUID(identifier)
         self.assertEqual(identifiers[1:], [item["service_id"] for item in services[1:]])

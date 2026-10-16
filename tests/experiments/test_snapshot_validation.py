@@ -1,15 +1,19 @@
 """Approved snapshots.md A/B/C/F: real files and strict archive validation."""
 
+import asyncio
 import copy
 import hashlib
 import os
 import shutil
+import tempfile
 import unittest
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
 from core.experiments.restore_inputs import _restored_saved_state
+from core.experiments.runner import ExperimentRunner
 from core.experiments.snapshot_validation import _validate_snapshot_manifest
 from core.journal.events import LoggingError
 from core.journal.storage import SQLiteEventStore
@@ -22,18 +26,43 @@ from core.models.snapshot_documents import (
     SnapshotPayload,
 )
 from core.primitives.json_files import read_json, write_json
+from tests.helpers.dag import TEMP_ROOT, DagWorkspace
 from tests.helpers.snapshots import SnapshotWorkspace, file_inventory
 
 
 class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        cls.addClassCleanup(temporary.cleanup)
+        cls._source_archive = Path(temporary.name).resolve() / "snapshot"
+        asyncio.run(cls._create_source_snapshot(cls._source_archive))
+
+    @staticmethod
+    async def _create_source_snapshot(destination):
+        """Close the source owner before any test receives its independent copy."""
+        workspace = SnapshotWorkspace(services=False, keep=2)
+        try:
+            runner = await workspace.launch()
+            await runner.step()
+            snapshot = await runner.snapshot("valid")
+            shutil.copytree(workspace.archive(snapshot["snapshot_id"]), destination)
+        finally:
+            await workspace.close()
+
     async def asyncSetUp(self):
-        self.w = SnapshotWorkspace(services=False, keep=2)
-        self.w.template["storage"]["min_snapshot_free_bytes"] = 1
-        self.addAsyncCleanup(self.w.close)
-        self.runner = await self.w.launch()
-        await self.runner.step()
-        self.snapshot = await self.runner.snapshot("valid")
-        self.archive = self.w.archive(self.snapshot["snapshot_id"])
+        self.w = DagWorkspace()
+        self.addCleanup(self.w.close)
+        self.runner = ExperimentRunner(self.w.root, self.w.manager)
+        self.addAsyncCleanup(self.runner.close)
+        self.archive = self.w.root / "snapshot"
+        shutil.copytree(self._source_archive, self.archive)
+        self.snapshot = read_json(self.archive / "manifest.json")
+        self.assertEqual(
+            self.runner._snapshots._validate_snapshot(self.archive), self.snapshot
+        )
 
     def clone(self):
         destination = self.w.root / "validation" / str(uuid4())
@@ -128,7 +157,8 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(SQLiteEventStore, "open", observe_open),
             patch.object(
-                SQLiteEventStore, "complete_restore",
+                SQLiteEventStore,
+                "complete_restore",
                 side_effect=AssertionError("Validation must not restore the journal"),
             ) as restore,
             patch(
@@ -275,6 +305,17 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             os.rmdir(link)
 
+
+class SnapshotRuntimeValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.w = SnapshotWorkspace(services=False, keep=2)
+        self.w.template["storage"]["min_snapshot_free_bytes"] = 1
+        self.addAsyncCleanup(self.w.close)
+        self.runner = await self.w.launch()
+        await self.runner.step()
+        self.snapshot = await self.runner.snapshot("valid")
+        self.archive = self.w.archive(self.snapshot["snapshot_id"])
+
     async def test_latest_valid_skips_corruption_and_retention_removes_old_archives(
         self,
     ):
@@ -315,7 +356,9 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
             older_time["snapshot_id"],
         )
 
-    async def test_retention_does_not_validate_the_published_or_deleted_snapshot_twice(self):
+    async def test_retention_does_not_validate_the_published_or_deleted_snapshot_twice(
+        self,
+    ):
         preceding = await self.runner.snapshot("preceding")
         old = self.archive
         (old / "files/experiment.yaml").write_bytes(b"corrupt old snapshot")
@@ -323,7 +366,9 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
         checked = []
 
         def read(directory, **kwargs):
-            self.assertNotEqual(directory, old, "A deleted snapshot must not be validated")
+            self.assertNotEqual(
+                directory, old, "A deleted snapshot must not be validated"
+            )
             checked.append(directory)
             return load(directory, **kwargs)
 
@@ -381,6 +426,23 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
             [self.snapshot["snapshot_id"]],
         )
 
+    async def test_snapshot_from_another_experiment_is_refused_before_replacement(self):
+        """F1: selecting a valid archive from another experiment cannot authorize rollback."""
+        other = SnapshotWorkspace(services=False)
+        self.addAsyncCleanup(other.close)
+        runner = await other.launch()
+        foreign = await runner.snapshot()
+        location = self.archive.parent / foreign["snapshot_id"]
+        shutil.copytree(other.archive(foreign["snapshot_id"]), location)
+        root = self.runner._state.experiment_directory
+        before = file_inventory(root / "shared_artifacts")
+        with self.assertRaises(ValueError):
+            await self.runner.rollback(foreign["snapshot_id"])
+        self.assertEqual(file_inventory(root / "shared_artifacts"), before)
+        self.assertEqual(self.runner.get_state()["phase"], "waiting")
+
+
+class SnapshotServiceValidationTests(unittest.IsolatedAsyncioTestCase):
     async def test_required_exports_and_service_definitions_must_match_snapshot(self):
         """C2: required RAM state, service settings and export ownership are validated."""
         w = SnapshotWorkspace()
@@ -411,18 +473,3 @@ class SnapshotValidationTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 with self.assertRaises((ValueError, TypeError, KeyError)):
                     runner._snapshots._validate_snapshot(archive, manifest=manifest)
-
-    async def test_snapshot_from_another_experiment_is_refused_before_replacement(self):
-        """F1: selecting a valid archive from another experiment cannot authorize rollback."""
-        other = SnapshotWorkspace(services=False)
-        self.addAsyncCleanup(other.close)
-        runner = await other.launch()
-        foreign = await runner.snapshot()
-        location = self.archive.parent / foreign["snapshot_id"]
-        shutil.copytree(other.archive(foreign["snapshot_id"]), location)
-        root = self.runner._state.experiment_directory
-        before = file_inventory(root / "shared_artifacts")
-        with self.assertRaises(ValueError):
-            await self.runner.rollback(foreign["snapshot_id"])
-        self.assertEqual(file_inventory(root / "shared_artifacts"), before)
-        self.assertEqual(self.runner.get_state()["phase"], "waiting")

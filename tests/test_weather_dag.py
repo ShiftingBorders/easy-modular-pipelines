@@ -1,7 +1,7 @@
-"""Approved groups A-K: real 30-second weather service in a four-step DAG.
+"""Real process/HTTP/TCP/SQLite weather DAGs with controlled functional waits.
 
-All scenarios keep the real 40-second first step. No clock or TCP substitutes.
-The object storage fixture serves files over loopback HTTP; journals use SQLite.
+The timing smoke retains the real 40-second stage and 30-second service timer.
+Other cases release owned gates after observing the operation under test.
 """
 
 import asyncio
@@ -65,7 +65,7 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         self.service = {
             "service_id": self.sid,
             "module": references["service"],
-            "settings": {},
+            "settings": {"controlled_forecast": True},
             "heartbeat": {"interval_seconds": 1, "grace_seconds": 5},
             "command_timeout_seconds": 10,
             "on_command_timeout": "pause",
@@ -87,6 +87,7 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
                 else {"module": references["stage"]}
             )
             self.template["stages"].append(node)
+        self.template["stages"][0]["settings"]["controlled_wait"] = True
         self.path = self.w.source / "template.yaml"
         self.code_before = inventory(self.w.source / "modules")
         self.runner = self.new_runner()
@@ -116,8 +117,134 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
                 return events
             cursor = page["checkpoint"]
 
+    async def _wait_for_wait(self):
+        """Observe module entry, not merely creation of its executor process."""
+
+        def entered():
+            attempt = self.runner._state.active_attempt
+            if (
+                attempt is not None
+                and attempt.stage_id == self.template["stages"][0]["stage_id"]
+                and attempt.process_identity is not None
+                and (attempt.artifacts_directory / "wait-entered").is_file()
+            ):
+                return attempt
+            return None
+
+        attempt = await wait_until(entered, timeout=30)
+        self.w.gates.append(attempt.artifacts_directory / "release-wait")
+        return attempt
+
+    async def _release_wait(self):
+        """Generate the second forecast in the live service before releasing work."""
+        attempt = await self._wait_for_wait()
+        instance = self.runner._state.services[self.sid]
+        (instance.artifacts_directory / "generate-next").touch()
+        await wait_until(
+            (instance.artifacts_directory / "next-generated").is_file, timeout=30
+        )
+        self.assertIs(self.runner._state.active_attempt, attempt)
+        self.assertFalse((attempt.artifacts_directory / "wait-finished").exists())
+        (attempt.artifacts_directory / "release-wait").touch()
+
+    async def _step_wait(self):
+        step = asyncio.create_task(self.runner.step())
+        try:
+            await self._release_wait()
+            self.assertEqual(
+                (await asyncio.wait_for(step, 30))["result"]["result"], "success"
+            )
+        finally:
+            if not step.done():
+                step.cancel()
+            await asyncio.gather(step, return_exceptions=True)
+
+    async def _start_owned_runner(
+        self, log_name: str, experiment_id: str
+    ) -> asyncio.subprocess.Process:
+        """Start a runner and register its process, output and ownership for cleanup."""
+        output = (self.w.root / log_name).open("wb")
+        self.w.child_files.append(output)
+        owner = await asyncio.create_subprocess_exec(
+            "uv",
+            "run",
+            "--project",
+            str(REPOSITORY),
+            "--no-sync",
+            "python",
+            "-B",
+            "-m",
+            "tests.helpers.snapshot_owner",
+            "--root",
+            str(self.w.source),
+            "--experiment",
+            experiment_id,
+            # No internal halt: the parent chooses the crash after work enters.
+            "--operation",
+            "stage",
+            "--phase",
+            "parent_controlled",
+            cwd=REPOSITORY,
+            stdout=output,
+            stderr=output,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.w.children.append(owner)
+        self.w.child_owners.append(self.w.source / "owner-ready.json")
+        return owner
+
+    async def _crash_owner_after_entry(self, log_name, entered_path=None):
+        """Kill an owned runner only after its dispatched work has entered its gate."""
+        state = self.runner._state
+        await self.runner.close()
+        owner = await self._start_owned_runner(log_name, state.experiment_id)
+        await wait_until((self.w.source / "owner-ready.json").is_file, timeout=30)
+        attempt = await wait_until(
+            lambda: (
+                self.runner._state_store.load(state.experiment_directory).active_attempt
+            ),
+            timeout=30,
+        )
+        if entered_path is None:
+            entered_path = attempt.artifacts_directory / "wait-entered"
+            self.w.gates.append(attempt.artifacts_directory / "release-wait")
+        await wait_until(entered_path.is_file, timeout=30)
+        if attempt.service_id is not None:
+            await wait_until(
+                lambda: (
+                    self.runner._state_store.load(state.experiment_directory)
+                    .services[self.sid]
+                    .active_request
+                ),
+                timeout=30,
+            )
+        saved = self.runner._state_store.load(state.experiment_directory)
+        if attempt.service_id is not None:
+            self.assertEqual(
+                saved.services[self.sid].active_request.request_id, attempt.request_id
+            )
+            self.assertIsNotNone(saved.services[self.sid].active_request.sent_monotonic)
+        expected_process = (
+            saved.services[self.sid].process_identity
+            if attempt.service_id is not None
+            else read_json(attempt.artifacts_directory / "process.json")["stage"]
+        )
+        self.assertIsNone(owner.returncode)
+        self.assertTrue(process_running(_process_identity_pid(expected_process)))
+        # Terminate the Python owner identified by its own fixture, not uv's wrapper.
+        owner_identity = read_json(self.w.source / "owner-ready.json")["process"]
+        terminate_owned(owner_identity)
+        self.assertNotEqual(await asyncio.wait_for(owner.wait(), 30), 0)
+        return attempt, expected_process
+
     async def finish(self):
         await self.runner.resume()
+        first = self.template["stages"][0]
+        if (
+            first["settings"].get("controlled_wait")
+            and first["stage_id"] not in self.runner._state.stage_result_ids
+        ):
+            await self._release_wait()
         await wait_until(
             lambda: self.runner.get_state()["phase"] in ("completed", "failed"),
             timeout=100,
@@ -151,6 +278,8 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_complete_real_timing_dataflow_and_journal(self):
         """J/K23: 40 real seconds include the service's next 30-second forecast."""
+        self.service["settings"] = {}
+        self.template["stages"][0]["settings"].pop("controlled_wait")
         await self.launch()
         await self.finish()
         state = self.runner._state
@@ -180,8 +309,18 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         """E14: pause finishes the current wait; step calls the existing service."""
         instance = await self.launch()
         await self.runner.resume()
-        await wait_until(lambda: self.runner.get_state()["phase"] == "stage_running")
-        await asyncio.wait_for(self.runner.pause(), 70)
+        attempt = await self._wait_for_wait()
+        pause = asyncio.create_task(self.runner.pause())
+        try:
+            await wait_until(lambda: self.runner._state.pause_requested, timeout=30)
+            self.assertFalse(pause.done())
+            self.assertIs(self.runner._state.active_attempt, attempt)
+            await self._release_wait()
+            await asyncio.wait_for(pause, 30)
+        finally:
+            if not pause.done():
+                pause.cancel()
+            await asyncio.gather(pause, return_exceptions=True)
         self.assertEqual(self.runner.get_state()["mode"], "paused")
         self.assertTrue(
             process_running(_process_identity_pid(instance.process_identity))
@@ -209,10 +348,7 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_rollback_and_complete(self):
         """H20: snapshot after forecast acquisition preserves its ledger result."""
         await self.launch()
-        self.assertEqual(
-            (await asyncio.wait_for(self.runner.step(), 70))["result"]["result"],
-            "success",
-        )
+        await self._step_wait()
         self.assertEqual((await self.runner.step())["result"]["result"], "success")
         snapshot = await self.runner.snapshot("weather acquired")
         retained = self.runner._state.last_result_id
@@ -225,39 +361,8 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         """E/H19: an independent runner dies while its executor and service survive."""
         instance = await self.launch()
         experiment_id = self.runner._state.experiment_id
-        await self.runner.close()
-        output = (self.w.root / "weather-owner.log").open("wb")
-        self.w.child_files.append(output)
-        owner = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "--project",
-            str(REPOSITORY),
-            "--no-sync",
-            "python",
-            "-B",
-            "-m",
-            "tests.helpers.snapshot_owner",
-            "--root",
-            str(self.w.source),
-            "--experiment",
-            experiment_id,
-            "--operation",
-            "stage",
-            "--phase",
-            "stage_running",
-            "--action",
-            "crash",
-            cwd=REPOSITORY,
-            stdout=output,
-            stderr=output,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        self.w.children.append(owner)
-        self.assertEqual(
-            await asyncio.wait_for(owner.wait(), 40),
-            23,
-            (self.w.root / "weather-owner.log").read_text(encoding="utf-8"),
+        original, original_process = await self._crash_owner_after_entry(
+            "weather-owner.log"
         )
         self.assertTrue(
             process_running(_process_identity_pid(instance.process_identity))
@@ -265,8 +370,15 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         self.runner = self.new_runner()
         try:
             await self.runner.recover(experiment_id)
+            recovered = await self._wait_for_wait()
+            self.assertEqual(recovered.attempt_id, original.attempt_id)
+            self.assertEqual(
+                _process_identity_document(recovered.process_identity),
+                _process_identity_document(original_process),
+            )
+            await self._release_wait()
             await wait_until(
-                lambda: self.runner._state.active_attempt is None, timeout=70
+                lambda: self.runner._state.active_attempt is None, timeout=30
             )
             await self.finish()
             self.assertEqual(
@@ -379,14 +491,7 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
         """B/D11: stop interrupts the first step and leaves no output or live service."""
         instance = await self.launch()
         await self.runner.resume()
-        await wait_until(
-            lambda: (
-                self.runner._state.active_attempt is not None
-                and self.runner._state.active_attempt.process_identity is not None
-            ),
-            timeout=15,
-        )
-        attempt = self.runner._state.active_attempt
+        attempt = await self._wait_for_wait()
         await self.runner.stop()
         self.assertFalse(
             process_running(_process_identity_pid(instance.process_identity))
@@ -401,46 +506,25 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_runner_crash_during_service_call_recovers_without_replay(self):
         """E/H19: preserve the sent service call across actual owner process loss."""
-        self.template["stages"][1]["settings"] = {"delay_first": 12}
+        self.template["stages"][1]["settings"] = {"hold_first": True}
         instance = await self.launch()
-        await asyncio.wait_for(self.runner.step(), 70)
+        await self._step_wait()
         experiment_id = self.runner._state.experiment_id
-        await self.runner.close()
-        output = (self.w.root / "weather-call-owner.log").open("wb")
-        self.w.child_files.append(output)
-        owner = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "--project",
-            str(REPOSITORY),
-            "--no-sync",
-            "python",
-            "-B",
-            "-m",
-            "tests.helpers.snapshot_owner",
-            "--root",
-            str(self.w.source),
-            "--experiment",
-            experiment_id,
-            "--operation",
-            "stage",
-            "--phase",
-            "service_work",
-            "--action",
-            "crash",
-            cwd=REPOSITORY,
-            stdout=output,
-            stderr=output,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        self.w.children.append(owner)
-        self.assertEqual(
-            await asyncio.wait_for(owner.wait(), 30),
-            23,
-            (self.w.root / "weather-call-owner.log").read_text(encoding="utf-8"),
+        release = instance.artifacts_directory / "release-first"
+        self.w.gates.append(release)
+        original, original_process = await self._crash_owner_after_entry(
+            "weather-call-owner.log",
+            instance.artifacts_directory / "first-request-entered",
         )
         self.runner = self.new_runner()
         await self.runner.recover(experiment_id)
+        self.assertEqual(
+            self.runner._state.active_attempt.request_id, original.request_id
+        )
+        self.assertEqual(
+            self.runner._state.services[self.sid].process_identity, original_process
+        )
+        release.touch()
         await wait_until(lambda: self.runner._state.active_attempt is None, timeout=30)
         self.assertEqual(
             self.runner._state.services[self.sid].service_instance_id,
@@ -451,6 +535,7 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
             event for event in self.events() if event["event_type"] == "weather.request"
         ]
         self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["data"]["request_id"], original.request_id)
         self.assertEqual(
             self.runner._state.stage_attempt_numbers[
                 self.template["stages"][1]["stage_id"]
@@ -461,17 +546,41 @@ class WeatherDagTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_late_response_and_retry_keep_original_service(self):
         """D/E13: timeout remains accepted even after the service finishes that call."""
         node = self.template["stages"][1]
-        node["settings"] = {"delay_first": 3}
+        node["settings"] = {"hold_first": True}
         node["timeout_seconds"] = 2
         node["errors"]["retries"] = 1
         instance = await self.launch()
-        await self.finish()
+        release = instance.artifacts_directory / "release-first"
+        entered = instance.artifacts_directory / "first-request-entered"
+        self.w.gates.append(release)
+        await self._step_wait()
+        completion = asyncio.create_task(self.finish())
+        try:
+            await wait_until(entered.is_file, timeout=30)
+            request_id = read_json(entered)["request_id"]
+            first = await wait_until(
+                lambda: self.runner._journal.client.read_command_result(request_id),
+                timeout=30,
+            )
+            self.assertEqual(first["outcome"], "timed_out")
+            self.assertEqual(first["author"], "runner")
+            self.assertEqual(
+                {item["author"] for item in first["observations"]}, {"runner"}
+            )
+            release.touch()
+            await asyncio.wait_for(completion, 60)
+        finally:
+            release.touch()
+            if not completion.done():
+                completion.cancel()
+            await asyncio.gather(completion, return_exceptions=True)
         calls = [
             event["data"]
             for event in self.events()
             if event["event_type"] == "weather.request"
         ]
         self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0]["request_id"], calls[1]["request_id"])
         first = self.runner._journal.client.read_command_result(calls[0]["request_id"])
         self.assertEqual(first["outcome"], "timed_out")
         self.assertEqual(first["author"], "runner")

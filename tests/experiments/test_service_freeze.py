@@ -5,8 +5,11 @@ import os
 import subprocess
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
+from core.experiments import services as service_runtime
 from core.experiments.state import _process_identity_pid
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
@@ -23,35 +26,45 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
     async def owner(self, snapshot, *, mode="freeze", phase="frozen", fault="none"):
         controls = self.w.root / f"owner-{uuid4()}"
         controls.mkdir()
-        process = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "--project",
-            str(REPOSITORY),
-            "--no-sync",
-            "python",
-            "-B",
-            "-m",
-            "tests.helpers.service_owner",
-            "--workspace",
-            str(self.w.root),
-            "--controls",
-            str(controls),
-            "--snapshot",
-            snapshot,
-            "--mode",
-            mode,
-            "--phase",
-            phase,
-            "--fault",
-            fault,
-            cwd=REPOSITORY,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        output = asyncio.create_task(process.communicate())
+        # The subprocess takes the journal's exclusive owner lease.
+        self.w.journal.close()
+        stdout_path, stderr_path = controls / "stdout.log", controls / "stderr.log"
+        # Surviving services may inherit handles; files do not hold communicate() open.
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = await asyncio.create_subprocess_exec(
+                "uv",
+                "run",
+                "--project",
+                str(REPOSITORY),
+                "--no-sync",
+                "python",
+                "-B",
+                "-m",
+                "tests.helpers.service_owner",
+                "--workspace",
+                str(self.w.root),
+                "--controls",
+                str(controls),
+                "--snapshot",
+                snapshot,
+                "--mode",
+                mode,
+                "--phase",
+                phase,
+                "--fault",
+                fault,
+                cwd=REPOSITORY,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                stdout=stdout,
+                stderr=stderr,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+
+        async def collect_output():
+            await process.wait()
+            return stdout_path.read_bytes(), stderr_path.read_bytes()
+
+        output = asyncio.create_task(collect_output())
         self.owners.append((process, controls, output))
         await wait_for(lambda: (controls / "owner.json").exists())
         return process, controls, output
@@ -64,7 +77,7 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
             await output
 
     async def test_owner_crash_during_startup_preserves_original_deadline(self):
-        """E: reconnecting after an owner crash cannot grant another 30-second startup budget."""
+        """A real owner crash cannot grant a new budget at the original startup deadline."""
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service(retries=0)
@@ -77,17 +90,34 @@ class ServiceFreezeTests(unittest.IsolatedAsyncioTestCase):
                 str(uuid4()), mode="start-crash"
             )
             await asyncio.wait_for(process.wait(), 15)
-            await output
-            self.assertTrue((controls / "checkpoint.json").exists())
+            _, stderr = await output
+            error = controls / "error.json"
+            self.assertTrue(
+                (controls / "checkpoint.json").exists(),
+                error.read_text(encoding="utf-8")
+                if error.exists()
+                else stderr.decode(),
+            )
             w.state = w.store.load(w.experiment)
+            w.journal.open(w.state, create=False)
             instance = w.state.services[sid]
             deadline = instance.start_deadline
             self.assertFalse(instance.ever_ready)
-            await wait_for(lambda: time.monotonic() >= deadline - 22, timeout=12)
-            began = time.monotonic()
-            self.assertEqual(await w.manager.recover(w.state), "stop")
-            self.assertGreaterEqual(time.monotonic(), deadline)
-            self.assertLess(time.monotonic() - began, 28)
+            recovering = asyncio.current_task()
+
+            def recovery_time():
+                return (
+                    deadline
+                    if asyncio.current_task() is recovering
+                    else time.monotonic()
+                )
+
+            with patch.object(
+                service_runtime, "time", SimpleNamespace(monotonic=recovery_time)
+            ):
+                self.assertEqual(await w.manager.recover(w.state), "stop")
+            self.assertEqual(instance.start_deadline, deadline)
+            self.assertEqual(instance.failure.code, "startup_timeout")
             self.assertTrue(instance.stopped)
             self.assertEqual(
                 len([row for row in w.trace(definition) if row["event"] == "started"]),

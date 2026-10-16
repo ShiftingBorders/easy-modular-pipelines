@@ -26,8 +26,17 @@ class PrecacheTests(unittest.TestCase):
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)
         self.root = Path(temporary.name)
+        (self.root / "project").mkdir()
         self.workspaces = []
-        for index in range(3):
+        self.config = write_settings(
+            self.root, project_root=str(self.root / "project"), cache_workers=2
+        )
+        self.settings = load_settings(self.config)
+        self.reader = LocalJournals(self.settings)
+        self.addCleanup(self.reader.close)
+
+    def _prepare_histories(self, count):
+        for index in range(count):
             data = history(((1, 2),))
             data["state"]["phase"] = "stopped"
             workspace = JournalWorkspace(
@@ -38,17 +47,12 @@ class PrecacheTests(unittest.TestCase):
             )
             self.addCleanup(workspace.close)
             self.workspaces.append(workspace)
-        self.config = write_settings(
-            self.root, project_root=str(self.root / "project"), cache_workers=2
-        )
-        self.settings = load_settings(self.config)
-        self.reader = LocalJournals(self.settings)
-        self.addCleanup(self.reader.close)
 
     def test_cli_precaches_stopped_experiments_in_independent_processes(self):
         """T015/T045/T046/T047/T051/T066: finite targets, process PIDs, final Modules."""
         from tests.helpers.logging_process import database_dump
 
+        self._prepare_histories(3)
         snapshots = [
             database_dump(workspace.directory / "journals/events.sqlite")
             for workspace in self.workspaces
@@ -96,6 +100,7 @@ class PrecacheTests(unittest.TestCase):
 
     def test_fixed_target_finishes_despite_later_appends(self):
         """T045/T027: appends after a captured target cannot prolong that task."""
+        self._prepare_histories(1)
         first = cache_experiment(self.settings, "exp-0")
         self.assertTrue(first["complete"])
         target = first["target_boundary"]
@@ -110,6 +115,7 @@ class PrecacheTests(unittest.TestCase):
 
     def test_writer_lock_is_visible_in_another_native_process(self):
         """T048/T050: Windows and POSIX workers observe the same writer exclusion."""
+        self._prepare_histories(1)
         cache_experiment(self.settings, "exp-0")
         dataset = self.reader.cached("exp-0")
         with ProcessPoolExecutor(
@@ -127,6 +133,7 @@ class PrecacheTests(unittest.TestCase):
 
     def test_one_failed_source_does_not_discard_other_experiment_progress(self):
         """T049/T051: failed experiment exit code and independent successful caches."""
+        self._prepare_histories(3)
         self.workspaces[0].close()
         (self.workspaces[0].directory / "journals/events.sqlite").unlink()
         result = subprocess.run(

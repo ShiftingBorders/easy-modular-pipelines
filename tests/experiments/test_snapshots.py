@@ -38,7 +38,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     await work.close()
 
     async def test_snapshot_after_applies_to_successful_service_call_nodes(self):
-        work = self.w
+        work = self._workspace()
         work.template["snapshots"]["mode"] = "after_epoch"
         call = copy.deepcopy(work.stages[0])
         del call["module"]
@@ -56,7 +56,8 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def test_restore_phases_retain_models_and_leave_previous_states_unchanged(
         self,
     ):
-        runner = await self.w.launch()
+        work = self._workspace()
+        runner = await work.launch()
         await runner.step()
         snapshot = await runner.snapshot("typed restoration")
         await runner.step()
@@ -106,7 +107,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         detached.used_request_ids.clear()
         self.assertEqual(original.model_dump(exclude_unset=True), before)
         marker = (
-            self.w.root
+            work.root
             / "controller/restore_transactions"
             / f"{runner._state.experiment_directory.name}.json"
         )
@@ -116,7 +117,8 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(journal.call_args.args[1], JournalSnapshotManifest)
 
     async def test_runner_journal_restore_accepts_the_existing_json_input(self):
-        runner = await self.w.launch()
+        work = self._workspace()
+        runner = await work.launch()
         await runner.step()
         snapshot = await runner.snapshot("JSON journal restoration")
         await runner.step()
@@ -138,13 +140,14 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             seen[0],
             read_json(
-                self.w.archive(snapshot["snapshot_id"]) / "journal/manifest.json"
+                work.archive(snapshot["snapshot_id"]) / "journal/manifest.json"
             ),
         )
 
-    async def asyncSetUp(self):
-        self.w = SnapshotWorkspace()
-        self.addAsyncCleanup(self.w.close)
+    def _workspace(self) -> SnapshotWorkspace:
+        work = SnapshotWorkspace()
+        self.addAsyncCleanup(work.close)
+        return work
 
     @unittest.skipUnless(os.name == "nt", "Windows file sharing")
     async def test_temporary_endpoint_sharing_violation_does_not_fail_stage_startup(
@@ -239,7 +242,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
     ):
         """B1/B5/B6/F3-F5: S1 after A, mutate B/RAM, rollback, then both cycles."""
         async with asyncio.timeout(150):
-            w = self.w
+            w = self._workspace()
             runner = await w.launch()
             first = await runner.step()
             self.assertEqual(first["result"]["data"]["trail"], ["A"])
@@ -364,7 +367,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_continue_creates_paused_clone_without_changing_source(self):
         """H1/H2/H4: inherited artifacts keep origin; clone resumes at B."""
-        w = self.w
+        w = self._workspace()
         runner = await w.launch()
         await runner.step()
         await w.value(10)
@@ -399,7 +402,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rollback_at_cycle_boundary_and_repeated_rollback_keep_pause(self):
         """B6/F4/G5: a saved completed cycle advances once after each explicit rollback."""
-        w = self.w
+        w = self._workspace()
         runner = await w.launch()
         for _ in range(3):
             await runner.step()
@@ -459,7 +462,7 @@ class ExperimentSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_running_stage_rejects_snapshot_without_interrupting_it(self):
         """B2: a stage-free boundary is required even when pause has been requested."""
-        w = self.w
+        w = self._workspace()
         gate = w.files.gate()
         w.stages[0]["settings"]["gate"] = str(gate)
         runner = await w.launch()

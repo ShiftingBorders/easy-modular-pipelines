@@ -44,6 +44,19 @@ try {
     }
     const result=await send('Runtime.evaluate',{awaitPromise:true,returnByValue:true,expression:`(async()=>{
         const wait=async(predicate)=>{const deadline=Date.now()+10000;while(!predicate()){if(Date.now()>deadline)throw new Error('UI deadline exceeded');await new Promise(r=>setTimeout(r,20));}};
+        // A posted task runs after the response consumer's promise continuations.
+        // This acknowledges handling without guessing a network/rendering delay.
+        const nextTurn=()=>new Promise(resolve=>{
+            const channel=new MessageChannel();
+            channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};
+            channel.port2.postMessage(null);
+        });
+        const acknowledgedResponse=(document,handled)=>{
+            const response=new Response(JSON.stringify(document),{headers:{'content-type':'application/json'}});
+            const read=response.json.bind(response);
+            response.json=async()=>{const result=await read();void nextTurn().then(handled);return result;};
+            return response;
+        };
         const go=async(page,experiment='exp-test')=>{const a=document.createElement('a');a.href='/?page='+page+'&experiment='+encodeURIComponent(experiment);document.body.append(a);a.click();a.remove();await wait(()=>document.querySelector('#main h1')?.textContent!=='Loading\u2026' && !document.querySelector('#main .loading'));};
         const output={screens:{}};
         for(const page of ['overview','experiments','timeline','dag','errors','events','resources','artifacts','settings','commands','snapshots','forecast','modules','services','compute','alerts','icmp']){
@@ -59,10 +72,17 @@ try {
         await go('forecast');output.forecastText=document.getElementById('forecast-body').innerText;
         await go('compute');output.refreshChoices=[...document.querySelector('#refresh-rate').options].map(o=>o.value);
         // Capture the actual refresh scheduled by the public refresh control.
-        let refreshCallback;const nativeInterval=window.setInterval;
-        window.setInterval=(callback,...args)=>{refreshCallback=callback;return nativeInterval(callback,...args);};
+        let refreshCallback,refreshInterval,refreshTimer,scheduledRefreshes=0;
+        const nativeInterval=window.setInterval;
+        window.setInterval=(callback,interval,...args)=>{
+            refreshCallback=callback;refreshInterval=interval;
+            refreshTimer=nativeInterval(()=>{scheduledRefreshes++;callback(...args);},interval);
+            return refreshTimer;
+        };
         try {document.querySelector('#refresh-rate').dispatchEvent(new Event('change',{bubbles:true}));}
         finally {window.setInterval=nativeInterval;}
+        await wait(()=>scheduledRefreshes>0&&!document.querySelector('#main[aria-busy]'));
+        output.periodicRefreshObserved=scheduledRefreshes>0;
         output.rangeChoices=[...document.querySelector('#resource-window').options].map(o=>o.value);
         output.gpuVisible=/GPU|VRAM/.test(document.getElementById('main').innerText);
         await go('alerts');document.querySelector('[data-action="new-rule"]').click();
@@ -93,40 +113,71 @@ try {
         ui.updateContent(sandbox,'<div data-key="b">Updated</div><div data-key="a"><input><details><summary>Details</summary>New text</details></div><div data-key="c">Inserted</div>');
         output.domState.reorder=sandbox.children[1]===first&&sandbox.children.length===3;
         sandbox.remove();
+        // Functional refresh assertions control the callback after the real timer
+        // has been observed. Restore the same interval for performance samples.
+        clearInterval(refreshTimer);
         await go('events');
-        const nativeFetch=window.fetch.bind(window);let release;
+        const nativeFetch=window.fetch.bind(window);let release,oldResponseReady=false,oldResponseHandled=false;
         const held=new Promise(resolve=>release=resolve);
-        window.fetch=async(...args)=>{if(String(args[0]).includes('/exp-test/errors'))await held;return nativeFetch(...args);};
+        window.fetch=async(...args)=>{
+            if(!String(args[0]).includes('/exp-test/errors'))return nativeFetch(...args);
+            const document=await (await nativeFetch(...args)).json();oldResponseReady=true;
+            await held;return acknowledgedResponse(document,()=>oldResponseHandled=true);
+        };
         const heading=document.querySelector('#main .heading'), tabs=document.querySelector('#main .tabs');
         document.querySelector('.tabs a[href*="page=errors"]').click();
         output.tabsPreserved=document.querySelector('#main .heading')===heading&&document.querySelector('#main .tabs')===tabs&&Boolean(document.querySelector('#page-loading'));
-        await go('artifacts');release();await new Promise(resolve=>setTimeout(resolve,50));
-        output.lateResponseIgnored=new URL(location.href).searchParams.get('page')==='artifacts'&&document.getElementById('main').innerText.includes('Artifacts');
-        window.fetch=nativeFetch;
+        try {
+            await wait(()=>oldResponseReady);
+            await go('artifacts');release();await wait(()=>oldResponseHandled);
+            output.lateResponseIgnored=new URL(location.href).searchParams.get('page')==='artifacts'&&document.getElementById('main').innerText.includes('Artifacts');
+        } finally {release();window.fetch=nativeFetch;}
         let retries=0;
         window.fetch=(...args)=>String(args[0]).includes('/exp-test/errors')?(retries++,Promise.resolve(new Response(JSON.stringify({error:{code:'history_changed',message:'Changed'}}),{status:409,headers:{'content-type':'application/json'}}))):nativeFetch(...args);
         await go('errors');output.historyRetryCount=retries;window.fetch=nativeFetch;
         await go('events');
         const oldRows=[...document.querySelectorAll('[data-row]')];
         window.fetch=(...args)=>String(args[0]).includes('/exp-test/events')?Promise.resolve(new Response(JSON.stringify({error:{code:'unavailable',message:'Temporary read failure'}}),{status:503,headers:{'content-type':'application/json'}})):nativeFetch(...args);
+        refreshCallback();
         await wait(()=>Boolean(document.getElementById('refresh-error')));
         output.previousDataRetained=oldRows.every(row=>row.isConnected);window.fetch=nativeFetch;
         await go('events');
-        let releaseDetail;const detailHeld=new Promise(resolve=>releaseDetail=resolve);let detailRequests=0;
-        window.fetch=async(...args)=>{if(String(args[0]).includes('/exp-test/detail')&&++detailRequests===1)await detailHeld;return nativeFetch(...args);};
+        let releaseDetail,firstDetailReady=false,firstDetailHandled=false;
+        const detailHeld=new Promise(resolve=>releaseDetail=resolve);let detailRequests=0;
+        window.fetch=async(...args)=>{
+            if(!String(args[0]).includes('/exp-test/detail'))return nativeFetch(...args);
+            const request=++detailRequests;
+            const document=await (await nativeFetch(...args)).json();
+            document.record.__test_response='detail-'+request;
+            if(request===1){firstDetailReady=true;await detailHeld;}
+            return acknowledgedResponse(document,()=>{if(request===1)firstDetailHandled=true;});
+        };
         const inspect=[...document.querySelectorAll('[data-inspect]')];
-        inspect[0].click();document.getElementById('details-dialog').close();inspect[1].click();
-        const secondId=JSON.parse(inspect[1].dataset.inspect).event_id;
-        await wait(()=>document.getElementById('detail-content').textContent.includes(secondId));
-        releaseDetail();await new Promise(resolve=>setTimeout(resolve,80));
-        output.detailRaceSafe=document.getElementById('detail-content').textContent.includes(secondId);
-        document.getElementById('details-dialog').close();window.fetch=nativeFetch;
+        try {
+            inspect[0].click();await wait(()=>firstDetailReady);
+            document.getElementById('details-dialog').close();inspect[1].click();
+            const secondId=JSON.parse(inspect[1].dataset.inspect).event_id;
+            await wait(()=>document.getElementById('detail-content').textContent.includes('detail-2'));
+            releaseDetail();await wait(()=>firstDetailHandled);
+            const detail=document.getElementById('detail-content').textContent;
+            output.detailRaceSafe=detail.includes(secondId)&&detail.includes('detail-2')&&!detail.includes('detail-1');
+        } finally {releaseDetail();document.getElementById('details-dialog').close();window.fetch=nativeFetch;}
         await go('events');document.querySelector('[data-action="load-more"]').click();
         await wait(()=>Number(document.querySelector('[data-count]')?.textContent)===400);
-        await new Promise(resolve=>setTimeout(resolve,1100));
+        let paginationRequests=0;
+        window.fetch=(...args)=>{if(String(args[0]).includes('/exp-test/events'))paginationRequests++;return nativeFetch(...args);};
+        refreshCallback();await nextTurn();
+        output.paginationRequestsOnRefresh=paginationRequests;window.fetch=nativeFetch;
         output.paginationRetained=Number(document.querySelector('[data-count]')?.textContent)===400;
         await go('settings');document.querySelector('[data-settings="json"]').click();
-        await new Promise(resolve=>setTimeout(resolve,1100));
+        let settingsRefreshed=false;
+        window.fetch=async(...args)=>{
+            const response=await nativeFetch(...args);
+            if(!String(args[0]).includes('/exp-test/template'))return response;
+            return acknowledgedResponse(await response.json(),()=>settingsRefreshed=true);
+        };
+        refreshCallback();await wait(()=>settingsRefreshed&&!document.querySelector('#main[aria-busy]'));
+        window.fetch=nativeFetch;
         output.settingsModeRetained=document.querySelector('[data-settings="json"]').classList.contains('active')&&document.querySelector('#settings-content pre').textContent.trim().startsWith('{');
         window.fetch=async(...args)=>{
             const response=await nativeFetch(...args);
@@ -140,6 +191,7 @@ try {
         const history=await (await fetch('/api/system/experiments/exp-test/events?compact=1')).json();
         output.historyEvents=history.total;
         if(!history.complete)throw new Error('Performance history is incomplete');
+        refreshTimer=nativeInterval(refreshCallback,refreshInterval);
         output.pageTimings={};output.summaryRequests=0;
         window.fetch=(...args)=>{if(String(args[0]).includes('/exp-test/summary'))output.summaryRequests++;return nativeFetch(...args);};
         for(const page of ['overview','experiments','modules','errors','artifacts','events','resources','settings']){

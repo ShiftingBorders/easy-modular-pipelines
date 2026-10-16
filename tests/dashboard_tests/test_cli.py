@@ -62,40 +62,30 @@ class CommandLineTests(unittest.TestCase):
         self.config = write_settings(self.directory)
         self.server = SimpleNamespace(run=Mock())
 
-    def test_passes_explicit_host_port_and_one_worker_to_server(self) -> None:
-        arguments = [
-            "dashboard",
-            "--config",
-            str(self.config),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9002",
-        ]
-        with (
-            patch.object(sys, "argv", arguments),
-            patch.dict(sys.modules, {"uvicorn": self.server}),
-        ):
-            main()
-        self.server.run.assert_called_once()
-        self.assertEqual(self.server.run.call_args.kwargs["host"], "127.0.0.1")
-        self.assertEqual(self.server.run.call_args.kwargs["port"], 9002)
-        self.assertEqual(self.server.run.call_args.kwargs["workers"], 1)
-        self.assertEqual(
-            self.server.run.call_args.args[0].state.settings.state_directory,
-            self.directory / ".state",
-        )
-        self.assertFalse((self.directory / ".state").exists())
-
-    def test_uses_configured_host_and_port_without_overrides(self) -> None:
+    def test_server_options_use_configuration_and_explicit_overrides(self) -> None:
         self.config = write_settings(self.directory, host="localhost", port=9123)
-        with (
-            patch.object(sys, "argv", ["dashboard", "--config", str(self.config)]),
-            patch.dict(sys.modules, {"uvicorn": self.server}),
+        for arguments, host, port in (
+            ([], "localhost", 9123),
+            (["--host", "127.0.0.1", "--port", "9002"], "127.0.0.1", 9002),
         ):
-            main()
-        self.assertEqual(self.server.run.call_args.kwargs["host"], "localhost")
-        self.assertEqual(self.server.run.call_args.kwargs["port"], 9123)
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(
+                    sys, "argv", ["dashboard", "--config", str(self.config), *arguments]
+                ),
+                patch.dict(sys.modules, {"uvicorn": self.server}),
+            ):
+                self.server.run.reset_mock()
+                main()
+                self.server.run.assert_called_once()
+                self.assertEqual(self.server.run.call_args.kwargs["host"], host)
+                self.assertEqual(self.server.run.call_args.kwargs["port"], port)
+                self.assertEqual(self.server.run.call_args.kwargs["workers"], 1)
+                self.assertEqual(
+                    self.server.run.call_args.args[0].state.settings.state_directory,
+                    self.directory / ".state",
+                )
+                self.assertFalse((self.directory / ".state").exists())
 
     def test_invalid_port_does_not_start_server(self) -> None:
         for port in ["0", "65536", "-1", "text"]:

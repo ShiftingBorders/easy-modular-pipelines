@@ -71,17 +71,12 @@ class HashDBTestCase(unittest.TestCase):
 class HashDBConfigTests(HashDBTestCase):
     """Verify configuration loading, validation, and path resolution."""
 
-    def test_rejects_missing_config_file(self) -> None:
-        """A nonexistent configuration file must fail during JSON loading."""
-        with self.assertRaises(StorageConfigurationError) as raised:
-            HashDB(self.temp_path / "missing.json")
-        self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
-
-    def test_rejects_config_directory(self) -> None:
-        """A directory cannot be used as the configuration file."""
-        with self.assertRaises(StorageConfigurationError) as raised:
-            HashDB(self.temp_path)
-        self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
+    def test_rejects_missing_config_and_directory_with_file_cause(self) -> None:
+        for path in (self.temp_path / "missing.json", self.temp_path):
+            with self.subTest(path=path):
+                with self.assertRaises(StorageConfigurationError) as raised:
+                    HashDB(path)
+                self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
 
     def test_rejects_invalid_json_config(self) -> None:
         """Malformed configuration JSON must fail during loading."""
@@ -132,31 +127,15 @@ class HashDBConfigTests(HashDBTestCase):
                     with self.assertRaises(StorageConfigurationError):
                         HashDB(config_path)
 
-    def test_rejects_missing_schema_file(self) -> None:
-        """schema_path must reference an existing file."""
-        config_path = self._write_config(schema_path="missing.json")
-
-        with self.assertRaises(StorageConfigurationError):
-            HashDB(config_path)
-
-    def test_rejects_schema_without_json_extension(self) -> None:
-        """The schema filename must have a JSON extension."""
-        schema_path = self.temp_path / "schema.txt"
-        self._write_json(schema_path, LOCKED_SCHEMA)
-        config_path = self._write_config(schema_path="schema.txt")
-
-        with self.assertRaises(StorageConfigurationError):
-            HashDB(config_path)
-
-    def test_rejects_schema_directory(self) -> None:
-        """A directory with a JSON-like name is not a schema file."""
-        schema_directory = self.temp_path / "schema.json"
+    def test_schema_path_requires_an_existing_json_file(self) -> None:
+        self._write_json(self.temp_path / "schema.txt", LOCKED_SCHEMA)
         self.schema_path.unlink()
-        schema_directory.mkdir()
-        config_path = self._write_config(schema_path="schema.json")
-
-        with self.assertRaises(StorageConfigurationError):
-            HashDB(config_path)
+        self.schema_path.mkdir()
+        for name in ("missing.json", "schema.txt", "schema.json"):
+            with self.subTest(path=name):
+                config_path = self._write_config(schema_path=name)
+                with self.assertRaises(StorageConfigurationError):
+                    HashDB(config_path)
 
     def test_rejects_directory_as_database_path(self) -> None:
         """db_path must not reference a directory."""
@@ -288,16 +267,10 @@ class HashDBSchemaFileTests(HashDBTestCase):
                 with self.assertRaises(StorageConfigurationError):
                     self._new_uninitialized_hash_db()._validate_schema_file(path)
 
-    def test_rejects_schema_with_fewer_than_three_columns(self) -> None:
-        """The schema must contain all three locked columns."""
-        self._write_json(self.schema_path, {"Mname": "VARCHAR(255) NOT NULL"})
-
-        with self.assertRaises(StorageConfigurationError):
-            self._new_uninitialized_hash_db()._validate_schema_file(self.schema_path)
-
     def test_rejects_any_change_to_locked_schema(self) -> None:
         """Names, order, types, constraints, and count are fixed."""
         changed_schemas = (
+            {"Mname": "VARCHAR(255) NOT NULL"},
             {**LOCKED_SCHEMA, "Extra": "TEXT"},
             {
                 "MVersion": LOCKED_SCHEMA["MVersion"],
@@ -375,11 +348,15 @@ class HashDBDatabaseSchemaTests(HashDBTestCase):
         self.db.close()
 
     def test_returns_empty_when_main_is_absent(self) -> None:
-        """A database without MAIN reports an empty schema state."""
-        self.assertIs(
-            self.hash_db._validate_db_schema(self.db, LOCKED_SCHEMA),
-            SchemaValidationStatus.empty,
-        )
+        """Absence of MAIN is empty with or without unrelated tables."""
+        for unrelated_table in (False, True):
+            with self.subTest(unrelated_table=unrelated_table):
+                if unrelated_table:
+                    self.db.execute('CREATE TABLE "OTHER" (value TEXT)')
+                self.assertIs(
+                    self.hash_db._validate_db_schema(self.db, LOCKED_SCHEMA),
+                    SchemaValidationStatus.empty,
+                )
 
     def test_rejects_case_variants_of_main(self) -> None:
         """Only the exact stored table name MAIN is accepted."""
@@ -392,15 +369,6 @@ class HashDBDatabaseSchemaTests(HashDBTestCase):
                     self.hash_db._validate_db_schema(db, LOCKED_SCHEMA),
                     SchemaValidationStatus.mismatch,
                 )
-
-    def test_ignores_unrelated_table_when_main_is_absent(self) -> None:
-        """Unrelated tables do not prevent MAIN from being considered absent."""
-        self.db.execute('CREATE TABLE "OTHER" (value TEXT)')
-
-        self.assertIs(
-            self.hash_db._validate_db_schema(self.db, LOCKED_SCHEMA),
-            SchemaValidationStatus.empty,
-        )
 
     def test_rejects_mismatched_main_columns(self) -> None:
         """Column count, names, order, types, and constraints must match."""
@@ -659,15 +627,8 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         """Close the test HashDB connection."""
         self.hash_db.close_connection()
 
-    def test_adds_and_reads_module_hash(self) -> None:
-        """A valid module hash can be stored and retrieved."""
-        result = self.hash_db.add_module_hash("module", "1.0", "hash-1")
-
-        self.assertIs(result, ModuleAddResult.module_added)
-        self.assertEqual(self.hash_db.get_module_hash("module", "1.0"), "hash-1")
-
-    def test_normalizes_values_for_storage_and_lookup(self) -> None:
-        """Registration and lookup remove surrounding whitespace."""
+    def test_normalizes_values_for_storage_lookup_and_removal(self) -> None:
+        """All operations use normalized identifiers and store normalized values."""
         self.hash_db.add_module_hash(" module ", " 1.0 ", " hash-1 ")
 
         stored_row = self.hash_db.hash_db.execute(
@@ -677,48 +638,47 @@ class HashDBModuleOperationsTests(HashDBTestCase):
 
         self.assertEqual(stored_row, ("module", "1.0", "hash-1"))
         self.assertEqual(found_hash, "hash-1")
+        self.assertTrue(self.hash_db.remove_module_hash(" module ", " 1.0 "))
 
-    def test_rejects_invalid_registration_values(self) -> None:
-        """Registration rejects every invalid name, version, or hash value."""
+    def test_public_operations_reject_invalid_values(self) -> None:
+        """Each argument of add, lookup and removal retains its input boundary."""
         invalid_values = ("", "   ", None, 1, [], {})
-
-        for position in range(3):
-            for invalid_value in invalid_values:
-                with self.subTest(position=position, value=invalid_value):
-                    values = ["module", "1.0", "hash-1"]
-                    values[position] = invalid_value
-                    with self.assertRaises(StorageInputError):
-                        self.hash_db.add_module_hash(*values)
+        operations = (
+            (self.hash_db.add_module_hash, ("module", "1.0", "hash-1")),
+            (self.hash_db.get_module_hash, ("module", "1.0")),
+            (self.hash_db.remove_module_hash, ("module", "1")),
+        )
+        for operation, valid in operations:
+            for position in range(len(valid)):
+                for invalid_value in invalid_values:
+                    with self.subTest(
+                        operation=operation.__name__,
+                        position=position,
+                        value=invalid_value,
+                    ):
+                        values = list(valid)
+                        values[position] = invalid_value
+                        with self.assertRaises(StorageInputError):
+                            operation(*values)
 
         row_count = self.hash_db.hash_db.execute(
             'SELECT COUNT(*) FROM "MAIN"'
         ).fetchone()[0]
         self.assertEqual(row_count, 0)
 
-    def test_rejects_invalid_lookup_values(self) -> None:
-        """Lookup rejects invalid module names and versions."""
-        invalid_values = ("", "   ", None, 1, [], {})
-
-        for position in range(2):
-            for invalid_value in invalid_values:
-                with self.subTest(position=position, value=invalid_value):
-                    values = ["module", "1.0"]
-                    values[position] = invalid_value
-                    with self.assertRaises(StorageInputError):
-                        self.hash_db.get_module_hash(*values)
-
     def test_duplicate_pair_preserves_original_hash(self) -> None:
         """Duplicate registration reports an error and retains the first hash."""
-        first_result = self.hash_db.add_module_hash("module", "1", "hash-1")
+        first_result = self.hash_db.add_module_hash("module", "1.0", "hash-1")
+        self.assertIs(first_result, ModuleAddResult.module_added)
+        self.assertEqual(self.hash_db.get_module_hash("module", "1.0"), "hash-1")
         duplicate_result = self.hash_db.add_module_hash(
             "module",
-            "1",
+            "1.0",
             "hash-2",
         )
 
-        self.assertIs(first_result, ModuleAddResult.module_added)
         self.assertIs(duplicate_result, ModuleAddResult.module_exists_err)
-        self.assertEqual(self.hash_db.get_module_hash("module", "1"), "hash-1")
+        self.assertEqual(self.hash_db.get_module_hash("module", "1.0"), "hash-1")
         row_count = self.hash_db.hash_db.execute(
             'SELECT COUNT(*) FROM "MAIN"'
         ).fetchone()[0]
@@ -766,15 +726,11 @@ class HashDBModuleOperationsTests(HashDBTestCase):
             "SELECT name FROM sqlite_master WHERE name = 'MAIN'"
         ).fetchone()
         self.assertEqual(table, ("MAIN",))
-
-    def test_removes_existing_module_hash(self) -> None:
-        """Removing an existing module returns True and makes it unavailable."""
-        self.hash_db.add_module_hash("module", "1", "hash-1")
-
-        removed = self.hash_db.remove_module_hash("module", "1")
-
-        self.assertTrue(removed)
-        self.assertEqual(self.hash_db.get_module_hash("module", "1"), "")
+        self.assertTrue(self.hash_db.remove_module_hash(module_name, module_version))
+        table = self.hash_db.hash_db.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'MAIN'"
+        ).fetchone()
+        self.assertEqual(table, ("MAIN",))
 
     def test_missing_removal_preserves_other_modules(self) -> None:
         """Removing an unknown pair returns False without changing other rows."""
@@ -793,36 +749,6 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         self.assertTrue(self.hash_db.remove_module_hash("module", "1"))
         self.assertEqual(self.hash_db.get_module_hash("module", "1"), "")
         self.assertEqual(self.hash_db.get_module_hash("module", "2"), "hash-2")
-
-    def test_normalizes_removal_values(self) -> None:
-        """Removal strips surrounding whitespace from name and version."""
-        self.hash_db.add_module_hash("module", "1", "hash-1")
-
-        self.assertTrue(self.hash_db.remove_module_hash(" module ", " 1 "))
-
-    def test_rejects_invalid_removal_values(self) -> None:
-        """Removal rejects empty and non-string names and versions."""
-        invalid_values = ("", "   ", None, 1, [], {})
-
-        for position in range(2):
-            for invalid_value in invalid_values:
-                with self.subTest(position=position, value=invalid_value):
-                    values = ["module", "1"]
-                    values[position] = invalid_value
-                    with self.assertRaises(StorageInputError):
-                        self.hash_db.remove_module_hash(*values)
-
-    def test_removal_treats_sql_metacharacters_as_data(self) -> None:
-        """Parameterized removal treats SQL-like identifiers as plain data."""
-        module_name = 'module"; DROP TABLE "MAIN"; --'
-        module_version = "1' OR '1'='1"
-        self.hash_db.add_module_hash(module_name, module_version, "hash")
-
-        self.assertTrue(self.hash_db.remove_module_hash(module_name, module_version))
-        table = self.hash_db.hash_db.execute(
-            "SELECT name FROM sqlite_master WHERE name = 'MAIN'"
-        ).fetchone()
-        self.assertEqual(table, ("MAIN",))
 
     def test_removal_persists_after_reopening_database(self) -> None:
         """A committed removal remains effective after reopening HashDB."""
@@ -847,8 +773,13 @@ class HashDBModuleOperationsTests(HashDBTestCase):
         self.assertIs(raised.exception.__cause__, removal_error)
 
     def test_closed_database_rejects_public_operations(self) -> None:
-        """Public operations use a custom error after HashDB is closed."""
+        """Repeated close releases SQLite and all public operations reject use."""
+        connection = self.hash_db.hash_db
         self.hash_db.close_connection()
+        self.hash_db.close_connection()
+        self.assertTrue(self.hash_db._connection_closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
         operations = (
             lambda: self.hash_db.add_module_hash("module", "1", "hash"),
@@ -861,22 +792,6 @@ class HashDBModuleOperationsTests(HashDBTestCase):
                 self.assertRaises(StorageClosedError),
             ):
                 operation()
-
-
-class HashDBConnectionLifecycleTests(HashDBTestCase):
-    """Verify explicit and repeated connection closure."""
-
-    def test_closes_connection_and_allows_repeated_close(self) -> None:
-        """Closing releases SQLite and a second close is harmless."""
-        hash_db = self._create_hash_db()
-        connection = hash_db.hash_db
-
-        hash_db.close_connection()
-        hash_db.close_connection()
-
-        self.assertTrue(hash_db._connection_closed)
-        with self.assertRaises(sqlite3.ProgrammingError):
-            connection.execute("SELECT 1")
 
 
 if __name__ == "__main__":

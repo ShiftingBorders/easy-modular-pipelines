@@ -230,17 +230,24 @@ class ProbeProcess:
 
 class ResponseStream(httpx.AsyncByteStream):
     def __init__(
-        self, chunks: list[bytes], *, delay: float = 0, failure: Exception | None = None
+        self,
+        chunks: list[bytes],
+        *,
+        blocked_after: int | None = None,
+        failure: Exception | None = None,
     ) -> None:
         self.chunks = chunks
-        self.delay = delay
+        self.blocked_after = blocked_after
+        self.reading = asyncio.Event()
+        self.release = asyncio.Event()
         self.failure = failure
         self.closed = False
 
     async def __aiter__(self):
-        for chunk in self.chunks:
-            if self.delay:
-                await asyncio.sleep(self.delay)
+        for index, chunk in enumerate(self.chunks):
+            if index == self.blocked_after:
+                self.reading.set()
+                await self.release.wait()
             yield chunk
         if self.failure:
             raise self.failure

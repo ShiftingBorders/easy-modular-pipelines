@@ -102,6 +102,9 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
         await self.monitor.configure(icmp_settings(timeout_seconds=2))
         self.assertEqual(incident.status, "active")
         self.assertEqual(self.monitor.incidents[0].status, "closed")
+        self.assertEqual(self.monitor.incidents[0].resolution, "configuration_changed")
+        self.assertEqual(self.monitor.history[-1].status, "no_reply")
+        self.assertFalse(self.monitor.snapshot()["fresh"])
         stored = json.loads((self.directory / "icmp.json").read_text(encoding="utf-8"))
         self.assertEqual(stored["settings"], self.monitor.settings.model_dump())
         self.assertEqual(stored["incidents"], self.monitor.snapshot()["incidents"])
@@ -142,14 +145,37 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_parallel_check_now_calls_share_one_process(self) -> None:
         process = ProbeProcess(blocked=True)
         spawn = AsyncMock(return_value=process)
-        with patch("dashboard.icmp.asyncio.create_subprocess_exec", new=spawn):
+        joined = asyncio.Event()
+        waiters = []
+        shield = asyncio.shield
+
+        def observe_shared_probe(task):
+            if task is self.monitor._probe_task:
+                waiters.append(asyncio.current_task())
+                if len(waiters) == 2:
+                    joined.set()
+            return shield(task)
+
+        with (
+            patch("dashboard.icmp.asyncio.create_subprocess_exec", new=spawn),
+            patch("dashboard.icmp.asyncio.shield", side_effect=observe_shared_probe),
+        ):
             first = asyncio.create_task(self.monitor.probe())
-            await asyncio.wait_for(process.started.wait(), 1)
-            second = asyncio.create_task(self.monitor.probe())
-            await asyncio.sleep(0)
-            self.assertTrue(self.monitor.snapshot()["probing"])
-            process.release.set()
-            results = await asyncio.gather(first, second)
+            tasks = [first]
+            try:
+                await asyncio.wait_for(process.started.wait(), 10)
+                second = asyncio.create_task(self.monitor.probe())
+                tasks.append(second)
+                await asyncio.wait_for(joined.wait(), 10)
+                self.assertEqual(waiters, [first, second])
+                self.assertTrue(self.monitor.snapshot()["probing"])
+                process.release.set()
+                results = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            finally:
+                process.release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         self.assertEqual(spawn.await_count, 1)
         self.assertEqual(len(self.monitor.history), 1)
         self.assertEqual([result["status"] for result in results], ["reply", "reply"])
@@ -161,7 +187,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=process),
         ):
             browser = asyncio.create_task(self.monitor.probe())
-            await process.started.wait()
+            await asyncio.wait_for(process.started.wait(), 10)
             browser.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await browser
@@ -183,7 +209,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("dashboard.icmp.asyncio.create_subprocess_exec", side_effect=spawn):
             await self.monitor.open()
-            await asyncio.wait_for(second_probe.wait(), 3)
+            await asyncio.wait_for(second_probe.wait(), 10)
             await self.monitor.close()
         self.assertGreaterEqual(count, 2)
         self.assertTrue(self.monitor._task.done())
@@ -203,16 +229,6 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(incident.resolution, "echo_reply")
         self.assertIsNotNone(incident.ended_at)
 
-    async def test_configuration_change_closes_incident_without_fake_reply(
-        self,
-    ) -> None:
-        await self.measure("no_reply")
-        await self.monitor.configure(icmp_settings(timeout_seconds=2))
-        self.assertEqual(self.monitor.incidents[0].status, "closed")
-        self.assertEqual(self.monitor.incidents[0].resolution, "configuration_changed")
-        self.assertEqual(self.monitor.history[-1].status, "no_reply")
-        self.assertFalse(self.monitor.snapshot()["fresh"])
-
     async def test_late_response_from_old_configuration_is_discarded(self) -> None:
         process = ProbeProcess(blocked=True)
         with patch(
@@ -220,7 +236,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=process),
         ):
             pending = asyncio.create_task(self.monitor.probe())
-            await process.started.wait()
+            await asyncio.wait_for(process.started.wait(), 10)
             await self.monitor.configure(
                 icmp_settings(enabled=False, timeout_seconds=2)
             )
@@ -291,7 +307,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=process),
         ):
             await self.monitor.open()
-            await asyncio.wait_for(process.started.wait(), 1)
+            await asyncio.wait_for(process.started.wait(), 10)
             await self.monitor.close()
         self.assertTrue(process.killed)
         self.assertTrue(process.waited)

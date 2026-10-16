@@ -1,9 +1,8 @@
 """Approved N6/N7: real writer read delays and independent bounded diagnostics."""
 
 import asyncio
-import importlib
-import importlib.util
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +10,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from core.journal.logger import OperationLogger
+from core.journal.startup_diagnostics import StartupDiagnostics
 from tests.helpers.dag import wait_until
 from tests.helpers.journal_writer import WriterFixture, require_writer
 from tests.helpers.logging_process import SCRATCH_ROOT
@@ -42,6 +42,8 @@ class WriterStartupDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["queue_depth"], 0)
             self.assertIn("active_read", status, "Read health is currently invisible.")
             self.assertEqual(status["active_read"]["command"], "open")
+            diagnostic_id = status["active_read"]["diagnostic_id"]
+            self.assertIsNotNone(diagnostic_id)
             self.assertGreaterEqual(status["active_read"]["age_seconds"], 0.2)
             self.assertGreaterEqual(status["read_queue_depth"], 1)
             self.assertFalse(reading.done())
@@ -49,7 +51,7 @@ class WriterStartupDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(w.logger._recovery_seconds(), 0)
         finally:
             gate.release()
-        await asyncio.wait_for(opening, 15)
+        opened = await asyncio.wait_for(opening, 15)
         self.assertIsNone(await asyncio.wait_for(reading, 15))
         await wait_until(lambda: w.logger._store.get_status()["active_read"] is None)
         status = w.logger._store.get_status()
@@ -61,7 +63,12 @@ class WriterStartupDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         records = [
             json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
         ]
-        checks = [row for row in records if row["phase"] == "sqlite.quick_check.end"]
+        checks = [
+            row
+            for row in records
+            if row["phase"] == "sqlite.quick_check.end"
+            and row["details"].get("diagnostic_id") == diagnostic_id
+        ]
         self.assertTrue(
             any(row["details"]["duration_seconds"] >= 0.2 for row in checks)
         )
@@ -80,6 +87,31 @@ class WriterStartupDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 for row in reads
             )
         )
+        client_records = [
+            json.loads(line)
+            for line in opened._store._startup_diagnostics.path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        replies = [
+            row
+            for row in client_records
+            if row["phase"] == "journal.reply.received"
+            and row["details"].get("diagnostic_id") == diagnostic_id
+            and row["details"].get("command") == "open"
+        ]
+        self.assertTrue(replies)
+        self.assertTrue(
+            all(row["details"]["duration_seconds"] >= 0.2 for row in replies)
+        )
+        self.assertTrue(
+            any(
+                row["phase"] == "writer.read.finished"
+                and row["details"].get("diagnostic_id") == diagnostic_id
+                and row["details"].get("command") == "open"
+                for row in records
+            )
+        )
 
 
 class IndependentStartupDiagnosticsTests(unittest.TestCase):
@@ -89,19 +121,10 @@ class IndependentStartupDiagnosticsTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
 
-    def _diagnostics(self, path, context=None, **kwargs):
-        name = "core.journal.startup_diagnostics"
-        self.assertIsNotNone(
-            importlib.util.find_spec(name),
-            "Independent startup diagnostics are not implemented.",
-        )
-        module = importlib.import_module(name)
-        return module.StartupDiagnostics(path, context or {}, **kwargs)
-
     def test_bounded_records_exclude_secret_context_without_journal_access_n7(self):
         destination = self.root / "startup.jsonl"
         attempt_id = str(uuid4())
-        sink = self._diagnostics(
+        sink = StartupDiagnostics(
             destination,
             {
                 "attempt_id": attempt_id,
@@ -111,27 +134,41 @@ class IndependentStartupDiagnosticsTests(unittest.TestCase):
             },
             max_bytes=2048,
         )
-        with patch.object(
-            OperationLogger,
-            "record_event",
-            side_effect=AssertionError("Recursive logging"),
+        with (
+            patch.object(
+                OperationLogger,
+                "record_event",
+                side_effect=AssertionError("Recursive logging"),
+            ),
+            patch.object(
+                sqlite3, "connect", side_effect=AssertionError("Diagnostic DB access")
+            ),
         ):
             for _ in range(100):
                 sink.record("logger.open.begin", duration_seconds=0.1)
-        self.assertLessEqual(destination.stat().st_size, 2048)
-        content = destination.read_text(encoding="utf-8")
-        records = [json.loads(line) for line in content.splitlines()]
-        self.assertTrue(records)
-        self.assertEqual(records[0]["context"]["attempt_id"], attempt_id)
-        self.assertIn("diagnostics.truncated", [row["phase"] for row in records])
-        for secret in ("secret-ipc-token", "secret-settings", "secret-environment"):
-            self.assertNotIn(secret, content)
-        self.assertFalse(list(self.root.glob("*.sqlite")))
+        previous = destination.with_suffix(".jsonl.previous")
+        self.assertEqual(set(self.root.iterdir()), {destination, previous})
+        for path in (destination, previous):
+            with self.subTest(file=path.name):
+                self.assertLessEqual(path.stat().st_size, 2048)
+                content = path.read_text(encoding="utf-8")
+                records = [json.loads(line) for line in content.splitlines()]
+                self.assertTrue(records)
+                self.assertEqual(records[0]["context"]["attempt_id"], attempt_id)
+                self.assertIn(
+                    "diagnostics.truncated", [row["phase"] for row in records]
+                )
+                for secret in (
+                    "secret-ipc-token",
+                    "secret-settings",
+                    "secret-environment",
+                ):
+                    self.assertNotIn(secret, content)
 
     def test_unwritable_diagnostics_cannot_replace_primary_failure_n7(self):
         occupied = self.root / "occupied"
         occupied.write_text("keep", encoding="utf-8")
-        sink = self._diagnostics(occupied / "startup.jsonl")
+        sink = StartupDiagnostics(occupied / "startup.jsonl", {})
         primary = RuntimeError("primary startup failure")
         with self.assertRaises(RuntimeError) as caught:
             try:

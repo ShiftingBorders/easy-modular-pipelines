@@ -4,9 +4,11 @@ import asyncio
 import copy
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+from core.experiments import services as service_runtime
 from core.experiments.state import _process_identity_pid
 from core.models.experiment_template import ExperimentTemplate
 from core.models.updates import _update_model
@@ -259,45 +261,72 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
 
-    async def test_recovery_uses_remaining_real_command_deadline(self):
-        """E: eight seconds of downtime/prehistory are not added to the 30-second request budget."""
+    async def test_recovery_preserves_command_deadline_for_late_result(self):
+        """Real reconnection cannot grant a fresh budget to the original sent request."""
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service()
             sid = definition["service_id"]
             w.publish_service_definitions()
             await w.manager.start_all(w.state)
+            gate = w.root / "release-after-recovery"
             call = asyncio.create_task(
-                w.manager.request(
-                    w.state, sid, "echo", {"gate": str(w.root / "unreleased")}
+                w.manager.request(w.state, sid, "echo", {"gate": str(gate)})
+            )
+            await wait_for(
+                lambda: any(
+                    row["event"] == "work_started" for row in w.trace(definition)
                 )
             )
-            await wait_for(lambda: w.state.services[sid].active_request is not None)
             entry = dict(w.state.services[sid].active_request)
-            await wait_for(
-                lambda: time.monotonic() - entry["sent_monotonic"] >= 8, timeout=12
-            )
             w.store.save(w.state)
             await w.manager.close()
             await asyncio.gather(call, return_exceptions=True)
             w.state = w.store.load(w.experiment)
             manager = w.replacement_manager()
-            recovered_at = time.monotonic()
             self.assertEqual(await manager.recover(w.state), "ready")
             self.assertEqual(
                 w.state.services[sid].active_request.sent_monotonic,
                 entry["sent_monotonic"],
             )
-            self.assertEqual(await manager.monitor(w.state), "pause")
-            self.assertGreaterEqual(time.monotonic() - entry["sent_monotonic"], 30)
-            self.assertLess(time.monotonic() - recovered_at, 28)
+            # Hold acceptance until the original boundary; heartbeat clocks stay real.
+            manager._monitor_task.cancel()
+            await asyncio.gather(manager._monitor_task, return_exceptions=True)
+            self.assertIsNone(w.journal.client.read_command_result(entry["request_id"]))
+            gate.touch()
+            await wait_for(
+                lambda: w.journal.client.read_command_result(entry["request_id"])
+            )
+            observing = asyncio.current_task()
+            deadline = entry["sent_monotonic"] + definition["command_timeout_seconds"]
+
+            def observation_time():
+                return (
+                    deadline
+                    if asyncio.current_task() is observing
+                    else time.monotonic()
+                )
+
+            with patch.object(
+                service_runtime, "time", SimpleNamespace(monotonic=observation_time)
+            ):
+                await manager._poll_result(w.state, sid)
+            self.assertEqual(manager._pending_action, "pause")
             self.assertEqual(
                 w.journal.client.read_command_result(entry["request_id"])["outcome"],
                 "timed_out",
             )
+            self.assertEqual(
+                sum(
+                    row["event"] == "received"
+                    and row.get("request_id") == entry["request_id"]
+                    for row in w.trace(definition)
+                ),
+                1,
+            )
 
     async def test_journal_accepted_result_is_not_reclassified_after_deadline(self):
-        """E: actual accepted outcome survives stale state.json and more than 30 seconds elapsed."""
+        """The accepted journal outcome wins over stale state at an expired deadline."""
         async with asyncio.timeout(120):
             w = self.w
             definition = w.service()
@@ -320,16 +349,38 @@ class ServiceRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 reply = await call
                 self.assertEqual(reply["result"], "success")
                 await w.manager.close()
-            await wait_for(
-                lambda: time.monotonic() - entry["sent_monotonic"] > 30, timeout=35
-            )
             w.state = w.store.load(w.experiment)
             self.assertIsNotNone(w.state.services[sid].active_request)
-            self.assertEqual(await w.replacement_manager().recover(w.state), "ready")
+            recovering = asyncio.current_task()
+            expired = (
+                entry["sent_monotonic"] + definition["command_timeout_seconds"] + 1
+            )
+
+            def recovery_time():
+                return (
+                    expired
+                    if asyncio.current_task() is recovering
+                    else time.monotonic()
+                )
+
+            with patch.object(
+                service_runtime, "time", SimpleNamespace(monotonic=recovery_time)
+            ):
+                self.assertEqual(
+                    await w.replacement_manager().recover(w.state), "ready"
+                )
             self.assertIsNone(w.state.services[sid].active_request)
             self.assertEqual(
                 w.journal.client.read_command_result(entry["request_id"])["outcome"],
                 "succeeded",
+            )
+            self.assertEqual(
+                sum(
+                    row["event"] == "received"
+                    and row.get("request_id") == entry["request_id"]
+                    for row in w.trace(definition)
+                ),
+                1,
             )
 
     async def test_changed_service_restarts_while_unchanged_instance_survives(self):

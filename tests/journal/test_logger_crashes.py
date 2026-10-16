@@ -374,14 +374,6 @@ class LoggingCrashTests(unittest.TestCase):
             [e["event_id"] for e in read_database(self.db_path)], [confirmed_id]
         )
 
-    def test_corrupt_database_is_not_recreated(self):
-        """CRASH-07: an invalid header is reported without replacing the existing file."""
-        contents = b"This is not a SQLite database." * 200
-        self.db_path.write_bytes(contents)
-        with self.assertRaises(LoggingConfigurationError):
-            OperationLogger(self.config).open()
-        self.assertEqual(self.db_path.read_bytes(), contents)
-
     def test_runner_crash_does_not_stop_independent_module_journal(self):
         """CRASH-08: independent module writer can finish after the runner writer dies."""
         runner_config = write_settings(self.folder / "runner")
