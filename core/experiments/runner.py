@@ -476,9 +476,11 @@ class ExperimentRunner:
                 if reason is not None:
                     self._journal_pause_reason = reason
                     state.mode = "paused"
-                    if state.active_attempt is None and state.phase in (
-                        "starting",
-                        "waiting",
+                    # Journal readiness does not complete DAG/service preparation.
+                    if (
+                        self._ready.is_set()
+                        and state.active_attempt is None
+                        and state.phase == "starting"
                     ):
                         state.phase = "waiting"
                 elif (
