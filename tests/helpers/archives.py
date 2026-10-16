@@ -21,12 +21,12 @@ from uuid import uuid4
 
 import yaml
 
-from core.experimentarchiver import ExperimentArchiver
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import read_json, write_json
-from core.seaweed import SeaweedDB
+from core.experiments.archiver import ExperimentArchiver
+from core.experiments.runner import ExperimentRunner
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import read_json, write_json
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned, wait_until
 
 TEMP_ROOT = REPOSITORY / ".artifacts/tmp/archive-tests"
@@ -394,6 +394,14 @@ class ArchiveWorkspace:
                     await wait_until(
                         lambda pid=data[key]["pid"]: not process_running(pid)
                     )
+        # A detached runner can retain a Popen whose child was stopped through
+        # another owner. Reap those handles after native termination is complete.
+        for runner in self.runners:
+            for owner in (runner._stages, runner._services):
+                try:
+                    await owner.close()
+                except Exception as error:  # noqa: BLE001 - Reap every fixture owner before reporting cleanup failure.
+                    failure = failure or error
         for hashes, storage in self.clients:
             storage.close()
             hashes.close_connection()
@@ -404,6 +412,9 @@ class ArchiveWorkspace:
             or not self.root.is_relative_to(TEMP_ROOT.resolve())
         ):
             raise ValueError("Unsafe archive fixture cleanup target.")
+        from tests.helpers.logging_process import stop_journal_writers
+
+        await asyncio.to_thread(stop_journal_writers, self.root)
         for attempt in range(10):
             try:
                 self.temporary.cleanup()

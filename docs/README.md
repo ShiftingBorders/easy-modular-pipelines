@@ -12,6 +12,19 @@ experiments. Commands in these guides use the source checkout and its
 4. [Configure and run an experiment](basic_dag.md).
 5. [Debug execution](debugging.md).
 
+## Features
+
+Each feature has a dedicated page explaining its workflow, guarantees, and
+links to the relevant guides and references.
+
+| Feature | Contents |
+| --- | --- |
+| [Module identity and integrity checks](module_integrity.md) | Pinned module contents, runtime checks, and limits of hash verification. |
+| [Controlled experiment execution](execution.md) | Sequential stages, services, execution controls, and conditional flow. |
+| [Snapshots, rollbacks, and recovery](restoration.md) | Saved state, rollback, interrupted runs, and continuations. |
+| [Experiment packaging, exchange, and installation](packaging.md) | Archive creation, transfer, inspection, and installation for another run. |
+| [Execution history and observation](observation.md) | Journal evidence, live state, artifacts, resources, and alerts. |
+
 ## Guides and references
 
 | Document | Contents |
@@ -20,6 +33,7 @@ experiments. Commands in these guides use the source checkout and its
 | [CLI reference](cli.md) | Commands, server modes, configuration, waiting, shell, paths and exit codes. |
 | [Experiment template](experiment_template.md) | Required YAML fields, module and service references, settings, policies, and paths. |
 | [Service authoring](instructions/python_bridges.md) | ParticipantServer handlers, external processes, readiness, shutdown, and snapshots. |
+| [Module behavior contract](instructions/module_contract.md) | Module and service responsibilities, required behavior, and prohibited actions. |
 | [Participant API and protocol](instructions/participant_protocol.md) | StageClient, shared service API, identities, versioning, and result semantics. |
 | [Module storage](storage.md) | Maintenance mode, registration, validation, versions, and SeaweedFS. |
 | [Logging](logging.md) | Module events, errors, artifacts, read APIs, and journal generations. |

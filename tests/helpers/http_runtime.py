@@ -11,7 +11,8 @@ import httpx
 import psutil
 import yaml
 
-from core.runner_utils.runtimeio import process_identity, read_json, write_json
+from core.primitives.json_files import read_json, write_json
+from core.primitives.processes import process_identity
 from tests.helpers.archives import ArchiveTestCase
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 

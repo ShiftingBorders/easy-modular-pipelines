@@ -11,6 +11,7 @@ from pathlib import Path
 
 import psutil
 
+from core.primitives.processes import process_identity
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals, cache_experiment
 from dashboard.projections import cached_experiment_views, experiment_views
@@ -20,6 +21,7 @@ from tests.dashboard_tests.helpers import (
     write_settings,
 )
 from tests.dashboard_tests.integration_helpers import JournalWorkspace
+from tests.helpers.dag import terminate_owned
 
 
 class RealHistoryCacheTests(unittest.TestCase):
@@ -61,16 +63,7 @@ class RealHistoryCacheTests(unittest.TestCase):
                         )
                         for identifier, target in pending.items()
                     }
-                    while any(not future.done() for future in futures.values()):
-                        memory = psutil.Process().memory_info().rss
-                        for process in psutil.Process().children(recursive=True):
-                            try:
-                                memory += process.memory_info().rss
-                            except psutil.NoSuchProcess:
-                                pass
-                        peak = max(peak, memory)
-                        self.assertLessEqual(memory, budget)
-                        time.sleep(0.02)
+                    peak = max(peak, self._observe_worker_batch(pool, futures, budget))
                     for identifier, future in futures.items():
                         result = future.result()
                         self.assertNotIn("error", result)
@@ -91,6 +84,37 @@ class RealHistoryCacheTests(unittest.TestCase):
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(measurements, indent=2), encoding="utf-8")
+
+    def _observe_worker_batch(self, pool, futures, budget):
+        """Bound worker completion and stop this pool's owned processes on failure."""
+        owned = []
+        peak = 0
+        deadline = time.monotonic() + 120
+        try:
+            for process in pool._processes.values():
+                owned.append(process_identity(process.pid))
+            while any(not future.done() for future in futures.values()):
+                # Surface worker exceptions before waiting for unrelated workers.
+                for future in futures.values():
+                    if future.done():
+                        future.result()
+                pending = [key for key, future in futures.items() if not future.done()]
+                if time.monotonic() >= deadline:
+                    self.fail(f"Cache workers did not finish their batch: {pending}")
+                memory = psutil.Process().memory_info().rss
+                for process in psutil.Process().children(recursive=True):
+                    try:
+                        memory += process.memory_info().rss
+                    except psutil.NoSuchProcess:
+                        pass
+                peak = max(peak, memory)
+                self.assertLessEqual(memory, budget)
+                time.sleep(0.02)
+        except BaseException:
+            for identity in owned:
+                terminate_owned(identity)
+            raise
+        return peak
 
     def test_heilbronn_history_matches_frozen_source_results(self):
         """T092: real cycles, screen records and module statistics survive caching."""

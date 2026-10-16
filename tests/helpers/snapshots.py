@@ -6,8 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import read_json
+from core.experiments.runner import ExperimentRunner
+from core.primitives.json_files import read_json
 from tests.helpers.dag import REPOSITORY, process_running, terminate_owned
 from tests.helpers.service_integration import ServiceDagWorkspace
 from tests.helpers.services import wait_for

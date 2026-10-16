@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 
 
 def main() -> None:

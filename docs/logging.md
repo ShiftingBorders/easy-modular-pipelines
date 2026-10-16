@@ -2,6 +2,9 @@
 
 Each experiment uses a shared local SQLite journal. Each process opens its own
 `OperationLogger` client; do not pass an open client across process boundaries.
+One separate writer process owns the primary database. The synchronous logging
+API and returned event IDs are unchanged; active clients communicate with that
+writer over an authenticated local connection.
 
 Modules receive an absolute `logging_config_path` in their runtime context.
 Use that configuration instead of creating another journal.
@@ -11,7 +14,7 @@ Use that configuration instead of creating another journal.
 ```python
 from pathlib import Path
 
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 
 # context is the runner-provided module context.
 with OperationLogger(Path(context["logging_config_path"])) as logger:
@@ -81,7 +84,7 @@ Start with CLI `logs` / `logs --follow` or dashboard Events and Errors.
 For library readers, use an existing runner-provided logging configuration:
 
 ```python
-from core.logger import OperationLogger
+from core.journal.logger import OperationLogger
 
 with OperationLogger(existing_config_path, read_only=True) as logger:
     page = logger.read_events(limit=100, view="effective")
@@ -140,12 +143,111 @@ not write a competing `record_command_result` for the same request.
 
 The runner records the template and effective attempt settings before work.
 Secrets embedded in settings enter history; use supported references to separate
-secret sources when needed. Each event's process identity belongs to its writer.
+secret sources when needed. Each event retains the identity of the process that
+emitted it, rather than the storage process.
 
-A returned event ID confirms a database commit. This does not guarantee survival
-of disk failure or power loss. Unknown commit outcomes prevent further writes
-by that client. Missing, mismatched, or incompatible journals are not silently
-recreated. An obligatory journal failure stops execution.
+A returned event ID confirms a database COMMIT. If the connection disappears
+before the acknowledgement, the client retries the same event ID. The writer
+reconciles a committed request without inserting a second event or result.
+Unrecoverable standalone storage errors still raise `LoggingStorageError`;
+validation and journal-generation errors remain explicit.
+
+## Writer lifetime and recovery
+
+EMP supervises its writer independently of the experiment event loop and the
+SQLite worker thread. Process death is checked every 250 ms by default; the
+detection budget is two seconds, with a target below one second. A separate
+progress check detects stalled SQL work. Restart attempts use a 60-second
+recovery budget. The waiting write queue holds 100 requests by default; full
+queues apply backpressure without reporting uncommitted writes as successful.
+
+During recovery, journal calls wait and DAG scheduling pauses. Module deadlines
+exclude the observed recovery interval. Service heartbeat remains active, and
+EMP can still stop owned processes. When the same journal becomes available,
+pending requests and DAG execution continue automatically. A user pause remains
+in effect. If stopping cannot finish its journal audit, state exposes
+`journal_audit_complete: false` separately from confirmed process termination.
+Heartbeat observations use one bounded audit worker; repeated pending
+observations retain the latest data and report `coalesced_observations`.
+
+If EMP cannot reopen the primary journal, it creates a uniquely named journal
+and commits `journal.created_after_failure` as its first event. That event names
+the predecessor and the failure. EMP preserves the old database and does not
+manually delete its WAL/SHM files. The DAG remains paused while required history
+is unavailable; creating a new file does not reconstruct stage results. Failure
+to create usable replacement storage also pauses the DAG. Inspect
+`journal_writer` and `journal_pause_reason` in experiment state before restoring
+the necessary history through the experiment recovery workflow.
+
+Outside EMP, opening a writable logger starts or connects to the same writer
+implementation. That process outlives the application that launched it and exits
+after five minutes without requests. Active work prevents idle shutdown. The
+next client starts it again under a shared startup lock. Closing a standalone
+logger closes its connection; it does not stop other clients' writer.
+
+If the EMP owner process dies, its surviving writer switches to standalone
+lifetime. Surviving participants can still commit their results. A recovering
+EMP verifies ownership, stops that exact writer instance, and takes over
+supervision before resuming the experiment.
+
+Active read clients and filtered-view exports use the writer, so their handles
+do not keep the primary SQLite file open in other processes during rollback.
+Read-only queries report temporary unavailability during recovery so dashboard
+workers do not remain blocked behind mandatory writes.
+Offline read-only history can be opened without starting a writer; close such
+readers before replacing their files. A restored generation rejects old clients
+and checkpoints.
+
+Logging calls are synchronous. In an asynchronous application handler, use
+`await asyncio.to_thread(logger.record_event, "module.message", data)` to keep
+the event loop responsive while waiting for COMMIT. Framework-owned async paths
+perform this wait outside their event loop.
+
+## Startup diagnostics
+
+Startup also records small independent diagnostic files, including when the
+journal cannot yet accept calls. These are evidence, never command results or
+recovery checkpoints. An attempt directory can contain:
+
+| File | Evidence |
+| --- | --- |
+| `startup-runner.jsonl` | Launch request/return, effective timeout and source, connection, execute dispatch, failure and cleanup. |
+| `startup-executor.jsonl` | Executor entry after imports, validated launch, logger open, listener/endpoint readiness, execute receipt and module spawn. |
+| `executor.stdout.log`, `executor.stderr.log` | Early uv/Python output, including failures before logger availability. |
+| `failure.jsonl` | Runner failure with original exception/traceback and separate cleanup observation. |
+
+Writer evidence is `controller/journals/<experiment-directory>/startup.jsonl`.
+Other logger clients can create `startup/client-<pid>-<id>.jsonl` under the
+selected database's parent directory; configuration/code directories are not
+used for this output. Failures outside an active attempt use the experiment's
+`runner/failure.jsonl`, or the project's `controller/failure.jsonl` before an
+experiment is available. Paths follow their runtime owners, not the caller's cwd.
+
+Records contain UTC time, monotonic time, process identity and allowlisted
+experiment/attempt coordinates. Startup failures include the effective budget,
+excluded recovery time, last phase, traceback/cause and error ID. That error ID
+links to the later journal error; its journal timestamp can follow cleanup.
+The interval before the executor entry record includes interpreter/import work.
+Client and writer request records share a `diagnostic_id`, including the
+per-client SQLite probe. It is separate from the stage's execution request ID.
+
+Each structured file is limited to 256 KiB and retains one bounded `.previous`
+file. Rotation or oversized records produce `diagnostics.truncated`. Each raw
+executor stream retains its first 1 MiB while draining later bytes;
+`output.truncated`/`output.finished` report loss. Files follow attempt retention,
+but removing the live endpoint does not remove the diagnostic files. Diagnostic
+I/O failure does not replace the original failure or make execution successful.
+Structured metadata excludes authentication tokens and settings/environment
+payloads; captured stdout/stderr remains the process's own output.
+
+`journal_writer.active_read` identifies the current read command, its monotonic
+start and observed age; `read_queue_depth` counts waiting reads. These are
+separate from write `busy` and `queue_depth`. The writer trace separates queue
+wait, SQLite opening/quick_check, execution and response delivery; client traces
+measure IPC. Routine fast result polls are not logged individually. Read
+observations do not introduce a new watchdog or change restart policy.
+Integrity-check frequency, COMMIT acknowledgement and replay behavior are
+unchanged.
 
 ## Template reload audit
 
@@ -169,11 +271,18 @@ Template logging settings are documented in the
 [template reference](experiment_template.md#snapshots-and-journal).
 Runtime client configuration adds `db_path`, `open_mode`, and
 `expected_journal` to those settings.
+EMP also supplies `writer_endpoint_path`; preserve this routing information.
+An optional `writer_settings` object configures the writer. For example,
+`"writer_settings": {"idle_timeout_seconds": 300}` selects the standalone idle
+timeout in seconds. Managed EMP writers do not use an idle timeout. Use one
+consistent writer policy for clients sharing a journal; an already running
+writer retains the policy with which it started.
 
 `open_mode: create` reserves a new journal name with `expected_journal: null`.
 `existing` requires the expected `journal_id` and `generation`.
 Relative `db_path` is resolved from the containing JSON file; the configuration
 path passed to the logger itself must be absolute.
+Relative `writer_endpoint_path` uses the same configuration-directory base.
 Use runner-provided configurations inside experiments.
 
 Journal snapshots and diagnostic exports are available through the library,

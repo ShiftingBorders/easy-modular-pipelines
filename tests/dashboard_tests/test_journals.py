@@ -1,5 +1,7 @@
+
 """Approved D: local SQLite history, immutable snapshots, paths and publication limits."""
 
+import asyncio
 import json
 import sqlite3
 import subprocess
@@ -11,7 +13,9 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from core.runner_utils.runtimeio import write_json
+from core.models.artifacts import ArtifactLocation, RecordedArtifactLocation
+from core.models.updates import _update_model
+from core.primitives.json_files import write_json
 from dashboard.api_client import SystemAPIClient, SystemAPIError
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals, read_object
@@ -25,6 +29,82 @@ from tests.dashboard_tests.integration_helpers import JournalWorkspace
 
 
 class JournalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_historical_artifact_models_preserve_nested_names_and_path_checks(
+        self,
+    ):
+        context = {
+            "attempt_id": "1-0",
+            "cycle_number": 1,
+            "stage_id": "A",
+            "attempt_number": 1,
+            "module_name": "nested/module",
+        }
+        location = RecordedArtifactLocation.model_validate(
+            {"context": context, "path": "sub/../result.txt"}
+        )
+        self.assertEqual(location.context.module_name, "nested/module")
+        self.assertEqual(location.path, "sub/../result.txt")
+        with self.assertRaises(ValueError):
+            ArtifactLocation.model_validate({"context": context, "path": "result.txt"})
+        directory = (
+            self.workspace.directory
+            / "shared_artifacts/epoch_1/nested/module/A/attempt_1"
+        )
+        directory.mkdir(parents=True)
+        (directory / "sub").mkdir()
+        target = directory / "result.txt"
+        target.write_text("recorded", encoding="utf-8")
+        self.workspace.logger.record_artifact(
+            "result.txt", "output", artifact_id="nested-artifact", context=context
+        )
+        recorded = self.workspace.logger.read_events(limit=1000)["events"][-1]["event"]
+        for number, (identifier, path) in enumerate(
+            (
+                ("internal-parent", "sub/../result.txt"),
+                ("escaped-artifact", "../../../../../../outside"),
+                ("empty-path", ""),
+                ("blank-path", "   "),
+                ("null-path", "result\x00.txt"),
+            ),
+            1,
+        ):
+            # Historical records enter through the journal envelope boundary,
+            # retaining path forms no longer emitted by strict registration.
+            event = json.loads(json.dumps(recorded))
+            event.update(
+                event_id=identifier,
+                producer_instance_id="historical-fixture",
+                sequence_number=number,
+            )
+            event["data"].update(artifact_id=identifier, path=path)
+            self.workspace.logger._store.append(event)
+        self.assertEqual(
+            self.reader.artifact("exp-test", "nested-artifact"), target.resolve()
+        )
+        self.assertEqual(
+            self.reader.artifact("exp-test", "internal-parent"), target.resolve()
+        )
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "escaped-artifact")
+        self.assertEqual(
+            (error.exception.code, error.exception.status_code),
+            ("invalid_artifact", 400),
+        )
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "empty-path")
+        self.assertEqual(
+            (error.exception.code, error.exception.status_code), ("not_found", 404)
+        )
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "blank-path")
+        self.assertEqual(str(error.exception), "Recorded artifact file is unavailable.")
+        with self.assertRaises(SystemAPIError) as error:
+            self.reader.artifact("exp-test", "null-path")
+        self.assertEqual(
+            (error.exception.code, error.exception.status_code),
+            ("invalid_artifact", 400),
+        )
+
     async def asyncSetUp(self):
         tmp = temporary_directory()
         self.addCleanup(cleanup_directory, tmp)
@@ -57,7 +137,7 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
             write_json(path, {"readers_closed": True})
             self.assertEqual(read_object(path), {"readers_closed": True})
 
-    def test_separate_dashboard_reader_observes_only_complete_publications(self):
+    async def test_separate_dashboard_reader_observes_only_complete_publications(self):
         """Use real processes and file sharing on both Windows and Linux."""
         path = self.root / "metadata.json"
         write_json(path, {"sequence": 0, "payload": "0" * 1024})
@@ -77,29 +157,36 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
             sys.stdin.readline()
             print(json.dumps(read_object(path)), flush=True)
         ''')
-        process = subprocess.Popen(
-            [sys.executable, "-B", "-c", code, str(path)],
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-B", "-c", code, str(path),
             cwd=Path(__file__).resolve().parents[2],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
-            self.assertEqual(process.stdout.readline().strip(), "ready")
+            ready = await asyncio.wait_for(process.stdout.readline(), 10)
+            if not ready:
+                _, errors = await asyncio.wait_for(process.communicate(), 10)
+                self.fail(f"Publication reader exited before readiness: {errors!r}")
+            self.assertEqual(ready.strip(), b"ready")
             for sequence in range(1, 151):
                 write_json(path, {"sequence": sequence, "payload": str(sequence) * 1024})
-            output, errors = process.communicate("done\n", timeout=20)
+            output, errors = await asyncio.wait_for(process.communicate(b"done\n"), 20)
             self.assertEqual(process.returncode, 0, errors)
             self.assertEqual(json.loads(output), {"sequence": 150, "payload": "150" * 1024})
             self.assertEqual(list(self.root.glob(".publish-*")), [])
         finally:
-            if process.poll() is None:
+            if process.returncode is None:
                 process.kill()
-            process.communicate(timeout=10)
+            await asyncio.wait_for(process.communicate(), 10)
 
     async def test_readonly_snapshot_is_reused_and_not_mutated_by_later_ingestion(self):
         before = self.reader.load("exp-test")
-        self.assertIs(before, self.reader.load("exp-test"))
+        retained = self.reader._snapshots["exp-test"]
+        self.assertEqual(before, self.reader.load("exp-test"))
+        self.assertIs(retained, self.reader._snapshots["exp-test"])
         size = len(before["entries"])
         self.workspace.logger.record_event("later.event")
         after = self.reader.load("exp-test", force=True)
@@ -203,7 +290,10 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
                 "exp-test", "events", {"cursor": json.dumps(page["next_cursor"])}
             )
         self.assertEqual(expired.exception.status_code, 409)
-        self.views.settings["max_response_bytes"] = 1024
+        self.views.settings = _update_model(
+            self.views.settings, max_response_bytes=1024
+        )
+        self.views.journals.settings = self.views.settings
         with self.assertRaises(SystemAPIError) as large:
             await self.views.experiment("exp-test", "parameters", {})
         self.assertEqual(large.exception.status_code, 413)

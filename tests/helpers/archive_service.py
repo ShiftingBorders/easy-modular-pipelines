@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from core.runner_utils.runtimeio import read_json
+from core.primitives.json_files import read_json
 
 
 def main():

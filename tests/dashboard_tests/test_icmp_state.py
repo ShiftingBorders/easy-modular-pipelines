@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from core.models.dashboard_icmp import ICMPSettings
 from dashboard.icmp import ICMPMonitor
 from tests.dashboard_tests.helpers import (
     ProbeProcess,
@@ -30,7 +31,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(signal_patch.stop)
         self.addAsyncCleanup(self.monitor.close)
         self.initial = {
-            "settings": dict(self.monitor.settings),
+            "settings": self.monitor.settings.model_dump(),
             "history": [],
             "incidents": [],
         }
@@ -43,7 +44,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         replacement = ICMPMonitor(self.directory)
         await replacement.open()
         try:
-            self.assertEqual(replacement.settings, expected)
+            self.assertEqual(replacement.settings.model_dump(), expected)
             self.assertFalse(replacement.snapshot()["fresh"])
         finally:
             await replacement.close()
@@ -51,7 +52,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_previous_observations_and_active_incident_survive_restart_but_are_stale(
         self,
     ) -> None:
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         with patch(
             "dashboard.icmp.asyncio.create_subprocess_exec",
             new=AsyncMock(
@@ -69,7 +70,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await replacement.open()
             try:
-                self.assertEqual(replacement.incidents[0]["status"], "active")
+                self.assertEqual(replacement.incidents[0].status, "active")
                 self.assertFalse(replacement.snapshot()["fresh"])
                 self.assertEqual(replacement.snapshot()["status"], "waiting")
             finally:
@@ -152,7 +153,7 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
             await self.monitor.open()
         self.assertEqual(path.stat().st_size, original_size)
 
-    async def test_temp_creation_failure_preserves_published_state(self) -> None:
+    async def test_publication_failures_preserve_state_and_remove_temporary(self) -> None:
         original_open = Path.open
 
         def fail_temporary(path, *args, **kwargs):
@@ -160,51 +161,38 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
                 raise PermissionError("cannot create temporary file")
             return original_open(path, *args, **kwargs)
 
-        with (
-            patch("dashboard.icmp.Path.open", new=fail_temporary),
-            self.assertRaises(PermissionError),
-        ):
-            await self.monitor.configure(icmp_settings(enabled=False))
-        self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
-        self.assertEqual(self.monitor.settings, self.initial["settings"])
-
-    async def test_partial_write_failure_preserves_old_file_and_removes_temporary(
-        self,
-    ) -> None:
         def fail_write(document, stream, **kwargs):
             stream.write('{"settings":')
             raise OSError(errno.ENOSPC, "disk full")
 
-        with (
-            patch("dashboard.icmp.json.dump", new=fail_write),
-            self.assertRaises(OSError),
-        ):
-            await self.monitor.configure(icmp_settings(enabled=False))
-        self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
-        self.assertEqual(list(self.directory.glob(".icmp-*.json")), [])
-        self.assertEqual(self.monitor.settings, self.initial["settings"])
-
-    async def test_flush_failure_preserves_old_configuration(self) -> None:
-        with (
-            patch("dashboard.icmp.os.fsync", side_effect=OSError("flush failed")),
-            self.assertRaises(OSError),
-        ):
-            await self.monitor.configure(icmp_settings(enabled=False))
-        self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
-        self.assertEqual(list(self.directory.glob(".icmp-*.json")), [])
-
-    async def test_replace_failure_preserves_old_configuration(self) -> None:
-        with (
-            patch(
-                "dashboard.icmp.Path.replace",
-                side_effect=PermissionError("replacement denied"),
+        failures = (
+            (
+                "create",
+                patch("dashboard.icmp.Path.open", new=fail_temporary),
+                PermissionError,
             ),
-            self.assertRaises(PermissionError),
-        ):
-            await self.monitor.configure(icmp_settings(enabled=False))
-        self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
-        self.assertEqual(self.monitor.settings, self.initial["settings"])
-        self.assertEqual(list(self.directory.glob(".icmp-*.json")), [])
+            ("write", patch("dashboard.icmp.json.dump", new=fail_write), OSError),
+            (
+                "flush",
+                patch("dashboard.icmp.os.fsync", side_effect=OSError("flush failed")),
+                OSError,
+            ),
+            (
+                "replace",
+                patch(
+                    "dashboard.icmp.Path.replace",
+                    side_effect=PermissionError("replacement denied"),
+                ),
+                PermissionError,
+            ),
+        )
+        for stage, injected, error in failures:
+            with self.subTest(stage=stage):
+                with injected, self.assertRaises(error):
+                    await self.monitor.configure(icmp_settings(enabled=False))
+                self.assertEqual((self.directory / "icmp.json").read_bytes(), self.original)
+                self.assertEqual(self.monitor.settings.model_dump(), self.initial["settings"])
+                self.assertEqual(list(self.directory.glob(".icmp-*.json")), [])
 
     async def test_shutdown_waits_for_pending_state_write_before_releasing_lock(
         self,
@@ -219,16 +207,26 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
         def blocked_write(document):
             started.set()
             try:
-                if not release.wait(3):
+                if not release.wait(30):
                     raise TimeoutError("test did not release the pending write")
                 original_write(document)
             finally:
                 finished.set()
 
+        shutdown_waiting = asyncio.Event()
+        gather = asyncio.gather
+
+        def observe_shutdown(*tasks, **kwargs):
+            waiting = gather(*tasks, **kwargs)
+            if self.monitor._closing and self.monitor._probe_task in tasks:
+                shutdown_waiting.set()
+            return waiting
+
         await self.monitor.open()
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         with (
             patch.object(self.monitor, "_write", side_effect=blocked_write),
+            patch("dashboard.icmp.asyncio.gather", side_effect=observe_shutdown),
             patch(
                 "dashboard.icmp.asyncio.create_subprocess_exec",
                 new=AsyncMock(return_value=ProbeProcess()),
@@ -237,19 +235,22 @@ class ICMPStateTests(unittest.IsolatedAsyncioTestCase):
             pending = asyncio.create_task(self.monitor.probe())
             closing = None
             try:
-                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                self.assertTrue(await asyncio.to_thread(started.wait, 10))
                 closing = asyncio.create_task(self.monitor.close())
-                done, _ = await asyncio.wait({closing}, timeout=0.1)
+                await asyncio.wait_for(shutdown_waiting.wait(), 10)
                 self.assertFalse(
-                    done,
+                    closing.done(),
                     "Shutdown released ownership while a state write was still running",
                 )
+                self.assertFalse(finished.is_set())
                 second = ICMPMonitor(self.directory)
                 with self.assertRaises(OSError):
                     await second.open()
             finally:
                 release.set()
-                self.assertTrue(await asyncio.to_thread(finished.wait, 2))
+                self.assertTrue(await asyncio.to_thread(finished.wait, 10))
                 if closing:
-                    await closing
+                    await asyncio.wait_for(closing, 10)
                 await asyncio.gather(pending, return_exceptions=True)
+            await second.open()
+            await second.close()

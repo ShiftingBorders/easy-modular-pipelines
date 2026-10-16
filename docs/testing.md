@@ -20,26 +20,92 @@ Temporary outputs belong under `.artifacts/`.
 The repository's VS Code configuration uses `unittest`, the `tests` directory,
 and the `test_*.py` discovery pattern.
 
+## Continuous integration
+
+GitHub Actions runs Ruff and Python compilation in a separate `Static checks`
+job. Test jobs run independently using a matrix of Ubuntu and Windows with
+nine groups: `storage`, `modules`, `experiments`, `journal`, `participants`,
+`resources`, `server`, `dashboard_tests`, and `root`.
+
+Each test job installs the locked environment and pinned SeaweedFS binary.
+Directory groups use discovery with the repository as the import root:
+
+```text
+uv run python -m unittest discover -s tests/experiments -t . -p "test_*.py" -v
+```
+
+The `root` group explicitly lists the test modules directly under `tests/`.
+When adding a root test module or a new test directory, update the workflow
+to keep all tests included. The matrix uses `fail-fast: false`, so a failed
+group does not cancel other groups. Failure diagnostics are uploaded from
+`.artifacts/ci-failures/` with the group and OS in the artifact name.
+
+Browser tests still require the prerequisites described below and skip when
+they are unavailable. Splitting the suite does not change platform-specific
+or opt-in test behavior.
+
 ## Selected suites
 
 | Area | Command |
 | --- | --- |
-| Module storage | `uv run python -m unittest tests.test_hashdb tests.test_modulemanager tests.test_seaweed -v` |
-| CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.test_experimentreader tests.test_cli_library_reads tests.test_cli_discovery -v` |
-| Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.test_runtime_restart tests.test_server_lifecycle tests.test_server_results -v` |
-| Graceful server shutdown and response delivery | `uv run python -m unittest tests.test_server_shutdown -v` |
-| Service control review regressions | `uv run python -m unittest tests.test_service_control_review -v` |
-| Template reload | `uv run python -m unittest tests.runner_utils.test_template_reload tests.runner_utils.test_template_reload_services tests.runner_utils.test_template_reload_failures tests.runner_utils.test_template_reload_recovery tests.test_template_reload_cli tests.test_cli -v` |
-| Participant protocol and modules | `uv run python -m unittest tests.runner_utils.test_participant_protocol tests.runner_utils.test_stage_client tests.runner_utils.test_service_dag_requests tests.runner_utils.test_command_proxy -v` |
-| Conditional stages | `uv run python -m unittest tests.runner_utils.test_conditional_stages tests.runner_utils.test_conditional_transitions tests.runner_utils.test_conditional_recovery -v` |
+| Module storage | `uv run python -m unittest tests.storage.test_hash_db tests.modules.test_manager tests.storage.test_seaweed -v` |
+| CLI discovery and downloads (direct library calls) | `uv run python -m unittest tests.experiments.test_reader tests.test_cli_library_reads tests.test_cli_discovery -v` |
+| Runtime restart, mode changes and retained receipts | `uv run python -m unittest tests.server.test_runtime_restart tests.server.test_lifecycle tests.server.test_results -v` |
+| Graceful server shutdown and response delivery | `uv run python -m unittest tests.server.test_shutdown -v` |
+| Service control review regressions | `uv run python -m unittest tests.server.test_service_control_review -v` |
+| Template reload | `uv run python -m unittest tests.experiments.test_template_reload tests.experiments.test_template_reload_services tests.experiments.test_template_reload_failures tests.experiments.test_template_reload_recovery tests.test_template_reload_cli tests.test_cli -v` |
+| Participant protocol and modules | `uv run python -m unittest tests.participants.test_participant_protocol tests.participants.test_stage_client tests.experiments.test_service_dag_requests tests.participants.test_command_proxy -v` |
+| Conditional stages | `uv run python -m unittest tests.experiments.test_conditional_stages tests.experiments.test_conditional_transitions tests.experiments.test_conditional_recovery -v` |
 | Weather experiment | `uv run python -m unittest tests.test_weather_dag -v` |
-| Resource collector | `uv run python -m unittest discover -s tests/resource_utils -t . -p "test_*.py" -v` |
+| Resource collector | `uv run python -m unittest discover -s tests/resources -t . -p "test_*.py" -v` |
 | Dashboard | `uv run python -m unittest discover -s tests/dashboard_tests -t . -p "test_*.py" -v` |
 
-The weather suite includes real timing intervals, processes, and journal
-behavior; do not assume that all scenarios finish immediately.
+The weather timing smoke retains the real 40-second stage and 30-second
+forecast timer. Its other scenarios use acknowledged fixture gates while
+retaining real stage/service processes, TCP and SQLite. They release held work
+after observing the relevant pause, recovery or accepted timeout. The next
+forecast is still generated by the live service.
+
+## Timing and focused validation
+
+Functional concurrency checks synchronize on entry, readiness, accepted results
+and completion. A fixed sleep is not evidence that another task has reached a
+particular phase. Test guards bound hangs independently of the deadline being
+verified; they do not change production timeouts.
+
+Service deadline boundaries and recovery accounting also have isolated checks
+with controlled observations. Real startup, heartbeat and command watchdog
+cases remain. Clock substitutions are local to the tested module/operation and
+do not replace the event loop's monotonic clock. Deadline expiry alone does not
+authorize terminating a process whose ownership is unconfirmed.
+
+Run changed areas separately and use unittest's duration report to identify
+expensive cases:
+
+```text
+uv run python -m unittest tests.experiments.test_service_timeouts tests.experiments.test_service_recovery -v --durations 10
+uv run python -m unittest tests.experiments.test_archiver_validation tests.experiments.test_snapshot_validation -v --durations 10
+uv run python -m unittest tests.dashboard_tests.test_api_client tests.dashboard_tests.test_icmp tests.dashboard_tests.test_icmp_state tests.dashboard_tests.test_views -v --durations 10
+uv run python -m unittest tests.test_weather_dag -v --durations 10
+```
+
+Durations include fixture preparation and cleanup. Archive and snapshot
+validation reuse closed source images with independent copies per test;
+publication, retention and rollback cases retain their own live runtimes.
+Do not share mutable journals, processes or event loops between cases.
+
+Keep failed runs when repeating race-sensitive cases. A later success does not
+erase an earlier failure. Browser functional checks use acknowledged responses
+and refresh callbacks; the actual periodic timer and the documented latency
+limits remain separate observable requirements.
 
 Conditional tests use real stage/service processes and the SQLite journal.
+The single-writer tests also terminate or stall real writer processes at COMMIT
+boundaries, check replay without duplicate events, exercise bounded queues and
+heartbeat during recovery, and verify rollback, replacement storage, and
+standalone idle shutdown. Fault instrumentation lives in test fixtures inside
+the writer process. Temporary-directory cleanup stops only fixture-owned
+standalone writers before removing their files on Windows.
 They cover result errors and retries, exact move inputs, backwards/self visits,
 pause/stop/step boundaries, service-call targets, template reload, protected
 artifact reads, and snapshot/rollback/continuation. Owner-crash fixtures exercise
@@ -84,14 +150,15 @@ readiness after partial service startup, and replaying retained commands/chains
 across mode changes. They reuse the service/DAG, receipt and HTTP fixtures and
 run on Windows and Linux without additional dependencies.
 
-An additional integration entry point is outside normal `test_*.py` discovery:
+The HTTP/CLI and full-system DAG integration cases are part of normal discovery.
+To run those suites separately:
 
 ```text
-uv run python -m unittest tests.integration_cli -v
+uv run python -m unittest tests.test_cli tests.test_system_dag -v
 ```
 
-It requires an available SeaweedFS executable and permission to start a local
-service. Do not point integration checks at valuable runtime data.
+These checks start isolated local HTTP/CLI and participant processes with their
+own temporary data. Do not point integration checks at valuable runtime data.
 
 ## Dashboard
 
@@ -113,14 +180,30 @@ The Heilbronn regression is self-contained: compressed extracted events and
 fixed reference results live in `tests/dashboard_tests/fixtures/heilbronn`.
 No original experiment directory or network access is needed to run it.
 
-Browser checks use a 500-event history and require each sampled ready-page
-navigation, including the first opening of a stopped uncached history, to
-finish within 200 ms; loading placeholders do not count. Run
-latency checks without unrelated host benchmarks. Resource tests include the
+Browser checks use a 500-event history and require each sampled warm-page
+navigation to finish within 200 ms. The first opening of a stopped uncached
+history is measured for diagnostics without a latency assertion.
+Each interval starts before navigation and ends after
+the matching successful DOM update and two animation frames; loading and
+error pages do not count as ready. A mutation observer detects readiness
+without polling. The test samples eight warm pages five times each and one
+cold opening. The normal periodic refresh stays active during measurement;
+the forced refresh that checks row preservation starts after the cold sample.
+
+Run latency checks without unrelated host benchmarks. Separate profiling runs
+add overhead and should not be used as latency baselines. Raw and performance
+reports are saved before assertions in a unique
+`.artifacts/logs/dashboard-browser-<run-id>/` directory, with latest copies at
+`dashboard-browser-results-<platform>.json` and
+`dashboard-browser-performance-<platform>.json` in the logs directory.
+Reports include navigation, DOM and frame timestamps, full HTTP resource
+timings, refresh markers, environment details, and memory usage.
+
+Resource tests include the
 dashboard process and its cache subprocesses: 2,000,000,000 bytes with zero or
 one caching experiment, 4,000,000,000 bytes with multiple concurrent builds.
-Reports are written under `.artifacts/logs/`. A delay beyond 300 ms is allowed
-only while a large, previously uncached experiment is actively being built,
+A delay beyond 300 ms is allowed only while a large, previously uncached
+experiment is actively being built,
 with the initial-build notice visible in dashboard.
 
 The live external ICMP scenario is opt-in. In PowerShell:
@@ -159,8 +242,15 @@ alongside any validation result rather than relying on an old test count.
 
 ## Changing tests
 
-Follow [AGENTS.md](../AGENTS.md). Before adding or modifying tests, finalize the
-feature and create its Markdown plan under `.artifacts/test-plans/`.
+Follow [AGENTS.md](../AGENTS.md). Before writing tests or implementation code,
+create the feature's Markdown test plan.
 Describe affected files, observable behavior, relevant boundaries and errors,
 and open questions. Write test code only after the maintainer explicitly
 confirms the plan. Existing approval does not authorize new cases automatically.
+
+Write and run the approved tests before implementing the feature or behavior
+change. Confirm that new behavior or regression tests fail for the expected
+reason, then implement the behavior and run the tests again together with
+relevant existing regression tests. For behavior-preserving refactoring,
+establish passing coverage before changing production code. Do not start
+implementation while test approval is pending.

@@ -34,7 +34,7 @@ owns DAG retries; the service manager owns restarts.
 ## StageClient
 
 ```python
-from core.runner_utils.stage_client import StageClient
+from core.participants.stage_client import StageClient
 
 # context_path is the absolute Path supplied by --emp-context.
 with StageClient(context_path) as client:
@@ -136,6 +136,19 @@ each call. See the [template reference](../experiment_template.md).
 The attempt deadline starts at queue admission. Queueing, transmission, and
 response all consume it. Retrying creates a new request ID; restarting a service
 does not silently resend a DAG request.
+EMP excludes journal-writer recovery intervals from this deadline. Framework
+journal waits leave heartbeat and control handling available; write methods
+still acknowledge only committed records. Async application handlers should
+offload synchronous logger calls with `asyncio.to_thread` as described in
+[logging](../logging.md#writer-lifetime-and-recovery).
+
+For ordinary stages, executor startup has its own `start_timeout` budget from
+the runner's launch request through handshake; the earlier attempt deadline
+still applies. The executor's wait for execute after publishing its endpoint
+uses the control allowance, also excluding journal recovery. The runner checks
+the effective deadline again after journal/connection waits before dispatch.
+Cancellation or expiry cannot authorize a later execute. Startup failures enter
+stage retry/exhaustion policy only after the old work is confirmed stopped.
 
 ## Wire protocol
 

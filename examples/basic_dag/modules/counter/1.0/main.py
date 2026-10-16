@@ -5,8 +5,8 @@ import json
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.runner_utils.stage_client import StageClient
+from core.journal.logger import OperationLogger
+from core.participants.stage_client import StageClient
 
 
 def main() -> None:

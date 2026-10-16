@@ -13,12 +13,19 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Self
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import httpx
 
-from core.logger_utils.events import (
+from core.models.client_settings import (
+    ClientConfiguration,
+    ClientConnectionConfiguration,
+)
+from core.models.server_commands import ServerChain, ServerCommand
+from core.models.server_receipts import ChainReceipt, CommandReceipt
+from core.models.updates import _update_model
+from core.primitives.json_values import (
     JsonObject,
     copy_json_object,
     require_number,
@@ -82,33 +89,54 @@ def json_argument(value: str) -> JsonObject:
 
 def command_receipt(value: object) -> JsonObject:
     """Reject malformed success responses instead of treating absent fields as success."""
+    return _command_receipt(value).model_dump(exclude_unset=True)
+
+
+def _command_receipt(value: object) -> CommandReceipt:
     try:
-        result = copy_json_object(value, "command receipt")
-        UUID(require_text(result.get("command_id"), "command_id"))
-        UUID(require_text(result.get("server_instance_id"), "server_instance_id"))
-        expected = {
-            "pending": None,
-            "unknown": None,
-            "unavailable": None,
-            "succeeded": "success",
-            "failed": "fail",
-            "cancelled": "fail",
-        }
-        state = require_text(result.get("state"), "state")
-        if (
-            state not in expected
-            or "result" not in result
-            or result["result"] != expected[state]
-        ):
-            raise ValueError("Invalid command state/result combination.")
-        return result
+        return CommandReceipt.model_validate(value)
     except (ValueError, TypeError) as error:
         raise ClientError(
             "Server returned an invalid command receipt.", code="invalid_response"
         ) from error
 
 
+def _chain_receipt(
+    value: object, chain_id: str, identifiers: list[str]
+) -> ChainReceipt:
+    try:
+        receipt = ChainReceipt.model_validate(value)
+    except (ValueError, TypeError) as error:
+        raise ClientError(
+            "Server returned invalid chain receipts.", code="invalid_response"
+        ) from error
+    if (
+        receipt.chain_id != chain_id
+        or [item.command_id for item in receipt.commands] != identifiers
+    ):
+        raise ClientError(
+            "Server returned receipts for another chain.",
+            code="invalid_response",
+            details=copy_json_object({"command_ids": identifiers}, "command IDs"),
+        )
+    return receipt
+
+
+def _chain_document(path: Path, chain_id: str | None) -> ServerChain:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    document = copy_json_object(
+        {"commands": loaded} if isinstance(loaded, list) else loaded, "chain"
+    )
+    if chain_id is not None:
+        document["chain_id"] = chain_id
+    return ServerChain.model_validate(document)
+
+
 def load_settings(config_path: Path | None, overrides: JsonObject) -> JsonObject:
+    return _load_settings(config_path, overrides).model_dump()
+
+
+def _load_settings(config_path: Path | None, overrides: JsonObject) -> ClientConfiguration:
     if config_path is not None and not config_path.is_absolute():
         raise ValueError("config_path must be absolute.")
     settings = copy_json_object(
@@ -123,60 +151,30 @@ def load_settings(config_path: Path | None, overrides: JsonObject) -> JsonObject
             raise ValueError(f"Unknown CLI settings: {sorted(custom.keys() - fields)}")
         settings.update(custom)
     settings.update(overrides)
-    if type(settings["schema_version"]) is not int or settings["schema_version"] != 1:
-        raise ValueError("Only CLI settings schema_version 1 is supported.")
-    url = urlsplit(require_text(settings["server_url"], "server_url"))
-    if (
-        url.scheme not in ("http", "https")
-        or not url.hostname
-        or url.username is not None
-        or url.password is not None
-        or url.query
-        or url.fragment
-    ):
-        raise ValueError(
-            "server_url must be an HTTP(S) base URL without credentials, query or fragment."
-        )
-    if url.port is not None and not 1 <= url.port <= 65535:
-        raise ValueError("Invalid server_url port.")
-    if settings["token_env"] is not None:
-        require_text(settings["token_env"], "token_env")
-    for name in (
-        "request_timeout_seconds",
-        "wait_timeout_seconds",
-        "poll_interval_seconds",
-    ):
-        if require_number(settings[name], name) <= 0:
-            raise ValueError(f"{name} must be positive.")
-    value = settings["max_response_bytes"]
-    if type(value) is not int or value < 1:
-        raise ValueError("max_response_bytes must be a positive integer.")
-    return settings
+    return ClientConfiguration.model_validate(settings)
 
 
 class APIClient:
     """Own only an HTTP connection; closing it never sends a runtime stop."""
 
-    def __init__(self, settings: JsonObject) -> None:
-        self.url = require_text(settings["server_url"], "server_url").rstrip("/")
-        self.timeout = require_number(
-            settings["request_timeout_seconds"], "request_timeout_seconds"
+    def __init__(self, settings: JsonObject | ClientConnectionConfiguration) -> None:
+        validated = (
+            settings if isinstance(settings, ClientConnectionConfiguration)
+            else ClientConnectionConfiguration.model_validate(settings)
         )
-        self.wait_timeout = require_number(
-            settings["wait_timeout_seconds"], "wait_timeout_seconds"
-        )
-        self.interval = require_number(
-            settings["poll_interval_seconds"], "poll_interval_seconds"
-        )
-        value = settings["max_response_bytes"]
-        if type(value) is not int or value < 1:
-            raise ValueError("max_response_bytes must be positive.")
-        self.max_bytes = value
-        token_env = settings["token_env"]
+        self._configure(validated)
+
+    def _configure(self, settings: ClientConnectionConfiguration) -> None:
+        self.url = settings.server_url.rstrip("/")
+        self.timeout = settings.request_timeout_seconds
+        self.wait_timeout = settings.wait_timeout_seconds
+        self.interval = settings.poll_interval_seconds
+        self.max_bytes = settings.max_response_bytes
+        token_env = settings.token_env
         self.token = (
             None
             if token_env is None
-            else os.environ.get(require_text(token_env, "token_env"))
+            else os.environ.get(token_env)
         )
         if token_env is not None and not self.token:
             raise ValueError(f"CLI token environment variable is empty: {token_env}")
@@ -362,12 +360,15 @@ class APIClient:
             ) from error
 
     async def wait(self, receipt: JsonObject, timeout: float) -> JsonObject:
-        receipt = command_receipt(receipt)
-        identifier = require_text(receipt.get("command_id"), "command_id")
-        instance = receipt.get("server_instance_id")
+        result = await self._wait(_command_receipt(receipt), timeout)
+        return result.model_dump(exclude_unset=True)
+
+    async def _wait(self, receipt: CommandReceipt, timeout: float) -> CommandReceipt:
+        identifier = receipt.command_id
+        instance = receipt.server_instance_id
         deadline = time.monotonic() + timeout
         result = receipt
-        while result.get("state") == "pending":
+        while result.state == "pending":
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ClientError(
@@ -379,7 +380,7 @@ class APIClient:
             await asyncio.sleep(min(self.interval, remaining))
             try:
                 async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
-                    result = command_receipt(
+                    result = _command_receipt(
                         await self.request(
                             "GET", "/commands/" + quote(identifier, safe="")
                         )
@@ -396,13 +397,13 @@ class APIClient:
                     command_id=identifier, expected_server_instance_id=instance
                 )
                 raise
-            if result.get("server_instance_id") != instance:
+            if result.server_instance_id != instance:
                 raise ClientError(
                     "Server instance changed; the previous command outcome is unknown.",
                     code="server_restarted",
                     details={"command_id": identifier, "server_instance_id": instance},
                 )
-            if result["command_id"] != identifier:
+            if result.command_id != identifier:
                 raise ClientError(
                     "Server returned a result for another command.",
                     code="invalid_response",
@@ -684,7 +685,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_arguments(options: argparse.Namespace) -> JsonObject:
+    args: JsonObject = {"delayed_start": options.delayed_start}
+    if options.continue_from is not None:
+        if options.experiment_id is not None:
+            raise ValueError("--experiment-id cannot be combined with --continue-from.")
+        args.update({"experiment_id": options.continue_from, "continue": True})
+    else:
+        args["template_path"] = options.template
+        if options.experiment_id is not None:
+            args["experiment_id"] = options.experiment_id
+    return args
+
+
+def _rerun_arguments(options: argparse.Namespace) -> JsonObject:
+    args: JsonObject = {"scope": options.scope}
+    if options.scope == "stage":
+        if options.position is None or options.experiment_id is not None:
+            raise ValueError("Stage rerun requires --position and no --experiment-id.")
+        args["position"] = options.position
+    elif options.position is not None:
+        raise ValueError("Experiment rerun does not accept --position.")
+    elif options.experiment_id is not None:
+        args["experiment_id"] = options.experiment_id
+    return args
+
+
 def command_document(options: argparse.Namespace) -> JsonObject:
+    return _command_model(options).model_dump(exclude_none=True)
+
+
+def _command_model(options: argparse.Namespace) -> ServerCommand:
     name = options.action
     args: JsonObject = {}
     target: JsonObject | None = None
@@ -705,29 +736,9 @@ def command_document(options: argparse.Namespace) -> JsonObject:
                 raise ValueError("--name requires --version.")
             args.update({"name": options.name, "version": version})
     elif name == "run":
-        args["delayed_start"] = options.delayed_start
-        if options.continue_from is not None:
-            if options.experiment_id is not None:
-                raise ValueError(
-                    "--experiment-id cannot be combined with --continue-from."
-                )
-            args.update({"experiment_id": options.continue_from, "continue": True})
-        else:
-            args["template_path"] = options.template
-            if options.experiment_id is not None:
-                args["experiment_id"] = options.experiment_id
+        args = _run_arguments(options)
     elif name == "rerun":
-        args["scope"] = options.scope
-        if options.scope == "stage":
-            if options.position is None or options.experiment_id is not None:
-                raise ValueError(
-                    "Stage rerun requires --position and no --experiment-id."
-                )
-            args["position"] = options.position
-        elif options.position is not None:
-            raise ValueError("Experiment rerun does not accept --position.")
-        elif options.experiment_id is not None:
-            args["experiment_id"] = options.experiment_id
+        args = _rerun_arguments(options)
     elif name == "move":
         args["position"] = options.position
     elif name in ("retry", "reset-retries"):
@@ -768,7 +779,7 @@ def command_document(options: argparse.Namespace) -> JsonObject:
     }
     if target is not None:
         document["target"] = target
-    return document
+    return ServerCommand.model_validate(document)
 
 
 def display(document: JsonObject, *, as_json: bool, streaming: bool = False) -> None:
@@ -801,10 +812,12 @@ def display(document: JsonObject, *, as_json: bool, streaming: bool = False) -> 
     )
 
 
-def outcome_code(document: JsonObject) -> int:
-    if document.get("state") in ("unknown", "unavailable"):
+def outcome_code(document: JsonObject | CommandReceipt) -> int:
+    state = document.state if isinstance(document, CommandReceipt) else document.get("state")
+    result = document.result if isinstance(document, CommandReceipt) else document.get("result")
+    if state in ("unknown", "unavailable"):
         return 3
-    return 1 if document.get("result") == "fail" else 0
+    return 1 if result == "fail" else 0
 
 
 async def execute(
@@ -873,79 +886,11 @@ async def execute(
     if action == "experiment" or (
         action == "snapshot" and options.snapshot_action is not None
     ):
-        params = {}
-        if action == "experiment":
-            path = "/experiments"
-            if options.experiment_action == "inspect":
-                path += "/inspect"
-                params["experiment_id"] = options.experiment_id
-        else:
-            if (
-                options.label is not None
-                or options.wait is not None
-                or options.wait_timeout is not None
-                or options.command_id is not None
-            ):
-                raise ValueError(
-                    "Snapshot reads do not accept creation or wait options."
-                )
-            path = "/snapshots"
-            if options.experiment_id is not None:
-                params["experiment_id"] = options.experiment_id
-            if options.snapshot_action == "inspect":
-                path += "/inspect"
-                params["snapshot_id"] = options.snapshot_id
-        document = await client.request("GET", path, params=params)
-        display(document, as_json=as_json)
-        return 0
+        return await _read_experiment_metadata(options, client, as_json=as_json)
     if action in ("health", "status", "state", "resources", "resource-history"):
-        path = {
-            "health": "/health",
-            "status": "/state",
-            "state": "/state",
-            "resources": "/resources",
-            "resource-history": "/resources/history",
-        }[action]
-        params = {}
-        if action in ("status", "state") and options.experiment_id is not None:
-            params["experiment_id"] = options.experiment_id
-        if action == "resource-history":
-            if options.after < 0 or options.limit > 1000:
-                raise ValueError("after must be nonnegative and limit must be 1..1000.")
-            params = {"after": options.after, "limit": options.limit}
-        watch = getattr(options, "watch", None)
-        while True:
-            document = await client.request("GET", path, params=params)
-            display(document, as_json=as_json, streaming=watch is not None)
-            if watch is None:
-                return 0
-            await asyncio.sleep(watch)
+        return await _read_runtime_state(options, client, as_json=as_json)
     if action == "logs":
-        identifier = options.experiment_id
-        if identifier is None:
-            current = await client.request("GET", "/state")
-            identifier = require_text(
-                current.get("experiment_id"),
-                "selected experiment_id; use --experiment-id",
-            )
-        cursor = None if options.cursor is None else json_argument(options.cursor)
-        if options.limit > 1000:
-            raise ValueError("limit must be 1..1000.")
-        while True:
-            params = {"limit": options.limit}
-            if cursor is not None:
-                params["cursor"] = json.dumps(cursor, separators=(",", ":"))
-            document = await client.request(
-                "GET",
-                "/experiments/" + quote(identifier, safe="") + "/events",
-                params=params,
-            )
-            display(document, as_json=as_json, streaming=options.follow)
-            if not options.follow:
-                return 0
-            cursor = copy_json_object(document.get("checkpoint"), "journal checkpoint")
-            if not document.get("has_more"):
-                await asyncio.sleep(client.interval)
+        return await _read_journal(options, client, as_json=as_json)
     timeout = (
         client.wait_timeout if options.wait_timeout is None else options.wait_timeout
     )
@@ -965,49 +910,106 @@ async def execute(
             response = await client.wait(response, timeout)
         display(response, as_json=as_json)
         return outcome_code(response)
-    if action == "chain":
-        loaded = json.loads(options.file.read_text(encoding="utf-8"))
-        document = copy_json_object(
-            {"commands": loaded} if isinstance(loaded, list) else loaded, "chain"
-        )
-        entries = document.get("commands")
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("A chain requires a nonempty commands array.")
-        prepared = []
-        for item in entries:
-            item = copy_json_object(item, "chain command")
-            item.setdefault("command_id", str(uuid4()))
-            prepared.append(item)
-        document["commands"] = copy_json_object({"items": prepared}, "commands")[
-            "items"
-        ]
-        document["chain_id"] = options.chain_id or document.get(
-            "chain_id", str(uuid4())
-        )
-        document["chain_id"] = str(UUID(require_text(document["chain_id"], "chain_id")))
-        identifiers = [
-            str(UUID(require_text(item["command_id"], "command_id")))
-            for item in prepared
-        ]
-        path = "/chains"
+    return await _execute_submission(
+        client, options, timeout, as_json=as_json,
+        wait=not interactive if options.wait is None else options.wait,
+    )
+
+
+async def _read_experiment_metadata(
+    options: argparse.Namespace, client: APIClient, *, as_json: bool,
+) -> int:
+    params = {}
+    if options.action == "experiment":
+        path = "/experiments"
+        if options.experiment_action == "inspect":
+            path += "/inspect"
+            params["experiment_id"] = options.experiment_id
     else:
-        document = command_document(options)
-        identifiers = [require_text(document["command_id"], "command_id")]
-        path = "/commands"
-    print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
-    wait = not interactive if options.wait is None else options.wait
-    wait_for_shutdown = document.get("command") == "server.shutdown" and wait
+        if (
+            options.label is not None
+            or options.wait is not None
+            or options.wait_timeout is not None
+            or options.command_id is not None
+        ):
+            raise ValueError("Snapshot reads do not accept creation or wait options.")
+        path = "/snapshots"
+        if options.experiment_id is not None:
+            params["experiment_id"] = options.experiment_id
+        if options.snapshot_action == "inspect":
+            path += "/inspect"
+            params["snapshot_id"] = options.snapshot_id
+    document = await client.request("GET", path, params=params)
+    display(document, as_json=as_json)
+    return 0
+
+
+async def _read_runtime_state(
+    options: argparse.Namespace, client: APIClient, *, as_json: bool,
+) -> int:
+    action = options.action
+    path = {
+        "health": "/health",
+        "status": "/state",
+        "state": "/state",
+        "resources": "/resources",
+        "resource-history": "/resources/history",
+    }[action]
+    params = {}
+    if action in ("status", "state") and options.experiment_id is not None:
+        params["experiment_id"] = options.experiment_id
+    if action == "resource-history":
+        if options.after < 0 or options.limit > 1000:
+            raise ValueError("after must be nonnegative and limit must be 1..1000.")
+        params = {"after": options.after, "limit": options.limit}
+    watch = getattr(options, "watch", None)
+    while True:
+        document = await client.request("GET", path, params=params)
+        display(document, as_json=as_json, streaming=watch is not None)
+        if watch is None:
+            return 0
+        await asyncio.sleep(watch)
+
+
+async def _read_journal(
+    options: argparse.Namespace, client: APIClient, *, as_json: bool,
+) -> int:
+    identifier = options.experiment_id
+    if identifier is None:
+        current = await client.request("GET", "/state")
+        identifier = require_text(
+            current.get("experiment_id"), "selected experiment_id; use --experiment-id"
+        )
+    cursor = None if options.cursor is None else json_argument(options.cursor)
+    if options.limit > 1000:
+        raise ValueError("limit must be 1..1000.")
+    while True:
+        params = {"limit": options.limit}
+        if cursor is not None:
+            params["cursor"] = json.dumps(cursor, separators=(",", ":"))
+        document = await client.request(
+            "GET", "/experiments/" + quote(identifier, safe="") + "/events", params=params
+        )
+        display(document, as_json=as_json, streaming=options.follow)
+        if not options.follow:
+            return 0
+        cursor = copy_json_object(document.get("checkpoint"), "journal checkpoint")
+        if not document.get("has_more"):
+            await asyncio.sleep(client.interval)
+
+
+async def _send_submission(
+    client: APIClient, path: str, submission: ServerCommand | ServerChain,
+    identifiers: list[str], timeout: float, *, wait_for_shutdown: bool,
+) -> JsonObject:
+    document = submission.model_dump(exclude_none=True)
     try:
         if wait_for_shutdown:
-            receipt = await client.request(
-                "POST",
-                path,
-                document=document,
-                params={"wait": "true"},
-                timeout=timeout,
+            return await client.request(
+                "POST", path, document=document,
+                params={"wait": "true"}, timeout=timeout,
             )
-        else:
-            receipt = await client.request("POST", path, document=document)
+        return await client.request("POST", path, document=document)
     except ClientError as error:
         error.details.update(
             copy_json_object({"command_ids": identifiers}, "command IDs")
@@ -1015,79 +1017,76 @@ async def execute(
         if wait_for_shutdown and error.code == "http_timeout":
             raise ClientError(
                 "Shutdown wait expired; the server operation was not cancelled.",
-                code="wait_timeout",
-                exit_code=4,
-                details=error.details,
+                code="wait_timeout", exit_code=4, details=error.details,
             ) from error
         raise
-    if action != "chain":
-        receipt = command_receipt(receipt)
-        if receipt["command_id"] != identifiers[0]:
+
+
+async def _execute_submission(
+    client: APIClient, options: argparse.Namespace, timeout: float,
+    *, as_json: bool, wait: bool,
+) -> int:
+    action = options.action
+    if action == "chain":
+        submission = _chain_document(options.file, options.chain_id)
+        identifiers = [item.command_id for item in submission.commands]
+        path = "/chains"
+    else:
+        submission = _command_model(options)
+        identifiers = [submission.command_id]
+        path = "/commands"
+    print("command_id=" + ",".join(identifiers), file=sys.stderr, flush=True)
+    wait_for_shutdown = isinstance(submission, ServerCommand) and submission.command == "server.shutdown" and wait
+    received = await _send_submission(
+        client, path, submission, identifiers, timeout,
+        wait_for_shutdown=wait_for_shutdown,
+    )
+    if isinstance(submission, ServerCommand):
+        receipt = _command_receipt(received)
+        if receipt.command_id != identifiers[0]:
             raise ClientError(
                 "Server returned a receipt for another command.",
                 code="invalid_response",
                 details={"command_id": identifiers[0]},
             )
     else:
-        tickets = receipt.get("commands")
-        if not isinstance(tickets, list):
-            raise ClientError(
-                "Server returned no chain receipts.", code="invalid_response"
-            )
-        validated = [command_receipt(item) for item in tickets]
-        if (
-            receipt.get("chain_id") != document["chain_id"]
-            or [item["command_id"] for item in validated] != identifiers
-            or any(
-                item["server_instance_id"] != receipt.get("server_instance_id")
-                for item in validated
-            )
-        ):
-            raise ClientError(
-                "Server returned receipts for another chain.",
-                code="invalid_response",
-                details=copy_json_object({"command_ids": identifiers}, "command IDs"),
-            )
-    wait = not interactive if options.wait is None else options.wait
+        receipt = _chain_receipt(
+            received, submission.chain_id, identifiers
+        )
     if not wait:
-        display(receipt, as_json=as_json)
-        if action == "chain":
-            tickets = receipt.get("commands")
-            if not isinstance(tickets, list):
-                raise ClientError(
-                    "Server returned no chain receipts.", code="invalid_response"
-                )
+        display(receipt.model_dump(exclude_unset=True), as_json=as_json)
+        if isinstance(receipt, ChainReceipt):
             return max(
-                (outcome_code(command_receipt(item)) for item in tickets),
+                (outcome_code(item) for item in receipt.commands),
                 default=0,
             )
         return outcome_code(receipt)
-    if action != "chain":
-        result = await client.wait(receipt, timeout)
-        display(result, as_json=as_json)
+    if isinstance(receipt, CommandReceipt):
+        result = _command_receipt(await client.wait(
+            receipt.model_dump(exclude_unset=True), timeout
+        ))
+        display(result.model_dump(exclude_unset=True), as_json=as_json)
         return outcome_code(result)
-    tickets = receipt.get("commands")
-    if not isinstance(tickets, list):
-        raise ClientError("Server returned no chain receipts.", code="invalid_response")
     results = []
     deadline = time.monotonic() + timeout
-    for item in tickets:
-        ticket = command_receipt(item)
-        results.append(await client.wait(ticket, max(0, deadline - time.monotonic())))
-    receipt["commands"] = copy_json_object({"items": results}, "chain results")["items"]
-    display(receipt, as_json=as_json)
+    for ticket in receipt.commands:
+        results.append(_command_receipt(await client.wait(
+            ticket.model_dump(exclude_unset=True), max(0, deadline - time.monotonic())
+        )))
+    receipt = _update_model(receipt, commands=results)
+    display(receipt.model_dump(exclude_unset=True), as_json=as_json)
     return max((outcome_code(result) for result in results), default=0)
 
 
 async def run_command(
     options: argparse.Namespace,
-    settings: JsonObject,
+    settings: JsonObject | ClientConfiguration,
     *,
     as_json: bool,
     interactive: bool = False,
 ) -> int:
     if options.action == "template" and options.template_action == "create":
-        from core.experimenttemplate import create_template
+        from core.experiments.template import create_template
 
         path = create_template(options.destination.absolute(), options.name)
         display(
@@ -1127,7 +1126,7 @@ def report_error(error: Exception, *, as_json: bool) -> int:
 
 
 def shell(
-    parser: argparse.ArgumentParser, settings: JsonObject, *, as_json: bool
+    parser: argparse.ArgumentParser, settings: JsonObject | ClientConfiguration, *, as_json: bool
 ) -> int:
     print(
         "Connected client shell. Commands run asynchronously by default; use result ID or --wait. quit/EOF disconnect only.",
@@ -1204,7 +1203,7 @@ def main() -> None:
         if value is not None:
             overrides[name] = value
     try:
-        settings = load_settings(
+        settings = _load_settings(
             None if options.config is None else options.config.resolve(), overrides
         )
         code = (

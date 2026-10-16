@@ -1,5 +1,6 @@
 """Real local modules and a controller session for the approved integration plan."""
 
+import asyncio
 import copy
 import json
 import shutil
@@ -9,7 +10,7 @@ from uuid import uuid4
 import yaml
 
 from tests.helpers.dag import DagSession
-from tests.helpers.services import ServiceWorkspace, wait_for
+from tests.helpers.services import ServiceWorkspace
 
 
 class ServiceDagWorkspace:
@@ -79,7 +80,7 @@ class ServiceDagWorkspace:
         }
 
     def template(self, stages=None, *, services=None, cycles=1):
-        template = copy.deepcopy(self.files.state.template)
+        template = copy.deepcopy(self.files.template)
         template["stages"] = [self.stage()] if stages is None else stages
         if services is not None:
             template["services"] = services
@@ -110,9 +111,8 @@ class ServiceDagWorkspace:
         )
         if reply["result"] != "success":
             raise AssertionError(reply)
-        await wait_for(
-            lambda: self.session.runner.get_state()["phase"] != "starting", timeout=100
-        )
+        # Writer startup may temporarily publish waiting before services exist.
+        await asyncio.wait_for(self.session.runner._ready.wait(), timeout=100)
         return self.session.runner
 
     def trace(self, service):

@@ -7,6 +7,7 @@ import sqlite3
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from core.primitives.json_files import read_json
 from tests.helpers.http_runtime import ServerTestCase
 
 
@@ -102,7 +103,7 @@ class HTTPContractTests(ServerTestCase):
             await writer.wait_closed()
 
     async def test_retained_ids_chains_conflicts_and_expired_results(self):
-        server = await self.start_server(settings={"result_ttl_seconds": 0.5})
+        server = await self.start_server()
         identifier = str(uuid4())
         body = {"command_id": identifier, "command": "stats.state"}
         first = await server.client.post("/commands", json=body)
@@ -139,7 +140,14 @@ class HTTPContractTests(ServerTestCase):
             ).status_code,
             409,
         )
-        await asyncio.sleep(0.6)
+        # Expiry must not race the replay/chain assertions on a loaded host.
+        # Age completed receipts only after those independent checks finish.
+        (server.control / "expire-results").touch()
+        expired = server.control / "results-expired.json"
+        async with asyncio.timeout(5):
+            while not expired.exists():
+                await asyncio.sleep(0.01)
+        self.assertIn(identifier, read_json(expired)["command_ids"])
         response = await server.client.get("/commands/" + identifier)
         self.assertEqual(response.status_code, 404)
         self.assertIn("never executed", response.json()["error"]["message"])
