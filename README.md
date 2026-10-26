@@ -17,11 +17,6 @@ implementation and environment; it is not an unconditional guarantee.
 > configuration, and stored experiment formats may change. Compatibility with
 > older experimental formats is not guaranteed.
 
-
-> [!IMPORTANT]
-> Version 0.1.0 preview is available in dedicated branch. This is the first version, considered "stable".
-> All modules, done prior 0.1.0, are incompatible with 0.1.0. 
-
 ## What it does
 
 - **[Module identity and integrity checks](docs/module_integrity.md).** Pin
