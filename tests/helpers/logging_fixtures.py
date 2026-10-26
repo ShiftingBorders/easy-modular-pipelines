@@ -1,5 +1,6 @@
 """Full-context fixtures and subprocess checkpoints for approved groups A, C, E, F."""
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -81,20 +82,26 @@ def main() -> None:
                 sqlite3, "connect", side_effect=AssertionError("Unexpected DB I/O")
             ),
         ):
-            from core.logger import OperationLogger
-            from core.logger_utils.storage import SQLiteEventStore
+            from core.journal.logger import OperationLogger
+            from core.journal.storage import SQLiteEventStore
 
             OperationLogger(config)
             SQLiteEventStore(config.parent / "unopened.db", **STORE_OPTIONS)
-            from core.logger_utils.filtered import FilteredJournal
+            from core.journal.filtered import FilteredJournal
 
             FilteredJournal(config, config.parent / "view.db")
         announce({"imported": True})
         return
 
-    from core.logger import OperationLogger
-    from core.logger_utils.events import LoggingStateError
-    from core.logger_utils.storage import SQLiteEventStore
+    from core.journal.events import LoggingStateError
+    from core.journal.logger import OperationLogger
+    from core.journal.storage import SQLiteEventStore
+
+    if mode in ("result_before_commit", "result_after_commit", "snapshot_crash"):
+        from tests.helpers.journal_owner import run_crash_writer
+
+        asyncio.run(run_crash_writer(mode, config, arguments))
+        return
 
     if mode in ("restore_before_commit", "restore_after_commit"):
         manifest = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
@@ -132,7 +139,7 @@ def main() -> None:
         return
 
     if mode in ("view_reader", "view_crash"):
-        from core.logger_utils.filtered import FilteredJournal
+        from core.journal.filtered import FilteredJournal
 
         view = FilteredJournal(config, Path(arguments[0]))
         view.open()
@@ -167,7 +174,7 @@ def main() -> None:
 
     with OperationLogger(config) as logger:
         if mode == "fork":
-            from core.logger_utils.filtered import FilteredJournal
+            from core.journal.filtered import FilteredJournal
 
             view = FilteredJournal(config, config.parent / "unopened-fork-view.db")
             child = os.fork()
@@ -206,35 +213,6 @@ def main() -> None:
             announce(
                 {"child_exit": os.waitstatus_to_exitcode(status), "child_pid": child}
             )
-            return
-
-        if mode in ("result_before_commit", "result_after_commit"):
-            request_id = arguments[0]
-            if mode == "result_before_commit":
-
-                def before_index(sql: str) -> None:
-                    if sql.startswith("INSERT INTO command_results"):
-                        checkpoint({"phase": "result_uncommitted"})
-
-                logger._store._connection.set_trace_callback(before_index)
-            result_id = logger.record_command_result(
-                request_id, {"origin": "runner"}, author="runner", outcome="failed"
-            )
-            checkpoint({"phase": "result_committed", "event_id": result_id})
-            return
-
-        if mode == "snapshot_crash":
-            original_rename = Path.rename
-
-            def after_database_copy(path, target):
-                result = original_rename(path, target)
-                if path.name == "journal.sqlite.part":
-                    checkpoint({"phase": "database_copied"})
-                return result
-
-            with patch.object(Path, "rename", after_database_copy):
-                logger.export_snapshot(Path(arguments[0]), min_free_bytes=0)
-            announce({"exported": True})
             return
 
         if mode != "worker":

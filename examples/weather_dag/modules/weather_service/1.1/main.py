@@ -6,9 +6,9 @@ import random
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.runner_utils.participant_server import ParticipantServer
-from core.runner_utils.runtimeio import read_json, write_json
+from core.journal.logger import OperationLogger
+from core.participants.server import ParticipantServer
+from core.primitives.json_files import read_json, write_json
 
 
 class WeatherService:

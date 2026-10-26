@@ -6,8 +6,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from core.logger import OperationLogger
-from tests.helpers.logging_process import existing_settings, write_settings
+from core.journal.logger import OperationLogger
+from tests.helpers.logging_process import (
+    existing_settings,
+    stop_journal_writers,
+    write_settings,
+)
 
 
 def timestamp(seconds=0):
@@ -152,6 +156,7 @@ class JournalWorkspace:
 
     def close(self):
         self.logger.close()
+        stop_journal_writers(self.directory)
 
 
 def resource_status(value=25):

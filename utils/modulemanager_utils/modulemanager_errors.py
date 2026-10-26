@@ -1,2 +1,0 @@
-class HashMismatch(Exception):
-    pass

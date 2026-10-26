@@ -3,8 +3,8 @@
 import asyncio
 import json
 
-from core.experimentassembler import find_experiment
-from core.runner_utils.runtimeio import read_json
+from core.experiments.assembler import find_experiment
+from core.primitives.json_files import read_json
 from tests.helpers.dag import process_running
 from tests.helpers.http_runtime import ServerTestCase
 

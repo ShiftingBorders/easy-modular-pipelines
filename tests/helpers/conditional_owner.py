@@ -6,12 +6,13 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from core.hashdb import HashDB
-from core.modulemanager import ModuleManager
-from core.runner_utils.experimentrunner import ExperimentRunner
-from core.runner_utils.runtimeio import process_identity, write_json
-from core.runner_utils.stages import StageRunner
-from core.seaweed import SeaweedDB
+from core.experiments.runner import ExperimentRunner
+from core.experiments.stages import StageRunner
+from core.modules.manager import ModuleManager
+from core.primitives.json_files import write_json
+from core.primitives.processes import process_identity
+from core.storage.hash_db import HashDB
+from core.storage.seaweed_client import SeaweedDB
 
 
 async def run_owner(options) -> None:
@@ -22,7 +23,7 @@ async def run_owner(options) -> None:
     )
     runner = ExperimentRunner(options.root, manager)
     original_accept = StageRunner._accept
-    original_save = ExperimentRunner._save_state
+    original_save = ExperimentRunner._save_state_async
     original_attempt_save = StageRunner._save_state
 
     def crash():
@@ -35,28 +36,28 @@ async def run_owner(options) -> None:
         )
         os._exit(23)
 
-    def accept(stages, state, attempt, response, outcome):
-        result = original_accept(stages, state, attempt, response, outcome)
+    async def accept(stages, state, attempt, response, outcome):
+        result = await original_accept(stages, state, attempt, response, outcome)
         if (
             options.boundary == "accepted"
             and attempt.stage_id == options.condition
-            and result["result"] == "success"
+            and result.result == "success"
         ):
             crash()
         return result
 
-    def save(owner):
-        original_save(owner)
+    async def save(owner):
+        await original_save(owner)
         transfer = owner._state.pending_input
         if (
             options.boundary == "transition"
             and transfer is not None
-            and transfer["source_stage_id"] == options.condition
+            and transfer.source_stage_id == options.condition
         ):
             crash()
 
-    def save_attempt(stages, state, **kwargs):
-        original_attempt_save(stages, state, **kwargs)
+    async def save_attempt(stages, state, **kwargs):
+        await original_attempt_save(stages, state, **kwargs)
         attempt = state.active_attempt
         if (
             options.boundary == "target_started"
@@ -74,7 +75,7 @@ async def run_owner(options) -> None:
         )
         with (
             patch.object(StageRunner, "_accept", accept),
-            patch.object(ExperimentRunner, "_save_state", save),
+            patch.object(ExperimentRunner, "_save_state_async", save),
             patch.object(StageRunner, "_save_state", save_attempt),
         ):
             await runner.resume()

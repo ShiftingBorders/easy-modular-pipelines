@@ -102,6 +102,13 @@ leaves `pending`. Completed responses carry `state`, `result`, `data`, and
 `error`. Success of `run` signals launch; it does not mean the DAG completed.
 Use `/state` to observe the experiment.
 
+Experiment state includes `journal_writer` (writer process, recovery state,
+queue depth/capacity, active database, and history availability),
+`journal_pause_reason`, and `journal_audit_complete`. These observations do not
+require a primary-journal read. `/health` includes the controller journal's
+`journal_writer` status. A replacement journal with missing history keeps the
+DAG paused even when its new writer is ready.
+
 For conditional execution, state additionally exposes `dag_decision` and
 `pending_input`. A decision identifies its source request/stage/experiment and
 the accepted command. Pending input identifies the move target and the journal

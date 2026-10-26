@@ -8,7 +8,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from core.historycache import JournalHistoryCache
+from core.journal.history_cache import JournalHistoryCache
 from dashboard.config import load_settings
 from dashboard.journals import LocalJournals
 from dashboard.projections import (

@@ -94,22 +94,9 @@ and replace the controller and its owned resources while HTTP remains available.
 They do not automatically resume an experiment or modify the configuration file.
 See [runtime lifecycle](http_api.md#runtime-lifecycle).
 
-| CLI command | Behavior |
-| --- | --- |
-| `run --template <path> --delayed-start --wait` | Prepare the experiment and services, then wait before the first stage. |
-| `pause --wait` | Wait for the active attempt to finish; services remain alive. |
-| `step --wait` | Execute the next stage from an idle pause, then pause again. |
-| `resume --wait` | Continue normal execution. |
-| `stop --wait` | Interrupt active work and stop owned services. |
-| `rerun stage --position 1 --wait` | Rerun a stage from a permitted paused state. |
-| `retry 1 --wait` | Restart service 1 from a permitted paused state. |
-| `move 2 --wait` | Move the paused stage pointer to position 2. |
-| `reset-retries stage 1 --wait` | Reset that stage's retry counter while paused. |
-
-Positions are one-based. A service retry and a DAG-stage rerun are different
-operations. The runtime validates the current phase and may reject a command.
-Moving or rerunning can change available input; each module must validate it.
-See [debugging](debugging.md) for a step-by-step workflow.
+See [controlled experiment execution](execution.md) for pause, step, resume,
+stop, rerun, and cursor controls, their state requirements, and command completion
+semantics. Use [debugging](debugging.md) for a step-by-step workflow.
 
 ## Conditional execution
 
@@ -209,37 +196,13 @@ even though their journal records remain.
 
 ## Snapshots, recovery, and exchange
 
-Create a manual snapshot at an idle pause:
+[Snapshots, rollbacks, and recovery](restoration.md) explains how to save state
+at an idle pause, restore a snapshot, recover interrupted work, and create a
+continuation. Rollback replaces experiment state and journal history.
 
-```text
-uv run python -B cli.py pause --wait
-uv run python -B cli.py snapshot --label before-change --wait
-```
-
-Use the returned snapshot ID with `rollback <snapshot-id> --wait` to restore
-the paused experiment. Rollback replaces experiment state and journal history;
-clients must refresh their journal generation.
-
-After a server interruption, inspect `health` and `status` for recovery
-requirements, then use `recover <experiment-id> --wait`. Recovery reconciles the
-existing experiment and any surviving participants. Do not treat a saved PID
-or missing endpoint as proof that the old work has stopped.
-
-`run --continue-from <experiment-id> --wait` creates a continuation from a valid
-saved snapshot. It is different from reconnecting to a live participant.
-
-For a stopped experiment, the CLI also provides:
-
-```text
-uv run python -B cli.py archive create "<absolute-archive-path>" --wait
-uv run python -B cli.py archive inspect "<absolute-archive-path>" --wait
-uv run python -B cli.py archive install "<absolute-archive-path>" "<new-absolute-directory>" --wait
-```
-
-Archive paths and installation destinations belong to the server. The runtime
-checks archive validity, space, and experiment state. A snapshot must be fully
-valid before continuation or rollback. Automatic snapshot settings and final
-snapshots are described in the [template reference](experiment_template.md).
+[Experiment packaging and exchange](packaging.md) explains how to create,
+inspect, and install an archive for another run. Archives carry module packages,
+the applied template, and static resources; snapshots serve runtime restoration.
 
 ## Current limits
 
@@ -247,6 +210,5 @@ snapshots are described in the [template reference](experiment_template.md).
   parallel stage execution and dependency-based fan-out/fan-in are unsupported.
 - `replace` is not supported yet.
 - StageClient currently has a synchronous public API.
-- GPU/VRAM monitoring is unfinished and disabled.
 - Old incompatible experiment, journal, and archive formats are rejected;
   automatic migration is not provided.

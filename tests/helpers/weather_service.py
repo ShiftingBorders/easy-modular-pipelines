@@ -6,9 +6,9 @@ import random
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.runner_utils.participant_server import ParticipantServer
-from core.runner_utils.runtimeio import read_json, write_json
+from core.journal.logger import OperationLogger
+from core.participants.server import ParticipantServer
+from core.primitives.json_files import read_json, write_json
 
 
 class WeatherService:
@@ -16,6 +16,7 @@ class WeatherService:
         self.context = context
         self.root = Path(context["experiment_directory"])
         self.data = Path(context["module_data_directory"])
+        self.artifacts = Path(context["artifacts_directory"])
         self.logger = OperationLogger(Path(context["logging_config_path"]))
         self.server = ParticipantServer(
             Path(context["endpoint_path"]), context["context"], self.logger, self.handle
@@ -38,8 +39,17 @@ class WeatherService:
         self.logger.record_event("weather.generated", self.forecast)
 
     async def tick(self):
+        if self.context["settings"].get("controlled_forecast"):
+            while not (self.artifacts / "generate-next").is_file() or self.frozen:
+                await asyncio.sleep(0.02)
+            self.generate()
+            (self.artifacts / "next-generated").touch()
+            return
         while True:
-            await asyncio.sleep(30)
+            deadline = time.monotonic() + 30
+            # Asyncio timers can wake up one clock-resolution step early.
+            while (remaining := deadline - time.monotonic()) > 0:
+                await asyncio.sleep(remaining)
             if not self.frozen:
                 self.generate()
 
@@ -60,8 +70,13 @@ class WeatherService:
             )
             if settings.get("fail_first") and self.calls == 1:
                 return {"result": "fail", "data": {"reason": "temporary_failure"}}
-            if settings.get("delay_first") and self.calls == 1:
-                await asyncio.sleep(settings["delay_first"])
+            if settings.get("hold_first") and self.calls == 1:
+                write_json(
+                    self.artifacts / "first-request-entered",
+                    {"request_id": request["request_id"]},
+                )
+                while not (self.artifacts / "release-first").is_file():
+                    await asyncio.sleep(0.02)
             return {"result": "success", "data": dict(self.forecast)}
         if command == "shutdown":
             self.stop.set()

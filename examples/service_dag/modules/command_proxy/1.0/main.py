@@ -6,10 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.logger_utils.events import LoggingError
-from core.runner_utils.participant_server import ParticipantServer
-from core.runner_utils.runtimeio import capture_stream, read_json, write_json
+from core.journal.events import LoggingError
+from core.journal.logger import OperationLogger
+from core.journal.streams import capture_stream
+from core.participants.server import ParticipantServer
+from core.primitives.json_files import read_json, write_json
 
 
 class CommandProxy:

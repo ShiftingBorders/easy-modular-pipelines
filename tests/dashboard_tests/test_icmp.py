@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from core.models.dashboard_icmp import ICMPIncident, ICMPObservation, ICMPSettings
+from core.models.updates import _update_model
 from dashboard.icmp import ICMPMonitor, validate_icmp_settings
 from tests.dashboard_tests.helpers import (
     ProbeProcess,
@@ -86,13 +88,34 @@ class ICMPSettingsTests(unittest.TestCase):
 
 
 class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observations_and_incidents_remain_models_until_json_output(self):
+        await self.measure("no_reply")
+        self.assertIsInstance(self.monitor.settings, ICMPSettings)
+        self.assertIsInstance(self.monitor.history[-1], ICMPObservation)
+        incident = self.monitor.incidents[0]
+        self.assertIsInstance(incident, ICMPIncident)
+        before = self.monitor.snapshot()
+        emitted = self.monitor.snapshot()
+        emitted["latest"]["host"] = "external"
+        emitted["incidents"][0]["status"] = "resolved"
+        self.assertEqual(self.monitor.snapshot(), before)
+        await self.monitor.configure(icmp_settings(timeout_seconds=2))
+        self.assertEqual(incident.status, "active")
+        self.assertEqual(self.monitor.incidents[0].status, "closed")
+        self.assertEqual(self.monitor.incidents[0].resolution, "configuration_changed")
+        self.assertEqual(self.monitor.history[-1].status, "no_reply")
+        self.assertFalse(self.monitor.snapshot()["fresh"])
+        stored = json.loads((self.directory / "icmp.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["settings"], self.monitor.settings.model_dump())
+        self.assertEqual(stored["incidents"], self.monitor.snapshot()["incidents"])
+
     async def asyncSetUp(self) -> None:
         temporary = temporary_directory()
         self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
         # Exercise explicit probe calls independently of the periodic scheduler.
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         if os.name != "nt":
             self.signal_patch = patch("dashboard.icmp.os.killpg")
             self.killpg = self.signal_patch.start()
@@ -122,14 +145,37 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_parallel_check_now_calls_share_one_process(self) -> None:
         process = ProbeProcess(blocked=True)
         spawn = AsyncMock(return_value=process)
-        with patch("dashboard.icmp.asyncio.create_subprocess_exec", new=spawn):
+        joined = asyncio.Event()
+        waiters = []
+        shield = asyncio.shield
+
+        def observe_shared_probe(task):
+            if task is self.monitor._probe_task:
+                waiters.append(asyncio.current_task())
+                if len(waiters) == 2:
+                    joined.set()
+            return shield(task)
+
+        with (
+            patch("dashboard.icmp.asyncio.create_subprocess_exec", new=spawn),
+            patch("dashboard.icmp.asyncio.shield", side_effect=observe_shared_probe),
+        ):
             first = asyncio.create_task(self.monitor.probe())
-            await asyncio.wait_for(process.started.wait(), 1)
-            second = asyncio.create_task(self.monitor.probe())
-            await asyncio.sleep(0)
-            self.assertTrue(self.monitor.snapshot()["probing"])
-            process.release.set()
-            results = await asyncio.gather(first, second)
+            tasks = [first]
+            try:
+                await asyncio.wait_for(process.started.wait(), 10)
+                second = asyncio.create_task(self.monitor.probe())
+                tasks.append(second)
+                await asyncio.wait_for(joined.wait(), 10)
+                self.assertEqual(waiters, [first, second])
+                self.assertTrue(self.monitor.snapshot()["probing"])
+                process.release.set()
+                results = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            finally:
+                process.release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         self.assertEqual(spawn.await_count, 1)
         self.assertEqual(len(self.monitor.history), 1)
         self.assertEqual([result["status"] for result in results], ["reply", "reply"])
@@ -141,7 +187,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=process),
         ):
             browser = asyncio.create_task(self.monitor.probe())
-            await process.started.wait()
+            await asyncio.wait_for(process.started.wait(), 10)
             browser.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await browser
@@ -163,37 +209,25 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("dashboard.icmp.asyncio.create_subprocess_exec", side_effect=spawn):
             await self.monitor.open()
-            await asyncio.wait_for(second_probe.wait(), 3)
+            await asyncio.wait_for(second_probe.wait(), 10)
             await self.monitor.close()
         self.assertGreaterEqual(count, 2)
         self.assertTrue(self.monitor._task.done())
 
     async def test_incident_opens_once_and_only_reply_resolves_it(self) -> None:
         await self.measure("no_reply")
-        incident_id = self.monitor.incidents[0]["id"]
+        incident_id = self.monitor.incidents[0].id
         await self.measure("no_reply")
         await self.measure("error")
         self.assertEqual(len(self.monitor.incidents), 1)
-        self.assertEqual(self.monitor.incidents[0]["status"], "active")
-        self.assertIsNone(self.monitor.history[-1]["rtt_ms"])
+        self.assertEqual(self.monitor.incidents[0].status, "active")
+        self.assertIsNone(self.monitor.history[-1].rtt_ms)
         await self.measure("reply")
         incident = self.monitor.incidents[0]
-        self.assertEqual(incident["id"], incident_id)
-        self.assertEqual(incident["status"], "resolved")
-        self.assertEqual(incident["resolution"], "echo_reply")
-        self.assertIsNotNone(incident["ended_at"])
-
-    async def test_configuration_change_closes_incident_without_fake_reply(
-        self,
-    ) -> None:
-        await self.measure("no_reply")
-        await self.monitor.configure(icmp_settings(timeout_seconds=2))
-        self.assertEqual(self.monitor.incidents[0]["status"], "closed")
-        self.assertEqual(
-            self.monitor.incidents[0]["resolution"], "configuration_changed"
-        )
-        self.assertEqual(self.monitor.history[-1]["status"], "no_reply")
-        self.assertFalse(self.monitor.snapshot()["fresh"])
+        self.assertEqual(incident.id, incident_id)
+        self.assertEqual(incident.status, "resolved")
+        self.assertEqual(incident.resolution, "echo_reply")
+        self.assertIsNotNone(incident.ended_at)
 
     async def test_late_response_from_old_configuration_is_discarded(self) -> None:
         process = ProbeProcess(blocked=True)
@@ -202,7 +236,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=process),
         ):
             pending = asyncio.create_task(self.monitor.probe())
-            await process.started.wait()
+            await asyncio.wait_for(process.started.wait(), 10)
             await self.monitor.configure(
                 icmp_settings(enabled=False, timeout_seconds=2)
             )
@@ -221,15 +255,13 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"observed_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
             {"observed_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
         ]:
-            original = dict(latest)
-            latest.update(changes)
+            self.monitor.history[-1] = _update_model(latest, **changes)
             self.assertFalse(self.monitor.snapshot()["fresh"])
             self.assertEqual(self.monitor.snapshot()["status"], "waiting")
-            latest.clear()
-            latest.update(original)
+            self.monitor.history[-1] = latest
 
     async def test_disabled_monitor_does_not_spawn_process(self) -> None:
-        self.monitor.settings["enabled"] = False
+        self.monitor.settings = _update_model(self.monitor.settings, enabled=False)
         with (
             patch("dashboard.icmp.asyncio.create_subprocess_exec") as spawn,
             self.assertRaises(ValueError),
@@ -275,7 +307,7 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=process),
         ):
             await self.monitor.open()
-            await asyncio.wait_for(process.started.wait(), 1)
+            await asyncio.wait_for(process.started.wait(), 10)
             await self.monitor.close()
         self.assertTrue(process.killed)
         self.assertTrue(process.waited)
@@ -300,15 +332,25 @@ class ICMPMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_and_incidents_are_bounded(self) -> None:
         await self.measure()
         original = self.monitor.history[0]
-        self.monitor.history = [{**original, "marker": index} for index in range(720)]
+        self.monitor.history = [
+            _update_model(original, marker=index) for index in range(720)
+        ]
         now = datetime.now(UTC).isoformat()
         self.monitor.incidents = [
-            {"id": str(index), "status": "closed", "started_at": now}
+            ICMPIncident.model_validate(
+                {
+                    "id": str(index),
+                    "host": "www.google.com",
+                    "probe_host": self.monitor.host_name,
+                    "status": "closed",
+                    "started_at": now,
+                }
+            )
             for index in range(200)
         ]
         result = await self.measure("no_reply")
         self.assertEqual(len(self.monitor.history), 720)
-        self.assertEqual(self.monitor.history[0]["marker"], 1)
+        self.assertEqual(self.monitor.history[0].model_extra["marker"], 1)
         self.assertEqual(len(result["history"]), 200)
         self.assertEqual(len(self.monitor.incidents), 200)
-        self.assertEqual(self.monitor.incidents[-1]["status"], "active")
+        self.assertEqual(self.monitor.incidents[-1].status, "active")

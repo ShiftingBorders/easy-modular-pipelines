@@ -113,6 +113,8 @@ def main() -> None:
     try:
         host, timeout_text = sys.argv[1:]
         timeout = float(timeout_text)
+        if not math.isfinite(timeout) or not 0.1 <= timeout <= 60:
+            raise ValueError("ICMP timeout must be between 0.1 and 60 seconds.")
         address = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)[0][
             4
         ][0]

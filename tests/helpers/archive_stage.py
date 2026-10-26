@@ -5,8 +5,8 @@ import json
 import time
 from pathlib import Path
 
-from core.logger import OperationLogger
-from core.runner_utils.runtimeio import read_json, write_json
+from core.journal.logger import OperationLogger
+from core.primitives.json_files import read_json, write_json
 
 
 def main():

@@ -4,6 +4,9 @@ A service runs before and alongside the DAG. It stays alive during pauses and
 can be called from several stage nodes. Use a service for a database, model
 server, background worker, or another resource whose lifetime spans attempts.
 
+Before implementing a service, read the
+[module and service behavior contract](module_contract.md).
+
 Start with [module authoring](modules.md) for directory, configuration, logging,
 and artifact rules. Use the shared `ParticipantServer` instead of implementing
 another transport.
@@ -44,7 +47,7 @@ takes:
 ```python
 from pathlib import Path
 
-from core.runner_utils.participant_server import ParticipantServer
+from core.participants.server import ParticipantServer
 
 # context, logger, and handle_request belong to your service implementation.
 server = ParticipantServer(
@@ -85,6 +88,10 @@ The shared server implements `command_state` for its own current and pending
 calls. It records working command results and interrupt/shutdown outcomes in
 the journal. Do not record a second result for the same request ID in a handler.
 Use your logger for application events, progress, and errors.
+In an async handler, await synchronous logging with `asyncio.to_thread`, for
+example `await asyncio.to_thread(logger.record_event, "service.progress", data)`.
+The call can wait for COMMIT while the shared writer restarts. ParticipantServer
+already keeps its own journal waits outside the event loop.
 
 Long work must yield to the event loop. A synchronous compute loop or blocking
 subprocess wait in an async handler prevents heartbeat, cancellation, and

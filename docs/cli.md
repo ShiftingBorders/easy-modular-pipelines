@@ -369,6 +369,9 @@ Commands can fail when the experiment phase does not permit them. See the
 
 ## Snapshots and archives
 
+For workflows and guarantees, see [snapshots and recovery](restoration.md) and
+[experiment packaging and exchange](packaging.md).
+
 | Command | Behavior |
 | --- | --- |
 | `snapshot [--label TEXT]` | Create a restorable snapshot at a paused boundary with no active attempt. |

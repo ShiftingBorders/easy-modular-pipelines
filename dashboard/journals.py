@@ -15,17 +15,50 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from core.historycache import (
+from core.journal.events import LoggingError
+from core.journal.history_cache import (
     HistoryCacheBusy,
     HistoryCacheChanged,
     HistoryCacheLimit,
     JournalHistoryCache,
     acquire_cache_writer,
 )
-from core.logger import OperationLogger
-from core.logger_utils.events import LoggingError
-from core.runner_utils.runtimeio import read_json, write_json
+from core.journal.logger import OperationLogger
+from core.models.artifacts import ArtifactAttemptMetadata, RecordedArtifactLocation
+from core.models.dashboard_cache import CacheWorkerResult, ModulePublication
+from core.models.dashboard_metadata import (
+    CompactTemplate,
+    RecordedReaderLogging,
+    SchedulingMetadata,
+    SchedulingState,
+)
+from core.models.dashboard_queries import (
+    DashboardQuery,
+    DetailIdentity,
+    DetailReference,
+    KeysetCursor,
+    PageLimit,
+    ViewQuery,
+)
+from core.models.dashboard_settings import DashboardRuntimeConfiguration
+from core.models.experiment_registry import RegistryEntry
+from core.models.journal_cache import (
+    CacheIdentity,
+    CachePublication,
+    CacheReaderContext,
+    CacheSource,
+    HistoryCacheRefresh,
+    JournalBoundary,
+)
+from core.primitives.json_files import read_json, write_json
 from dashboard.api_client import SystemAPIError
+from dashboard.cache_dataset import (
+    CachedDataset,
+    CacheReader,
+    CacheWindow,
+    _history_dataset,
+)
+from dashboard.module_publication import ModuleDataset, ModuleSource
 from dashboard.projections import (
     compact_event,
     instant,
@@ -36,6 +69,36 @@ from dashboard.projections import (
 
 def read_object(path: Path, maximum: int = 33554432) -> dict:
     return read_json(path, max_bytes=maximum)
+
+
+def _artifact_attempt(
+    cache: JournalHistoryCache | None, entries: list[dict], context: dict
+) -> ArtifactAttemptMetadata:
+    """Read the recorded attempt header without applying portable-path restrictions."""
+    rows = (
+        cache.query(
+            "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
+            (context.get("attempt_id"),),
+        )
+        if cache is not None
+        else []
+    )
+    parameters = json.loads(rows[0][0])["context"] if rows else {}
+    parameters = next(
+        (
+            entry["context"]
+            for entry in reversed(entries)
+            if entry["event_type"] == "attempt.parameters"
+            and entry["context"].get("attempt_id") == context.get("attempt_id")
+        ),
+        parameters,
+    )
+    try:
+        return ArtifactAttemptMetadata.model_validate({**parameters, **context})
+    except (TypeError, ValueError) as error:
+        raise SystemAPIError(
+            "not_found", "The artifact's attempt directory is not recorded.", 404
+        ) from error
 
 
 def cache_experiment(
@@ -60,15 +123,15 @@ def cache_experiment(
             publication["modules_published"] = journals.publish_modules()
         except Exception as error:  # noqa: BLE001 - Module publication failure must not invalidate journal projections.
             publication["modules_error"] = str(error)
-        return {
+        return CacheWorkerResult.model_validate({
             "experiment_id": identifier,
             "pid": os.getpid(),
             "complete": complete,
             **publication,
             **{key: dataset[key] for key in ("cached_through", "target_boundary")},
-        }
+        }).model_dump(exclude_unset=True)
     except Exception as error:  # noqa: BLE001 - A failed experiment must not break the worker pool.
-        return {
+        return CacheWorkerResult.model_validate({
             "experiment_id": identifier,
             "pid": os.getpid(),
             "complete": False,
@@ -76,7 +139,7 @@ def cache_experiment(
                 "code": getattr(error, "code", "cache_failed"),
                 "message": str(error),
             },
-        }
+        }).model_dump(exclude_unset=True)
     finally:
         journals.close()
 
@@ -90,23 +153,98 @@ def publish_module_statistics(settings: dict) -> bool:
         journals.close()
 
 
+def _timeline_statistics(
+    cache: JournalHistoryCache, where: str, args: list, start_sql: str
+) -> dict:
+    finish_sql = "julianday(json_extract(payload,'$.finished_at'))"
+    recorded_end = f"MAX({start_sql},COALESCE({finish_sql},{start_sql}))"
+    first, last, count, has_open = cache.query(
+        f"SELECT MIN({start_sql}),MAX({recorded_end}),COUNT(*),MAX({finish_sql} IS NULL) FROM records WHERE {where}",
+        tuple(args),
+    )[0]
+    first_ms = (
+        round((first - 2440587.5) * 86400000) if first is not None else None
+    )
+    last_ms = round((last - 2440587.5) * 86400000) if last is not None else None
+    histogram = [0] * 64
+    if count:
+        bins = cache.query(
+            f"SELECT MIN(63,CAST((ROUND(({start_sql}-2440587.5)*86400000)-?)*64.0/? AS INTEGER)),COUNT(*) FROM records WHERE {where} GROUP BY 1",
+            (first_ms, max(last_ms - first_ms, 1), *args),
+        )
+        for bucket, number in bins:
+            histogram[max(0, bucket)] = number
+    return {
+        "has_open": bool(has_open),
+        "timeline": {
+            "start": first_ms,
+            "end": last_ms,
+            "histogram_end": last_ms,
+            "histogram": histogram,
+            "operation_count": count,
+        },
+    }
+
+
+def _timeline_ancestors(
+    cache: JournalHistoryCache, selected: list[tuple], identity: dict
+) -> list[dict]:
+    seeds = json.dumps(
+        [{"key": key, "scope": partition} for _, key, partition, _ in selected]
+    )
+    ancestors = cache.query(
+        """WITH RECURSIVE tree(record_key,scope,run_id,payload) AS (
+            SELECT r.record_key,r.scope,r.run_id,r.payload
+            FROM json_each(?) seed CROSS JOIN records r
+            WHERE r.kind='operations' AND r.record_key=json_extract(seed.value,'$.key')
+              AND r.scope=json_extract(seed.value,'$.scope')
+            UNION
+            SELECT p.record_key,p.scope,p.run_id,p.payload
+            FROM tree child CROSS JOIN records p
+            WHERE p.kind='operations' AND p.run_id IS child.run_id
+              AND p.record_key=json_extract(child.payload,'$.parent_operation_id')
+        ) SELECT payload FROM tree LIMIT 1001""",
+        (seeds,),
+    )
+    if len(ancestors) > 1000:
+        raise SystemAPIError(
+            "history_limit",
+            "Too many timeline ancestors; request a smaller page.",
+            413,
+        )
+    items = []
+    for (encoded,) in ancestors:
+        row = json.loads(encoded)
+        if row.get("detail_ref"):
+            row["detail_ref"] = {**row["detail_ref"], **identity}
+        items.append(row)
+    return items
+
+
 class LocalJournals:
-    def __init__(self, settings: dict) -> None:
-        self.settings = settings
-        self.project = settings["project_root"]
-        self.state_directory = settings["state_directory"] / "readers"
-        self.max_events = settings["history_max_events"]
-        self.max_bytes = settings["history_max_bytes"]
-        self.interval = min(settings["refresh_seconds"], 5)
-        self._cache: dict[str, dict] = {}
-        self._snapshots: dict[str, dict] = {}
-        self.window_events = settings.get("history_window_events", 1000)
+    def __init__(self, settings: dict | DashboardRuntimeConfiguration) -> None:
+        validated = (
+            settings if isinstance(settings, DashboardRuntimeConfiguration)
+            else DashboardRuntimeConfiguration.model_validate(settings)
+        )
+        self.settings = validated
+        self._configure(validated)
+
+    def _configure(self, settings: DashboardRuntimeConfiguration) -> None:
+        self.project = settings.project_root
+        self.state_directory = settings.state_directory / "readers"
+        self.max_events = settings.history_max_events
+        self.max_bytes = settings.history_max_bytes
+        self.interval = min(settings.refresh_seconds, 5)
+        self._cache: dict[str, CacheReader] = {}
+        self._snapshots: dict[str, CachedDataset] = {}
+        self.window_events = settings.history_window_events
         self._lock = threading.RLock()
         self._experiment_locks: dict[str, threading.RLock] = {}
         self._module_signature: tuple | None = None
-        self._module_publication: dict | None = None
-        self._read_snapshots: dict[str, tuple[tuple, dict]] = {}
-        self._windows: dict[str, tuple[dict, tuple, OrderedDict, dict]] = {}
+        self._module_publication: ModulePublication | None = None
+        self._read_snapshots: dict[str, tuple[tuple, CachedDataset]] = {}
+        self._windows: dict[str, CacheWindow] = {}
         self._timeline_overviews: OrderedDict[tuple, dict] = OrderedDict()
         self._timeline_lock = threading.Lock()
 
@@ -140,9 +278,6 @@ class LocalJournals:
             )
             if not metadata.get("reader_revision") or "version" not in metadata:
                 return self._pending_dataset(identifier)
-            source = json.loads(metadata["source"])
-            if source.get("version") != JournalHistoryCache.SCHEMA_VERSION:
-                return self._pending_dataset(identifier)
             status = path.stat()
             signature = (
                 status.st_dev,
@@ -156,88 +291,81 @@ class LocalJournals:
             )
             previous = self._read_snapshots.get(identifier)
             if previous and previous[0] == signature:
-                dataset = previous[1]
+                retained = previous[1]
             else:
-                values = dict(
-                    db.execute(
-                        "SELECT key,value FROM metadata WHERE key IN ('reader_context','ready','cached_through','boundary','publication_boundary')"
-                    )
+                retained = self._load_cached_snapshot(
+                    identifier, path, key, db, metadata
                 )
-                context = json.loads(values["reader_context"])
-                if (
-                    context["project_root"] != str(self.project)
-                    or source["experiment_id"] != identifier
-                ):
+                if retained is None:
                     return self._pending_dataset(identifier)
-                identity, file_key = source["identity"], tuple(source["file_key"])
-                reader = JournalHistoryCache(
-                    path,
-                    self.state_directory / f"{key}.json",
-                    identity,
-                    file_key,
-                    identifier,
-                    self.window_events,
-                    self.max_bytes,
-                    self.max_events,
-                )
-                latest = db.execute(
-                    "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
-                ).fetchone()
-                boundary = json.loads(values.get("boundary", "null"))
-                target_key = (
-                    "publication_boundary" if values.get("ready") == "1" else "boundary"
-                )
-                dataset = {
-                    "experiment_id": identifier,
-                    "directory": Path(context["directory"]),
-                    "identity": identity,
-                    "file_key": file_key,
-                    "state": context["state"],
-                    "entries": [],
-                    "cache": reader,
-                    "version": int(metadata["version"]),
-                    "complete": values.get("ready") == "1",
-                    "cached_through": json.loads(values["cached_through"]),
-                    "boundary": boundary,
-                    "target_boundary": json.loads(
-                        values.get(target_key, values.get("boundary", "null"))
-                    ),
-                    "observed_at": latest[0] if latest else None,
-                    "gap": None,
-                    "error": None,
-                    "refreshed": time.monotonic(),
-                }
-                self._read_snapshots[identifier] = (signature, dataset)
+                self._read_snapshots[identifier] = (signature, retained)
             window = self._windows.get(identifier)
             if (
                 window
-                and window[0] == dataset["identity"]
-                and window[1] == dataset["file_key"]
+                and window.identity == retained.source.identity
+                and window.file_key == retained.file_key
             ):
-                dataset["cache"].window = window[2]
-                first = next(iter(window[2].values()), None)
-                dataset["window_start_cursor"] = (
-                    first["entry"]["cursor"] if first else None
-                )
-                dataset["window_count"] = len(window[2])
-                observed = window[3].get("boundary") or {}
-                requested = dataset.get("target_boundary") or {}
-                if observed.get("change_cursor", 0) > requested.get("change_cursor", 0):
-                    dataset["target_boundary"] = observed
-                cached = dataset["cached_through"]
-                if cached["cursor"] < observed.get("cursor", 0) or cached[
-                    "change_cursor"
-                ] < observed.get("change_cursor", 0):
-                    dataset["complete"] = False
-                predecessor = window[3].get("window_predecessor_cursor")
-                cached_end = dataset["cached_through"]["cursor"]
-                if predecessor is not None and cached_end < predecessor:
-                    dataset["gap"] = {
-                        "after": cached_end,
-                        "before": dataset["window_start_cursor"],
-                    }
-                    dataset["complete"] = False
-            return dataset
+                retained.reader.window = window.entries
+                return retained.document(retained.publication_in_window(window))
+            return retained.document()
+
+    def _load_cached_snapshot(
+        self,
+        identifier: str,
+        path: Path,
+        key: str,
+        db: sqlite3.Connection,
+        metadata: dict[str, str],
+    ) -> CachedDataset | None:
+        source_document = json.loads(metadata["source"])
+        if source_document.get("version") != JournalHistoryCache.SCHEMA_VERSION:
+            return None
+        source = CacheSource.model_validate(source_document)
+        values = dict(
+            db.execute(
+                "SELECT key,value FROM metadata WHERE key IN ('reader_context','ready','cached_through','boundary','publication_boundary')"
+            )
+        )
+        context = CacheReaderContext.model_validate(
+            json.loads(values["reader_context"])
+        )
+        if (
+            context.project_root != str(self.project)
+            or source.experiment_id != identifier
+        ):
+            return None
+        file_key = (source.file_key[0], source.file_key[1])
+        reader = JournalHistoryCache(
+            path,
+            self.state_directory / f"{key}.json",
+            source.identity,
+            file_key,
+            identifier,
+            self.window_events,
+            self.max_bytes,
+            self.max_events,
+        )
+        latest = db.execute(
+            "SELECT occurred_at FROM facts ORDER BY cursor DESC LIMIT 1"
+        ).fetchone()
+        boundary = json.loads(values.get("boundary", "null"))
+        target_key = (
+            "publication_boundary" if values.get("ready") == "1" else "boundary"
+        )
+        publication = CachePublication.model_validate(
+            {
+                "version": int(metadata["version"]),
+                "complete": values.get("ready") == "1",
+                "cached_through": json.loads(values["cached_through"]),
+                "boundary": boundary,
+                "target_boundary": json.loads(
+                    values.get(target_key, values.get("boundary", "null"))
+                ),
+                "observed_at": latest[0] if latest else None,
+                "gap": None,
+            }
+        )
+        return CachedDataset(source, context, publication, reader, time.monotonic())
 
     def _pending_dataset(self, identifier: str) -> dict:
         return {
@@ -277,9 +405,9 @@ class LocalJournals:
                 status.st_size,
             )
             if signature == self._module_signature:
-                return self._module_publication
+                return self._module_publication.model_dump(exclude_unset=True)
             try:
-                document = read_object(path, self.settings["max_response_bytes"])
+                document = read_object(path, self.settings.max_response_bytes)
             except (OSError, TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "cache_unavailable", f"Cannot read module statistics: {error}"
@@ -292,17 +420,15 @@ class LocalJournals:
                     "complete": False,
                     "error": "Module statistics have not been prepared for this project.",
                 }
-            if (
-                not isinstance(document.get("items"), list)
-                or not isinstance(document.get("sources"), dict)
-                or type(document.get("complete")) is not bool
-            ):
+            try:
+                publication = ModulePublication.model_validate(document)
+            except (TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "cache_unavailable", "Invalid module statistics publication."
-                )
-            self._module_publication = document
+                ) from error
+            self._module_publication = publication
             self._module_signature = signature
-            return document
+            return publication.model_dump(exclude_unset=True)
 
     def publish_modules(self) -> bool:
         """Materialize exact project statistics from consistent cache snapshots."""
@@ -319,17 +445,22 @@ class LocalJournals:
             signature = {
                 "schema_version": 2,
                 "project_root": str(self.project),
-                "sources": sources,
+                "sources": {
+                    identifier: source.document()
+                    for identifier, source in sources.items()
+                },
             }
             previous = (
-                read_object(path, self.settings["max_response_bytes"])
+                read_object(path, self.settings.max_response_bytes)
                 if path.exists()
                 else {}
             )
             if all(previous.get(key) == value for key, value in signature.items()):
                 return True
-            complete = all(source["complete"] for source in sources.values())
-            items = module_statistics(models)
+            complete = all(source.complete for source in sources.values())
+            items = module_statistics(
+                [(dataset.document(), dataset.connection) for dataset in models]
+            )
             for item in items:
                 item["complete"] = item["complete"] and complete
             document = {
@@ -343,7 +474,7 @@ class LocalJournals:
             }
             if (
                 len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
-                > self.settings["max_response_bytes"]
+                > self.settings.max_response_bytes
             ):
                 raise HistoryCacheLimit("Module statistics exceed max_response_bytes.")
             write_json(path, document)
@@ -351,15 +482,15 @@ class LocalJournals:
 
     def _module_sources(
         self, registry: dict[str, Path], resources: ExitStack
-    ) -> tuple[list[tuple[dict, sqlite3.Connection]], dict[str, dict]]:
+    ) -> tuple[list[ModuleDataset], dict[str, ModuleSource]]:
         models, sources = [], {}
         for identifier, directory in registry.items():
             key = hashlib.sha256(identifier.encode()).hexdigest()
             database = self.state_directory / f"{key}.cache.sqlite"
-            source = {"directory": str(directory), "complete": False}
+            source = ModuleSource(str(directory))
             sources[identifier] = source
             if not database.exists():
-                source["error"] = "Cache is not initialized."
+                source.error = "Cache is not initialized."
                 continue
             try:
                 connection = resources.enter_context(
@@ -368,44 +499,37 @@ class LocalJournals:
                 connection.execute("PRAGMA query_only=ON")
                 connection.execute("BEGIN")
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-                identity = json.loads(metadata["source"])
+                identity = CacheSource.model_validate(json.loads(metadata["source"]))
                 configuration = read_object(
                     self.state_directory / f"{key}.json", 1048576
                 )
                 if (
-                    identity["experiment_id"] != identifier
+                    identity.experiment_id != identifier
                     or configuration["logging"]["expected_journal"]
-                    != identity["identity"]
+                    != identity.identity.model_dump()
                     or Path(configuration["logging"]["db_path"]).resolve()
                     != (directory / "journals/events.sqlite").resolve()
                 ):
-                    source["error"] = "Cache belongs to a different journal."
+                    source.error = "Cache belongs to a different journal."
                     continue
-                source.update(
-                    journal=identity["identity"],
-                    file_key=identity["file_key"],
-                    cache_schema_version=identity["version"],
-                    version=int(metadata.get("version", 0)),
-                    cached_through=json.loads(metadata.get("cached_through", "null")),
-                    complete=metadata.get("ready") == "1",
-                )
+                version = int(metadata.get("version", 0))
+                checkpoint = json.loads(metadata.get("cached_through", "null"))
+                source.cache = identity
+                source.version = version
+                source.cached_through = checkpoint
+                source.complete = metadata.get("ready") == "1"
                 template = connection.execute(
                     "SELECT json_extract(compact,'$.data.template.name') FROM facts WHERE kind='template.applied' AND effective=1 ORDER BY cursor DESC LIMIT 1"
                 ).fetchone()
                 name = template[0] if template and template[0] else identifier
                 models.append(
-                    (
-                        {
-                            "experiment_id": identifier,
-                            "name": name,
-                            "complete": source["complete"],
-                            "identity": source["journal"],
-                        },
-                        connection,
+                    ModuleDataset(
+                        identifier, name, source.complete, identity.identity, connection
                     )
                 )
             except (sqlite3.Error, ValueError, KeyError, OSError) as error:
-                source.update(complete=False, error=str(error))
+                source.complete = False
+                source.error = str(error)
         return models, sources
 
     def registry(self) -> dict[str, Path]:
@@ -420,12 +544,10 @@ class LocalJournals:
             raise ValueError("Experiment directory escapes the configured project.")
         result = {}
         for identifier, folder in document.items():
-            if (
-                not isinstance(folder, str)
-                or Path(folder).name != folder
-                or folder in {".", ".."}
-            ):
-                raise ValueError("Invalid experiment registry entry.")
+            try:
+                folder = RegistryEntry.model_validate({"folder": folder}).folder
+            except (ValueError, TypeError) as error:
+                raise ValueError("Invalid experiment registry entry.") from error
             directory = (base / folder).resolve()
             if not directory.is_relative_to(base):
                 raise ValueError("Registered experiment escapes the project.")
@@ -434,6 +556,14 @@ class LocalJournals:
 
     def scheduling_states(self, registry: dict[str, Path]) -> dict[str, dict]:
         """Read runner metadata for scheduling without opening stopped journals."""
+        return {
+            identifier: state.document()
+            for identifier, state in self._scheduling_states(registry).items()
+        }
+
+    def _scheduling_states(
+        self, registry: dict[str, Path]
+    ) -> dict[str, SchedulingState]:
         states = {}
         for identifier, directory in registry.items():
             try:
@@ -441,16 +571,12 @@ class LocalJournals:
                 state = read_object(path) if path.exists() else {}
                 if state.get("experiment_id") not in (None, identifier):
                     raise ValueError("Experiment state belongs to another experiment.")
-                template = state.get("template", {})
-                if not isinstance(template, dict):
-                    raise TypeError("Experiment state template must be a JSON object.")
-                states[identifier] = {
-                    "phase": state.get("phase", "unknown"),
-                    "mode": state.get("mode"),
-                    "name": template.get("name") or identifier,
-                }
+                metadata = SchedulingMetadata.model_validate(state)
+                states[identifier] = SchedulingState(
+                    metadata=metadata, name=metadata.template.get("name") or identifier
+                )
             except (OSError, ValueError, TypeError) as error:
-                states[identifier] = {"phase": "unknown", "error": str(error)}
+                states[identifier] = SchedulingState(error=str(error))
         return states
 
     def preview(self, identifier: str) -> dict | None:
@@ -481,7 +607,7 @@ class LocalJournals:
                     return None
                 encoded_size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
                 size += encoded_size
-                if size > min(self.max_bytes, self.settings["max_response_bytes"]):
+                if size > min(self.max_bytes, self.settings.max_response_bytes):
                     return None
                 metadata = {
                     "effective": True,
@@ -513,7 +639,12 @@ class LocalJournals:
                 window[event["event_id"]] = {"entry": item, "size": encoded_size}
             if source.read_event_batch([])["boundary"] != boundary:
                 return None
-        self._windows[identifier] = (identity, file_key, window, {"boundary": boundary})
+        self._windows[identifier] = CacheWindow(
+            CacheIdentity.model_validate(identity),
+            file_key,
+            window,
+            JournalBoundary.model_validate(boundary),
+        )
         return {
             "experiment_id": identifier,
             "directory": directory,
@@ -603,17 +734,17 @@ class LocalJournals:
         file_key = (status.st_dev, status.st_ino)
         previous = self._cache.get(identifier)
         if previous and (
-            previous["identity"] != identity or previous["file_key"] != file_key
+            previous.identity.model_dump() != identity or previous.file_key != file_key
         ):
-            previous["reader"].close()
+            previous.reader.close()
             previous = None
         if (
             previous
             and build
             and not force
-            and time.monotonic() - previous["checked"] < self.interval
+            and time.monotonic() - previous.checked < self.interval
         ):
-            return self._snapshots[identifier]
+            return self._snapshots[identifier].document()
         config_path = self._reader_configuration(identifier, state, database, identity)
         if previous is None:
             reader = JournalHistoryCache(
@@ -626,72 +757,91 @@ class LocalJournals:
                 self.max_bytes,
                 self.max_events,
             )
-            previous = {"reader": reader, "identity": identity, "file_key": file_key}
-        reader = previous["reader"]
-        if build:
-            publication = reader.refresh(
-                state,
-                compact_event,
-                project_scope,
-                target=target,
-                window=window,
-                reader_context={
-                    "directory": str(directory),
-                    "project_root": str(self.project),
-                },
-            )
-        else:
-            publication = reader.observe(target)
+            previous = CacheReader(reader, reader.identity, file_key)
+        reader = previous.reader
+        publication = self._history_publication(
+            reader, directory, state, build, window, target
+        )
         if read_object(identity_path) != identity:
             raise ValueError("Journal generation changed while reading history.")
         old = self._snapshots.get(identifier)
-        previous["checked"] = time.monotonic()
+        previous.checked = time.monotonic()
         self._cache[identifier] = previous
         if window:
-            self._windows[identifier] = (
-                identity,
+            self._windows[identifier] = CacheWindow(
+                reader.identity,
                 file_key,
                 OrderedDict(reader.window),
                 publication,
             )
         if (
             old
-            and old.get("version") == publication["version"]
-            and old["state"] == state
-            and old["identity"] == identity
-            and old["complete"] == publication["complete"]
-            and old.get("boundary") == publication.get("boundary")
-            and old.get("target_boundary") == publication.get("target_boundary")
+            and old.publication.version == publication.version
+            and old.context.state == state
+            and old.source.identity.model_dump() == identity
+            and old.publication.complete == publication.complete
+            and old.publication.boundary == publication.boundary
+            and old.publication.target_boundary == publication.target_boundary
         ):
-            return old
+            return old.document()
         # Only the configured RAM window is detached for legacy reader consumers.
-        available = publication.get("cache_available", True)
+        available = (
+            publication.cache_available
+            if "cache_available" in publication.model_fields_set
+            else True
+        )
         entries = reader.events(list(reader.window)) if window and available else []
-        snapshot = {
-            "experiment_id": identifier,
-            "directory": directory,
-            "identity": identity,
-            "file_key": file_key,
-            "state": state,
-            "entries": entries,
-            **publication,
-            "error": None if available else "The history cache is being initialized.",
-            "refreshed": time.monotonic(),
-        }
-        if available:
-            snapshot["cache"] = reader
+        snapshot = _history_dataset(
+            reader,
+            directory,
+            str(self.project),
+            state,
+            publication,
+            entries,
+            time.monotonic(),
+        )
         self._snapshots[identifier] = snapshot
-        return snapshot
+        return snapshot.document()
+
+    def _history_publication(
+        self,
+        reader: JournalHistoryCache,
+        directory: Path,
+        state: dict,
+        build: bool,
+        window: bool,
+        target: dict | None,
+    ) -> CachePublication:
+        if not build:
+            requested = (
+                JournalBoundary.model_validate(target) if target is not None else None
+            )
+            return reader._observe(requested)
+        request = HistoryCacheRefresh.model_validate(
+            {
+                "state": state,
+                "target": target,
+                "window": window,
+                "reader_context": {
+                    "directory": str(directory),
+                    "project_root": str(self.project),
+                    "state": state,
+                },
+            }
+        )
+        return reader._refresh(request, compact_event, project_scope)
 
     def _reader_configuration(
         self, identifier: str, state: dict, database: Path, identity: dict
     ) -> Path:
-        logging = state.get("template", {}).get("logging")
-        if not isinstance(logging, dict):
-            raise TypeError("Recorded logging settings are missing.")
+        # Check the compact projection contract before writing reader settings.
+        CompactTemplate.model_validate(state.get("template", {}))
+        logging = RecordedReaderLogging.model_validate(
+            state.get("template", {}).get("logging")
+        )
         configuration = {
             "logging": {
-                **logging,
+                **logging.root,
                 "db_path": str(database),
                 "open_mode": "existing",
                 "expected_journal": identity,
@@ -713,7 +863,7 @@ class LocalJournals:
         with self._lock:
             for identifier, entry in self._cache.items():
                 with self._experiment_locks[identifier]:
-                    entry["reader"].close()
+                    entry.reader.close()
             self._cache.clear()
             self._snapshots.clear()
             self._read_snapshots.clear()
@@ -734,86 +884,59 @@ class LocalJournals:
         except (LoggingError, OSError, sqlite3.Error) as error:
             raise SystemAPIError("journal_unavailable", str(error)) from error
 
-    def timeline(self, dataset: dict, params: dict, observed_at: str | None) -> dict:
+    def timeline(
+        self,
+        dataset: dict,
+        params: dict | DashboardQuery | ViewQuery,
+        observed_at: str | None,
+    ) -> dict:
         """Read a bounded time slice and its ancestors from the existing cache."""
+        params = ViewQuery.from_query(params)
         cache = dataset["cache"]
         scope = [
             dataset["identity"],
-            params.get("run_id"),
-            params.get("since"),
-            params.get("until"),
+            params.run_id,
+            params.since,
+            params.until,
         ]
         position = [0, "", ""]
-        if params.get("cursor"):
+        if params.cursor:
             try:
-                cursor = json.loads(params["cursor"])
+                cursor = KeysetCursor.model_validate_json(params.cursor)
                 if (
-                    cursor["scope"] != scope
-                    or cursor["version"] != dataset["version"]
-                    or time.time() - cursor["at"] > 300
+                    cursor.scope != scope
+                    or cursor.version != dataset["version"]
+                    or time.time() - cursor.at > 300
                 ):
                     raise ValueError("Timeline changed.")
-                position = cursor["position"]
-                if (
-                    not isinstance(position, list)
-                    or len(position) != 3
-                    or type(position[0]) is not int
-                    or not all(isinstance(value, str) for value in position[1:])
-                ):
-                    raise ValueError("Invalid timeline cursor.")
+                position = list(cursor.position)
             except (KeyError, TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "history_changed", "Refresh this timeline range.", 409
                 ) from error
-        limit = int(params.get("limit", 200))
-        if not 1 <= limit <= 1000:
+        try:
+            limit = PageLimit.model_validate(params.limit).root
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_limit", "limit must be between 1 and 1000.", 400
-            )
+            ) from error
         start_sql = "julianday(json_extract(payload,'$.started_at'))"
         # Open operations extend only to the last available observation.
         end_sql = f"MAX({start_sql},COALESCE(julianday(json_extract(payload,'$.finished_at')),julianday(?),{start_sql}))"
         where, args = "kind='operations'", []
-        if params.get("run_id"):
+        if params.run_id:
             where += " AND run_id=?"
-            args.append(params["run_id"])
+            args.append(params.run_id)
         where += f" AND {start_sql} IS NOT NULL"
         # Reader identity changes on replacement/rebuild, even if version resets.
         # Weak references avoid retaining readers and their raw payload windows.
-        overview_key = (weakref.ref(cache), dataset["version"], params.get("run_id"))
+        overview_key = (weakref.ref(cache), dataset["version"], params.run_id)
         with self._timeline_lock:
             overview = self._timeline_overviews.get(overview_key)
             if overview is not None:
                 self._timeline_overviews.move_to_end(overview_key)
         if overview is None:
-            finish_sql = "julianday(json_extract(payload,'$.finished_at'))"
-            recorded_end = f"MAX({start_sql},COALESCE({finish_sql},{start_sql}))"
-            first, last, count, has_open = cache.query(
-                f"SELECT MIN({start_sql}),MAX({recorded_end}),COUNT(*),MAX({finish_sql} IS NULL) FROM records WHERE {where}",
-                tuple(args),
-            )[0]
-            first_ms = (
-                round((first - 2440587.5) * 86400000) if first is not None else None
-            )
-            last_ms = round((last - 2440587.5) * 86400000) if last is not None else None
-            histogram = [0] * 64
-            if count:
-                bins = cache.query(
-                    f"SELECT MIN(63,CAST((ROUND(({start_sql}-2440587.5)*86400000)-?)*64.0/? AS INTEGER)),COUNT(*) FROM records WHERE {where} GROUP BY 1",
-                    (first_ms, max(last_ms - first_ms, 1), *args),
-                )
-                for bucket, number in bins:
-                    histogram[max(0, bucket)] = number
-            overview = {
-                "has_open": bool(has_open),
-                "timeline": {
-                    "start": first_ms,
-                    "end": last_ms,
-                    "histogram_end": last_ms,
-                    "histogram": histogram,
-                    "operation_count": count,
-                },
-            }
+            overview = _timeline_statistics(cache, where, args, start_sql)
             with self._timeline_lock:
                 self._timeline_overviews[overview_key] = overview
                 self._timeline_overviews.move_to_end(overview_key)
@@ -828,11 +951,11 @@ class LocalJournals:
         observed = instant(observed_at)
         if overview["has_open"] and observed is not None:
             timeline["end"] = max(timeline["end"], round(observed * 1000))
-        if params.get("since") is not None:
+        if params.since is not None:
             where += f" AND {start_sql}<=julianday(?) AND {end_sql}>=julianday(?)"
-            args.extend((params["until"], observed_at, params["since"]))
+            args.extend((params.until, observed_at, params.since))
         total = timeline["operation_count"]
-        if params.get("since") is not None:
+        if params.since is not None:
             total = cache.query(
                 f"SELECT COUNT(*) FROM records WHERE {where}", tuple(args)
             )[0][0]
@@ -842,35 +965,7 @@ class LocalJournals:
             (*args, *position, limit + 1),
         )
         selected = rows[:limit]
-        seeds = json.dumps(
-            [{"key": key, "scope": partition} for _, key, partition, _ in selected]
-        )
-        ancestors = cache.query(
-            """WITH RECURSIVE tree(record_key,scope,run_id,payload) AS (
-                SELECT r.record_key,r.scope,r.run_id,r.payload
-                FROM json_each(?) seed CROSS JOIN records r
-                WHERE r.kind='operations' AND r.record_key=json_extract(seed.value,'$.key')
-                  AND r.scope=json_extract(seed.value,'$.scope')
-                UNION
-                SELECT p.record_key,p.scope,p.run_id,p.payload
-                FROM tree child CROSS JOIN records p
-                WHERE p.kind='operations' AND p.run_id IS child.run_id
-                  AND p.record_key=json_extract(child.payload,'$.parent_operation_id')
-            ) SELECT payload FROM tree LIMIT 1001""",
-            (seeds,),
-        )
-        if len(ancestors) > 1000:
-            raise SystemAPIError(
-                "history_limit",
-                "Too many timeline ancestors; request a smaller page.",
-                413,
-            )
-        items = []
-        for (encoded,) in ancestors:
-            row = json.loads(encoded)
-            if row.get("detail_ref"):
-                row["detail_ref"] = {**row["detail_ref"], **dataset["identity"]}
-            items.append(row)
+        items = _timeline_ancestors(cache, selected, dataset["identity"])
         return {
             "items": items,
             "total": total,
@@ -885,36 +980,35 @@ class LocalJournals:
             else None,
         }
 
-    def page(self, dataset: dict, view: str, params: dict) -> dict:
+    def page(
+        self, dataset: dict, view: str, params: dict | DashboardQuery | ViewQuery
+    ) -> dict:
+        params = ViewQuery.from_query(params)
         cache = dataset["cache"]
-        run_id = params.get("run_id")
+        run_id = params.run_id
         scope = [
             dataset["identity"],
             run_id,
             view,
-            params.get("view", "effective"),
-            params.get("revision"),
+            params.view,
+            params.revision,
         ]
         position = [0, "", ""]
-        if params.get("cursor"):
+        if params.cursor:
             try:
-                cursor = json.loads(params["cursor"])
+                cursor = KeysetCursor.model_validate_json(params.cursor)
                 if (
-                    cursor["scope"] != scope
-                    or cursor["version"] != dataset["version"]
-                    or time.time() - cursor["at"] > 300
+                    cursor.scope != scope
+                    or cursor.version != dataset["version"]
+                    or time.time() - cursor.at > 300
                 ):
                     raise ValueError("History changed.")
-                position = cursor["position"]
-                if len(position) != 3 or type(position[0]) is not int:
-                    raise ValueError("Invalid cursor position.")
+                position = list(cursor.position)
             except (KeyError, TypeError, ValueError) as error:
                 raise SystemAPIError(
                     "history_changed", "Refresh this history publication.", 409
                 ) from error
-        limit = int(params.get("limit", 200))
-        if not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000.")
+        limit = PageLimit.model_validate(params.limit).root
         if view == "events":
             return self._event_page(dataset, params, scope, position, limit)
         if view == "runs":
@@ -923,9 +1017,9 @@ class LocalJournals:
         if run_id:
             selection += " AND run_id=?"
             args.append(run_id)
-        if view == "measurements" and params.get("revision"):
+        if view == "measurements" and params.revision:
             selection += " AND revision=?"
-            args.append(params["revision"])
+            args.append(params.revision)
         total = cache.query(
             "SELECT COUNT(*) FROM records WHERE " + selection, tuple(args)
         )[0][0]
@@ -943,10 +1037,10 @@ class LocalJournals:
                 if item.get("detail_ref")
                 else None
             )
-            if params.get("compact") != "1" and item["detail_ref"]:
+            if params.compact != "1" and item["detail_ref"]:
                 item = self.detail(dataset, item["detail_ref"], item)
             size += len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
-            if size > self.settings["max_response_bytes"]:
+            if size > self.settings.max_response_bytes:
                 if not selected:
                     raise SystemAPIError(
                         "response_too_large",
@@ -971,11 +1065,9 @@ class LocalJournals:
         }
 
     def _run_page(
-        self, dataset: dict, params: dict, scope: list, position: list, limit: int
+        self, dataset: dict, params: ViewQuery, scope: list, position: list, limit: int
     ) -> dict:
-        where, args = (
-            ("run_id=?", [params["run_id"]]) if params.get("run_id") else ("1=1", [])
-        )
+        where, args = ("run_id=?", [params.run_id]) if params.run_id else ("1=1", [])
         cache = dataset["cache"]
         rows = cache.query(
             "SELECT first_cursor, run_id, started_at, revision FROM runs WHERE "
@@ -1009,14 +1101,14 @@ class LocalJournals:
         }
 
     def _event_page(
-        self, dataset: dict, params: dict, scope: list, position: list, limit: int
+        self, dataset: dict, params: ViewQuery, scope: list, position: list, limit: int
     ) -> dict:
         cache = dataset["cache"]
         selection, args = "1=1", []
-        if params.get("run_id"):
+        if params.run_id:
             selection += " AND run_id=?"
-            args.append(params["run_id"])
-        if params.get("view", "effective") == "effective":
+            args.append(params.run_id)
+        if params.view == "effective":
             selection += " AND effective=1"
         total = cache.query(
             "SELECT COUNT(*) FROM facts WHERE " + selection, tuple(args)
@@ -1028,7 +1120,7 @@ class LocalJournals:
             (*args, position[0], limit + 1),
         )
         items, size = [], 1024
-        if params.get("compact") == "1":
+        if params.compact == "1":
             events = iter(json.loads(row[2]) for row in records[:limit])
         else:
             events = cache.iter_events([row[1] for row in records[:limit]])
@@ -1040,7 +1132,7 @@ class LocalJournals:
                     **dataset["identity"],
                 }
                 size += len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
-                if size > self.settings["max_response_bytes"]:
+                if size > self.settings.max_response_bytes:
                     if not items:
                         raise SystemAPIError(
                             "response_too_large",
@@ -1065,28 +1157,30 @@ class LocalJournals:
         }
 
     def detail(self, dataset: dict, reference: dict, row: dict | None = None) -> dict:
-        if not isinstance(reference, dict):
+        try:
+            identity = DetailIdentity.model_validate(reference)
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_reference", "Detail reference must be an object.", 400
-            )
-        if any(
-            reference.get(key) != dataset["identity"][key]
-            for key in ("journal_id", "generation")
+            ) from error
+        if (
+            identity.journal_id != dataset["identity"]["journal_id"]
+            or identity.generation != dataset["identity"]["generation"]
         ):
             raise SystemAPIError(
                 "history_changed", "This detail belongs to replaced history.", 409
             )
-        identifiers = reference.get("event_ids")
-        if (
-            not isinstance(identifiers, list)
-            or not 1 <= len(identifiers) <= 1000
-            or any(not isinstance(key, str) or not key for key in identifiers)
-        ):
+        try:
+            validated = DetailReference.model_validate(reference)
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "invalid_reference", "Detail requires a bounded list of event IDs.", 400
-            )
-        events = dataset["cache"].events(identifiers)
-        kind = reference.get("kind")
+            ) from error
+        return self._detail(dataset, validated, row)
+
+    def _detail(self, dataset: dict, reference: DetailReference, row: dict | None) -> dict:
+        events = dataset["cache"].events(reference.event_ids)
+        kind = reference.kind
         if kind == "events":
             return events[0]
         result = dict(row or {})
@@ -1157,8 +1251,12 @@ class LocalJournals:
         cache = dataset.get("cache")
         window = self._windows.get(identifier)
         entries = []
-        if window and window[:2] == (dataset["identity"], dataset.get("file_key")):
-            entries = [item["entry"]["event"] for item in window[2].values()]
+        if (
+            window
+            and window.identity.model_dump() == dataset["identity"]
+            and window.file_key == dataset.get("file_key")
+        ):
+            entries = [item["entry"]["event"] for item in window.entries.values()]
         records = (
             cache.query(
                 "SELECT payload FROM records WHERE kind='artifacts' AND record_key=? LIMIT 1",
@@ -1186,50 +1284,18 @@ class LocalJournals:
             )
         directory = dataset["directory"]
         if event["event_type"] == "artifact.recorded":
-            context = event["context"]
-            rows = (
-                cache.query(
-                    "SELECT compact FROM facts WHERE attempt_id=? AND kind='attempt.parameters' ORDER BY cursor DESC LIMIT 1",
-                    (context.get("attempt_id"),),
-                )
-                if cache is not None
-                else []
-            )
-            parameters = json.loads(rows[0][0])["context"] if rows else {}
-            parameters = next(
-                (
-                    entry["context"]
-                    for entry in reversed(entries)
-                    if entry["event_type"] == "attempt.parameters"
-                    and entry["context"].get("attempt_id") == context.get("attempt_id")
-                ),
-                parameters,
-            )
-            context = {**parameters, **context}
-            if any(
-                context.get(key) is None
-                for key in (
-                    "attempt_id",
-                    "cycle_number",
-                    "module_name",
-                    "stage_id",
-                    "attempt_number",
-                )
-            ):
-                raise SystemAPIError(
-                    "not_found",
-                    "The artifact's attempt directory is not recorded.",
-                    404,
-                )
-            relative_directory = f"shared_artifacts/epoch_{context['cycle_number']}/{context['module_name']}/{context['stage_id']}/attempt_{context['attempt_number']}"
+            attempt = _artifact_attempt(cache, entries, event["context"])
+            relative_directory = f"shared_artifacts/epoch_{attempt.cycle_number}/{attempt.module_name}/{attempt.stage_id}/attempt_{attempt.attempt_number}"
             directory = self.safe_path(directory, relative_directory)
             relative_file = event["data"]["path"]
-        if not isinstance(relative_file, str) or not relative_file:
+        try:
+            location = RecordedArtifactLocation(context=attempt, path=relative_file)
+        except (TypeError, ValueError) as error:
             raise SystemAPIError(
                 "not_found", "The artifact has no recorded local path.", 404
-            )
+            ) from error
         try:
-            path = self.safe_path(directory, relative_file)
+            path = self.safe_path(directory, location.path)
         except ValueError as error:
             raise SystemAPIError(
                 "invalid_artifact", "The recorded artifact escapes its directory.", 400

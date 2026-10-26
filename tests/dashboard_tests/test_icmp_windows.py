@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from core.models.dashboard_icmp import ICMPSettings
 from dashboard import icmp_worker
 from dashboard.icmp import ICMPMonitor
 from tests.dashboard_tests.helpers import (
@@ -171,7 +172,7 @@ class ProbeProcessCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(cleanup_directory, temporary)
         self.directory = Path(temporary.name)
         self.monitor = ICMPMonitor(self.directory)
-        self.monitor.settings = icmp_settings()
+        self.monitor.settings = ICMPSettings.model_validate(icmp_settings())
         self.addAsyncCleanup(self.monitor.close)
         self.processes = []
         self.mode = "hang"

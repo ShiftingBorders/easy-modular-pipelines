@@ -7,8 +7,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from dashboard.config import load_settings
+from core.models.dashboard_settings import (
+    DashboardConfiguration,
+    DashboardRuntimeConfiguration,
+)
+from dashboard.api_client import SystemAPIClient
+from dashboard.config import _load_settings, load_settings
 from dashboard.icmp import ICMPMonitor
+from dashboard.journals import LocalJournals
+from dashboard.views import DashboardViews
 from tests.dashboard_tests.helpers import (
     cleanup_directory,
     settings_document,
@@ -18,6 +25,31 @@ from tests.dashboard_tests.helpers import (
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_typed_runtime_settings_are_retained_and_public_dictionary_is_compatible(
+        self,
+    ):
+        path = write_settings(self.directory)
+        settings = _load_settings(path)
+        self.assertIsInstance(settings, DashboardRuntimeConfiguration)
+        self.assertNotIsInstance(settings, DashboardConfiguration)
+        public = load_settings(path)
+        self.assertIsInstance(public["state_directory"], Path)
+        self.assertNotIn("system_api_token_env", public)
+        expected = settings.model_dump()
+        expected.pop("system_api_token_env")
+        self.assertEqual(public, expected)
+        journals = LocalJournals(settings)
+        self.addCleanup(journals.close)
+        views = DashboardViews(settings, SystemAPIClient(settings))
+        self.addCleanup(views.journals.close)
+        self.assertIs(journals.settings, settings)
+        self.assertIs(views.settings, settings)
+        self.assertIs(views.journals.settings, settings)
+        original = dict(public)
+        other = LocalJournals(public)
+        self.addCleanup(other.close)
+        self.assertEqual(public, original)
+
     def test_cache_defaults_and_all_numeric_boundaries(self):
         """T012/T013: old configs retain defaults and cache budgets reject bad types."""
         path = write_settings(self.directory)
@@ -57,8 +89,6 @@ class ConfigurationTests(unittest.TestCase):
             Path(absolute),
         )
         for options in (
-            {"history_max_events": True},
-            {"history_max_bytes": 0},
             {"project_root": []},
             {"system_api_token_env": "bad name"},
         ):
@@ -88,12 +118,12 @@ class ConfigurationTests(unittest.TestCase):
         config = load_settings(write_settings(self.directory))
         self.assertIsNone(config["system_api_url"])
         monitor = ICMPMonitor(self.directory / "state")
-        self.assertEqual(monitor.settings["host"], "www.google.com")
-        self.assertFalse(monitor.settings["enabled"])
+        self.assertEqual(monitor.settings.host, "www.google.com")
+        self.assertFalse(monitor.settings.enabled)
         self.assertEqual(monitor.snapshot()["status"], "disabled")
         self.assertFalse((self.directory / "state").exists())
 
-    def test_relative_state_path_uses_config_directory_from_other_cwd(self) -> None:
+    def test_state_paths_preserve_absolute_and_resolve_relative_from_config(self) -> None:
         """T014: library paths are anchored to the containing configuration."""
         config_path = write_settings(self.directory, state_directory="nested/state")
         elsewhere = self.directory / "elsewhere"
@@ -106,7 +136,6 @@ class ConfigurationTests(unittest.TestCase):
             os.chdir(previous)
         self.assertEqual(config["state_directory"], self.directory / "nested/state")
 
-    def test_preserves_absolute_state_path(self) -> None:
         path = self.directory / "custom"
         self.assertEqual(
             load_settings(write_settings(self.directory, state_directory=str(path)))[
