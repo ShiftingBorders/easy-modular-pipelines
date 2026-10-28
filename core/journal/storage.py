@@ -1,4 +1,4 @@
-"""One durable journal format, command reconciliation and identified recovery."""
+"""Durable journal storage, command reconciliation and identified recovery."""
 
 from __future__ import annotations
 
@@ -53,7 +53,8 @@ from core.journal.records import (
 )
 from core.journal.schema import (
     _APPLICATION_ID,
-    _TABLES,
+    _SCHEMAS,
+    STORAGE_SCHEMA_VERSION,
     _create_tables,
     _matches_table_definition,
 )
@@ -67,6 +68,7 @@ from core.primitives.json_values import (
 )
 
 _PAGE_BYTES = 16777216
+_EVENT_COLUMNS = "cursor, event_id, producer_instance_id, sequence_number, event_json"
 
 if TYPE_CHECKING:
     from core.journal.startup_diagnostics import StartupDiagnostics
@@ -179,6 +181,8 @@ class SQLiteEventStore:
         self._expected_journal = settings.expected_journal
         self._open_mode = settings.open_mode
         self._min_free_bytes = settings.min_free_bytes
+        self._storage_version = STORAGE_SCHEMA_VERSION
+        self._event_columns = _EVENT_COLUMNS + ", payload_encoding"
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.RLock()
         self._process_id = os.getpid()
@@ -216,7 +220,7 @@ class SQLiteEventStore:
             )
 
     def _check_schema(self, connection: sqlite3.Connection) -> bool:
-        """Recognize exactly one format; never alter a file during validation.
+        """Recognize supported formats without altering a file during validation.
 
         Args:
             connection: Open SQLite connection; caller owns its lifetime and
@@ -234,10 +238,8 @@ class SQLiteEventStore:
         stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
         if not objects and application_id == 0 and stored_version == 0:
             return True
-        expected = _TABLES
-        compatible = (
-            application_id == _APPLICATION_ID and stored_version == SCHEMA_VERSION
-        )
+        expected = _SCHEMAS.get(stored_version, {})
+        compatible = application_id == _APPLICATION_ID and bool(expected)
         compatible = compatible and len(objects) == len(expected)
         for kind, name, sql in objects:
             if not _matches_table_definition(kind, name, sql, expected):
@@ -247,6 +249,10 @@ class SQLiteEventStore:
                 f"Incompatible journal schema at {self.db_path}; "
                 "The file was not converted."
             )
+        self._storage_version = stored_version
+        self._event_columns = _EVENT_COLUMNS
+        if stored_version == 3:
+            self._event_columns += ", payload_encoding"
         return False
 
     def _check_file(self) -> tuple[int, int]:
@@ -612,7 +618,7 @@ class SQLiteEventStore:
         """Create journal tables and set application/schema identifiers in the transaction."""
         _create_tables(connection)
         connection.execute(f"PRAGMA application_id={_APPLICATION_ID}")
-        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        connection.execute(f"PRAGMA user_version={STORAGE_SCHEMA_VERSION}")
 
     def _insert_event(
         self,
@@ -629,18 +635,12 @@ class SQLiteEventStore:
             connection: Open SQLite connection; caller owns its lifetime and
                 transaction unless omitted.
         """
+        # Model initialization may discover Pydantic plugins; defer it until I/O
+        # is allowed rather than changing the store's import/constructor contract.
+        from core.journal.checkpoint_request_ids import _insert_stored_event
+
         writer = self._connection if connection is None else connection
-        writer.execute(
-            "INSERT INTO events "
-            "(event_id, producer_instance_id, sequence_number, event_json) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                event["event_id"],
-                event["producer_instance_id"],
-                event["sequence_number"],
-                encoded,
-            ),
-        )
+        _insert_stored_event(writer, event, encoded, self._storage_version)
 
     def append(self, event: JsonObject) -> None:
         """Validate and commit an ordinary event with its corresponding change record.
@@ -684,7 +684,7 @@ class SQLiteEventStore:
                 self._check_health(writing=True)
                 if replay:
                     existing = self._connection.execute(
-                        "SELECT event_json FROM events WHERE event_id=?",
+                        f"SELECT {self._event_columns} FROM events WHERE event_id=?",
                         (snapshot["event_id"],),
                     ).fetchone()
                     if existing is not None:
@@ -692,7 +692,8 @@ class SQLiteEventStore:
                             snapshot, sort_keys=True, ensure_ascii=True
                         )
                         previous = json.dumps(
-                            json.loads(existing[0]), sort_keys=True, ensure_ascii=True
+                            json.loads(self._decode_row(existing).encoded_event),
+                            sort_keys=True, ensure_ascii=True
                         )
                         if canonical != previous:
                             raise ValueError(
@@ -708,9 +709,11 @@ class SQLiteEventStore:
                 self._rollback(self._connection, error)
                 raise self._storage_failure(error, "append event", snapshot)
 
-    def _decode_row(self, row: tuple) -> JournalEntry:
-        """Validate a SQLite event row while retaining its original encoded representation."""
-        return _decode_row(row)
+    def _decode_row(
+        self, row: tuple, connection: sqlite3.Connection | None = None
+    ) -> JournalEntry:
+        """Decode using the caller's consistent SQL view, including dependencies."""
+        return _decode_row(row, self._connection if connection is None else connection)
 
     def read_events(
         self,
@@ -749,8 +752,8 @@ class SQLiteEventStore:
                 boundary = _read_boundary(self._connection)
                 after = _checkpoint_position(parsed, boundary, "cursor")
                 rows = self._connection.execute(
-                    "SELECT cursor, event_id, producer_instance_id, sequence_number, "
-                    "event_json FROM events WHERE cursor > ? ORDER BY cursor LIMIT 1000",
+                    f"SELECT {self._event_columns} FROM events "
+                    "WHERE cursor > ? ORDER BY cursor LIMIT 1000",
                     (after,),
                 )
                 result = []
@@ -807,7 +810,7 @@ class SQLiteEventStore:
             if entry is None:
                 after = row[0]
                 continue
-            size = len(row[4].encode("utf-8"))
+            size = len(entry.encoded_event.encode("utf-8"))
             if result and page_bytes + size > _PAGE_BYTES:
                 break
             result.append(entry)
@@ -859,10 +862,11 @@ class SQLiteEventStore:
                 entries, size = [], 0
                 try:
                     for row in rows:
-                        length = len(row[4].encode("utf-8"))
+                        entry = self._decode_row(row)
+                        length = len(entry.encoded_event.encode("utf-8"))
                         if size + length > _PAGE_BYTES and entries:
                             break
-                        entries.append(self._decode_row(row))
+                        entries.append(entry)
                         size += length
                 finally:
                     rows.close()
@@ -900,7 +904,7 @@ class SQLiteEventStore:
             Open SQLite cursor over matching original rows; the caller must close
             it.
         """
-        columns = "cursor, event_id, producer_instance_id, sequence_number, event_json"
+        columns = self._event_columns
         if event_ids is not None:
             placeholders = ",".join("?" for _ in event_ids)
             rows = self._connection.execute(
@@ -931,13 +935,12 @@ class SQLiteEventStore:
             Validated original entry for the referenced event ID.
         """
         row = connection.execute(
-            "SELECT cursor, event_id, producer_instance_id, sequence_number, event_json "
-            "FROM events WHERE event_id=?",
+            f"SELECT {self._event_columns} FROM events WHERE event_id=?",
             (event_id,),
         ).fetchone()
         if row is None:
             raise LoggingStorageError("Journal reference points to a missing event.")
-        return self._decode_row(row)
+        return self._decode_row(row, connection)
 
     def _effective_entry(
         self, entry: JournalEntry, connection: sqlite3.Connection
@@ -1278,13 +1281,12 @@ class SQLiteEventStore:
                         raise ValueError("Observation has no associated event.")
                     continue
                 stored = reader.execute(
-                    "SELECT cursor, event_id, producer_instance_id, sequence_number, "
-                    "event_json FROM events WHERE event_id=?",
+                    f"SELECT {self._event_columns} FROM events WHERE event_id=?",
                     (event_id,),
                 ).fetchone()
                 if stored is None:
                     raise ValueError("Command result refers to a missing event.")
-                entry = self._decode_row(stored)
+                entry = self._decode_row(stored, reader)
                 event = entry.event
                 observation, command_data = _decode_author_observation(
                     event, observation_json, request_id, identity
@@ -1454,12 +1456,11 @@ class SQLiteEventStore:
             reader: Open source SQLite connection used for a consistent read.
         """
         rows = reader.execute(
-            "SELECT cursor, event_id, producer_instance_id, sequence_number, "
-            "event_json FROM events ORDER BY cursor"
+            f"SELECT {self._event_columns} FROM events ORDER BY cursor"
         )
         try:
             for row in rows:
-                entry = self._decode_row(row)
+                entry = self._decode_row(row, reader)
                 if entry.event.event_type == "command.result":
                     self._effective_entry(entry, reader)
         finally:
@@ -1476,6 +1477,10 @@ class SQLiteEventStore:
             self._decode_change(row, reader)
         if reader.execute("PRAGMA foreign_key_check").fetchall():
             raise LoggingStorageError("Journal contains broken references.")
+        if self._storage_version == 3:
+            from core.journal.checkpoint_request_ids import _validate_history_links
+
+            _validate_history_links(reader)
 
     def export_snapshot(
         self, destination: str | Path, *, min_free_bytes: int
@@ -1586,7 +1591,7 @@ class SQLiteEventStore:
                     "snapshot_id": self._export_request_id or uuid4().hex,
                     "journal_id": info["journal_id"],
                     "generation": info["generation"],
-                    "storage_schema_version": SCHEMA_VERSION,
+                    "storage_schema_version": self._storage_version,
                     "cursor": cursor,
                     "event_count": event_count,
                     "change_cursor": change_cursor,
@@ -1685,7 +1690,9 @@ class SQLiteEventStore:
                     request_id, connection=reader
                 )
                 metadata, starts, selected_operations, selected = (
-                    _diagnostic_operation_events(reader, roots, self._decode_row)
+                    _diagnostic_operation_events(
+                        reader, roots, lambda row: self._decode_row(row, reader)
+                    )
                 )
                 _add_diagnostic_observer_events(
                     reader, selected_operations, selected, read_result
@@ -2066,6 +2073,9 @@ class SQLiteEventStore:
                 transaction unless omitted.
             manifest: Expected journal snapshot boundary and content checksum.
         """
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != manifest.storage_schema_version:
+            raise ValueError("Snapshot storage version does not match its database.")
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
             raise LoggingStorageError("Restored journal failed its integrity check.")
         self._validate_snapshot_source(connection)
@@ -2145,13 +2155,14 @@ class SQLiteEventStore:
         inserted = []
         for event, encoded in events:
             previous = connection.execute(
-                "SELECT event_json FROM events WHERE event_id=?",
+                f"SELECT {self._event_columns} FROM events WHERE event_id=?",
                 (event["event_id"],),
             ).fetchone()
             if previous is not None:
-                if json.dumps(json.loads(previous[0]), sort_keys=True) != json.dumps(
-                    event, sort_keys=True
-                ):
+                if json.dumps(
+                    json.loads(self._decode_row(previous, connection).encoded_event),
+                    sort_keys=True,
+                ) != json.dumps(event, sort_keys=True):
                     raise ValueError(
                         "Diagnostic event ID conflicts with restored history."
                     )

@@ -671,7 +671,9 @@ def _export_source_view(store, previous, destination: Path) -> None:
             try:
                 for row in rows:
                     if rebuild:
-                        entry = store._effective_entry(store._decode_row(row), source)
+                        entry = store._effective_entry(
+                            store._decode_row(row, source), source
+                        )
                         if entry is None:
                             continue
                         record = {

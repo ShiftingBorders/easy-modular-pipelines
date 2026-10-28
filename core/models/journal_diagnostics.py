@@ -251,7 +251,7 @@ class JournalSnapshotManifest(_Document):
     snapshot_id: UUIDText
     journal_id: UUIDText
     generation: UUIDText
-    storage_schema_version: VersionTwo
+    storage_schema_version: Literal[2, 3]
     cursor: SQLitePosition
     event_count: SQLitePosition
     change_cursor: SQLitePosition

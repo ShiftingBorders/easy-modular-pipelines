@@ -48,9 +48,15 @@ def _read_journal_info(connection: sqlite3.Connection) -> JsonObject:
     }
 
 
-def _decode_row(row: tuple) -> JournalEntry:
+def _decode_row(
+    row: tuple, connection: sqlite3.Connection | None = None
+) -> JournalEntry:
     from core.models.journal_records import JournalEntry, JournalEvent
 
+    if len(row) == 6:
+        from core.journal.checkpoint_request_ids import _reconstruct_event
+
+        row = _reconstruct_event(connection, row)
     cursor, event_id, producer, sequence, encoded = row
     if not isinstance(encoded, str):
         raise TypeError("Stored event must be JSON text.")

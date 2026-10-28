@@ -69,7 +69,7 @@ class LoggerSnapshotTests(unittest.TestCase):
         self.assertEqual(UUID(manifest["generation"]).hex, manifest["generation"])
         self.assertEqual(manifest["cursor"], len(original))
         self.assertEqual(manifest["event_count"], len(original))
-        self.assertEqual(manifest["storage_schema_version"], 2)
+        self.assertEqual(manifest["storage_schema_version"], 3)
         self.assertEqual(manifest["database"], "journal.sqlite")
         # Windows may briefly expose SQLite's delete-pending temporary journal.
         deadline = time.monotonic() + 1

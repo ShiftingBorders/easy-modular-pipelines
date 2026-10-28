@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.journal.logger import OperationLogger
+from core.journal.records import _decode_row
 from core.journal.settings import _load_logging_settings
 from core.primitives.json_files import read_json, write_json
 from tests.helpers.dag import process_running, wait_until
@@ -56,7 +57,10 @@ def database_snapshot(path: Path) -> dict[str, list[tuple]]:
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("BEGIN")
         result = {
-            "events": db.execute("SELECT * FROM events ORDER BY cursor").fetchall(),
+            "events": db.execute(
+                "SELECT cursor, event_id, producer_instance_id, sequence_number, "
+                "event_json FROM events ORDER BY cursor"
+            ).fetchall(),
             "changes": db.execute(
                 "SELECT * FROM journal_changes ORDER BY change_cursor"
             ).fetchall(),
@@ -64,12 +68,25 @@ def database_snapshot(path: Path) -> dict[str, list[tuple]]:
                 "SELECT * FROM command_results ORDER BY request_id"
             ).fetchall(),
         }
+        if db.execute("PRAGMA user_version").fetchone()[0] == 3:
+            result["encodings"] = db.execute(
+                "SELECT cursor, payload_encoding FROM events ORDER BY cursor"
+            ).fetchall()
+            result["checkpoint_ids"] = db.execute(
+                "SELECT * FROM checkpoint_request_ids ORDER BY event_cursor"
+            ).fetchall()
         db.rollback()
         return result
 
 
 def stored_events(path: Path) -> list[dict]:
-    return [json.loads(row[-1]) for row in database_snapshot(path)["events"]]
+    """Return original events, resolving compact arrays in the same SQL view."""
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        return [
+            json.loads(_decode_row(row, db).encoded_event)
+            for row in db.execute("SELECT * FROM events ORDER BY cursor")
+        ]
 
 
 class WriterFixture:

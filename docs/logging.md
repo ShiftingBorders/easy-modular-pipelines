@@ -117,9 +117,89 @@ old and new generations or silently reuse an old write client.
 the existing event ID unique index; tail lookup uses the cursor primary key.
 The byte budget can shorten either page. For ID lookup, request any remaining
 IDs explicitly; for a tail page, continue with `before` equal to the smallest
-returned cursor. An absent ID is not fabricated. This API adds no journal
-tables, columns, indexes, or schema migration. It returns original raw events;
+returned cursor. An absent ID is not fabricated. Reading does not change the
+journal schema. It returns original raw events;
 use the change feed for effective-result and confirmation metadata.
+
+## Compact checkpoint history
+
+New journals use SQLite storage format 3. The event envelopes, public reader
+responses, and diagnostic document format remain version 2. Snapshot manifests
+identify the database format with `storage_schema_version`.
+
+The journal stores the accumulated `used_request_ids` arrays from
+`runner.checkpoint` and `rebuild.checkpoint` as full anchors and additions to
+earlier arrays. Every checkpoint remains a separate committed event, including
+unchanged states. An anchor is followed by at most 31 deltas. A different
+experiment, run, checkpoint type, or journal generation starts an independent
+chain; a shrinking set also starts a full anchor.
+
+All journal readers return the complete original event, including the original
+request-ID array and encoded JSON. Indexed reads of historical events resolve
+their own dependencies. Event-size and page-byte limits use the complete event,
+not its smaller stored representation. Invalid dependencies or a failed content
+checksum raise a storage error rather than returning an incomplete state.
+
+Event, request-ID history, and change-feed publication share one transaction.
+COMMIT acknowledgement, WAL/FULL synchronization, and writer replay guarantees
+are unchanged. Snapshots contain the required history; diagnostic exports and
+filtered views contain reconstructed events and are independent of unselected
+base events. Runtime state and standalone `state.json` retain their full arrays.
+
+Storage-format-2 journals remain readable and writable in their original format;
+opening them does not convert their history. Old snapshots remain restorable.
+Older application versions cannot open format-3 databases.
+
+### Convert an existing journal
+
+The standalone maintenance script creates a verified format-3 copy:
+
+```text
+uv run python -B scripts/convert_journal_request_ids.py --source "<absolute-old-journal.sqlite>" --destination "<absolute-new-journal.sqlite>"
+```
+
+Both paths must be absolute. The destination directory must exist, and the output
+file must not exist. The script accepts storage format 2, preserves the source,
+and uses the existing request-ID representation without general JSON compression.
+Savings depend on repeated checkpoint arrays; a journal with little eligible
+history can become slightly larger because of the new storage metadata.
+It is not part of the server, application CLI, or automatic startup.
+
+From outside the checkout, use:
+
+```text
+uv run --project "<absolute-checkout>" python -B "<absolute-checkout>/scripts/convert_journal_request_ids.py" --source "<absolute-old-journal.sqlite>" --destination "<absolute-new-journal.sqlite>"
+```
+
+The script captures a consistent SQLite backup, including committed WAL data.
+It preserves every event's original JSON text, IDs and cursors, command results
+and observations, the change feed, restoration records, and sequence high-water
+marks. It verifies the complete reconstructed history before publishing the
+destination. A source write after capture is outside the reported boundary.
+
+Progress goes to stderr; stdout contains a JSON summary with the captured
+boundary, counts, logical checksums, sizes, elapsed time, and report path.
+The same verification report is kept under
+`.artifacts/logs/journal-conversion/<run-id>/report.json`. It is written before
+publication and may remain as verification evidence if publication fails.
+
+Temporary source copies use `.artifacts/tmp/journal-conversion/`. The unpublished
+output is staged beside the destination. Space checks allow for both copies and
+a 64 MiB free-space reserve; conversion can require roughly three source
+database sizes of free space when both locations share a disk. Final publication
+uses an atomic hard link and refuses a destination created concurrently. The
+destination filesystem must support hard links, such as NTFS or ext4.
+Interrupted runs can leave temporary files, but do not publish incomplete output.
+
+To adopt the copy as an experiment's journal, stop the actual writer and
+participants and close readers **before capturing the copy for adoption**.
+Closing one logger client does not stop a standalone writer. Keep the original
+database and any remaining auxiliary files together as a backup; do not associate
+an old WAL with the new database. Then place the verified copy at the configured
+journal path and reopen it with the updated runtime. Its journal identity and
+generation are preserved, so the existing identity-bound configuration remains
+valid. Do not run both copies as independent writable journals with that identity.
+Existing snapshot bundles and their manifests remain unchanged.
 
 ## Results and reliability
 

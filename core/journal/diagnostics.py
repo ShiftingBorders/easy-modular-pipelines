@@ -67,14 +67,17 @@ def _decode_author_observation(
 def _content_digest(connection: sqlite3.Connection) -> str:
     """Hash logical rows, independent of WAL layout and checkpoint timing."""
     digest = hashlib.sha256()
-    for table, order in (
+    tables = [
         ("journal_info", "singleton"),
         ("events", "cursor"),
         ("command_results", "request_id"),
         ("journal_changes", "change_cursor"),
         ("journal_restorations", "restoration_id"),
         ("sqlite_sequence", "name"),
-    ):
+    ]
+    if connection.execute("PRAGMA user_version").fetchone()[0] == 3:
+        tables.append(("checkpoint_request_ids", "event_cursor"))
+    for table, order in tables:
         digest.update(table.encode("ascii") + b"\n")
         for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
             digest.update(

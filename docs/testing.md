@@ -46,6 +46,30 @@ or opt-in test behavior.
 
 ## Selected suites
 
+The compact checkpoint-history checks use five focused scenarios:
+
+```text
+uv run python -m unittest tests.journal.test_checkpoint_request_ids -v
+```
+
+They cover exact history and physical savings, bounded chains, legacy-format
+compatibility, transactional replay, corrupted dependencies, and snapshot/export/
+restore/projection behavior. The fixed format-2 SQL fixture is version-controlled;
+no private experiment journal is required. Existing journal and experiment
+recovery suites exercise the same format through real writer/runner processes.
+
+The standalone converter has three focused scenarios:
+
+```text
+uv run python -m unittest tests.journal.test_journal_converter tests.journal.test_checkpoint_request_ids -v
+```
+
+They cover committed WAL data, exact original JSON and auxiliary rows, cursor
+gaps and sequence allocation, an active source's capture boundary, failures and
+process interruption before publication, and normal replay/snapshot/restore of
+the converted database. The CLI is also exercised from another working directory.
+Fixtures are self-contained; no private runtime journal is required.
+
 | Area | Command |
 | --- | --- |
 | Module storage | `uv run python -m unittest tests.storage.test_hash_db tests.modules.test_manager tests.storage.test_seaweed -v` |
