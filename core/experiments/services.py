@@ -55,7 +55,11 @@ from core.participants.connection import ParticipantConnection
 from core.participants.protocol import PROTOCOL_VERSION
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
-from core.primitives.processes import module_process_arguments, process_identity
+from core.primitives.processes import (
+    _same_process_identity,
+    module_process_arguments,
+    process_identity,
+)
 
 type ServiceAction = Literal["ready", "pause", "stop"]
 
@@ -1760,7 +1764,7 @@ class ServiceManager:
         """
         while True:
             try:
-                if process_identity(launcher["pid"]) != launcher:
+                if not _same_process_identity(process_identity(launcher["pid"]), launcher):
                     return True
                 recovered_process = psutil.Process(launcher["pid"])
                 if recovered_process.status() == psutil.STATUS_ZOMBIE:
@@ -2012,7 +2016,7 @@ class ServiceManager:
             peer = announced.get("process")
             if isinstance(peer, dict):
                 try:
-                    peer_alive = process_identity(peer["pid"]) == peer
+                    peer_alive = _same_process_identity(process_identity(peer["pid"]), peer)
                 except OSError:
                     peer_alive = False
                 if peer_alive and instance.ever_ready:
@@ -2031,7 +2035,9 @@ class ServiceManager:
             ) and getattr(error, "winerror", None) not in (87, 1168):
                 raise
             actual = None
-        if actual != _process_identity_document(instance.process_identity):
+        if not _same_process_identity(
+            actual, _process_identity_document(instance.process_identity)
+        ):
             instance.failure = ServiceFailureDetails(
                 code="service_failure",
                 message="Previous service process no longer exists.",
@@ -2684,8 +2690,8 @@ class ServiceManager:
                     )
                 else:
                     observed = process_identity(instance.process_identity.pid)
-                    instance.stopped = observed != _process_identity_document(
-                        instance.process_identity
+                    instance.stopped = not _same_process_identity(
+                        observed, _process_identity_document(instance.process_identity)
                     )
                     if not instance.stopped:
                         participant = psutil.Process(observed["pid"])

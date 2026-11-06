@@ -28,7 +28,11 @@ from core.participants.protocol import (
 )
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_number
-from core.primitives.processes import process_identity, process_running
+from core.primitives.processes import (
+    _same_process_identity,
+    process_identity,
+    process_running,
+)
 
 
 class ParticipantServer:
@@ -150,7 +154,7 @@ class ParticipantServer:
                 # holds a handle to an already terminated child.
                 if (
                     process_running(identity["pid"])
-                    and process_identity(identity["pid"]) == identity
+                    and _same_process_identity(process_identity(identity["pid"]), identity)
                 ):
                     raise RuntimeError(
                         "The endpoint is still owned by a live participant."

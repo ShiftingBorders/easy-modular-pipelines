@@ -178,6 +178,29 @@ the recorded old/new module versions. Matching names authorize transfer across
 versions; they do not establish compatibility. Failed reload changes, errors,
 and rollback observations remain available in the journal after restoration.
 
+### Windows process ownership
+
+An accepted stage result does not prove that its executor has finished cleanup.
+EMP waits for the exact executor, separately from its `uv` launcher, before
+dependent artifact or snapshot operations. Confirmed exit is retained while the
+result remains referenced, so later DAG visits do not repeatedly open an old PID.
+An exit-check failure includes the request ID and expected OS identity in its
+traceback notes. Preserve those notes when reporting `WinError 5`.
+
+Access denial alone does not mean that a process is gone. On Windows, EMP checks
+the OS process list when `OpenProcess` returns access denied. Only independently
+confirmed absence permits treating it as a disappeared process. An inaccessible
+listed process or failed observation still blocks unsafe cleanup.
+
+New Windows process identities use `windows:<boot-session-guid>` for `boot_id`.
+Unlike the previous boot-time value, this does not change with wall-clock
+adjustments. Stop the original controller and its participants before upgrading
+an active Windows experiment. Old numeric boot IDs remain readable, but an
+otherwise matching live process raises `Cannot verify legacy Windows process
+identity` instead of being silently treated as terminated. Missing or definitely
+replaced old processes can still be reconciled. Do not edit saved ownership
+records to bypass this check. Linux process identity representation is unchanged.
+
 ### Manual snapshots and recovery
 
 At an idle pause, `snapshot --label <label> --wait` records a restoration point.

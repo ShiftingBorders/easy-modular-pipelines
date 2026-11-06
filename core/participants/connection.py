@@ -22,7 +22,7 @@ from core.participants.protocol import (
 )
 from core.primitives.json_files import read_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
-from core.primitives.processes import process_identity
+from core.primitives.processes import _same_process_identity, process_identity
 
 
 class ParticipantConnection:
@@ -90,7 +90,7 @@ class ParticipantConnection:
             ):
                 raise ValueError("Participant endpoint identity mismatch.")
             actual = await asyncio.to_thread(process_identity, endpoint.process.pid)
-            if actual != endpoint.process.model_dump():
+            if not _same_process_identity(actual, endpoint.process.model_dump()):
                 raise ValueError("Participant OS identity differs from its endpoint.")
             address = endpoint.endpoint
             token_path = Path(address.token_file)

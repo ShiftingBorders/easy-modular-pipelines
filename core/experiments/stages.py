@@ -71,7 +71,11 @@ from core.participants.connection import ParticipantConnection
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, JsonValue
 from core.primitives.paths import repository_root
-from core.primitives.processes import process_identity
+from core.primitives.processes import (
+    _same_process_identity,
+    _wait_process_exit,
+    process_identity,
+)
 
 if TYPE_CHECKING:
     from core.journal.logger import OperationLogger
@@ -149,6 +153,7 @@ class StageRunner:
         self._unstarted_attempt_id = None
         self._executor_processes = []
         self._executor_identities: dict[str, ProcessIdentity | JsonObject | None] = {}
+        self._completed_executor_identities: dict[str, ProcessIdentity | JsonObject] = {}
         self._notify_resources = notify_resources
         self._journal_deadlines: dict[str, float] = {}
         self._startup: _ExecutorStartup | None = None
@@ -1438,9 +1443,10 @@ class StageRunner:
                 return True
             if attempt.process_identity is not None:
                 try:
-                    if process_identity(
-                        _process_identity_pid(attempt.process_identity)
-                    ) != _process_identity_document(attempt.process_identity):
+                    if not _same_process_identity(
+                        process_identity(_process_identity_pid(attempt.process_identity)),
+                        _process_identity_document(attempt.process_identity),
+                    ):
                         return True
                     psutil.Process(
                         _process_identity_pid(attempt.process_identity)
@@ -1673,9 +1679,10 @@ class StageRunner:
         if identity is None:
             return False
         try:
-            if process_identity(
-                _process_identity_pid(identity)
-            ) != _process_identity_document(identity):
+            if not _same_process_identity(
+                process_identity(_process_identity_pid(identity)),
+                _process_identity_document(identity),
+            ):
                 return True
             psutil.Process(_process_identity_pid(identity)).wait(timeout=0)
             return True
@@ -1764,16 +1771,47 @@ class StageRunner:
             await self._wait_accepted_executors(state)
 
     async def _wait_accepted_executors(self, state: RunnerState) -> None:
-        """Recover accepted-result executor identities and wait for remaining writers to exit.
+        """Confirm actual executor exit without reopening already retired identities.
 
-        Args:
-            state: Runner state providing the selected template, cursor, and
-                participant ownership.
+        Completion belongs to an exact request/OS identity, not its accepted result
+        or uv launcher. Keep confirmations only while accepted results refer to them.
+        A new controller has no inherited confirmations and verifies exit again.
         """
+        accepted = await self._read_accepted_executor_identities(state)
+        self._completed_executor_identities = {
+            key: identity
+            for key, identity in self._completed_executor_identities.items()
+            if accepted.get(key) == identity
+        }
+        self._executor_identities.update(accepted)
+        for request_id, identity in list(self._executor_identities.items()):
+            if identity is None:
+                raise ValueError(f"Executor identity is missing for request {request_id}.")
+            if self._completed_executor_identities.get(request_id) != identity:
+                expected = _process_identity_document(identity)
+                try:
+                    await asyncio.to_thread(
+                        _wait_process_exit, expected, state.template.start_timeout
+                    )
+                except BaseException as error:
+                    error.add_note(
+                        f"Executor exit check failed for request {request_id}; "
+                        f"expected identity: {expected}."
+                    )
+                    raise
+                if request_id in accepted:
+                    self._completed_executor_identities[request_id] = identity
+            self._executor_identities.pop(request_id, None)
+
+    async def _read_accepted_executor_identities(
+        self, state: RunnerState
+    ) -> dict[str, ProcessIdentity | JsonObject]:
+        """Reconstruct executor ownership from retained results and process metadata."""
         request_ids = set(state.stage_result_ids.values())
         for transfer in (state.pending_input, state.last_dag_decision):
             if transfer is not None:
                 request_ids.add(transfer.request_id)
+        identities = {}
         for request_id in request_ids:
             record = await asyncio.to_thread(
                 self._journal.client.read_command_result, request_id
@@ -1799,21 +1837,12 @@ class StageRunner:
             if process_path.is_file():
                 process_record = read_json(process_path)
                 if process_record.get("experiment_id") == state.experiment_id:
-                    self._executor_identities[request_id] = _retain_process_identity(
+                    identity = _retain_process_identity(
                         process_record["executor"]
                     )
-        for request_id, identity in list(self._executor_identities.items()):
-            try:
-                if process_identity(
-                    _process_identity_pid(identity)
-                ) == _process_identity_document(identity):
-                    await asyncio.to_thread(
-                        psutil.Process(_process_identity_pid(identity)).wait,
-                        state.template.start_timeout,
-                    )
-            except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
-                pass
-            except OSError as error:
-                if getattr(error, "winerror", None) not in (87, 1168):
-                    raise
-            self._executor_identities.pop(request_id, None)
+                    if identity is None:
+                        raise ValueError(
+                            f"Executor identity is missing for request {request_id}."
+                        )
+                    identities[request_id] = identity
+        return identities

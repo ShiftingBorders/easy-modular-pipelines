@@ -27,7 +27,11 @@ from core.primitives.file_lock import _open_file_lock
 from core.primitives.framing import encode_frame, read_frame_sync
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object
-from core.primitives.processes import process_identity, process_running
+from core.primitives.processes import (
+    _same_process_identity,
+    process_identity,
+    process_running,
+)
 
 if TYPE_CHECKING:
     from core.models.journal_settings import JournalConfiguration
@@ -481,13 +485,13 @@ def ensure_standalone(
             try:
                 if (
                     process_running(identity["pid"])
-                    and process_identity(identity["pid"]) == identity
+                    and _same_process_identity(process_identity(identity["pid"]), identity)
                 ):
                     if endpoint.managed:
                         stop_standalone(endpoint, orphaned=True)
                     else:
                         return endpoint_path
-            except (OSError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError):
                 pass
         loaded, context = _load_logging_settings(config_path)
         configuration = configuration or loaded
@@ -552,7 +556,7 @@ def _wait_standalone(
             try:
                 if (
                     process_running(identity["pid"])
-                    and process_identity(identity["pid"]) == identity
+                    and _same_process_identity(process_identity(identity["pid"]), identity)
                 ):
                     write_json(
                         discovery_path(database),
@@ -605,7 +609,7 @@ def stop_standalone(endpoint: WriterEndpoint, *, orphaned: bool = False) -> None
     identity = endpoint.process.model_dump()
     if (
         not process_running(identity["pid"])
-        or process_identity(identity["pid"]) != identity
+        or not _same_process_identity(process_identity(identity["pid"]), identity)
     ):
         return
     try:
@@ -632,7 +636,7 @@ def stop_standalone(endpoint: WriterEndpoint, *, orphaned: bool = False) -> None
         time.sleep(0.025)
     try:
         process = psutil.Process(identity["pid"])
-        if process_identity(identity["pid"]) == identity:
+        if _same_process_identity(process_identity(identity["pid"]), identity):
             process.kill()
             process.wait(timeout=5)
     except psutil.NoSuchProcess:

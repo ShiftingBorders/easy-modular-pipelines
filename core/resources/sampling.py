@@ -29,7 +29,7 @@ from core.models.resource_target import ResourceTargetDocument
 from core.models.updates import _update_model
 from core.primitives.json_files import write_json
 from core.primitives.json_values import JsonObject
-from core.primitives.processes import process_identity
+from core.primitives.processes import _same_process_identity, process_identity
 from core.resources.observations import MeasuredResource, ResourceObservation
 from core.resources.state import CollectorSettings, ResourceTarget
 
@@ -313,14 +313,14 @@ class ResourceSampler:
                 observed_identity = identity
             if host_id != self.host["host_id"] or boot_id != self.host["boot_id"]:
                 reason = "different_host_or_boot"
-            elif process_identity(pid) != observed_identity:
+            elif not _same_process_identity(process_identity(pid), observed_identity):
                 reason = "identity_changed"
             else:
                 process = psutil.Process(pid)
                 times = process.cpu_times()
                 measured_memory = process.memory_info().rss
                 # Check both sides of the read so reused PIDs cannot mix two processes.
-                if process_identity(pid) != observed_identity:
+                if not _same_process_identity(process_identity(pid), observed_identity):
                     reason = "identity_changed"
                 else:
                     memory = measured_memory

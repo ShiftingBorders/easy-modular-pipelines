@@ -315,7 +315,7 @@ def recovery_candidates(project_root: Path) -> list[str]:
 def _needs_recovery(state: RunnerState, root: Path, local: JsonObject) -> bool:
     import psutil
 
-    from core.primitives.processes import process_identity
+    from core.primitives.processes import _same_process_identity, process_identity
 
     if state.pending_rebuild is not None:
         return True
@@ -352,14 +352,17 @@ def _needs_recovery(state: RunnerState, root: Path, local: JsonObject) -> bool:
             if identity["host_id"] != local["host_id"]:
                 alive = True
                 break
-            if identity["boot_id"] != local["boot_id"]:
+            legacy_windows = (
+                local["boot_id"].startswith("windows:") and identity["boot_id"].isdecimal()
+            )
+            if not legacy_windows and identity["boot_id"] != local["boot_id"]:
                 continue
             pid = identity["pid"]
             if type(pid) is not int or pid <= 0:
                 raise ValueError("Invalid saved process identity.")
             try:
                 process = psutil.Process(pid)
-                if process_identity(pid) == identity:
+                if _same_process_identity(process_identity(pid), identity):
                     process.wait(timeout=0)
             except (
                 psutil.NoSuchProcess,

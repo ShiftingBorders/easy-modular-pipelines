@@ -41,7 +41,7 @@ from core.modules.manager import ModuleManager
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
 from core.primitives.paths import repository_root
-from core.primitives.processes import process_identity
+from core.primitives.processes import _same_process_identity, process_identity
 from core.primitives.tasks import _await_outcome
 from core.storage.errors import StorageCapacityError, StorageConflict
 
@@ -309,7 +309,9 @@ class ExperimentArchiver:
             )
         if (
             state.owner_identity is not None
-            and state.owner_identity.model_dump() != process_identity(os.getpid())
+            and not _same_process_identity(
+                process_identity(os.getpid()), state.owner_identity.model_dump()
+            )
         ):
             self._assert_exited(state.owner_identity.model_dump())
         transaction = (
@@ -368,11 +370,14 @@ class ExperimentArchiver:
         local = process_identity(os.getpid())
         if identity["host_id"] != local["host_id"]:
             raise RuntimeError("Cannot confirm shutdown of a process on another host.")
-        if identity["boot_id"] != local["boot_id"]:
+        legacy_windows = (
+            local["boot_id"].startswith("windows:") and identity["boot_id"].isdecimal()
+        )
+        if not legacy_windows and identity["boot_id"] != local["boot_id"]:
             return
         try:
             process = psutil.Process(pid)
-            if process_identity(pid) != identity:
+            if not _same_process_identity(process_identity(pid), identity):
                 return
             process.wait(timeout=0)
         except (psutil.NoSuchProcess, ProcessLookupError, FileNotFoundError):

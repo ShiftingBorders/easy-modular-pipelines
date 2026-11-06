@@ -83,7 +83,7 @@ from core.primitives.json_values import (
     copy_json_object,
     require_text,
 )
-from core.primitives.processes import process_identity
+from core.primitives.processes import _same_process_identity, process_identity
 from core.primitives.tasks import _await_outcome, _await_read_task
 
 
@@ -3176,7 +3176,7 @@ class ExperimentRunner:
         owner = state.owner_identity
         if owner is not None and owner.pid != os.getpid():
             try:
-                if process_identity(owner.pid) == owner.model_dump():
+                if _same_process_identity(process_identity(owner.pid), owner.model_dump()):
                     try:
                         psutil.Process(owner.pid).wait(timeout=0)
                     except psutil.TimeoutExpired as error:
@@ -3469,9 +3469,10 @@ class ExperimentRunner:
             )
         if instance.process_identity is not None:
             try:
-                instance.stopped = process_identity(
-                    instance.process_identity.pid
-                ) != _process_identity_document(instance.process_identity)
+                instance.stopped = not _same_process_identity(
+                    process_identity(instance.process_identity.pid),
+                    _process_identity_document(instance.process_identity),
+                )
                 if not instance.stopped:
                     process = psutil.Process(instance.process_identity.pid)
                     instance.stopped = process.status() == psutil.STATUS_ZOMBIE
@@ -3532,7 +3533,7 @@ class ExperimentRunner:
             raise RuntimeError("Rebuild endpoint and saved process ownership disagree.")
         child_alive = False
         try:
-            if process_identity(declared["pid"]) != declared:
+            if not _same_process_identity(process_identity(declared["pid"]), declared):
                 raise RuntimeError("Rebuild endpoint process identity has changed.")
             child = psutil.Process(declared["pid"])
             if child.status() != psutil.STATUS_ZOMBIE:
@@ -3553,7 +3554,7 @@ class ExperimentRunner:
                     raise RuntimeError(
                         "Rebuild endpoint ancestry cannot be verified."
                     ) from error
-                if process_identity(declared["pid"]) != declared:
+                if not _same_process_identity(process_identity(declared["pid"]), declared):
                     raise RuntimeError("Rebuild endpoint process identity has changed.")
         except (
             FileNotFoundError,
@@ -3570,7 +3571,9 @@ class ExperimentRunner:
         if child_alive:
             if (
                 launched.pid not in {p.pid for p in ancestors}
-                or process_identity(launched.pid) != launched.model_dump()
+                or not _same_process_identity(
+                    process_identity(launched.pid), launched.model_dump()
+                )
             ):
                 raise RuntimeError(
                     "Rebuild endpoint is not owned by the launched process."

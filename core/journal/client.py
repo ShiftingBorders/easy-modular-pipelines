@@ -39,7 +39,11 @@ from core.models.journal_writer import (
 from core.primitives.file_lock import _open_file_lock
 from core.primitives.framing import encode_frame, read_frame_sync
 from core.primitives.json_files import read_json
-from core.primitives.processes import process_identity, process_running
+from core.primitives.processes import (
+    _same_process_identity,
+    process_identity,
+    process_running,
+)
 
 if TYPE_CHECKING:
     from core.models.journal_records import JournalContext
@@ -583,7 +587,7 @@ def _make_journal_store(
                 try:
                     active = (
                         process_running(identity["pid"])
-                        and process_identity(identity["pid"]) == identity
+                        and _same_process_identity(process_identity(identity["pid"]), identity)
                     )
                 except OSError:
                     active = False

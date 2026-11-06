@@ -58,7 +58,7 @@ from core.models.snapshot_documents import (
 from core.models.updates import _update_model
 from core.primitives.json_files import read_json, write_json
 from core.primitives.json_values import JsonObject, copy_json_object, require_text
-from core.primitives.processes import process_identity
+from core.primitives.processes import _same_process_identity, process_identity
 from core.primitives.tasks import _await_read_task
 
 
@@ -1230,7 +1230,7 @@ class ExperimentSnapshots:
         owner = validated.owner
         if owner.pid != os.getpid():
             try:
-                if process_identity(owner.pid) == owner.model_dump():
+                if _same_process_identity(process_identity(owner.pid), owner.model_dump()):
                     try:
                         psutil.Process(owner.pid).wait(timeout=0)
                     except psutil.TimeoutExpired as error:
